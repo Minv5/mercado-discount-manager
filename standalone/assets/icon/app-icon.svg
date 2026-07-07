@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Mercado discount manager desktop app icon">
+  <defs>
+    <linearGradient id="base" x1="36" y1="18" x2="220" y2="238" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#202620"/>
+      <stop offset="1" stop-color="#101311"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="86" y1="56" x2="172" y2="204" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#367747"/>
+      <stop offset="1" stop-color="#235332"/>
+    </linearGradient>
+  </defs>
+  <rect x="18" y="18" width="220" height="220" rx="44" fill="url(#base)"/>
+  <rect x="18" y="18" width="220" height="220" rx="44" fill="none" stroke="#4E472F" stroke-width="8"/>
+  <rect x="26" y="26" width="204" height="204" rx="36" fill="none" stroke="#8A7432" stroke-opacity=".55" stroke-width="2"/>
+
+  <path d="M128 50 190 74 178 156 128 204 78 156 66 74Z" fill="url(#shield)" stroke="#8A7432" stroke-width="7" stroke-linejoin="round"/>
+  <path d="M128 64 176 82 166 149 128 186 90 149 80 82Z" fill="none" stroke="#E6E2D8" stroke-opacity=".18" stroke-width="4" stroke-linejoin="round"/>
+
+  <path d="M70 105 116 80 180 94 169 151 106 162 67 132Z" fill="#171B19" stroke="#8A7432" stroke-width="8" stroke-linejoin="round"/>
+  <circle cx="104" cy="108" r="7" fill="#8A7432"/>
+  <text x="126" y="143" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="60" font-weight="800" fill="#E6E2D8">%</text>
+
+  <rect x="143" y="134" width="56" height="54" rx="11" fill="#202620" stroke="#4E472F" stroke-width="5"/>
+  <path d="m154 150 5 5 9-11" fill="none" stroke="#8A7432" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M174 150h14M154 169h34" fill="none" stroke="#E6E2D8" stroke-width="6" stroke-linecap="round"/>
+</svg>

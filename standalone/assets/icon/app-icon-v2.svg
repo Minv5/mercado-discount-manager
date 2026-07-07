@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Mercado discount manager app icon v2">
+  <defs>
+    <linearGradient id="goldBase" x1="36" y1="18" x2="220" y2="238" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFE34A"/>
+      <stop offset=".54" stop-color="#FFD219"/>
+      <stop offset="1" stop-color="#E6A900"/>
+    </linearGradient>
+    <linearGradient id="darkBar" x1="42" y1="70" x2="206" y2="184" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#444846"/>
+      <stop offset="1" stop-color="#171B19"/>
+    </linearGradient>
+    <linearGradient id="greenCheck" x1="78" y1="86" x2="184" y2="174" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#91D832"/>
+      <stop offset="1" stop-color="#4FA91E"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="6" flood-color="#000000" flood-opacity=".28"/>
+    </filter>
+  </defs>
+
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="url(#goldBase)"/>
+  <rect x="22" y="22" width="212" height="212" rx="42" fill="none" stroke="#FFF07A" stroke-width="3" opacity=".55"/>
+  <rect x="18" y="18" width="220" height="220" rx="46" fill="none" stroke="#C58F00" stroke-width="5" opacity=".45"/>
+
+  <g filter="url(#softShadow)">
+    <rect x="44" y="72" width="20" height="112" rx="10" fill="url(#darkBar)"/>
+    <rect x="194" y="72" width="20" height="112" rx="10" fill="url(#darkBar)"/>
+    <rect x="58" y="105" width="148" height="16" rx="5" fill="url(#darkBar)"/>
+    <rect x="58" y="164" width="148" height="16" rx="5" fill="url(#darkBar)"/>
+    <rect x="85" y="78" width="46" height="30" rx="7" fill="#3D413F" stroke="#545957" stroke-width="2"/>
+    <rect x="145" y="89" width="27" height="20" rx="6" fill="#3D413F" stroke="#545957" stroke-width="2"/>
+    <rect x="75" y="139" width="34" height="27" rx="7" fill="#3D413F" stroke="#545957" stroke-width="2"/>
+    <rect x="150" y="136" width="43" height="31" rx="8" fill="#3D413F" stroke="#545957" stroke-width="2"/>
+  </g>
+
+  <path d="M76 139 112 175 184 94" fill="none" stroke="#2B4B17" stroke-width="31" stroke-linecap="round" stroke-linejoin="round" opacity=".45"/>
+  <path d="M76 135 112 171 184 90" fill="none" stroke="url(#greenCheck)" stroke-width="29" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M76 124 112 160 184 79" fill="none" stroke="#B6EA4A" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" opacity=".55"/>
+
+  <g filter="url(#softShadow)">
+    <path d="M57 61 92 49 126 58 121 89 86 98 55 81Z" fill="#171B19" stroke="#3D413F" stroke-width="5" stroke-linejoin="round"/>
+    <circle cx="84" cy="66" r="4.5" fill="#FFD219"/>
+    <text x="92" y="85" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="800" fill="#FFE34A">%</text>
+  </g>
+</svg>

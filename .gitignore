@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+
+# Local runtime data, credentials, logs, exports, and databases
+data/
+AppData/
+logs/
+log/
+exports/
+cache/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.key
+.env
+.env.*
+
+# Build outputs
+bin/
+obj/
+dist/
+dist-full/
+launcher/bin/
+launcher/obj/
+standalone/bin/
+standalone/obj/
+standalone/Payload/
+standalone/PayloadWork/
+PayloadWork/
+*.exe
+*.dll
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+
+# Temporary verification artifacts
+tmp/
+temp/
+*.tmp
+tmp-*.png
+*-visual.png
+*-final.png
+screenshots/
+
+# Generated icon exploration assets
+standalone/assets/icon/candidates/**
+!standalone/assets/icon/candidates/
+!standalone/assets/icon/candidates/imagegen-10-flat-discount-20260703/
+!standalone/assets/icon/candidates/imagegen-10-flat-discount-20260703/flattened/
+!standalone/assets/icon/candidates/imagegen-10-flat-discount-20260703/flattened/flat-candidate-m02-discount-token.png
+
+# Local Codex metadata
+.codex/
+.agents/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

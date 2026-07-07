@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>美客多折扣管家</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="assistant-window" id="workspace">
+    <section class="top-toolbar">
+      <label>模式
+        <select id="uiModeSelect">
+          <option value="auto">自动判断</option>
+          <option value="enroll">批量报活动</option>
+          <option value="update">批量更新</option>
+          <option value="cancel">批量取消</option>
+        </select>
+      </label>
+      <label>店铺
+        <select id="accountSelect"></select>
+      </label>
+      <label>站点
+        <select id="siteFilter"><option value="">全部站点</option></select>
+      </label>
+      <label>自建活动
+        <select id="sellerActivityVisual">
+          <option>全部自建活动</option>
+        </select>
+      </label>
+      <input id="sellerDiscount" class="spin-input" type="number" min="1" max="90" step="0.1" value="5" title="自建活动折扣">
+      <span class="percent-label">%</span>
+      <label>官方活动
+        <select id="officialActivityVisual">
+          <option>全部官方活动</option>
+        </select>
+      </label>
+      <input id="officialDiscount" class="spin-input" type="number" min="1" max="90" step="0.1" value="6" title="官方活动折扣">
+      <span class="percent-label">%</span>
+      <button id="todayPrecheckBtn" type="button" class="primary-submit" title="点击后会二次确认并手动输入 REAL_SUBMIT，结果以后端确认包或返回结果为准">提交执行</button>
+      <details class="settings-menu">
+        <summary>设置</summary>
+        <div class="settings-panel">
+          <h3>常用操作</h3>
+          <div class="button-row">
+            <button id="refreshAllBtn" type="button">加载活动</button>
+            <button id="todayDecisionBtn" type="button">判断今日</button>
+            <button id="todayPreviewBtn" type="button">预览</button>
+            <button id="cancelFilteredPreviewBtn" type="button">预览筛选取消</button>
+            <button id="cancelFilteredPrecheckBtn" type="button">提交筛选取消</button>
+          </div>
+          <hr>
+          <h3>设置</h3>
+          <label>授权目录<input id="settingAuthDir"></label>
+          <label>输出目录<input id="settingOutputDir"></label>
+          <label>自建默认折扣 %<input id="settingSellerDiscount" type="number" min="1" max="90" step="0.1"></label>
+          <label>官方默认折扣 %<input id="settingOfficialDiscount" type="number" min="1" max="90" step="0.1"></label>
+          <label>样本读取上限<input id="settingMaxItems" type="number" min="1"></label>
+          <label>取消复查轮数<input id="settingCancelMaxRounds" type="number" min="1"></label>
+          <label>读取并发（活动/商品）<input id="settingReadConcurrency" type="number" min="1" max="5"></label>
+          <label>预检并发<input id="settingPreviewConcurrency" type="number" min="1" max="5"></label>
+          <label>写入并发（当前使用值，1-700）<input id="settingWriteConcurrency" type="number" min="1" max="700"></label>
+          <label>真实执行口令<input id="confirmText" placeholder="可留空；提交弹层会要求输入 REAL_SUBMIT"></label>
+          <p class="danger-note">提交执行会先二次确认并要求输入 REAL_SUBMIT；页面展示后端确认包或返回结果，不代表绕过后端保护。</p>
+          <div class="button-row">
+            <button id="saveSettingsBtn" type="button">保存设置</button>
+            <button id="exportWorkspaceBtn" type="button">导出结果目录</button>
+          </div>
+          <p id="settingsSummary">设置只保存路径和数值，不保存 token 或密码。</p>
+          <p class="mini-status">服务状态：<span id="serviceStatus">检查中</span></p>
+          <hr>
+          <h3>账号授权</h3>
+          <p id="accountTitle">读取中</p>
+          <p id="accountMeta">使用本机 standalone 授权。</p>
+          <div class="button-row">
+            <button id="verifyAccountBtn" type="button">验证账号</button>
+            <button id="refreshTokenBtn" type="button">刷新 token</button>
+          </div>
+          <details>
+            <summary>备用 OAuth 授权</summary>
+            <label>Client ID<input id="clientId" autocomplete="off"></label>
+            <label>Client Secret<input id="clientSecret" type="password" autocomplete="new-password"></label>
+            <label>Redirect URI<input id="redirectUri" value="http://127.0.0.1:28758/oauth/callback"></label>
+            <label>授权域名
+              <select id="authDomain">
+                <option value="https://global-selling.mercadolibre.com">Global Selling</option>
+                <option value="https://auth.mercadolibre.com.ar">Argentina</option>
+                <option value="https://auth.mercadolibre.com.br">Brazil</option>
+                <option value="https://auth.mercadolibre.com.mx">Mexico</option>
+                <option value="https://auth.mercadolibre.com.co">Colombia</option>
+                <option value="https://auth.mercadolibre.cl">Chile</option>
+              </select>
+            </label>
+            <div class="button-row">
+              <button id="createAuthBtn" type="button">生成授权链接</button>
+              <a id="authLink" class="link-button disabled" target="_blank" rel="noreferrer">打开授权页</a>
+            </div>
+          </details>
+        </div>
+      </details>
+    </section>
+
+    <section class="today-strip">
+      <strong id="todayTitle">今日判断：等待判断</strong>
+      <span id="todaySummary">等待判断今日。</span>
+    </section>
+
+    <section class="main-table">
+      <table id="mainResultTable">
+        <colgroup>
+          <col class="time-col">
+          <col class="action-col">
+          <col class="activity-col">
+          <col class="activity-col">
+          <col class="type-col">
+          <col class="quantity-col">
+          <col class="count-col">
+          <col class="count-col">
+          <col class="count-col">
+          <col class="reason-col">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>动作</th>
+            <th>自建活动</th>
+            <th>官方活动</th>
+            <th>类型</th>
+            <th>数量类型</th>
+            <th>商品数</th>
+            <th>成功</th>
+            <th>失败</th>
+            <th>失败原因</th>
+          </tr>
+        </thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+    </section>
+
+    <section class="bottom-log">
+      <div class="log-header">日志</div>
+      <pre id="logBox"></pre>
+    </section>
+
+    <section class="hidden-controls" aria-hidden="true">
+      <select id="typeFilter"><option value="">全部类型</option></select>
+      <select id="statusFilter"><option value="">全部状态</option></select>
+      <input id="nameFilter" placeholder="活动名 / ID">
+      <input id="siteMultiFilter" placeholder="多站点">
+      <input id="typeMultiFilter" placeholder="多类型">
+      <input id="keywordFilter" placeholder="多关键词">
+      <input id="directPrice" type="number" min="0" step="0.01">
+      <select id="priceMode"><option value="discount">按折扣百分比</option><option value="direct">直接活动价</option></select>
+      <select id="actionSelect"><option value="enroll">批量报活动 candidate</option><option value="update">批量更新 started</option><option value="cancel">批量取消 started</option></select>
+      <label><input id="excludeSellerFilter" type="checkbox">不处理自建</label>
+      <label><input id="excludeOfficialFilter" type="checkbox">不处理官方</label>
+      <button id="applyFiltersBtn" type="button">筛选</button>
+      <button id="cycleDecisionBtn" type="button">周期建议</button>
+      <button id="singlePlanBtn" type="button">选中活动预览</button>
+      <button id="batchPlanBtn" type="button">批量预览</button>
+      <button id="executeBtn" type="button" disabled>提交选中活动</button>
+      <button id="batchExecuteBtn" type="button" disabled>提交批量执行</button>
+      <select id="itemStatus"><option value="candidate">candidate</option><option value="started">started</option><option value="pending">pending</option></select>
+      <input id="maxItems" type="number" min="1" value="50">
+      <button id="fetchItemsBtn" type="button">读取选中商品</button>
+      <button id="fetchBatchItemsBtn" type="button">按筛选读取样本</button>
+      <button id="fetchFullCandidateBtn" type="button">全量读取候选</button>
+      <button id="inventoryFallbackBtn" type="button">开始兜底扫描</button>
+      <button id="manualCandidateImportBtn" type="button">保存导入草案</button>
+      <button id="refreshResultsBtn" type="button">刷新历史</button>
+      <button id="refreshCreationStatusBtn" type="button">创建说明</button>
+      <button id="sellerCampaignCreatePrecheckBtn" type="button">创建活动预检</button>
+      <button id="smartRealTestBtn" type="button">SMART 验证包</button>
+      <button id="clearLogBtn" type="button">清空日志</button>
+      <input id="createCampaignSiteId">
+      <input id="createCampaignChildUserId">
+      <input id="createCampaignName">
+      <select id="createCampaignSubType"><option value="FLEXIBLE_PERCENTAGE">FLEXIBLE_PERCENTAGE</option></select>
+      <input id="createCampaignStart" type="datetime-local">
+      <input id="createCampaignFinish" type="datetime-local">
+      <textarea id="manualCandidateIds"></textarea>
+      <div id="siteSummaryText"></div>
+      <div id="siteGrid"></div>
+      <table><tbody id="activitiesBody"></tbody></table>
+      <div id="selectedActivityText"></div>
+      <div id="itemSummary"></div>
+      <table><tbody id="itemsBody"></tbody></table>
+      <input id="selectAllItems" type="checkbox">
+      <div id="inventoryFallbackPanel"></div>
+      <div id="inventoryFallbackSummary"></div>
+      <div id="inventoryFallbackDetails"></div>
+      <div id="candidateResolutionBox"></div>
+      <div id="resultSummaryCards"></div>
+      <div id="resultMeta"></div>
+      <div id="resultDetailTable"></div>
+      <pre id="planBox"></pre>
+      <div id="creationStatusBox"></div>
+      <div id="smartRealTestBox"></div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,76 @@
+import { get, nowIso, run } from './db.js';
+import { defaultDiscountForPromotion } from './planner.js';
+
+const MAX_DISCOUNT = 10;
+
+export function classifyPromotionType(promotionType) {
+  const type = String(promotionType || '').toUpperCase();
+  if (type === 'SELLER_CAMPAIGN') return 'seller';
+  return 'official';
+}
+
+export function nextDiscountFor({ promotionType, lastDiscount, lastStatus }) {
+  const base = defaultDiscountForPromotion(promotionType);
+  if (!Number.isFinite(Number(lastDiscount))) return base;
+  if (lastStatus !== 'completed') return Number(lastDiscount);
+  return Math.min(MAX_DISCOUNT, Number(lastDiscount) + 1);
+}
+
+export function decideCycleAction({ promotionType, currentDiscount, hasStartedItems }) {
+  const discount = Number(currentDiscount ?? defaultDiscountForPromotion(promotionType));
+  if (discount >= MAX_DISCOUNT && hasStartedItems) {
+    return { action: 'cancel', discount, reason: '折扣已到 10%，应进入取消阶段' };
+  }
+  return { action: 'enroll', discount, reason: '按当前周期折扣报名或补报名' };
+}
+
+export function getCycleState(accountId, promotionId, promotionType) {
+  return get(
+    'SELECT * FROM cycle_states WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?',
+    [String(accountId), promotionId, promotionType]
+  );
+}
+
+export function upsertCycleState({ accountId, promotionId, promotionType, sellerDiscountPercent, officialDiscountPercent, status, raw }) {
+  run(
+    `INSERT INTO cycle_states
+      (account_id, promotion_id, promotion_type, seller_discount_percent, official_discount_percent, status, raw_json, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, promotion_id, promotion_type) DO UPDATE SET
+        seller_discount_percent = excluded.seller_discount_percent,
+        official_discount_percent = excluded.official_discount_percent,
+        status = excluded.status,
+        raw_json = excluded.raw_json,
+        updated_at = excluded.updated_at`,
+    [
+      String(accountId),
+      promotionId,
+      promotionType,
+      sellerDiscountPercent ?? null,
+      officialDiscountPercent ?? null,
+      status,
+      raw ? JSON.stringify(raw) : null,
+      nowIso()
+    ]
+  );
+}
+
+export function markCycleAfterTask({ accountId, promotionId, promotionType, action, discountPercent, completed }) {
+  const kind = classifyPromotionType(promotionType);
+  const existing = getCycleState(accountId, promotionId, promotionType);
+  const status = completed ? (action === 'cancel' ? 'cancelled_complete' : 'completed') : 'partial_or_failed';
+  upsertCycleState({
+    accountId,
+    promotionId,
+    promotionType,
+    sellerDiscountPercent: kind === 'seller' ? discountPercent : existing?.seller_discount_percent,
+    officialDiscountPercent: kind === 'official' ? discountPercent : existing?.official_discount_percent,
+    status,
+    raw: {
+      last_action: action,
+      completed,
+      last_discount_percent: discountPercent,
+      updated_at: nowIso()
+    }
+  });
+}
