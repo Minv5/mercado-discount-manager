@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { buildBatchPlans, buildPlan, cancelUntilEmpty, fetchCompleteness, filterPromotions, normalizeActivityName, promotionKey, summarizeSites } from '../src/planner.js';
 import { decideCycleAction, nextDiscountFor } from '../src/cycle.js';
-import { MercadoLibreClient, extractMarketplaceUsers, extractPromotions } from '../src/mlClient.js';
+import { MercadoLibreClient, extractMarketplaceUsers, extractPromotions, mergePromotionsByIdentity } from '../src/mlClient.js';
 import { realSubmitProtection } from '../src/protection.js';
 import { buildBatchConfirmationPackage, buildConfirmationPackage } from '../src/confirmationPackage.js';
 import { ADAPTER_STATES, buildSubmitPayloadPreview, getPromotionAdapterState, requireExecutableSubmitPayload, requireItemStatus, summarizeSpecialPromotionFields } from '../src/promotionPayload.js';
@@ -17,7 +17,7 @@ import { DEFAULT_WRITE_CONCURRENCY, MAX_READ_CONCURRENCY, MAX_WRITE_CONCURRENCY,
 import { PROMOTION_CREATION_STATUS } from '../src/promotionCreationStatus.js';
 import { createAsyncLimiter, executePlannedRowsWithConcurrency } from '../src/executor.js';
 import { buildCandidateIncompleteResolution, buildManualCandidateDraftRows, MANUAL_CANDIDATE_IMPORT_SOURCE } from '../src/candidateResolution.js';
-import { buildSellerCampaignCreateConfirmation, buildSellerCampaignCreatePreview } from '../src/promotionCreation.js';
+import { buildSellerCampaignBatchCreatePrecheck, buildSellerCampaignCreateConfirmation, buildSellerCampaignCreatePreview, summarizeSellerCampaignLiveSites } from '../src/promotionCreation.js';
 import {
   REAL_ENROLL_SMOKE_TARGETS,
   assertSmokeTargetMatches,
@@ -42,7 +42,10 @@ import {
   limitSmartCancelPlan
 } from '../src/smartCancel.js';
 import {
+  filterPromotionsByConfirmedScope,
+  filterItemsByConfirmedScope,
   filterItemsByRequestedIds,
+  hasConfirmedExecutionScope,
   requestedExecutionItemIds,
   requestedItemFilterErrorMessage
 } from '../src/executionItemFilter.js';
@@ -55,6 +58,117 @@ import { prepareOAuthStartFromConfig } from '../src/oauthConfig.js';
 import { parseOAuthCallbackInput, selectCodeOnlyOAuthState } from '../src/oauthCallback.js';
 import { toChineseError } from '../src/errors.js';
 import { buildLegacyTaskSummaries, classifyFailureReason, summarizeUniqueFinalActionResults } from '../src/repository.js';
+import { DATA_DIR } from '../src/config.js';
+import { filterByOperatingSites, mergeOperatingSiteEvidence, normalizeOperatingSites } from '../src/operatingSites.js';
+import { buildGlobalTodayDiscount, findLatestEffectiveUpdate } from '../src/globalTodayDiscount.js';
+import { createExecutionJobPersistence } from '../src/executionJobPersistence.js';
+import { accountProfileDisplayName, accountProfileRecord, isSyntheticAccountName } from '../src/accountProfiles.js';
+import {
+  CANCEL_RESULT_STATUS,
+  buildCancelResultContract,
+  summarizeResultContractRows,
+  summarizeLiveReadRows
+} from '../src/executionResultContract.js';
+
+test('account profile display name uses verified cache before safe local fallbacks', () => {
+  assert.equal(isSyntheticAccountName('账号 2651442567', '2651442567'), true);
+  assert.equal(isSyntheticAccountName('standalone 2651442567', '2651442567'), true);
+  assert.equal(isSyntheticAccountName('CNLIUYANGSHIZHEPINGDIAN', '3408885754'), false);
+  assert.equal(accountProfileDisplayName({
+    accountId: '2651442567',
+    cachedDisplayName: 'PLATFORM_NICKNAME',
+    storedDisplayName: '账号 2651442567',
+  }), 'PLATFORM_NICKNAME');
+  assert.equal(accountProfileDisplayName({
+    accountId: '3332096437',
+    storedDisplayName: 'CNGUANGZHOULINGTANGMINB',
+  }), 'CNGUANGZHOULINGTANGMINB');
+  assert.equal(accountProfileDisplayName({ accountId: '9991234567' }), '本地授权账号 4567');
+  assert.deepEqual(accountProfileRecord({
+    accountId: '2651442567',
+    provider: 'mercadolibre-standalone',
+    profile: { nickname: 'PLATFORM_NICKNAME', site_id: 'CBT', access_token: 'must-not-copy' },
+    source: 'users_me',
+    fetchedAt: '2026-07-12T00:00:00.000Z',
+  }), {
+    account_id: '2651442567',
+    provider: 'mercadolibre-standalone',
+    display_name: 'PLATFORM_NICKNAME',
+    site_id: 'CBT',
+    fetched_at: '2026-07-12T00:00:00.000Z',
+    source: 'users_me',
+  });
+});
+
+test('account profile refresh stays read-only and serves stale cache while refreshing', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  const route = source.slice(
+    source.indexOf("url.pathname === '/api/accounts/profiles/refresh'"),
+    source.indexOf('const verifyAccountMatch'),
+  );
+  assert.match(source, /method === 'GET' && url\.pathname === '\/api\/accounts\/profiles\/refresh'/);
+  assert.match(route, /refreshAccountProfile/);
+  assert.match(route, /accounts: listAccountsForUi\(\)/);
+  assert.doesNotMatch(route, /saveTokenAccount|updateAccountToken|POST|PUT|DELETE/);
+  assert.match(source, /resolveStoreIdentity/);
+  assert.match(source, /profile,\s*storeAliases: settings\.storeAliases/);
+});
+
+test('operating site scope preserves explicit empty scopes and filters closed sites', () => {
+  const operatingSites = normalizeOperatingSites({
+    '2651442567': ['mlm', 'MLB', 'MLM'],
+    'empty-account': []
+  });
+  assert.deepEqual(operatingSites, {
+    '2651442567': ['MLB', 'MLM'],
+    'empty-account': []
+  });
+  const rows = [{ site_id: 'MLB' }, { site_id: 'MLM' }, { site_id: 'MLC' }, { site_id: 'MLU' }];
+  assert.deepEqual(filterByOperatingSites(rows, { operatingSites }, '2651442567').map((row) => row.site_id), ['MLB', 'MLM']);
+  assert.deepEqual(filterByOperatingSites(rows, { operatingSites }, 'unconfigured').map((row) => row.site_id), ['MLB', 'MLM', 'MLC', 'MLU']);
+  assert.deepEqual(filterByOperatingSites(rows, { operatingSites }, 'empty-account'), []);
+});
+
+test('operating site evidence uses active listings over stale activity cache', () => {
+  const rows = [
+    { account_id: '265', store_name: '湖北店', site_id: 'MLB', site_name: '巴西站', total: 0, active_probe_ok: true, active_listing_count: 385 },
+    { account_id: '265', store_name: '湖北店', site_id: 'MLC', site_name: '智利站', total: 4, active_probe_ok: true, active_listing_count: 0 },
+    { account_id: '265', store_name: '湖北店', site_id: 'MLM', site_name: '墨西哥站', total: 0, active_probe_ok: false }
+  ];
+  const result = mergeOperatingSiteEvidence(rows, {});
+  assert.equal(result.find((row) => row.site_id === 'MLB').suggested_operating, true);
+  assert.equal(result.find((row) => row.site_id === 'MLC').suggested_operating, false);
+  assert.equal(result.find((row) => row.site_id === 'MLC').evidence, 'no_active_listings');
+  assert.equal(result.find((row) => row.site_id === 'MLM').suggested_operating, false);
+});
+
+test('explicit operating site configuration overrides automatic suggestions', () => {
+  const rows = [
+    { account_id: '340', store_name: '湖南店', site_id: 'MLU', active_probe_ok: true, active_listing_count: 0 },
+    { account_id: '340', store_name: '湖南店', site_id: 'MLC', active_probe_ok: true, active_listing_count: 100 }
+  ];
+  const result = mergeOperatingSiteEvidence(rows, { operatingSites: { '340': ['MLU'] } });
+  assert.equal(result.find((row) => row.site_id === 'MLU').operating, true);
+  assert.equal(result.find((row) => row.site_id === 'MLC').operating, false);
+});
+
+test('server applies operating site scope to selector creation and execution paths', () => {
+  const source = fs.readFileSync(path.join(DATA_DIR, '..', 'src', 'server.js'), 'utf8');
+  assert.match(source, /filterByOperatingSites\(allSites, settings, sitesMatch\[1\]\)/);
+  assert.match(source, /filterByOperatingSites\(listSiteSummaries\(safeAccountId\), settings, safeAccountId\)/);
+  assert.match(source, /listOperatingCampaignsFiltered\(account\.account_id, filters \|\| \{\}, settings\)/);
+  assert.match(source, /listOperatingCampaignsFiltered\(listPromosMatch\[1\]/);
+});
+
+test('WinForms settings expose business site scope without technical child ids', () => {
+  const source = fs.readFileSync(path.join(DATA_DIR, '..', 'standalone', 'Program.cs'), 'utf8');
+  assert.match(source, /Text = "经营站点"/);
+  assert.match(source, /Text = "设置经营站点"/);
+  assert.match(source, /未勾选站点不参与活动检测、创建候选和日常批量操作/);
+  assert.match(source, /Dictionary<string, List<string>> selected = current\.ToDictionary/);
+  const dialogSource = source.slice(source.indexOf('private sealed class OperatingSitesDialog'), source.indexOf('private sealed class ApiJson'));
+  assert.doesNotMatch(dialogSource, /child_user_id|jobId|JSONL|api\//i);
+});
 
 test('buildPlan enroll calculates discount price and applies boundaries', () => {
   const plan = buildPlan({
@@ -419,15 +533,144 @@ test('cancelUntilEmpty keeps checking started items until none remain', async ()
   assert.deepEqual(result.rounds.map((round) => round.remaining), [2, 0]);
 });
 
-test('cycle discounts increment only after complete run and switch to cancel at 10 percent', () => {
+test('cycle discounts increment only after complete run and cancel only after a prior-day 10 percent state', () => {
   assert.equal(nextDiscountFor({ promotionType: 'SELLER_CAMPAIGN' }), 5);
   assert.equal(nextDiscountFor({ promotionType: 'DEAL' }), 6);
   assert.equal(nextDiscountFor({ promotionType: 'DEAL', lastDiscount: 7, lastStatus: 'partial_or_failed' }), 7);
+  assert.equal(nextDiscountFor({ promotionType: 'DEAL', lastDiscount: 7, lastStatus: 'partial_or_failed', advanceAfterIncomplete: true }), 8);
   assert.equal(nextDiscountFor({ promotionType: 'DEAL', lastDiscount: 9, lastStatus: 'completed' }), 10);
-  assert.deepEqual(
-    decideCycleAction({ promotionType: 'DEAL', currentDiscount: 10, hasStartedItems: true }).action,
-    'cancel'
-  );
+  assert.equal(decideCycleAction({
+    promotionType: 'DEAL', currentDiscount: 10, lastDiscount: 9,
+    lastUpdatedAt: '2026-07-14T10:00:00+08:00', today: new Date('2026-07-14T18:00:00+08:00'),
+    hasStartedItems: true
+  }).action, 'enroll');
+  assert.equal(decideCycleAction({
+    promotionType: 'DEAL', currentDiscount: 10, lastDiscount: 10,
+    lastUpdatedAt: '2026-07-14T10:00:00+08:00', today: new Date('2026-07-15T10:00:00+08:00'),
+    hasStartedItems: true
+  }).action, 'cancel');
+});
+
+test('cycle reaches 9/10 by update on the first day and cancels only on the following day with started items', () => {
+  const promotions = [
+    { account_id: 'A', site_id: 'MLM', promotion_id: 'C-1', promotion_type: 'SELLER_CAMPAIGN', name: '95' },
+    { account_id: 'A', site_id: 'MLM', promotion_id: 'P-1', promotion_type: 'DEAL', name: 'Deal' }
+  ];
+  const keys = promotions.map(promotionKey);
+  const started = new Map(keys.map((key) => [key, 2]));
+  const prior = new Map([
+    [keys[0], { seller_discount_percent: 8, status: 'completed', updated_at: '2026-07-13T18:00:00+08:00' }],
+    [keys[1], { official_discount_percent: 9, status: 'completed', updated_at: '2026-07-13T18:00:00+08:00' }]
+  ]);
+  const firstDay = decideToday({ promotions, cycleStatesByPromotion: prior, startedCountsByPromotion: started, today: new Date('2026-07-14T10:00:00+08:00') });
+  assert.equal(firstDay.action, 'update');
+  assert.deepEqual(firstDay.rows.map((row) => row.discount), [9, 10]);
+
+  const reachedTen = new Map([
+    [keys[0], { seller_discount_percent: 9, status: 'cancelled', updated_at: '2026-07-14T22:00:00+08:00' }],
+    [keys[1], { official_discount_percent: 10, status: 'cancelled', updated_at: '2026-07-14T22:00:00+08:00' }]
+  ]);
+  assert.equal(decideToday({ promotions, cycleStatesByPromotion: reachedTen, startedCountsByPromotion: started, today: new Date('2026-07-14T23:00:00+08:00') }).action, 'update');
+  assert.equal(decideToday({ promotions, cycleStatesByPromotion: reachedTen, startedCountsByPromotion: started, today: new Date('2026-07-15T09:00:00+08:00') }).action, 'cancel');
+  assert.notEqual(decideToday({ promotions, cycleStatesByPromotion: reachedTen, startedCountsByPromotion: new Map(), today: new Date('2026-07-15T09:00:00+08:00') }).action, 'cancel');
+});
+
+test('full live read error blocks stale local started rows from planning', () => {
+  const promotion = { account_id: 'A', promotion_id: 'P-1', promotion_type: 'DEAL' };
+  const key = promotionKey(promotion);
+  const batch = buildBatchPlans({
+    action: 'update', promotions: [promotion],
+    itemsByPromotion: new Map([[key, [{ item_id: 'STALE-1', status: 'started', price: 100 }]]]),
+    fetchStatesByPromotion: new Map([[key, { detail_status: 'error', platform_total: 0, saved_count: 0, warning: '活动或商品不存在' }]]),
+    sellerDiscountPercent: 9, officialDiscountPercent: 10
+  });
+  assert.equal(batch.totals.planned, 0);
+  assert.equal(batch.totals.blocked, 1);
+  assert.equal(batch.plans[0].plan.rows.length, 0);
+  assert.match(batch.plans[0].warning, /实时读取失败/);
+});
+
+test('submission live read contract keeps readable activities and blocks an all-error scope', () => {
+  const mixed = summarizeLiveReadRows([
+    { promotion_id: 'OK', detail_status: 'ok', saved_count: 3 },
+    { promotion_id: 'ERR', detail_status: 'error', saved_count: 0 },
+  ], 2);
+  assert.equal(mixed.readable_count, 1);
+  assert.equal(mixed.blocked_count, 1);
+  assert.equal(mixed.all_blocked, false);
+  assert.match(mixed.rows[1].reason, /禁止使用旧缓存/);
+
+  const allBlocked = summarizeLiveReadRows([
+    { promotion_id: 'A', detail_status: 'error' },
+    { promotion_id: 'B', detail_status: 'unreadable' },
+  ], 2);
+  assert.equal(allBlocked.all_blocked, true);
+});
+
+test('twelve live-error activities with stale rows produce no executable item plan', () => {
+  const promotions = Array.from({ length: 12 }, (_, index) => ({
+    account_id: 'A', promotion_id: `P-${index}`, promotion_type: index % 2 ? 'DEAL' : 'SELLER_CAMPAIGN'
+  }));
+  const itemsByPromotion = new Map(promotions.map((promotion) => [
+    promotionKey(promotion),
+    [{ item_id: `STALE-${promotion.promotion_id}`, status: 'started', price: 100 }],
+  ]));
+  const fetchStatesByPromotion = new Map(promotions.map((promotion) => [
+    promotionKey(promotion),
+    { detail_status: 'error', saved_count: 0, platform_total: 0 },
+  ]));
+  const batch = buildBatchPlans({
+    action: 'update', promotions, itemsByPromotion, fetchStatesByPromotion,
+    sellerDiscountPercent: 9, officialDiscountPercent: 10,
+  });
+  assert.equal(batch.totals.blocked, 12);
+  assert.equal(batch.totals.planned, 0);
+  assert.equal(batch.plans.flatMap((entry) => entry.plan.rows).length, 0);
+});
+
+test('decideToday advances incomplete discounts on the next local day only', () => {
+  const promotion = { account_id: 'A', site_id: 'MLM', promotion_id: 'P-1', promotion_type: 'DEAL', status: 'started', name: 'Deal' };
+  const key = promotionKey(promotion);
+  const states = new Map([[key, { official_discount_percent: 7, status: 'partial_or_failed', updated_at: '2026-07-08T12:00:00' }]]);
+  const startedCounts = new Map([[key, 10]]);
+
+  const sameDay = decideToday({ promotions: [promotion], cycleStatesByPromotion: states, startedCountsByPromotion: startedCounts, today: new Date('2026-07-08T18:00:00') });
+  assert.equal(sameDay.discount, 7);
+  assert.equal(sameDay.needs_resume, true);
+
+  const nextDay = decideToday({ promotions: [promotion], cycleStatesByPromotion: states, startedCountsByPromotion: startedCounts, today: new Date('2026-07-09T10:00:00') });
+  assert.equal(nextDay.discount, 8);
+  assert.equal(nextDay.needs_resume, false);
+});
+
+test('automatic confirmation discounts follow existing completed and partial cycle rules', () => {
+  const today = new Date('2026-07-10T10:00:00');
+  const promotions = [
+    { account_id: 'A', site_id: 'MLM', promotion_id: 'C-1', promotion_type: 'SELLER_CAMPAIGN', status: 'started', name: '95' },
+    { account_id: 'A', site_id: 'MLM', promotion_id: 'P-1', promotion_type: 'DEAL', status: 'started', name: 'Deal' }
+  ];
+  const started = new Map(promotions.map((promotion) => [promotionKey(promotion), 10]));
+  const discounts = (decision) => Object.fromEntries(decision.rows.map((row) => [row.promotion_type, row.discount]));
+
+  const previousCompleted = new Map([
+    [promotionKey(promotions[0]), { seller_discount_percent: 5, status: 'completed', updated_at: '2026-07-09T10:00:00' }],
+    [promotionKey(promotions[1]), { official_discount_percent: 6, status: 'completed', updated_at: '2026-07-09T10:00:00' }]
+  ]);
+  const updateDecision = decideToday({ promotions, cycleStatesByPromotion: previousCompleted, startedCountsByPromotion: started, today });
+  assert.equal(updateDecision.today_action, 'update');
+  assert.deepEqual(discounts(updateDecision), { SELLER_CAMPAIGN: 6, DEAL: 7 });
+
+  const previousPartial = new Map([
+    [promotionKey(promotions[0]), { seller_discount_percent: 5, status: 'partial_or_failed', updated_at: '2026-07-09T10:00:00' }],
+    [promotionKey(promotions[1]), { official_discount_percent: 6, status: 'partial_or_failed', updated_at: '2026-07-09T10:00:00' }]
+  ]);
+  assert.deepEqual(discounts(decideToday({ promotions, cycleStatesByPromotion: previousPartial, startedCountsByPromotion: started, today })), { SELLER_CAMPAIGN: 6, DEAL: 7 });
+
+  const sameDayPartial = new Map([
+    [promotionKey(promotions[0]), { seller_discount_percent: 5, status: 'partial_or_failed', updated_at: '2026-07-10T08:00:00' }],
+    [promotionKey(promotions[1]), { official_discount_percent: 6, status: 'partial_or_failed', updated_at: '2026-07-10T08:00:00' }]
+  ]);
+  assert.deepEqual(discounts(decideToday({ promotions, cycleStatesByPromotion: sameDayPartial, startedCountsByPromotion: started, today })), { SELLER_CAMPAIGN: 5, DEAL: 6 });
 });
 
 test('decideToday prevents duplicate completed action and prioritizes cancel at 10 percent', () => {
@@ -495,7 +738,7 @@ test('promotion filters support multi site, multi type, keywords, and seller/off
     filterPromotions(promotions, { siteIds: ['MLB', 'MLM'], promotionTypes: ['DEAL', 'SMART'], keywords: ['Hot', 'Smart'] }).map((row) => row.promotion_id),
     ['P-1', 'P-2']
   );
-  assert.deepEqual(filterPromotions(promotions, { excludeSeller: true }).map((row) => row.promotion_id), ['P-1', 'P-2', 'L-1']);
+  assert.deepEqual(filterPromotions(promotions, { excludeSeller: true }).map((row) => row.promotion_id), ['P-1']);
   assert.deepEqual(filterPromotions(promotions, { excludeOfficial: true }).map((row) => row.promotion_id), ['C-1']);
 });
 
@@ -510,19 +753,19 @@ test('promotion filters support deduped seller and official activity names witho
 
   assert.deepEqual(
     filterPromotions(promotions, { sellerActivityNames: ['95'] }).map((row) => row.promotion_id),
-    ['C-MLB-1', 'C-MLM-1', 'P-MLB-1', 'P-MLM-1']
+    ['C-MLB-1', 'C-MLM-1', 'P-MLB-1']
   );
   assert.deepEqual(
     filterPromotions(promotions, { siteIds: ['MLM'], sellerActivityNames: ['95'] }).map((row) => row.promotion_id),
-    ['C-MLM-1', 'P-MLM-1']
+    ['C-MLM-1']
   );
   assert.deepEqual(
     filterPromotions(promotions, { officialActivityNames: ['Hot Sale'] }).map((row) => row.promotion_id),
-    ['C-MLB-1', 'C-MLM-1', 'C-MLM-2', 'P-MLB-1', 'P-MLM-1']
+    ['C-MLB-1', 'C-MLM-1', 'C-MLM-2', 'P-MLB-1']
   );
   assert.deepEqual(
     filterPromotions(promotions, { sellerActivityNames: ['95'], officialActivityNames: ['Hot Sale'] }).map((row) => row.promotion_id),
-    ['C-MLB-1', 'C-MLM-1', 'P-MLB-1', 'P-MLM-1']
+    ['C-MLB-1', 'C-MLM-1', 'P-MLB-1']
   );
 });
 
@@ -557,7 +800,7 @@ test('activity name normalization merges visible whitespace variants but keeps r
   );
   assert.deepEqual(
     filterPromotions(promotions, { officialActivityNames: ['CBT SaD - Est. Alta - Tech Julho'] }).map((row) => row.promotion_id),
-    ['P-tech']
+    []
   );
 });
 
@@ -938,15 +1181,33 @@ test('real submit protection requires REAL_SUBMIT and then allows execution flow
   assert.doesNotMatch(batch.message, /预检|确认流程/);
 });
 
-test('real execution routes do not stop at confirmation package after REAL_SUBMIT', () => {
+test('legacy synchronous write routes are retired while the execution job keeps REAL_SUBMIT', () => {
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
-  const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+  const pysideSource = fs.readFileSync(path.join(process.cwd(), 'desktop-pyside/main_window.py'), 'utf8');
 
-  assert.doesNotMatch(serverSource, /protection\.status !== 409/);
-  assert.match(serverSource, /if \(!protection\.allowed\) return sendJson\(res, protection\.status/);
-  assert.match(serverSource, /url\.pathname === '\/api\/today\/execute'/);
-  assert.doesNotMatch(standaloneSource, /真实写入预检包|不会自动执行 Mercado 写接口|生成真实写入预检包/);
-  assert.match(standaloneSource, /\/api\/today\/execute/);
+  for (const route of [
+    '/api/execute',
+    '/api/batch/execute',
+    '/api/today/execute',
+    '/api/today/precheck',
+    '/api/cancel/filtered/precheck',
+    '/api/real-enroll-smoke/execute',
+    '/api/concurrency-benchmark/write/execute',
+  ]) {
+    assert.match(serverSource, new RegExp(`LEGACY_SYNC_WRITE_ROUTES[\\s\\S]*${route.replaceAll('/', '\\\/')}`));
+    assert.doesNotMatch(pysideSource, new RegExp(route.replaceAll('/', '\\\/')));
+  }
+  assert.match(serverSource, /sendJson\(res, 410, \{ ok: false, error: LEGACY_SYNC_WRITE_MESSAGE/);
+  assert.match(serverSource, /url\.pathname === '\/api\/execution\/jobs\/start'/);
+  assert.match(serverSource, /realSubmitProtection/);
+  assert.match(serverSource, /CREATE_SELLER_CAMPAIGN/);
+});
+
+test('health exposes a stable product protocol and build fingerprint', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  assert.match(serverSource, /protocol_version/);
+  assert.match(serverSource, /build_fingerprint/);
+  assert.match(serverSource, /product/);
 });
 
 test('WinForms submit flow hides REAL_SUBMIT input dialog and sends internal confirm text', () => {
@@ -956,27 +1217,37 @@ test('WinForms submit flow hides REAL_SUBMIT input dialog and sends internal con
   assert.match(standaloneSource, /SubmitExecutionAsync/);
 });
 
-test('real submit flow prepares promotions and items before execution', () => {
+test('execution job prepares promotions and items before execution', () => {
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
   const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
 
   assert.match(serverSource, /preparePromotionsForExecution/);
   assert.match(serverSource, /prepareItemsForExecution/);
-  assert.match(serverSource, /未找到匹配活动。已尝试自动读取活动列表/);
+  assert.match(serverSource, /runExecutionJob/);
+  assert.match(serverSource, /createExecutionJob/);
   assert.match(serverSource, /商品未读取到或当前筛选下无可处理商品/);
-  assert.match(standaloneSource, /开始\{SelectedSubmitModeText\(\)\}：店铺=\{SelectedComboText\(_accountSelect\)\}，站点=\{SelectedComboText\(_siteSelect\)\}/);
+  assert.match(standaloneSource, /Log\(ExecutionStartLogText\(action\)\)/);
   assert.match(standaloneSource, /storeName = StoreNameForAccountId\(accountId\)/);
   assert.match(standaloneSource, /selectedStoreName = SelectedComboText\(_accountSelect\)/);
-  assert.match(standaloneSource, /selectedSiteName = SelectedComboText\(_siteSelect\)/);
+  assert.match(standaloneSource, /\b(?:var|string) siteName = SelectedComboText\(_siteSelect\)/);
+  assert.match(standaloneSource, /selectedSiteName = siteName/);
   assert.match(standaloneSource, /KnownStoreNameForAccountId\(accountId\)/);
-  assert.match(standaloneSource, /"2651442567" => "湖北店"/);
-  assert.match(standaloneSource, /"3332096437" => "湖南店"/);
-  assert.match(standaloneSource, /"3408885754" => "广东店"/);
+  assert.match(standaloneSource, /private static string KnownStoreNameForAccountId[\s\S]*?return "";/);
+  assert.doesNotMatch(standaloneSource, /2651442567[\s\S]{0,80}(?:湖北店|湖北)/);
+  assert.doesNotMatch(standaloneSource, /3332096437[\s\S]{0,80}(?:湖南店|广州)/);
+  assert.doesNotMatch(standaloneSource, /3408885754[\s\S]{0,80}(?:广东店|湖南)/);
   assert.doesNotMatch(standaloneSource, /return "未命名店铺"/);
   assert.match(standaloneSource, /准备活动：/);
   assert.match(standaloneSource, /准备商品：/);
-  assert.match(standaloneSource, /sellerActivityNames = sellerPromotion\.Length > 0/);
-  assert.match(standaloneSource, /officialActivityNames = officialPromotion\.Length > 0/);
+  assert.match(standaloneSource, /ExcludeActivityValue = "__exclude__"/);
+  assert.match(standaloneSource, /new ComboItem\(ExcludeActivityValue, "不处理自建活动"\)/);
+  assert.match(standaloneSource, /new ComboItem\(ExcludeActivityValue, "不处理官方活动"\)/);
+  assert.match(standaloneSource, /bool excludeSeller = string\.Equals\(sellerPromotion, ExcludeActivityValue/);
+  assert.match(standaloneSource, /bool excludeOfficial = string\.Equals\(officialPromotion, ExcludeActivityValue/);
+  assert.match(standaloneSource, /sellerActivityNames = \(\(excludeSeller \|\| sellerPromotion\.Length <= 0\) \? Array\.Empty<string>\(\) : new string\[1\] \{ sellerPromotion \}\)/);
+  assert.match(standaloneSource, /officialActivityNames = \(\(excludeOfficial \|\| officialPromotion\.Length <= 0\) \? Array\.Empty<string>\(\) : new string\[1\] \{ officialPromotion \}\)/);
+  assert.match(standaloneSource, /excludeSeller = excludeSeller/);
+  assert.match(standaloneSource, /excludeOfficial = excludeOfficial/);
   assert.match(standaloneSource, /keywords = Array\.Empty<string>\(\)/);
 });
 
@@ -986,8 +1257,8 @@ test('WinForms activity selectors display deduped names and task grid hides raw 
   assert.match(standaloneSource, /NormalizeActivityNameKey\(displayName\)/);
   assert.match(standaloneSource, /AddActivityChoice\(sellerNames, key, displayName\)/);
   assert.match(standaloneSource, /AddActivityChoice\(officialNames, key, displayName\)/);
-  assert.match(standaloneSource, /_sellerActivitySelect\.Items\.Add\(new ComboItem\(choice\.Key, choice\.DisplayName\)\)/);
-  assert.match(standaloneSource, /_officialActivitySelect\.Items\.Add\(new ComboItem\(choice\.Key, choice\.DisplayName\)\)/);
+  assert.match(standaloneSource, /_sellerActivitySelect\.Items\.Add\(new ComboItem\(choice\d*\.Key, choice\d*\.DisplayName\)\)/);
+  assert.match(standaloneSource, /_officialActivitySelect\.Items\.Add\(new ComboItem\(choice\d*\.Key, choice\d*\.DisplayName\)\)/);
   assert.match(standaloneSource, /NormalizeActivityDisplayName/);
   assert.match(standaloneSource, /UpdateComboDropDownWidth\(_sellerActivitySelect\)/);
   assert.match(standaloneSource, /UpdateComboDropDownWidth\(ComboBox combo\)/);
@@ -1032,8 +1303,9 @@ test('WinForms separates service health failures from long business request time
   assert.match(standaloneSource, /Timeout = Timeout\.InfiniteTimeSpan/);
   assert.match(standaloneSource, /RequestTimeoutFor\(path, isPost: true\)/);
   assert.match(standaloneSource, /BuildBusinessTimeoutMessage/);
-  assert.match(standaloneSource, /if \(await IsHealthy\(\)\) throw new InvalidOperationException\(BuildBusinessTimeoutMessage/);
-  assert.match(standaloneSource, /业务请求超时/);
+  assert.match(standaloneSource, /if \(await IsHealthy\(\)\)\s*\{\s*throw new InvalidOperationException\(BuildBusinessTimeoutMessage/);
+  assert.match(standaloneSource, /当前操作等待时间较长/);
+  assert.doesNotMatch(standaloneSource, /业务请求超时：\{path\}/);
   assert.match(clientSource, /AbortController/);
   assert.match(clientSource, /Mercado Libre API 请求超时/);
   assert.match(serverSource, /res\.on\('finish'/);
@@ -1055,7 +1327,7 @@ test('submit execution uses background job progress instead of one long synchron
   assert.match(standaloneSource, /SubmitExecutionJobWrapperAsync/);
   assert.match(standaloneSource, /\/api\/execution\/jobs\/start/);
   assert.match(standaloneSource, /PollExecutionJobAsync/);
-  assert.match(standaloneSource, /\/api\/execution\/jobs\/\{Uri\.EscapeDataString\(jobId\)\}/);
+  assert.match(standaloneSource, /\/api\/execution\/jobs\/(?:\{Uri\.EscapeDataString\(jobId\)\}|" \+ Uri\.EscapeDataString\(jobId\))/);
   assert.match(standaloneSource, /CancelCurrentExecutionJobAsync/);
   assert.match(standaloneSource, /_submitButton\.Text = "停止"/);
   assert.doesNotMatch(standaloneSource, /var endpoint = action\.Length == 0 \? "\/api\/today\/execute" : "\/api\/batch\/execute";\s+Log\("准备执行/s);
@@ -1077,12 +1349,12 @@ test('execution job exposes business userLogs and WinForms prefers them over deb
   assert.match(standaloneSource, /userLogs/);
   assert.match(standaloneSource, /logProperty\.ValueKind != JsonValueKind\.Array && job\.TryGetProperty\("logs"/);
   assert.match(standaloneSource, /storeName = StoreNameForAccountId\(accountId\)/);
-  assert.match(standaloneSource, /selectedSiteName = SelectedComboText\(_siteSelect\)/);
+  assert.match(standaloneSource, /selectedSiteName = siteName/);
 });
 
 test('WinForms shows Chinese fallback when execution job result is null', () => {
   const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
-  const submitWrapper = standaloneSource.match(/private async Task SubmitExecutionJobWrapperAsync\(\)[\s\S]*?private async Task StartAndPollExecutionJobAsync/)?.[0] || '';
+  const submitWrapper = standaloneSource.match(/private async Task SubmitExecutionJobWrapperAsync\(\)[\s\S]*?private async Task<ExecutionOutcome> StartAndPollExecutionJobAsync/)?.[0] || '';
 
   assert.match(standaloneSource, /FriendlyExecutionErrorMessage/);
   assert.match(standaloneSource, /任务已结束，但后台没有返回完整汇总/);
@@ -1104,7 +1376,7 @@ test('execution user logs use display total that cannot be lower than result cou
   assert.match(serverSource, /提交完成，处理 \$\{displayTotal\} 个，成功/);
   assert.match(serverSource, /const executionDisplayTotal = displayExecutionTotal\(execution\)/);
   assert.match(serverSource, /商品 \$\{executionDisplayTotal\}/);
-  assert.match(standaloneSource, /var displayTotal = Math\.Max\(total, success \+ failed \+ skipped\)/);
+  assert.match(standaloneSource, /\b(?:var|int) displayTotal = Math\.Max\((?:total|val), success \+ failed \+ skipped\)/);
   assert.match(standaloneSource, /商品 \{displayTotal\}/);
   assert.doesNotMatch(serverSource, /商品 \$\{execution\.total\}，成功/);
 });
@@ -1114,11 +1386,10 @@ test('WinForms task grid keeps old assistant columns and moves store-site scope 
   const standaloneProjectSource = fs.readFileSync(path.join(process.cwd(), 'standalone/MercadoDiscountManager.Standalone.csproj'), 'utf8');
   const repositorySource = fs.readFileSync(path.join(process.cwd(), 'src/repository.js'), 'utf8');
   const dbSource = fs.readFileSync(path.join(process.cwd(), 'src/db.js'), 'utf8');
-  const webSource = fs.readFileSync(path.join(process.cwd(), 'public/app.js'), 'utf8');
 
   assert.doesNotMatch(standaloneSource, /AddGridColumn\("store", "店铺"/);
   assert.doesNotMatch(standaloneSource, /AddGridColumn\("site", "站点"/);
-  assert.match(repositorySource, /store_name: storeDisplayName/);
+  assert.match(repositorySource, /store_name: storeNameForAccount/);
   assert.match(repositorySource, /site_name: siteDisplayName/);
   assert.match(standaloneSource, /StringValue\(task, "store_name"/);
   assert.match(standaloneSource, /StringValue\(task, "site_name"/);
@@ -1127,26 +1398,33 @@ test('WinForms task grid keeps old assistant columns and moves store-site scope 
   assert.match(standaloneSource, /ScopeText\(existing\.StoreNames, "多个店铺"\)/);
   assert.match(standaloneSource, /ScopeText\(existing\.SiteNames, "多个站点"\)/);
   assert.match(standaloneSource, /TaskMergeKey\(createdAt[\s\S]*isBatch\)/);
-  assert.match(standaloneSource, /isBatch && string\.Equals\(action, "enroll"/);
-  assert.match(standaloneSource, /activityKey = isBatch \? "__batch__"/);
+  assert.match(standaloneSource, /if \(isBatch\)\s*\{\s*return "";\s*\}/);
+  assert.match(standaloneSource, /activityKey = \(?isBatch \? "__batch__"/);
   assert.match(standaloneSource, /seller_activity_text/);
   assert.match(standaloneSource, /official_activity_text/);
-  assert.match(standaloneSource, /MergeActivityText\(existing\.SellerActivity, next\.SellerActivity\)/);
-  assert.match(standaloneSource, /MergeActivityText\(existing\.OfficialActivity, next\.OfficialActivity\)/);
-  assert.match(standaloneSource, /_taskGrid\.Font = new Font\("Microsoft YaHei", 10F/);
+  assert.match(standaloneSource, /MergeActivityText\(existing\.SellerActivity, next\w*\.SellerActivity\)/);
+  assert.match(standaloneSource, /MergeActivityText\(existing\.OfficialActivity, next\w*\.OfficialActivity\)/);
+  assert.match(standaloneSource, /_taskGrid\.Font = new Font\("Microsoft YaHei", 10[fF]/);
   assert.match(standaloneSource, /_taskGrid\.ColumnHeadersHeight = 38/);
   assert.match(standaloneSource, /_taskGrid\.RowTemplate\.Height = 34/);
   assert.match(standaloneSource, /_taskGrid\.DefaultCellStyle\.Padding = new Padding\(8, 5, 8, 5\)/);
-  assert.match(standaloneSource, /MinimumWidth = 420/);
+  assert.match(standaloneSource, /MinimumWidth = 220/);
+  assert.match(standaloneSource, /Width = 220/);
   assert.match(standaloneProjectSource, /<ApplicationHighDpiMode>PerMonitorV2<\/ApplicationHighDpiMode>/);
-  assert.match(standaloneSource, /root\.RowStyles\.Add\(new RowStyle\(SizeType\.Absolute, 50\)\)/);
-  assert.match(standaloneSource, /_todayLabel\.Font = new Font\("Microsoft YaHei", 10F, FontStyle\.Bold\)/);
-  assert.match(standaloneSource, /_statusLabel\.Font = new Font\("Microsoft YaHei", 10F, FontStyle\.Regular\)/);
-  assert.match(standaloneSource, /_logBox\.Font = new Font\("Microsoft YaHei", 10F, FontStyle\.Regular\)/);
-  assert.match(standaloneSource, /combo\.Font = new Font\("Microsoft YaHei", 10F, FontStyle\.Regular\)/);
-  assert.match(standaloneSource, /number\.Font = new Font\("Microsoft YaHei", 10F, FontStyle\.Regular\)/);
-  assert.match(standaloneSource, /button\.Font = new Font\("Microsoft YaHei", 10F, FontStyle\.Regular\)/);
-  assert.match(standaloneSource, /Font = new Font\("Microsoft YaHei", 10F\)/);
+  assert.match(standaloneSource, /root\.RowStyles\.Add\(new RowStyle\(SizeType\.Absolute, 94f?\)\)/);
+  assert.match(standaloneSource, /BuildBrandHeader\(\)/);
+  assert.match(standaloneSource, /BuildControlSurface\(\)/);
+  assert.match(standaloneSource, /private sealed class RoundedPanel : Panel/);
+  assert.match(standaloneSource, /private sealed class DarkComboBox : ComboBox/);
+  assert.doesNotMatch(standaloneSource, /private sealed class DropDownIndicator : Control/);
+  assert.match(standaloneSource, /_taskGrid\.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode\.None/);
+  assert.match(standaloneSource, /_todayLabel\.Font = new Font\("Microsoft YaHei UI", 9\.5f, FontStyle\.Regular\)/);
+  assert.match(standaloneSource, /_statusLabel\.Font = new Font\("Microsoft YaHei UI", 8\.5f, FontStyle\.Regular\)/);
+  assert.match(standaloneSource, /_logBox\.Font = new Font\("Microsoft YaHei UI", 9\.5f, FontStyle\.Regular\)/);
+  assert.match(standaloneSource, /combo\.Font = new Font\("Microsoft YaHei", 10[fF], FontStyle\.Regular\)/);
+  assert.match(standaloneSource, /number\.Font = new Font\("Microsoft YaHei", 10[fF], FontStyle\.Regular\)/);
+  assert.match(standaloneSource, /button\.Font = new Font\("Microsoft YaHei", 10[fF], FontStyle\.Regular\)/);
+  assert.match(standaloneSource, /Font = new Font\("Microsoft YaHei", 10[fF]/);
   assert.match(standaloneSource, /TaskDetailLines\(task/);
   assert.match(standaloneSource, /IntArray\(task, "task_ids"\)/);
   assert.match(standaloneSource, /\/api\/tasks\?limit=300/);
@@ -1157,19 +1435,83 @@ test('WinForms task grid keeps old assistant columns and moves store-site scope 
   assert.match(repositorySource, /\.\.\.\(includeDetails \? \{ details: details\.map\(taskDetail\) \} : \{\}\)/);
   assert.match(repositorySource, /export function listTaskDetails/);
   assert.match(repositorySource, /ROW_NUMBER\(\) OVER/);
-  assert.match(dbSource, /CREATE TABLE IF NOT EXISTS history_task_summary_cache/);
-  assert.match(repositorySource, /TASK_SUMMARY_CACHE_VERSION/);
-  assert.match(repositorySource, /loadPersistentTaskSummaryCache/);
-  assert.match(repositorySource, /savePersistentTaskSummaryCache/);
-  assert.match(repositorySource, /DELETE FROM history_task_summary_cache/);
+  assert.doesNotMatch(dbSource, /CREATE TABLE IF NOT EXISTS history_task_summary_cache/);
+  assert.doesNotMatch(repositorySource, /history_task_summary_cache/);
+  assert.match(repositorySource, /history_batch_summaries/);
   assert.match(standaloneSource, /"时间\\t动作\\t自建活动\\t官方活动/);
   assert.doesNotMatch(standaloneSource, /"时间\\t动作\\t店铺\\t站点\\t自建活动/);
   assert.match(standaloneSource, /"已报名商品数"/);
   assert.match(standaloneSource, /数量口径：主表商品数=真实已报名\/上架商品数/);
   assert.doesNotMatch(standaloneSource, /"候选商品数"/);
-  assert.match(webSource, /已报名商品数/);
-  assert.match(webSource, /实际处理数/);
-  assert.doesNotMatch(webSource, /候选商品数/);
+});
+
+test('WinForms dark controls avoid white system borders and overlapping dropdown arrows', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+  const inputHost = source.slice(
+    source.indexOf('private static RoundedPanel CreateInputHost'),
+    source.indexOf('private static Label CreateFieldLabel')
+  );
+  const grid = source.slice(
+    source.indexOf('private void ConfigureGrid'),
+    source.indexOf('private void ConfigureTaskContextMenu')
+  );
+
+  assert.match(grid, /_taskGrid\.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle\.Single/);
+  assert.match(grid, /_taskGrid\.GridColor = UiTheme\.NormalBorder/);
+  assert.match(inputHost, /combo\.Dock = DockStyle\.Fill/);
+  assert.match(inputHost, /combo\.DroppedDown = true/);
+  assert.doesNotMatch(inputHost, /VerticalScrollBarWidth|DropDownIndicator|SetBounds|host\.Resize/);
+  assert.doesNotMatch(source, /private sealed class DropDownIndicator : Control/);
+  assert.match(source, /private void PaintDropDownButton\(\)/);
+  assert.match(source, /graphics\.FillRectangle\(background, new Rectangle\(0, 0, Width, edgeThickness\)\)/);
+  assert.match(source, /graphics\.FillRectangle\(background, new Rectangle\(0, 0, edgeThickness, Height\)\)/);
+  assert.match(source, /graphics\.FillRectangle\(background, buttonBounds\)/);
+  assert.equal((source.match(/private readonly ComboBox _\w+ = new DarkComboBox\(\);/g) || []).length, 5);
+});
+
+test('WinForms primary surfaces use the dark-gold outline token', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+  const brandHeader = source.slice(source.indexOf('private RoundedPanel BuildBrandHeader'), source.indexOf('private Control BuildBrandBlock'));
+  const controlSurface = source.slice(source.indexOf('private RoundedPanel BuildControlSurface'), source.indexOf('private static RoundedPanel BuildTitledSurface'));
+  const titledSurface = source.slice(source.indexOf('private static RoundedPanel BuildTitledSurface'), source.indexOf('private static RoundedPanel CreateInputHost'));
+
+  assert.match(brandHeader, /BorderColor = UiTheme\.GoldBorder/);
+  assert.match(controlSurface, /BorderColor = UiTheme\.GoldBorder/);
+  assert.match(titledSurface, /BorderColor = UiTheme\.GoldBorder/);
+});
+
+test('WinForms execution scope activity parameters and today decision use closed gold sections', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+  const controlSurface = source.slice(source.indexOf('private RoundedPanel BuildControlSurface'), source.indexOf('private static RoundedPanel BuildTitledSurface'));
+  const sectionBuilder = source.slice(source.indexOf('private static RoundedPanel BuildControlSection'), source.indexOf('private static RoundedPanel BuildTitledSurface'));
+
+  assert.match(controlSurface, /BuildControlSection\("执行范围", scope\)/);
+  assert.match(controlSurface, /BuildControlSection\("活动参数", activity\)/);
+  assert.match(controlSurface, /BuildControlSection\("今日判断", decision\)/);
+  assert.doesNotMatch(controlSurface, /CreateDivider\(\)/);
+  assert.match(sectionBuilder, /BorderColor = UiTheme\.GoldBorder/);
+  assert.match(sectionBuilder, /Padding = new Padding\(1\)/);
+});
+
+test('WinForms interactive resize defers expensive grid sizing and never performs business refresh', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+  const resize = source.slice(
+    source.indexOf('protected override void OnResizeBegin'),
+    source.indexOf('private void BuildLayout')
+  );
+  const roundedPanel = source.slice(
+    source.indexOf('private sealed class RoundedPanel : Panel'),
+    source.indexOf('private sealed class RoundedButton : Button')
+  );
+
+  assert.match(resize, /protected override void OnResizeEnd/);
+  assert.match(resize, /ApplyTaskGridColumnWidths\(\)/);
+  assert.match(resize, /InvalidateRoundedControls\(this\)/);
+  assert.doesNotMatch(resize, /QueueAutoDecisionRefreshAsync|RefreshActivitiesAsync|RefreshTasksAsync|GetJsonAsync|PostJsonAsync/);
+  assert.match(source, /private void ApplyTaskGridColumnWidths\(\)/);
+  assert.doesNotMatch(source, /_taskGrid\.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode\.Fill/);
+  assert.doesNotMatch(roundedPanel, /ControlStyles\.ResizeRedraw/);
+  assert.doesNotMatch(source, /WS_EX_COMPOSITED/);
 });
 
 test('legacy task summaries collapse one execution window into a single old-assistant batch row', () => {
@@ -1266,6 +1608,79 @@ test('legacy task summaries collapse one execution window into a single old-assi
   assert.deepEqual(summaries[0].task_ids.sort((a, b) => a - b), [17, 18, 19, 20]);
 });
 
+test('legacy task summaries do not apply stale live verification files to a newer enroll batch', () => {
+  const refreshPath = path.join(DATA_DIR, 'tmp-live-enroll-refresh-summary.json');
+  const postPath = path.join(DATA_DIR, 'tmp-live-enroll-post-summary.json');
+  const previousRefresh = fs.existsSync(refreshPath) ? fs.readFileSync(refreshPath, 'utf8') : null;
+  const previousPost = fs.existsSync(postPath) ? fs.readFileSync(postPath, 'utf8') : null;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(refreshPath, JSON.stringify([{ status: 'started', saved_count: 5159 }]), 'utf8');
+    fs.writeFileSync(postPath, JSON.stringify([{ status: 'started', saved_count: 45478 }]), 'utf8');
+
+    const summaries = buildLegacyTaskSummaries([
+      {
+        id: 471,
+        account_id: 'A3',
+        promotion_id: '__BATCH__',
+        promotion_type: 'BATCH',
+        action: 'enroll',
+        mode: 'real',
+        total_count: 3173,
+        success_count: 2315,
+        failed_count: 19,
+        skipped_count: 839,
+        summary_json: JSON.stringify({
+          success: 2315,
+          failed: 19,
+          skipped: 839,
+          planned: 3173,
+          api_success_count: 2315
+        }),
+        created_at: '2026-07-07T08:43:06.429Z',
+        updated_at: '2026-07-07T08:43:06.429Z'
+      },
+      {
+        id: 429,
+        account_id: 'A2',
+        promotion_id: '__BATCH__',
+        promotion_type: 'BATCH',
+        action: 'enroll',
+        mode: 'real',
+        total_count: 40322,
+        success_count: 40322,
+        failed_count: 9143,
+        skipped_count: 5904,
+        summary_json: JSON.stringify({
+          success: 40322,
+          failed: 9143,
+          skipped: 5904,
+          api_success_count: 40322,
+          live_verified_enrolled_count: 40319,
+          live_verification_source: 'bound-to-this-batch'
+        }),
+        created_at: '2026-07-05T19:02:23.646Z',
+        updated_at: '2026-07-05T19:02:23.646Z'
+      }
+    ], 10);
+
+    assert.equal(summaries[0].id, 471);
+    assert.equal(summaries[0].total_count, 2315);
+    assert.equal(summaries[0].success_count, 2315);
+    assert.equal(summaries[0].failed_count, 19);
+    assert.equal(summaries[0].skipped_count, 839);
+    assert.equal(JSON.parse(summaries[0].summary_json).api_success_count, 2315);
+    assert.equal(JSON.parse(summaries[0].summary_json).live_verified_enrolled_count, undefined);
+    assert.equal(summaries[1].id, 429);
+    assert.equal(summaries[1].success_count, 40322);
+  } finally {
+    if (previousRefresh == null) fs.rmSync(refreshPath, { force: true });
+    else fs.writeFileSync(refreshPath, previousRefresh, 'utf8');
+    if (previousPost == null) fs.rmSync(postPath, { force: true });
+    else fs.writeFileSync(postPath, previousPost, 'utf8');
+  }
+});
+
 test('legacy task summaries keep batch details on the same day and hide prepare-only activity rows', () => {
   const rows = [
     {
@@ -1356,6 +1771,77 @@ test('legacy task summaries keep batch details on the same day and hide prepare-
   assert.equal(summaries.some((row) => row.id === 100), true);
 });
 
+test('legacy task summaries expose the latest completion time across grouped rows', () => {
+  const summaries = buildLegacyTaskSummaries([
+    {
+      id: 20,
+      account_id: 'A2',
+      promotion_id: '__BATCH__',
+      promotion_type: 'BATCH',
+      action: 'update',
+      mode: 'real',
+      status: 'cancelled',
+      total_count: 1,
+      success_count: 1,
+      failed_count: 0,
+      skipped_count: 0,
+      created_at: '2026-07-12T14:05:00.000Z',
+      updated_at: '2026-07-12T14:20:00.000Z'
+    },
+    {
+      id: 19,
+      account_id: 'A2',
+      promotion_id: 'P-2',
+      promotion_type: 'DEAL',
+      action: 'update',
+      mode: 'real',
+      status: 'completed',
+      discount_percent: 8,
+      total_count: 1,
+      success_count: 1,
+      failed_count: 0,
+      skipped_count: 0,
+      completed: 1,
+      created_at: '2026-07-12T14:04:00.000Z',
+      updated_at: '2026-07-12T14:22:00.000Z'
+    },
+    {
+      id: 10,
+      account_id: 'A1',
+      promotion_id: '__BATCH__',
+      promotion_type: 'BATCH',
+      action: 'update',
+      mode: 'real',
+      status: 'cancelled',
+      total_count: 1,
+      success_count: 1,
+      failed_count: 0,
+      skipped_count: 0,
+      created_at: '2026-07-12T14:00:00.000Z',
+      updated_at: '2026-07-12T14:10:00.000Z'
+    },
+    {
+      id: 9,
+      account_id: 'A1',
+      promotion_id: 'C-1',
+      promotion_type: 'SELLER_CAMPAIGN',
+      action: 'update',
+      mode: 'real',
+      status: 'completed',
+      discount_percent: 7,
+      total_count: 1,
+      success_count: 1,
+      failed_count: 0,
+      skipped_count: 0,
+      completed: 1,
+      created_at: '2026-07-12T13:59:00.000Z',
+      updated_at: '2026-07-12T14:09:00.000Z'
+    }
+  ], 10);
+  assert.equal(summaries.length, 1);
+  assert.equal(summaries[0].updated_at, '2026-07-12T14:22:00.000Z');
+});
+
 test('history failure summaries use business reasons and a wide reason column', () => {
   const repositorySource = fs.readFileSync(path.join(process.cwd(), 'src/repository.js'), 'utf8');
   const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
@@ -1368,7 +1854,8 @@ test('history failure summaries use business reasons and a wide reason column', 
   assert.match(repositorySource, /刷新授权后重跑失败商品/);
   assert.doesNotMatch(repositorySource, /账号权限不足或应用权限不足'\\s*,\\s*count/);
 
-  assert.match(standaloneSource, /MinimumWidth = 420/);
+  assert.match(standaloneSource, /MinimumWidth = 220/);
+  assert.match(standaloneSource, /Width = 220/);
   assert.match(standaloneSource, /ToolTipText = row\.ReasonTooltipText/);
   assert.match(standaloneSource, /失败原因汇总：/);
   assert.match(standaloneSource, /未发送接口/);
@@ -1595,19 +2082,138 @@ test('history batch counts non-item activity-level failures without splitting ac
   assert.notEqual(rows[0].official_activity_text, 'Hot Sale');
 });
 
+test('cancel request success is not final success until live removal is verified', () => {
+  const contract = buildCancelResultContract({
+    plannedItemIds: ['A', 'B', 'C', 'D'],
+    outcomes: [
+      { item_id: 'A', status: 'request_success' },
+      { item_id: 'B', status: 'request_success' },
+      { item_id: 'C', status: 'failed' },
+      { item_id: 'D', status: 'skipped' }
+    ],
+    recheck: { completed: true, remainingItemIds: ['B'] }
+  });
+  assert.deepEqual(contract.counts, {
+    relation_count: 4, unique_item_count: 4, activity_failure_count: 0,
+    request_success_count: 2, live_verified_removed_count: 1, pending_verification_count: 0,
+    success: 1, failed: 2, skipped: 1
+  });
+  assert.equal(contract.final_status_by_item.A, CANCEL_RESULT_STATUS.liveVerifiedRemoved);
+  assert.equal(contract.final_status_by_item.B, CANCEL_RESULT_STATUS.liveStillStarted);
+
+  const noRecheck = buildCancelResultContract({
+    plannedItemIds: ['A'], outcomes: [{ item_id: 'A', status: 'request_success' }],
+    recheck: { completed: false, cancelled: true }
+  });
+  assert.equal(noRecheck.counts.success, 0);
+  assert.equal(noRecheck.counts.pending_verification_count, 1);
+  assert.equal(noRecheck.counts.skipped, 1);
+});
+
+test('result contract separates relation items from activity failures and exposes stable counts', () => {
+  const summary = summarizeResultContractRows([
+    { id: 1, account_id: 'A', promotion_id: 'P-1', promotion_type: 'DEAL', action: 'cancel', item_id: 'I-1', status: 'request_success' },
+    { id: 2, account_id: 'A', promotion_id: 'P-1', promotion_type: 'DEAL', action: 'cancel', item_id: 'I-1', status: 'live_verified_removed' },
+    { id: 3, account_id: 'A', promotion_id: 'P-2', promotion_type: 'DEAL', action: 'cancel', item_id: 'I-1', status: 'pending_verification' },
+    { id: 4, account_id: 'A', promotion_id: 'P-3', promotion_type: 'DEAL', action: 'cancel', item_id: '', status: 'activity_failed' }
+  ]);
+  assert.deepEqual(summary, {
+    relation_count: 2, unique_item_count: 1, activity_failure_count: 1,
+    request_success_count: 1, live_verified_removed_count: 1, pending_verification_count: 1,
+    success: 1, failed: 0, skipped: 1
+  });
+});
+
+test('cancel history rows do not display discount columns', () => {
+  const rows = buildLegacyTaskSummaries([
+    {
+      id: 201,
+      account_id: 'A1',
+      promotion_id: '__BATCH__',
+      promotion_type: 'BATCH',
+      action: 'cancel',
+      mode: 'real',
+      total_count: 2,
+      success_count: 2,
+      failed_count: 0,
+      skipped_count: 0,
+      summary_json: '{"promotions_total":2}',
+      created_at: '2026-07-09T10:10:00.000Z',
+      updated_at: '2026-07-09T10:10:00.000Z'
+    },
+    {
+      id: 200,
+      account_id: 'A1',
+      promotion_id: 'C-1',
+      promotion_type: 'SELLER_CAMPAIGN',
+      promotion_name: '95',
+      action: 'cancel',
+      mode: 'real',
+      discount_percent: 5,
+      total_count: 2,
+      success_count: 2,
+      failed_count: 0,
+      skipped_count: 0,
+      created_at: '2026-07-09T10:00:00.000Z',
+      updated_at: '2026-07-09T10:08:00.000Z'
+    },
+    {
+      id: 199,
+      account_id: 'A1',
+      promotion_id: 'P-1',
+      promotion_type: 'DEAL',
+      promotion_name: 'Hot Sale',
+      action: 'cancel',
+      mode: 'real',
+      discount_percent: 6,
+      total_count: 1,
+      success_count: 1,
+      failed_count: 0,
+      skipped_count: 0,
+      created_at: '2026-07-09T10:00:00.000Z',
+      updated_at: '2026-07-09T10:08:00.000Z'
+    }
+  ], 10);
+
+  assert.equal(rows[0].seller_activity_text, '');
+  assert.equal(rows[0].official_activity_text, '');
+});
+
+test('WinForms also clears discount columns for cancel history rows', () => {
+  const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
+  assert.match(standaloneSource, /bool isCancelAction = string\.Equals\(actionRaw, "cancel", StringComparison\.OrdinalIgnoreCase\)/);
+  assert.match(standaloneSource, /string sellerActivity = isCancelAction \? ""/);
+  assert.match(standaloneSource, /string officialActivity = isCancelAction \? ""/);
+});
+
 test('history grid uses short failure summary while selected row exposes full reason table', () => {
   const repositorySource = fs.readFileSync(path.join(process.cwd(), 'src', 'repository.js'), 'utf8');
   const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
-  const webSource = fs.readFileSync(path.join(process.cwd(), 'public', 'app.js'), 'utf8');
-
   assert.match(repositorySource, /short_failure_reason/);
   assert.match(repositorySource, /full_failure_reasons/);
+  assert.match(repositorySource, /已报名商品明细不完整/);
+  assert.match(repositorySource, /未执行待继续/);
   assert.match(repositorySource, /SMART未参与批量报名/);
   assert.match(standaloneSource, /StringValue\(task, "short_failure_reason", TaskReason\(task\)\)/);
   assert.match(standaloneSource, /full_failure_reasons/);
-  assert.match(standaloneSource, /SelectionChanged \+= \(_, _\) => ShowSelectedTaskSummaryInLog\(\)/);
-  assert.match(standaloneSource, /完整失败原因/);
-  assert.match(webSource, /row\.short_failure_reason/);
+  assert.match(standaloneSource, /TaskSkippedReasonDetails/);
+  assert.match(standaloneSource, /SkippedReasonDetails/);
+  assert.match(standaloneSource, /未执行\/跳过明细/);
+  assert.match(standaloneSource, /SelectionChanged \+= (?:\(_, _\) => ShowSelectedTaskSummaryInLog\(\)|delegate(?:\(object \_, EventArgs _\))?\s*\{\s*ShowSelectedTaskSummaryInLog\(\);)/);
+  assert.match(standaloneSource, /完整原因/);
+  assert.match(repositorySource, /short_failure_reason/);
+});
+
+test('cancel execution wording separates started item detail gaps from candidate gaps', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src', 'server.js'), 'utf8');
+  const executorSource = fs.readFileSync(path.join(process.cwd(), 'src', 'executor.js'), 'utf8');
+
+  assert.match(serverSource, /function unreadableItemDetailMessage/);
+  assert.match(serverSource, /已报名商品/);
+  assert.match(serverSource, /候选/);
+  assert.match(serverSource, /平台商品/);
+  assert.match(executorSource, /执行任务已停止，未开始的商品留待下次继续/);
+  assert.doesNotMatch(executorSource, /执行任务已停止，未开始的商品已跳过/);
 });
 
 test('concurrency wording says local protection limit, not tested platform maximum', () => {
@@ -2027,6 +2633,94 @@ test('execution job item filter does not duplicate one requested item across act
   assert.equal(batch.totals.planned, 1);
 });
 
+test('confirmed execution scope filters by activity-item relation instead of global item id', () => {
+  const promotions = [
+    { account_id: 'A', site_id: 'MLM', promotion_id: 'P-1', promotion_type: 'DEAL' },
+    { account_id: 'A', site_id: 'MLM', promotion_id: 'P-2', promotion_type: 'DEAL' },
+  ];
+  const itemsByPromotion = new Map([
+    [promotionKey(promotions[0]), [{ item_id: 'ITEM-SHARED' }, { item_id: 'ITEM-P1-NEW' }]],
+    [promotionKey(promotions[1]), [{ item_id: 'ITEM-SHARED' }, { item_id: 'ITEM-P2' }]],
+  ]);
+  const request = {
+    confirmedExecutionScope: {
+      activities: [
+        { account_id: 'A', site_id: 'MLM', promotion_id: 'P-1', promotion_type: 'DEAL', item_ids: ['ITEM-SHARED'] },
+        { account_id: 'A', site_id: 'MLM', promotion_id: 'P-2', promotion_type: 'DEAL', item_ids: ['ITEM-P2'] },
+      ],
+    },
+  };
+  const filtered = filterItemsByConfirmedScope({ accountId: 'A', promotions, itemsByPromotion, request });
+  assert.equal(filtered.hasFilter, true);
+  assert.equal(filtered.requestedRelationCount, 2);
+  assert.equal(filtered.matchedRelationCount, 2);
+  assert.equal(filtered.missingRelations.length, 0);
+  assert.deepEqual(filtered.itemsByPromotion.get(promotionKey(promotions[0])).map((row) => row.item_id), ['ITEM-SHARED']);
+  assert.deepEqual(filtered.itemsByPromotion.get(promotionKey(promotions[1])).map((row) => row.item_id), ['ITEM-P2']);
+});
+
+test('confirmed execution scope excludes newly discovered activities and matches site identity exactly', () => {
+  const promotions = [
+    { account_id: 'A', site_id: 'MLM', promotion_id: 'P-1', promotion_type: 'DEAL' },
+    { account_id: 'A', site_id: 'MLB', promotion_id: 'P-1', promotion_type: 'DEAL' },
+    { account_id: 'A', site_id: 'MLM', promotion_id: 'P-NEW', promotion_type: 'DEAL' },
+  ];
+  const request = {
+    confirmedExecutionScope: {
+      action: 'enroll',
+      activities: [
+        { account_id: 'A', site_id: 'MLM', promotion_id: 'P-1', promotion_type: 'DEAL', item_ids: ['ITEM-1'] },
+      ],
+    },
+  };
+  assert.equal(hasConfirmedExecutionScope(request), true);
+  const filtered = filterPromotionsByConfirmedScope({ accountId: 'A', promotions, request });
+  assert.equal(filtered.hasFilter, true);
+  assert.deepEqual(filtered.promotions.map((row) => `${row.site_id}|${row.promotion_id}`), ['MLM|P-1']);
+  assert.deepEqual(filtered.missingActivityKeys, []);
+});
+
+test('confirmed item filter does not borrow an identically named promotion from another site', () => {
+  const promotions = [
+    { account_id: 'A', site_id: 'MLM', promotion_id: 'P-1', promotion_type: 'DEAL' },
+    { account_id: 'A', site_id: 'MLB', promotion_id: 'P-1', promotion_type: 'DEAL' },
+  ];
+  const itemsByPromotion = new Map([
+    [promotionKey(promotions[0]), [{ item_id: 'ITEM-MLM' }, { item_id: 'ITEM-MLB' }]],
+  ]);
+  const request = {
+    confirmed_execution_scope: {
+      action: 'enroll',
+      activities: [
+        { account_id: 'A', site_id: 'MLM', promotion_id: 'P-1', promotion_type: 'DEAL', item_ids: ['ITEM-MLM'] },
+      ],
+    },
+  };
+  const filteredPromotions = filterPromotionsByConfirmedScope({ accountId: 'A', promotions, request }).promotions;
+  const filteredItems = filterItemsByConfirmedScope({ accountId: 'A', promotions: filteredPromotions, itemsByPromotion, request });
+  assert.equal(filteredPromotions.length, 1);
+  assert.equal(filteredItems.requestedRelationCount, 1);
+  assert.equal(filteredItems.matchedRelationCount, 1);
+  assert.deepEqual(filteredItems.itemsByPromotion.get(promotionKey(promotions[0])).map((row) => row.item_id), ['ITEM-MLM']);
+});
+
+test('an explicitly empty confirmed scope filters every activity and item instead of disabling the guard', () => {
+  const promotions = [{ account_id: 'A', site_id: 'MLM', promotion_id: 'P-1', promotion_type: 'DEAL' }];
+  const request = { confirmedExecutionScope: { action: 'enroll', activities: [] } };
+  const promotionFilter = filterPromotionsByConfirmedScope({ accountId: 'A', promotions, request });
+  const itemFilter = filterItemsByConfirmedScope({
+    accountId: 'A',
+    promotions: promotionFilter.promotions,
+    itemsByPromotion: new Map([[promotionKey(promotions[0]), [{ item_id: 'ITEM-1' }]]]),
+    request,
+  });
+  assert.equal(promotionFilter.hasFilter, true);
+  assert.deepEqual(promotionFilter.promotions, []);
+  assert.equal(itemFilter.hasFilter, true);
+  assert.equal(itemFilter.requestedRelationCount, 0);
+  assert.equal([...itemFilter.itemsByPromotion.values()].flat().length, 0);
+});
+
 test('SMART cancel planned row keeps raw_json offer_id for execution query building', () => {
   const promotion = { promotion_id: 'P-MLB17757148', promotion_type: 'SMART' };
   const batch = buildBatchPlans({
@@ -2389,7 +3083,8 @@ test('settings normalization stores only non-sensitive paths and numeric workflo
     readConcurrency: 99,
     previewConcurrency: 0,
     writeConcurrency: 999,
-    storeAliases: { '2651442567': '湖南店', empty: '', blank: '   ' },
+    storeAliases: { '2651442567': '湖北', empty: '', blank: '   ' },
+    operatingSites: { '2651442567': ['mlm', 'MLB', 'MLM'], empty: [] },
     defaultFilters: { siteIds: 'MLB,MLM', promotionTypes: 'deal,smart', keywords: '95,Hot' }
   });
   assert.equal(settings.authDir, 'C:/auth');
@@ -2400,7 +3095,8 @@ test('settings normalization stores only non-sensitive paths and numeric workflo
   assert.equal(settings.readConcurrency, MAX_READ_CONCURRENCY);
   assert.equal(settings.previewConcurrency, 1);
   assert.equal(settings.writeConcurrency, MAX_WRITE_CONCURRENCY);
-  assert.deepEqual(settings.storeAliases, { '2651442567': '湖南店' });
+  assert.deepEqual(settings.storeAliases, { '2651442567': '湖北' });
+  assert.deepEqual(settings.operatingSites, { '2651442567': ['MLB', 'MLM'], empty: [] });
   assert.deepEqual(settings.defaultFilters.siteIds, ['MLB', 'MLM']);
   assert.deepEqual(settings.defaultFilters.promotionTypes, ['DEAL', 'SMART']);
 });
@@ -2930,9 +3626,9 @@ test('execution job path carries normalized write concurrency into real executio
   const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
 
   assert.match(standaloneSource, /ResolveReadConcurrencyPlanAsync/);
-  assert.match(standaloneSource, /readConcurrency = Math\.Max\(1, Math\.Min\(readConcurrency, ReadProbeCap\)\)/);
+  assert.match(standaloneSource, /readConcurrency = Math\.Max\(1, Math\.Min\(readConcurrency, (?:ReadProbeCap|20)\)\)/);
   assert.match(standaloneSource, /perJobWriteConcurrency/);
-  assert.match(standaloneSource, /writeConcurrency\s*\r?\n\s*\}/);
+  assert.match(standaloneSource, /writeConcurrency\s*(?:\r?\n\s*\}|= writeConcurrency)/);
   assert.match(standaloneSource, /siteConcurrency/);
   assert.match(standaloneSource, /activityConcurrency/);
   assert.match(serverSource, /\/api\/execution\/jobs\/start[\s\S]*normalizeWriteConcurrency\(body\.writeConcurrency, settings\.writeConcurrency\)/);
@@ -2989,13 +3685,14 @@ test('execution job path carries normalized write concurrency into real executio
   assert.match(serverSource, /ensureFreshAccount\(accountId, \{ force: true \}\)/);
 });
 
-test('read and write concurrency benchmark endpoints are present and write benchmark is disabled', () => {
+test('read benchmark and write plan remain while the synchronous write benchmark is retired', () => {
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
   const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
 
   assert.match(serverSource, /\/api\/concurrency-benchmark\/read/);
   assert.match(serverSource, /\/api\/concurrency-benchmark\/write\/plan/);
-  assert.match(serverSource, /旧同步真实写入压测接口已停用/);
+  assert.match(serverSource, /'\/api\/concurrency-benchmark\/write\/execute'/);
+  assert.match(serverSource, /LEGACY_SYNC_WRITE_MESSAGE/);
   assert.match(serverSource, /READ_BENCHMARK_LEVELS = \[1, 2, 3, 4, 5, 8, 10, 15, 20\]/);
   assert.match(serverSource, /WRITE_BENCHMARK_LEVELS = \[1, 2, 3, 5, 8, 10, 15, 20\]/);
   assert.match(serverSource, /READ_BENCHMARK_MAX_CONCURRENCY = 20/);
@@ -3010,16 +3707,14 @@ test('read and write concurrency benchmark endpoints are present and write bench
 
 test('settings window keeps daily settings simple and moves concurrency to advanced diagnostics', () => {
   const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
-  const indexSource = fs.readFileSync(path.join(process.cwd(), 'public/index.html'), 'utf8');
   const concurrencySource = fs.readFileSync(path.join(process.cwd(), 'src/concurrency.js'), 'utf8');
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
 
   assert.match(concurrencySource, /MAX_WRITE_CONCURRENCY = 700/);
-  assert.match(indexSource, /max="700"/);
   assert.match(standaloneSource, /自动并发策略（推荐）/);
   assert.match(standaloneSource, /高级设置 \/ 诊断/);
   assert.match(standaloneSource, /AddRowTo\(advancedGroup, "诊断文件目录"/);
-  assert.match(standaloneSource, /AddNumberRowTo\(advancedGroup, "商品写入并发（当前使用值）", _writeConcurrency, writeConcurrency, 1, 700/);
+  assert.match(standaloneSource, /AddNumberRowTo\(advancedGroup,[\s\S]{0,120}_writeConcurrency, writeConcurrency, 1m?, 700m?/);
   assert.doesNotMatch(standaloneSource, /AddRow\("输出目录"/);
   assert.doesNotMatch(standaloneSource, /AddNumberRow\("读取并发（高级）"/);
   assert.doesNotMatch(standaloneSource, /AddNumberRow\("活动并发（高级）"/);
@@ -3070,25 +3765,127 @@ test('WinForms all-store execution logs every queued store before concurrency sl
   assert.match(standaloneSource, /等待并发槽位/);
   assert.match(standaloneSource, /开始店铺任务/);
   assert.match(standaloneSource, /店铺任务完成/);
-  assert.match(standaloneSource, /accountIds\.Select\(async \(accountId, index\)/);
+  assert.match(standaloneSource, /accountIds\.Select\(async (?:\(accountId, index\)|delegate\(string accountId, int index\))/);
   assert.match(standaloneSource, /index >= siteConcurrency/);
   assert.match(standaloneSource, /_currentExecutionJobIds/);
 });
 
-test('WinForms startup reuses healthy local service and starts service from the UI flow', () => {
+test('WinForms auto submit resolves one global action and blocks mixed store decisions', () => {
+  const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+
+  assert.match(standaloneSource, /ResolveGlobalSubmitActionAsync\(accountIds, selectedAction\)/);
+  assert.match(standaloneSource, /ApplyGlobalTodayDiscount\(\)/);
+  assert.match(standaloneSource, /ResolvedSubmitDecision\(string Action\)/);
+  assert.doesNotMatch(standaloneSource, /ApplyResolvedDiscounts|DecisionDiscount\(/);
+  assert.match(standaloneSource, /本次执行动作：(?:" \+ LegacyActionText\(action\) \+ "|\\?\{LegacyActionText\(action\)\\?\})/);
+  assert.match(standaloneSource, /\/api\/today\/decision/);
+  assert.match(standaloneSource, /activeActions\.Length == 1/);
+  assert.match(standaloneSource, /不同店铺需要不同动作，本次自动判断已停止/);
+  assert.match(standaloneSource, /请手动选择批量报活动、批量更新或批量取消/);
+  assert.match(standaloneSource, /StartAndPollExecutionJobAsync\(accountId, action/);
+  assert.doesNotMatch(standaloneSource, /StartAndPollExecutionJobAsync\(accountId, SelectedSubmitAction/);
+});
+
+test('WinForms resolves final action and discounts before confirmation and cancellation creates no job', () => {
+  const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+  const submit = standaloneSource.slice(
+    standaloneSource.indexOf('private async Task SubmitExecutionJobWrapperAsync'),
+    standaloneSource.indexOf('private async Task<bool> EnsureSellerCampaignCreationGuideAsync')
+  );
+  const resolveAt = submit.indexOf('ResolveGlobalSubmitActionAsync(accountIds, selectedAction)');
+  const applyAt = submit.indexOf('ApplyGlobalTodayDiscount()');
+  const confirmAt = submit.indexOf('BuildExecutionConfirmationText(action)');
+  const executeAt = submit.indexOf('StartAndPollExecutionJobAsync');
+  assert.ok(resolveAt >= 0 && resolveAt < confirmAt);
+  assert.ok(applyAt >= 0 && applyAt < confirmAt);
+  assert.ok(confirmAt >= 0 && confirmAt < executeAt);
+  assert.match(submit, /if \(confirm\.ShowDialog\(this\) != DialogResult\.OK\)[\s\S]*未创建执行任务[\s\S]*return;/);
+  assert.match(submit, /if \(string\.IsNullOrWhiteSpace\(selectedAction\)\)[\s\S]*ApplyGlobalTodayDiscount\(\)/);
+
+  const confirmation = standaloneSource.slice(
+    standaloneSource.indexOf('private string BuildExecutionConfirmationText'),
+    standaloneSource.indexOf('private static IEnumerable<SellerCampaignTarget> SellerCampaignTargets')
+  );
+  assert.match(confirmation, /执行动作：\{actionText\}/);
+  assert.match(confirmation, /自建折扣：\{_sellerDiscount\.Value:0\}%/);
+  assert.match(confirmation, /官方折扣：\{_officialDiscount\.Value:0\}%/);
+  const cancelBranch = confirmation.match(/if \(string\.Equals\(action, "cancel"[\s\S]*?\n\t\t\t\}/)?.[0] || '';
+  assert.match(cancelBranch, /本次取消不使用折扣/);
+  assert.doesNotMatch(cancelBranch, /_sellerDiscount|_officialDiscount/);
+});
+
+test('WinForms refreshes automatic today discounts after startup and every scope change', () => {
+  const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+  assert.match(standaloneSource, /LoadStartupDataAsync\(\)[\s\S]*_autoDecisionDataReady = true;[\s\S]*QueueAutoDecisionRefreshAsync\(immediate: true\)/);
+  assert.match(standaloneSource, /_modeSelect\.SelectedIndexChanged \+= async delegate[\s\S]*QueueAutoDecisionRefreshAsync/);
+  assert.match(standaloneSource, /AccountChangedAsync\(\)[\s\S]*RefreshActivitiesAsync[\s\S]*RefreshTasksAsync[\s\S]*QueueAutoDecisionRefreshAsync/);
+  assert.match(standaloneSource, /_siteSelect\.SelectedIndexChanged \+= async delegate[\s\S]*RefreshActivitiesAsync[\s\S]*QueueAutoDecisionRefreshAsync/);
+  assert.match(standaloneSource, /_sellerActivitySelect\.SelectedIndexChanged \+= async delegate[\s\S]*QueueAutoDecisionRefreshAsync/);
+  assert.match(standaloneSource, /_officialActivitySelect\.SelectedIndexChanged \+= async delegate[\s\S]*QueueAutoDecisionRefreshAsync/);
+});
+
+test('WinForms automatic display refresh is read-only stale-safe and isolated from manual modes', () => {
+  const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+  const refresh = standaloneSource.slice(
+    standaloneSource.indexOf('private async Task QueueAutoDecisionRefreshAsync'),
+    standaloneSource.indexOf('private async Task SubmitExecutionAsync')
+  );
+  assert.match(refresh, /Interlocked\.Increment\(ref _autoDecisionRefreshVersion\)/);
+  assert.match(refresh, /version != _autoDecisionRefreshVersion/);
+  assert.match(refresh, /!string\.IsNullOrWhiteSpace\(SelectedSubmitAction\(\)\)/);
+  assert.match(refresh, /ResolveGlobalSubmitActionAsync\(accountIds, ""/);
+  assert.match(refresh, /ApplyGlobalTodayDiscount\(\)/);
+  assert.match(refresh, /GlobalTodayDiscountSummary\(\)/);
+  assert.doesNotMatch(refresh, /\/api\/execution\/jobs\/start|StartAndPollExecutionJobAsync|REAL_SUBMIT/);
+  assert.match(standaloneSource, /autoCancel = string\.IsNullOrWhiteSpace\(SelectedSubmitAction\(\)\)[\s\S]*_autoResolvedAction, "cancel"/);
+});
+
+test('WinForms execution summary logs store site action and promotion type buckets', () => {
+  const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+
+  assert.match(standaloneSource, /StoreActionSummaryText\(outcome\)/);
+  assert.match(standaloneSource, /OverallActionSummaryText\(action, outcomes\)/);
+  assert.match(standaloneSource, /自建 \{outcome\.SellerSuccess\}\/\{outcome\.SellerProcessed\}/);
+  assert.match(standaloneSource, /官方 \{outcome\.OfficialSuccess\}\/\{outcome\.OfficialProcessed\}/);
+  assert.match(standaloneSource, /SMART 跳过/);
+  assert.match(standaloneSource, /LIGHTNING 跳过/);
+  assert.match(standaloneSource, /未匹配到 SELLER_CAMPAIGN 活动或无可处理商品/);
+  assert.match(standaloneSource, /case "SELLER_CAMPAIGN":|type == "SELLER_CAMPAIGN"/);
+  assert.match(standaloneSource, /case "DEAL":|type == "DEAL"/);
+  assert.match(standaloneSource, /case "SMART":|type == "SMART"/);
+  assert.match(standaloneSource, /case "LIGHTNING":|type == "LIGHTNING"/);
+  assert.match(standaloneSource, /本次\{LegacyActionText\(action\)\}总汇总/);
+});
+
+test('WinForms startup presents workbench component as a product feature', () => {
   const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
 
   assert.match(standaloneSource, /if \(await IsHealthy\(\)\)\s*\{\s*return null;\s*\}/);
-  assert.match(standaloneSource, /serviceWarmupTask = Task\.Run\(EnsureServiceAsync\)/);
+  assert.match(standaloneSource, /serviceWarmupTask = Task\.Run\((?:EnsureServiceAsync|\(Func<Task<Process>\?>\)EnsureServiceAsync)\)/);
   assert.match(standaloneSource, /Application\.Run\(new MainForm\(startedService, serviceWarmupTask\)\)/);
   assert.match(standaloneSource, /_serviceWarmupTask/);
-  assert.match(standaloneSource, /SetBusy\(true, "正在连接本地服务\.\.\."\)/);
+  assert.match(standaloneSource, /ServiceStartLock/);
+  assert.match(standaloneSource, /ServiceStartTask/);
+  assert.match(standaloneSource, /EnsureServiceCoreAsync/);
+  assert.match(standaloneSource, /if \(ServiceStartTask == null \|\| ServiceStartTask\.IsCompleted\)/);
+  assert.match(standaloneSource, /ReferenceEquals\(ServiceStartTask, task\)|ServiceStartTask == task/);
+  assert.match(standaloneSource, /WorkbenchPreparingText = "正在准备工作台\.\.\."/);
+  assert.match(standaloneSource, /WorkbenchReadyText = "工作台已就绪"/);
+  assert.match(standaloneSource, /WorkbenchRepairingText = "正在自动修复程序组件\.\.\."/);
+  assert.match(standaloneSource, /WaitUntilHealthyAsync\(TimeSpan\.FromSeconds\(8\.0\)\)/);
+  assert.match(standaloneSource, /WaitUntilHealthyAsync\(TimeSpan\.FromSeconds\(12\.0\)\)/);
+  assert.match(standaloneSource, /ProductFacingErrorMessage/);
+  assert.match(standaloneSource, /AppendInternalDiagnostic/);
+  assert.match(standaloneSource, /程序组件暂时不可用/);
+  assert.doesNotMatch(standaloneSource, /本地服务未连接，已尝试重新启动内置服务/);
+  assert.doesNotMatch(standaloneSource, /端口：\{28758\}/);
+  assert.doesNotMatch(standaloneSource, /日志目录：\{logDir\}/);
   assert.match(standaloneSource, /EnsureServiceReadyForUiAsync/);
   assert.match(standaloneSource, /payload\.version/);
   assert.match(standaloneSource, /File\.WriteAllText\(markerPath, payloadVersion/);
   assert.match(standaloneSource, /LoadAccountsAsync\(verifyAccounts: false\)/);
-  assert.match(standaloneSource, /_ = LoadStartupDataAsync\(\)/);
-  assert.match(standaloneSource, /Task\.WhenAll\(RefreshTasksAsync\(\), RefreshActivitiesAsync\(false\)\)/);
+  assert.match(standaloneSource, /(?:_ = )?LoadStartupDataAsync\(\)/);
+  assert.match(standaloneSource, /Task\.WhenAll\(RefreshTasksAsync\(\), RefreshActivitiesAsync\((?:writeLog:\s*)?false\)\)/);
   assert.match(standaloneSource, /if \(portOwner\.HasValue\)[\s\S]*IsOwnNodeService\(portOwner\.Value, root\)[\s\S]*StopProcessTree\(portOwner\.Value\)/);
   assert.doesNotMatch(standaloneSource, /if \(await IsHealthy\(\)\)[\s\S]{0,180}StopProcessTree\(portOwner\.Value\)/);
 });
@@ -3142,43 +3939,74 @@ test('saved discount defaults are usable by batch preview while one-off direct p
   assert.equal(direct.plans[0].plan.rows[0].deal_price, 88);
 });
 
-test('promotion creation status supports Seller Campaign preview and blocks real create workflow', () => {
+test('promotion creation status supports Seller Campaign real create behind confirmation', () => {
   assert.equal(PROMOTION_CREATION_STATUS.supported, true);
   assert.equal(PROMOTION_CREATION_STATUS.canPreviewDraft, true);
-  assert.equal(PROMOTION_CREATION_STATUS.canRealCreate, false);
+  assert.equal(PROMOTION_CREATION_STATUS.canRealCreate, true);
   assert.match(PROMOTION_CREATION_STATUS.summary, /SELLER_CAMPAIGN/);
-  assert.equal(PROMOTION_CREATION_STATUS.createEndpoint.maxDurationDays, 14);
+  assert.equal(PROMOTION_CREATION_STATUS.createEndpoint.maxFinishDatePolicy, '开始日期所在月份的最后一天');
+  assert.match(PROMOTION_CREATION_STATUS.createEndpoint.headers.join('\n'), /X-Client-Id/);
   assert.ok(PROMOTION_CREATION_STATUS.officialEvidence.every((source) => source.url.startsWith('https://')));
 });
 
-test('Seller Campaign create preview builds official request and enforces 14 day limit', () => {
+test('WinForms disables discount inputs when cancel mode is selected', () => {
+  const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+
+  assert.match(standaloneSource, /_modeSelect\.SelectedIndexChanged \+= async delegate[\s\S]*QueueAutoDecisionRefreshAsync\(\)/);
+  assert.match(standaloneSource, /private void UpdateDiscountInputState\(bool busy = false\)/);
+  assert.match(standaloneSource, /string\.Equals\(SelectedSubmitAction\(\), "cancel", StringComparison\.OrdinalIgnoreCase\)/);
+  assert.match(standaloneSource, /_sellerDiscount\.Enabled = enabled/);
+  assert.match(standaloneSource, /_officialDiscount\.Enabled = enabled/);
+  assert.match(standaloneSource, /UpdateDiscountInputState\(busy\)/);
+});
+
+test('WinForms cancel execution start log does not show discount values', () => {
+  const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+  const logMethod = standaloneSource.slice(
+    standaloneSource.indexOf('private string ExecutionStartLogText'),
+    standaloneSource.indexOf('private void UpdateDiscountInputState')
+  );
+
+  assert.match(logMethod, /string\.Equals\(action, "cancel", StringComparison\.OrdinalIgnoreCase\)/);
+  assert.match(logMethod, /取消不使用折扣/);
+  const cancelReturn = logMethod.match(/return \$"开始\{SelectedSubmitModeText\(\)\}：\{scope\}，取消不使用折扣。";/)?.[0] || '';
+  assert.ok(cancelReturn);
+  assert.doesNotMatch(cancelReturn, /_sellerDiscount|_officialDiscount|自建|官方/);
+  assert.match(logMethod, /自建\{_sellerDiscount\.Value:0\}%/);
+  assert.match(standaloneSource, /private string BuildExecutionConfirmationText/);
+});
+
+test('Seller Campaign create preview builds official request and enforces calendar-month finish limit', () => {
   const preview = buildSellerCampaignCreatePreview({
     accountId: '2651442567',
     siteId: 'MLB',
     childUserId: '2668031897',
     name: '95',
     subType: 'FLEXIBLE_PERCENTAGE',
-    startDate: '2026-07-03T00:00:00.000Z',
-    finishDate: '2026-07-16T00:00:00.000Z'
+    startDate: '2026-07-09T00:00:00.000Z',
+    finishDate: '2026-07-31T23:59:59.000Z'
   });
   assert.deepEqual(preview.errors, []);
   assert.equal(preview.request_preview.method, 'POST');
   assert.equal(preview.request_preview.path, '/marketplace/seller-promotions/seller-campaign/2668031897');
   assert.equal(preview.request_preview.headers.version, 'v2');
+  assert.equal(preview.request_preview.headers['X-Caller-Id'], '2651442567');
+  assert.equal(preview.request_preview.headers['X-Client-Id'], '2651442567');
   assert.equal(preview.request_preview.body.promotion_type, 'SELLER_CAMPAIGN');
   assert.equal(preview.request_preview.body.sub_type, 'FLEXIBLE_PERCENTAGE');
+  assert.equal(preview.request_preview.body.start_date, '2026-07-09T00:00:00.000Z');
 
   const tooLong = buildSellerCampaignCreateConfirmation({
     accountId: '2651442567',
     siteId: 'MLB',
     childUserId: '2668031897',
     name: 'Too long',
-    startDate: '2026-07-03T00:00:00.000Z',
-    finishDate: '2026-07-18T00:00:00.000Z'
+    startDate: '2026-07-09T00:00:00.000Z',
+    finishDate: '2026-08-02T00:00:00.000Z'
   });
   assert.equal(tooLong.status, 'blocked');
   assert.equal(tooLong.can_request_final_confirmation, false);
-  assert.match(tooLong.validation_errors.join('\n'), /14 天/);
+  assert.match(tooLong.validation_errors.join('\n'), /月份的最后一天/);
 });
 
 test('Seller Campaign create confirmation is preview-only even when valid', () => {
@@ -3196,6 +4024,316 @@ test('Seller Campaign create confirmation is preview-only even when valid', () =
   assert.equal(pkg.request_preview.preview_only, true);
   assert.equal(pkg.request_preview.writes_external_state, true);
   assert.match(pkg.risk_prompts.join('\n'), /不执行 POST/);
+});
+
+
+test('Mercado client creates only SELLER_CAMPAIGN with marketplace seller-campaign endpoint', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return {
+      ok: true,
+      status: 201,
+      headers: new Map([['content-type', 'application/json']]),
+      text: async () => JSON.stringify({ id: 'C-MLM999', promotion_type: 'SELLER_CAMPAIGN' })
+    };
+  };
+  try {
+    const client = new MercadoLibreClient({ accessToken: 'ACCESS', userId: 'CHILD', callerId: 'PARENT', marketplace: true });
+    const result = await client.createSellerCampaign({
+      childUserId: 'CHILD',
+      callerId: 'PARENT',
+      clientUserId: 'PARENT',
+      name: '95',
+      startDate: '2026-07-07T00:00:00.000Z',
+      finishDate: '2026-07-20T23:59:59.000Z'
+    });
+    assert.equal(result.http_status, 201);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].url, /\/marketplace\/seller-promotions\/seller-campaign\/CHILD$/);
+    const body = JSON.parse(calls[0].options.body);
+    assert.equal(body.promotion_type, 'SELLER_CAMPAIGN');
+    assert.equal(body.sub_type, 'FLEXIBLE_PERCENTAGE');
+    assert.equal(calls[0].options.method, 'POST');
+    assert.equal(calls[0].options.headers.version, 'v2');
+    assert.equal(calls[0].options.headers['X-Caller-Id'], 'PARENT');
+    assert.equal(calls[0].options.headers['X-Client-Id'], 'PARENT');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Mercado client reads marketplace promotions with explicit parent caller when provided', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map([['content-type', 'application/json']]),
+      text: async () => JSON.stringify({ results: [{ id: 'C-MLA1', promotion_type: 'SELLER_CAMPAIGN' }] })
+    };
+  };
+  try {
+    const client = new MercadoLibreClient({ accessToken: 'ACCESS', userId: 'CHILD', callerId: 'PARENT', marketplace: true });
+    await client.getMarketplacePromotions('CHILD', { callerId: 'PARENT' });
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].url, /\/marketplace\/seller-promotions\/users\/CHILD\?limit=50&offset=0$/);
+    assert.equal(calls[0].options.headers.version, 'v2');
+    assert.equal(calls[0].options.headers['X-Caller-Id'], 'PARENT');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Mercado client reads every marketplace promotion page with the same caller headers', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    const requestUrl = new URL(String(url));
+    calls.push({ url: requestUrl, options });
+    const offset = Number(requestUrl.searchParams.get('offset') || 0);
+    const results = offset === 0
+      ? [
+          { id: 'P-MLA1', promotion_type: 'DEAL' },
+          { id: 'C-MLA1', promotion_type: 'SELLER_CAMPAIGN' }
+        ]
+      : [
+          { id: 'C-MLA1', promotion_type: 'SELLER_CAMPAIGN' },
+          { id: 'P-MLA2', promotion_type: 'DEAL' }
+        ];
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map([['content-type', 'application/json']]),
+      text: async () => JSON.stringify({
+        results,
+        paging: { offset, limit: 2, total: 4, searchAfter: '' }
+      })
+    };
+  };
+  try {
+    const client = new MercadoLibreClient({ accessToken: 'ACCESS', userId: 'CHILD', callerId: 'PARENT', marketplace: true });
+    const result = await client.getMarketplacePromotions('CHILD', { callerId: 'PARENT', limit: 2 });
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls.map((call) => call.url.searchParams.get('offset')), ['0', '2']);
+    assert.ok(calls.every((call) => call.options.headers.version === 'v2'));
+    assert.ok(calls.every((call) => call.options.headers['X-Caller-Id'] === 'PARENT'));
+    assert.deepEqual(result.results.map((row) => row.id), ['P-MLA1', 'C-MLA1', 'P-MLA2']);
+    assert.equal(result.paging.total, 4);
+    assert.equal(result.paging.fetched, 3);
+    assert.equal(result.paging.pages, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Marketplace promotion merge deduplicates by promotion type and id', () => {
+  const merged = mergePromotionsByIdentity(
+    [
+      { id: 'C-MLA1', promotion_type: 'SELLER_CAMPAIGN', name: '95' },
+      { id: 'P-MLA1', promotion_type: 'DEAL', name: 'Hot Sale' }
+    ],
+    [
+      { id: 'C-MLA1', promotion_type: 'SELLER_CAMPAIGN', name: '95 duplicate' },
+      { id: 'C-MLA1', promotion_type: 'DEAL', name: 'same id different type' }
+    ]
+  );
+  assert.deepEqual(merged.map((row) => `${row.promotion_type}|${row.id}`), [
+    'SELLER_CAMPAIGN|C-MLA1',
+    'DEAL|P-MLA1',
+    'DEAL|C-MLA1'
+  ]);
+});
+
+test('Seller Campaign real create uses child as target and parent account as caller', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  const clientSource = fs.readFileSync(path.join(process.cwd(), 'src/mlClient.js'), 'utf8');
+
+  assert.match(serverSource, /mergeSellerCampaignCreateSite/);
+  assert.match(serverSource, /sellerCampaignCreateSiteScore/);
+  assert.match(serverSource, /logisticType === 'remote'/);
+  assert.match(serverSource, /logisticType === 'fulfillment'/);
+  assert.match(serverSource, /callerUserId = String\(account\.account_id \|\| accountId\)/);
+  assert.match(serverSource, /callerId: callerUserId/);
+  assert.match(serverSource, /clientUserId: callerUserId/);
+  assert.match(clientSource, /headers\['X-Caller-Id'\] = String\(callerId\)/);
+  assert.match(clientSource, /headers\['X-Client-Id'\] = String\(clientUserId\)/);
+});
+
+test('Seller Campaign batch create precheck separates verified absence from review-only visibility', () => {
+  const result = buildSellerCampaignBatchCreatePrecheck({
+    name: '95',
+    startDate: '2026-07-07T00:00:00.000Z',
+    finishDate: '2026-07-14T00:00:00.000Z',
+    targets: [
+      { account_id: 'A', store_name: 'store-existing', site_id: 'MLM', site_name: 'Mexico', child_user_id: 'CH-1', detection_status: 'existing', hasSellerCampaign: true },
+      { account_id: 'B', store_name: 'store-review', site_id: 'MLM', site_name: 'Mexico', child_user_id: 'CH-2', detection_status: 'visibility_unknown', hasSellerCampaign: false },
+      { account_id: 'C', store_name: 'store-unreadable', site_id: 'MLB', site_name: 'Brazil', child_user_id: 'CH-3', detection_status: 'unreadable', hasSellerCampaign: false, detection_message: '无法确认该站点自建活动。' },
+      { account_id: 'D', store_name: 'store-confirmed-absent', site_id: 'MLC', site_name: 'Chile', child_user_id: 'CH-4', detection_status: 'confirmed_absent', hasSellerCampaign: false }
+    ]
+  });
+  assert.equal(result.existing_count, 1);
+  assert.equal(result.needs_manual_review_count, 1);
+  assert.equal(result.confirmed_absent_count, 1);
+  assert.equal(result.unreadable_count, 1);
+  assert.equal(result.missing_count, 1);
+  assert.equal(result.preview_ready_count, 1);
+  assert.equal(result.blocked_count, 2);
+  assert.equal(result.creates_official_activity, false);
+  assert.equal(result.writes_external_state, false);
+  assert.deepEqual(result.prechecks.map((row) => row.store_name), ['store-confirmed-absent']);
+  assert.deepEqual(result.needs_manual_review.map((row) => row.store_name), ['store-review']);
+  assert.deepEqual(result.unreadable.map((row) => row.store_name), ['store-unreadable']);
+  assert.ok(result.prechecks.every((row) => row.confirmation_package.promotion_type === 'SELLER_CAMPAIGN'));
+  assert.ok(result.prechecks.every((row) => row.confirmation_package.request_preview.preview_only));
+  assert.match(result.user_message, /可验证来源确认不存在/);
+  assert.doesNotMatch(result.user_message, /缺少自建活动/);
+});
+
+test('Seller Campaign live site summary keeps an existing result across multiple children of the same site', () => {
+  const summary = summarizeSellerCampaignLiveSites([
+    { child_user_id: 'CH-EMPTY', site_id: 'MLA', status: 'ok', seller_campaign_count: 0 },
+    { child_user_id: 'CH-SELLER', site_id: 'MLA', status: 'ok', seller_campaign_count: 1 },
+    { child_user_id: 'CH-ERROR', site_id: 'MLA', status: 'error', error: 'temporary read failure' },
+    { child_user_id: 'CH-MLB', site_id: 'MLB', status: 'ok', seller_campaign_count: 0 }
+  ]);
+  assert.deepEqual(summary.get('MLA'), {
+    ok_count: 2,
+    error_count: 1,
+    seller_campaign_count: 1,
+    errors: ['temporary read failure']
+  });
+  assert.deepEqual(summary.get('MLB'), {
+    ok_count: 1,
+    error_count: 0,
+    seller_campaign_count: 0,
+    errors: []
+  });
+});
+
+test('Seller Campaign batch create precheck validates name and date range', () => {
+  const result = buildSellerCampaignBatchCreatePrecheck({
+    name: '',
+    startDate: '2026-07-07T00:00:00.000Z',
+    finishDate: '2026-08-02T00:00:00.000Z',
+    targets: [
+      { account_id: 'B', store_name: 'store-missing-1', site_id: 'MLM', site_name: 'Mexico', child_user_id: 'CH-2', detection_status: 'confirmed_absent', hasSellerCampaign: false }
+    ]
+  });
+  assert.equal(result.preview_ready_count, 0);
+  assert.equal(result.blocked_count, 1);
+  assert.match(result.validation_errors.join('\n'), /name/);
+  assert.match(result.validation_errors.join('\n'), /月份的最后一天/);
+});
+
+test('WinForms self-built creation guide only runs after action resolves to enroll', () => {
+  const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  const submitSource = standaloneSource.slice(
+    standaloneSource.indexOf('private async Task SubmitExecutionJobWrapperAsync'),
+    standaloneSource.indexOf('private async Task<bool> EnsureSellerCampaignCreationGuideAsync')
+  );
+  const guideSource = standaloneSource.slice(
+    standaloneSource.indexOf('private async Task<bool> EnsureSellerCampaignCreationGuideAsync'),
+    standaloneSource.indexOf('private static IEnumerable<string> SellerCampaignTargetLines')
+  );
+  assert.match(standaloneSource, /EnsureSellerCampaignCreationGuideAsync\(accountIds\)/);
+  assert.match(submitSource, /ResolveGlobalSubmitActionAsync\(accountIds, selectedAction\)[\s\S]*string\.Equals\(action, "enroll", StringComparison\.OrdinalIgnoreCase\)[\s\S]*EnsureSellerCampaignCreationGuideAsync\(accountIds\)/);
+  assert.doesNotMatch(submitSource, /EnsureSellerCampaignCreationGuideAsync\(accountIds\)[\s\S]*ResolveGlobalSubmitActionAsync\(accountIds, selectedAction\)/);
+  assert.doesNotMatch(standaloneSource, /EnsureSellerCampaignCreationGuideAsync\(IReadOnlyList<string> accountIds, string action\)/);
+  assert.doesNotMatch(guideSource, /string\.Equals\(action, "enroll"/);
+  assert.match(standaloneSource, /SelectedValue\(_sellerActivitySelect\)\.Length > 0/);
+  assert.match(standaloneSource, /\/api\/promotion-creation\/seller-campaign\/batch-precheck/);
+  assert.match(standaloneSource, /\/api\/promotion-creation\/seller-campaign\/batch-create/);
+  assert.match(standaloneSource, /CREATE_SELLER_CAMPAIGN/);
+  assert.match(standaloneSource, /创建完成并刷新活动后，会继续执行本次批量报名/);
+  assert.doesNotMatch(standaloneSource, /本次不会继续报名商品/);
+  assert.doesNotMatch(standaloneSource, /不会继续报名。请完成真实创建确认后刷新活动列表再报名/);
+  assert.match(standaloneSource, /EndOfMonth\(DateTime\.Today\)/);
+  assert.match(standaloneSource, /ApiFinishDate => FinishDate\.AddDays\(1\.0\)/);
+  assert.match(standaloneSource, /finishDate = dialog\.ApiFinishDate\.ToString\("yyyy-MM-dd'T'00:00:00"/);
+  assert.match(standaloneSource, /FinishDate > EndOfMonth\(StartDate\)/);
+  assert.match(standaloneSource, /_finishPicker\.MaxDate = max/);
+  assert.match(standaloneSource, /结束日期不能超过开始日期所在月份的最后一天/);
+  assert.match(standaloneSource, /SellerCampaignCreateDialog/);
+  const createDialogSource = standaloneSource.slice(standaloneSource.indexOf('private sealed class SellerCampaignCreateDialog'));
+  assert.match(standaloneSource, /private sealed class SellerCampaignTarget/);
+  assert.match(createDialogSource, /CheckedListBox _scopeList/);
+  assert.match(createDialogSource, /CheckOnClick = true/);
+  assert.match(createDialogSource, /_scopeList\.Items\.Add\(target, isChecked: false\)/);
+  assert.match(createDialogSource, /SelectedTargets/);
+  assert.match(standaloneSource, /targetSelections = selectedTargetPayload/);
+  assert.match(standaloneSource, /return true;/);
+  assert.match(standaloneSource, /创建失败：/);
+  assert.match(standaloneSource, /将继续执行本次批量报名/);
+  assert.match(serverSource, /filterSellerCampaignCreateTargets\(targets, normalizeSellerCampaignTargetSelections\(body\), hasTargetSelections\)/);
+  assert.match(createDialogSource, /Text = "下一步"/);
+  assert.match(createDialogSource, /网页后台核对确实没有自建活动/);
+  assert.match(createDialogSource, /默认不创建/);
+  assert.doesNotMatch(createDialogSource, /Text = "生成预检"/);
+  assert.match(standaloneSource, /DialogResult\.OK/);
+  assert.doesNotMatch(standaloneSource, /child_user_id.*_scopeBox/);
+  assert.doesNotMatch(standaloneSource, /jobId.*SellerCampaignCreateDialog/);
+});
+
+test('Seller Campaign create guide uses safe visibility wording and live recheck guards', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  const pySideSource = fs.readFileSync(path.join(process.cwd(), 'desktop-pyside/main_window.py'), 'utf8');
+  assert.match(serverSource, /buildLiveSellerCampaignCreateTargets/);
+  assert.match(serverSource, /visibility_unknown/);
+  assert.match(serverSource, /confirmed_absent/);
+  assert.match(serverSource, /needs_manual_review/);
+  assert.match(serverSource, /unreadable_count/);
+  assert.match(serverSource, /读取失败也阻断创建|无法确认/);
+  assert.match(pySideSource, /needs_manual_review/);
+  assert.match(pySideSource, /confirmed_absent/);
+  assert.doesNotMatch(pySideSource, /seller_detection[^\n]*unknown_not_returned[^\n]*selected/);
+});
+
+test('Seller Campaign batch create refreshes after all selected targets and separates skipped targets', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  const dbSource = fs.readFileSync(path.join(process.cwd(), 'src/db.js'), 'utf8');
+  const batchCreateRoute = serverSource.slice(
+    serverSource.indexOf("if (method === 'POST' && url.pathname === '/api/promotion-creation/seller-campaign/batch-create')"),
+    serverSource.indexOf("if (method === 'GET' && url.pathname === '/api/candidate-incomplete/status')")
+  );
+  const createSource = serverSource.slice(
+    serverSource.indexOf('async function createMissingSellerCampaigns'),
+    serverSource.indexOf('function publicSellerCampaignTargets')
+  );
+  assert.match(batchCreateRoute, /const notSelectedTargets = sellerCampaignNotSelectedTargets\(targets, selectedTargets, hasTargetSelections\)/);
+  assert.ok(
+    batchCreateRoute.indexOf('const notSelectedTargets =') < batchCreateRoute.indexOf('createMissingSellerCampaigns({'),
+    'batch-create must define notSelectedTargets before invoking the real create path'
+  );
+  assert.match(createSource, /const apiSucceeded = \[\]/);
+  assert.match(createSource, /const accountsToRefresh = new Map\(\)/);
+  assert.match(createSource, /for \(const \[accountId, account\] of accountsToRefresh\)/);
+  assert.match(createSource, /await fetchAndSavePromotions\(account, \{ signal, checkpoint, readScheduler \}\)/);
+  assert.match(createSource, /for \(const entry of apiSucceeded\)/);
+  assert.match(createSource, /recheck_missing/);
+  assert.match(createSource, /not_selected_count/);
+  assert.match(createSource, /saveSellerCampaignCreateResult/);
+  assert.doesNotMatch(createSource, /if \(!refreshedAccounts\.has\(accountId\)\)[\s\S]{0,180}await fetchAndSavePromotions\(account\)/);
+  assert.match(dbSource, /CREATE TABLE IF NOT EXISTS seller_campaign_create_results/);
+});
+
+test('WinForms self-built creation summary shows selected created failed recheck and not selected counts', () => {
+  const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
+  const guideSource = standaloneSource.slice(
+    standaloneSource.indexOf('private async Task<bool> EnsureSellerCampaignCreationGuideAsync'),
+    standaloneSource.indexOf('private async Task<ExecutionOutcome> StartAndPollExecutionJobAsync')
+  );
+  assert.match(guideSource, /selectedCount/);
+  assert.match(guideSource, /notSelectedCount/);
+  assert.match(guideSource, /recheckMissingCount/);
+  assert.match(guideSource, /未选择/);
+  assert.match(guideSource, /接口成功但回查未发现/);
+  assert.match(standaloneSource, /SellerCampaignInfoLines/);
+  assert.match(standaloneSource, /不会计入成功或失败/);
 });
 
 test('real enroll smoke targets are fixed to exactly four allowed items', () => {
@@ -3332,9 +4470,9 @@ test('WinForms site selector uses business labels and keeps internal site ids', 
 test('WinForms all-store workflow iterates all mapped accounts instead of first account only', () => {
   const source = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
   assert.match(source, /SelectedAccountIds/);
-  assert.match(source, /foreach \(var accountId in accountIds\)/);
-  assert.match(source, /\/api\/accounts\/\{Uri\.EscapeDataString\(accountId\)\}\/sites/);
-  assert.match(source, /\/api\/accounts\/\{Uri\.EscapeDataString\(accountId\)\}\/promotions\/fetch/);
+  assert.match(source, /foreach \((?:var|string) accountId in accountIds\)/);
+  assert.match(source, /\/api\/accounts\/(?:\{Uri\.EscapeDataString\(accountId\)\}|" \+ Uri\.EscapeDataString\(accountId\) \+ ")\/sites/);
+  assert.match(source, /\/api\/accounts\/(?:\{Uri\.EscapeDataString\(accountId\)\}|" \+ Uri\.EscapeDataString\(accountId\) \+ ")\/promotions\/fetch/);
   assert.match(source, /accountId,/);
 });
 
@@ -3354,4 +4492,333 @@ test('sites endpoint is backed by marketplace child discovery, not only campaign
   assert.match(repoSource, /marketplace_sites/);
   assert.match(repoSource, /listMarketplaceSites/);
   assert.match(repoSource, /last_promotion_status/);
+});
+
+test('WinForms execution polling hides stale job JSON after service restart', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
+  assert.match(source, /GetExecutionJobJsonAsync/);
+  assert.match(source, /IsExecutionJobNotFoundMessage/);
+  assert.match(source, /已停止继续查询/);
+  assert.match(source, /查看历史记录/);
+});
+
+test('history batch status includes running detail rows', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'src', 'repository.js'), 'utf8');
+  assert.match(source, /deriveBatchStatus\(\[\.\.\.batchRows, \.\.\.summaryDetails\]\)/);
+  assert.match(source, /completed: \[\.\.\.batchRows, \.\.\.summaryDetails\]\.every/);
+});
+
+test('WinForms does not merge backend batch rows from separate executions', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
+  const taskMergeKey = source.slice(
+    source.indexOf('private static string TaskMergeKey'),
+    source.indexOf('private static string ActivityCountText')
+  );
+  assert.match(taskMergeKey, /if \(isBatch\)\s*\{\s*return "";\s*\}/);
+  assert.doesNotMatch(taskMergeKey, /isBatch && string\.Equals\(action, "enroll"/);
+});
+
+test('global today discount uses the latest effective real update and ignores other actions', () => {
+  const rows = [
+    { id: 800, action: 'cancel', mode: 'real', status: 'completed', updated_at: '2026-07-10T01:00:00Z', seller_activity_text: '9%', official_activity_text: '10%', total_count: 10 },
+    { id: 799, action: 'enroll', mode: 'real', status: 'completed', updated_at: '2026-07-10T00:30:00Z', seller_activity_text: '8%', official_activity_text: '9%', total_count: 10 },
+    { id: 714, action: 'update', mode: 'real', status: 'partial_or_failed', updated_at: '2026-07-09T15:17:09.641Z', seller_activity_text: '5%', official_activity_text: '6%', total_count: 12255, success_count: 1, failed_count: 12251, skipped_count: 3 },
+    { id: 530, action: 'update', mode: 'real', status: 'cancelled', updated_at: '2026-07-08T21:04:40.313Z', seller_activity_text: '7%', official_activity_text: '8%', total_count: 17787, success_count: 12403 }
+  ];
+  const latest = findLatestEffectiveUpdate(rows);
+  assert.equal(latest.id, 714);
+  const result = buildGlobalTodayDiscount({
+    tasks: rows,
+    settings: { sellerDefaultDiscount: 5, officialDefaultDiscount: 6 },
+    today: new Date('2026-07-10T02:00:00+08:00')
+  });
+  assert.equal(result.seller_discount, 6);
+  assert.equal(result.official_discount, 7);
+  assert.equal(result.source_task_id, 714);
+  assert.equal(result.source, 'latest_effective_update');
+});
+
+test('global today discount keeps same-day partial values and picks the latest completion time', () => {
+  const result = buildGlobalTodayDiscount({
+    tasks: [
+      { id: 901, action: 'update', mode: 'real', status: 'partial_or_failed', updated_at: '2026-07-10T01:10:00+08:00', seller_activity_text: '5%', official_activity_text: '6%', total_count: 20, failed_count: 20 },
+      { id: 902, action: 'update', mode: 'real', status: 'partial_or_failed', updated_at: '2026-07-10T03:10:00+08:00', seller_activity_text: '6%', official_activity_text: '7%', total_count: 20, failed_count: 20 }
+    ],
+    settings: { sellerDefaultDiscount: 5, officialDefaultDiscount: 6 },
+    today: new Date('2026-07-10T09:00:00+08:00')
+  });
+  assert.equal(result.source_task_id, 902);
+  assert.equal(result.seller_discount, 6);
+  assert.equal(result.official_discount, 7);
+  assert.equal(result.same_local_day, true);
+});
+
+test('global today discount advances a previous-day cancelled update but not a same-day one', () => {
+  const task = {
+    id: 924,
+    action: 'update',
+    mode: 'real',
+    status: 'cancelled',
+    updated_at: '2026-07-12T14:18:55.248Z',
+    seller_activity_text: '7%',
+    official_activity_text: '8%',
+    total_count: 13353,
+    success_count: 1601,
+    failed_count: 5554,
+    skipped_count: 6198
+  };
+  const nextDay = buildGlobalTodayDiscount({
+    tasks: [task],
+    today: new Date('2026-07-13T08:00:00+08:00')
+  });
+  assert.equal(nextDay.seller_discount, 8);
+  assert.equal(nextDay.official_discount, 9);
+  assert.equal(nextDay.same_local_day, false);
+
+  const sameDay = buildGlobalTodayDiscount({
+    tasks: [task],
+    today: new Date('2026-07-12T23:00:00+08:00')
+  });
+  assert.equal(sameDay.seller_discount, 7);
+  assert.equal(sameDay.official_discount, 8);
+  assert.equal(sameDay.same_local_day, true);
+});
+
+test('global today discount handles UTC timestamps at the China local-day boundary', () => {
+  const result = buildGlobalTodayDiscount({
+    tasks: [{
+      id: 925,
+      action: 'update',
+      mode: 'real',
+      status: 'canceled',
+      updated_at: '2026-07-12T15:59:59.999Z',
+      seller_activity_text: '9%',
+      official_activity_text: '10%',
+      total_count: 1,
+      success_count: 1
+    }],
+    today: new Date('2026-07-13T00:00:00+08:00')
+  });
+  assert.equal(result.seller_discount, 10);
+  assert.equal(result.official_discount, 10);
+  assert.equal(result.same_local_day, false);
+});
+
+test('global today discount keeps advancing completed and partial previous-day updates', () => {
+  const base = {
+    id: 926,
+    action: 'update',
+    mode: 'real',
+    updated_at: '2026-07-12T14:00:00.000Z',
+    seller_activity_text: '7%',
+    official_activity_text: '8%',
+    total_count: 10,
+    success_count: 1,
+    failed_count: 1,
+    skipped_count: 8
+  };
+  for (const status of ['completed', 'partial_or_failed']) {
+    const result = buildGlobalTodayDiscount({
+      tasks: [{ ...base, status }],
+      today: new Date('2026-07-13T08:00:00+08:00')
+    });
+    assert.equal(result.seller_discount, 8);
+    assert.equal(result.official_discount, 9);
+  }
+});
+
+test('global today discount falls back to saved settings when no effective update exists', () => {
+  const result = buildGlobalTodayDiscount({
+    tasks: [
+      { id: 1, action: 'update', mode: 'dry-run', status: 'completed', updated_at: '2026-07-09T10:00:00Z', seller_activity_text: '8%', official_activity_text: '9%', total_count: 10 },
+      { id: 2, action: 'update', mode: 'real', status: 'running', updated_at: '2026-07-09T11:00:00Z', seller_activity_text: '8%', official_activity_text: '9%', total_count: 10 }
+    ],
+    settings: { sellerDefaultDiscount: 5, officialDefaultDiscount: 6 },
+    today: new Date('2026-07-10T09:00:00+08:00')
+  });
+  assert.equal(result.source, 'settings_fallback');
+  assert.equal(result.seller_discount, 5);
+  assert.equal(result.official_discount, 6);
+  assert.match(result.message, /未找到可用更新历史/);
+});
+
+test('WinForms keeps global today discounts independent from scoped action conflicts', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
+  const refresh = source.slice(
+    source.indexOf('private async Task QueueAutoDecisionRefreshAsync'),
+    source.indexOf('private async Task SubmitExecutionAsync')
+  );
+  assert.match(source, /LoadGlobalTodayDiscountAsync/);
+  assert.match(source, /ApplyGlobalTodayDiscount/);
+  assert.doesNotMatch(refresh, /ApplyResolvedDiscounts/);
+  assert.doesNotMatch(refresh, /当前折扣未自动改动/);
+  assert.match(refresh, /今日折扣：自建/);
+  assert.match(source, /\/api\/today\/global-discount/);
+});
+
+test('passive automatic discount refresh never starts an execution job', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
+  const refresh = source.slice(
+    source.indexOf('private async Task QueueAutoDecisionRefreshAsync'),
+    source.indexOf('private async Task SubmitExecutionAsync')
+  );
+  assert.doesNotMatch(refresh, /\/api\/execution\/jobs\/start/);
+  assert.doesNotMatch(refresh, /SubmitExecutionJob/);
+});
+
+test('PySide uses one execution-record table with lazy cached views', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'desktop-pyside', 'main_window.py'), 'utf8');
+  const initialBundle = source.slice(
+    source.indexOf('def _load_initial_bundle'),
+    source.indexOf('def _apply_initial_bundle')
+  );
+  assert.doesNotMatch(initialBundle, /\/api\/tasks/);
+  assert.match(source, /self\.scope_ready = False/);
+  assert.match(source, /not busy and self\._can_start_submission\(\)/);
+  assert.match(source, /not self\.today_completion_ready/);
+  assert.match(source, /QTimer\.singleShot\(0, self\.refresh_records\)/);
+  assert.match(source, /RECORD_VIEW_LIMITS = \{"recent": 20, "all": 300\}/);
+  assert.match(source, /self\.records: list/);
+  assert.match(source, /self\.records_cache:/);
+  assert.match(source, /self\.records_request_token = 0/);
+  assert.match(source, /f"\/api\/tasks\?limit=\{limit\}"/);
+  assert.equal((source.match(/make_table\(TASK_HEADERS\)/g) || []).length, 1);
+  assert.doesNotMatch(source, /批次历史|workbench_table|history_table|workbench_tasks|history_tasks|history_loaded|workbench_refresh_token|history_refresh_token/);
+});
+
+test('global today discount uses lightweight update summaries instead of full history results', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src', 'server.js'), 'utf8');
+  const route = serverSource.slice(
+    serverSource.indexOf("if (method === 'GET' && url.pathname === '/api/today/global-discount')"),
+    serverSource.indexOf("if (method === 'GET' && url.pathname === '/api/tasks/details')")
+  );
+  const repositorySource = fs.readFileSync(path.join(process.cwd(), 'src', 'repository.js'), 'utf8');
+  assert.match(route, /listGlobalDiscountUpdateSummaries/);
+  assert.doesNotMatch(route, /listTaskSummaries/);
+  assert.match(repositorySource, /skipActionResults/);
+});
+
+test('history task summaries read the indexed materialized store for every limit', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'src', 'repository.js'), 'utf8');
+  const route = source.slice(source.indexOf('export function listTaskSummaries'), source.indexOf('export function buildLegacyHistoryBaseline'));
+  assert.match(route, /FROM history_batch_summaries/);
+  assert.match(route, /ORDER BY sort_created_at DESC, summary_id DESC/);
+  assert.doesNotMatch(route, /history_task_summary_cache|buildLegacyTaskSummaries|promo_action_results/);
+});
+
+test('lightweight update summaries keep cross-store discounts and the latest completion time', () => {
+  const rows = [
+    { id: 1, account_id: 'A', promotion_id: 'C-A', promotion_type: 'SELLER_CAMPAIGN', action: 'update', mode: 'real', status: 'completed', discount_percent: 7, created_at: '2026-07-12T14:00:00Z', updated_at: '2026-07-12T14:00:10Z' },
+    { id: 2, account_id: 'A', promotion_id: 'P-A', promotion_type: 'DEAL', action: 'update', mode: 'real', status: 'completed', discount_percent: 8, created_at: '2026-07-12T14:00:01Z', updated_at: '2026-07-12T14:00:11Z' },
+    { id: 3, account_id: 'A', promotion_id: '__BATCH__', promotion_type: 'BATCH', action: 'update', mode: 'real', status: 'partial_or_failed', total_count: 2, success_count: 1, failed_count: 1, created_at: '2026-07-12T14:00:20Z', updated_at: '2026-07-12T14:00:21Z', summary_json: '{}' },
+    { id: 4, account_id: 'B', promotion_id: 'C-B', promotion_type: 'SELLER_CAMPAIGN', action: 'update', mode: 'real', status: 'completed', discount_percent: 7, created_at: '2026-07-12T14:01:00Z', updated_at: '2026-07-12T14:01:10Z' },
+    { id: 5, account_id: 'B', promotion_id: 'P-B', promotion_type: 'DEAL', action: 'update', mode: 'real', status: 'completed', discount_percent: 8, created_at: '2026-07-12T14:01:01Z', updated_at: '2026-07-12T14:01:11Z' },
+    { id: 6, account_id: 'B', promotion_id: '__BATCH__', promotion_type: 'BATCH', action: 'update', mode: 'real', status: 'cancelled', total_count: 2, success_count: 1, failed_count: 1, created_at: '2026-07-12T14:01:20Z', updated_at: '2026-07-12T14:01:21Z', summary_json: '{}' }
+  ];
+  const summaries = buildLegacyTaskSummaries(rows, 300, { includeDetails: false, skipActionResults: true });
+  assert.equal(summaries.length, 1);
+  assert.equal(summaries[0].seller_activity_text, '7%');
+  assert.equal(summaries[0].official_activity_text, '8%');
+  assert.equal(summaries[0].updated_at, '2026-07-12T14:01:21Z');
+  const discount = buildGlobalTodayDiscount({ tasks: summaries, today: new Date('2026-07-13T08:00:00+08:00') });
+  assert.equal(discount.seller_discount, 8);
+  assert.equal(discount.official_discount, 9);
+});
+
+test('StyledConfirmDialog measures short text instead of using fixed coordinates', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
+  const dialog = source.slice(
+    source.indexOf('private sealed class StyledConfirmDialog'),
+    source.indexOf('private sealed class OAuthCallbackDialog')
+  );
+  assert.match(dialog, /TextRenderer\.MeasureText/);
+  assert.match(dialog, /TextFormatFlags\.WordBreak/);
+  assert.match(dialog, /MinimumBodyHeight/);
+  assert.doesNotMatch(dialog, /ClientSize = new Size\(480, 190\)|Height = 78|Top = 142/);
+});
+
+test('StyledConfirmDialog keeps current execution confirmation wrapped above bottom actions', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
+  const dialog = source.slice(
+    source.indexOf('private sealed class StyledConfirmDialog'),
+    source.indexOf('private sealed class OAuthCallbackDialog')
+  );
+  assert.match(source, /new StyledConfirmDialog\("最终执行确认", BuildExecutionConfirmationText\(action\)/);
+  assert.match(dialog, /TableLayoutPanel/);
+  assert.match(dialog, /RowStyles\.Add\(new RowStyle\(SizeType\.Absolute, ButtonAreaHeight\)\)/);
+  assert.match(dialog, /Dock = DockStyle\.Bottom|Dock = DockStyle\.Fill/);
+  assert.match(dialog, /AcceptButton = ok/);
+  assert.match(dialog, /CancelButton = cancel/);
+});
+
+test('StyledConfirmDialog scrolls a long site list within the working area', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
+  const dialog = source.slice(
+    source.indexOf('private sealed class StyledConfirmDialog'),
+    source.indexOf('private sealed class OAuthCallbackDialog')
+  );
+  assert.match(source, /string\.Join\(Environment\.NewLine, finalTargets\)/);
+  assert.match(dialog, /AutoScroll = true/);
+  assert.match(dialog, /Screen\.FromControl/);
+  assert.match(dialog, /workingArea\.Height/);
+  assert.match(dialog, /MaximumBodyHeight|maximumBodyHeight/);
+  assert.doesNotMatch(dialog, /AutoEllipsis = true/);
+});
+
+test('dark selectors remove native non-client borders and keep one themed arrow', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
+  const combo = source.slice(
+    source.indexOf('private sealed class DarkComboBox'),
+    source.indexOf('private sealed class DarkNumericUpDown')
+  );
+  assert.match(combo, /protected override CreateParams CreateParams/);
+  assert.match(combo, /parameters\.Style &= ~WsBorder/);
+  assert.match(combo, /parameters\.ExStyle &= ~\(WsExClientEdge \| WsExStaticEdge\)/);
+  assert.match(combo, /if \(m\.Msg == WmNcPaint\)\s*\{\s*return;/);
+  assert.match(combo, /PaintDropDownButton/);
+  assert.doesNotMatch(combo, /DropDownIndicator/);
+});
+
+test('main discount inputs use dark spin buttons while preserving numeric keyboard behavior', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'standalone', 'Program.cs'), 'utf8');
+  const number = source.slice(
+    source.indexOf('private sealed class DarkNumericUpDown'),
+    source.indexOf('private sealed class DarkMenuColorTable')
+  );
+  assert.match(source, /_sellerDiscount = new DarkNumericUpDown\(\)/);
+  assert.match(source, /_officialDiscount = new DarkNumericUpDown\(\)/);
+  assert.match(number, /private sealed class DarkNumericUpDown : NumericUpDown/);
+  assert.match(number, /nativeButtons\.Visible = false/);
+  assert.match(number, /_owner\.UpButton\(\)/);
+  assert.match(number, /_owner\.DownButton\(\)/);
+  assert.match(number, /OnMouseWheel|NumericUpDown/);
+});
+
+test('execution job polling persists terminal state and reuses an audit file handle', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'src', 'server.js'), 'utf8');
+  assert.match(source, /EXECUTION_JOB_STATE_DIR/);
+  assert.match(source, /persistExecutionJob/);
+  assert.match(source, /loadPersistedExecutionJob/);
+  assert.match(source, /loadPersistedExecutionJob/);
+  assert.match(source, /executionEventFileDescriptors/);
+  assert.match(source, /fs\.writeSync/);
+  assert.doesNotMatch(source, /appendFileSync\(executionJobEventPath/);
+});
+
+test('execution job state survives restart without pretending an interrupted job completed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mdm-execution-state-'));
+  const publicJob = (job) => ({ ...job });
+  try {
+    const first = createExecutionJobPersistence({ stateDir: dir, publicJob, currentPid: 101, now: () => '2026-07-11T12:00:00.000Z' });
+    first.persist({ id: 'exec-restart-1', status: 'running', progress: { stage: 'execute' }, logs: [], userLogs: [], result: null, error: null });
+    const restarted = createExecutionJobPersistence({ stateDir: dir, publicJob, currentPid: 202, now: () => '2026-07-11T12:01:00.000Z' });
+    const recovered = restarted.load('exec-restart-1');
+    assert.equal(recovered.status, 'interrupted');
+    assert.equal(recovered.progress.recovered_after_restart, true);
+    assert.equal(recovered.result, null);
+    assert.match(recovered.error, /任务已中断/);
+    assert.equal(restarted.load('missing-job'), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -53,6 +53,15 @@ function migrate(database) {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS account_profiles (
+      account_id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      site_id TEXT,
+      fetched_at TEXT NOT NULL,
+      source TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS promo_campaigns (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       account_id TEXT NOT NULL,
@@ -124,6 +133,8 @@ function migrate(database) {
       empty_count INTEGER NOT NULL DEFAULT 0,
       completed INTEGER NOT NULL DEFAULT 0,
       summary_json TEXT,
+      execution_group_id TEXT,
+      execution_job_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -147,15 +158,53 @@ function migrate(database) {
       FOREIGN KEY(task_id) REFERENCES promo_tasks(id)
     );
 
-    CREATE TABLE IF NOT EXISTS history_task_summary_cache (
-      cache_key TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS history_batch_summaries (
+      summary_key TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL,
+      summary_id INTEGER NOT NULL,
+      action TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      status TEXT NOT NULL,
+      sort_created_at TEXT NOT NULL,
+      sort_updated_at TEXT NOT NULL,
+      task_ids_json TEXT NOT NULL,
+      data_json TEXT NOT NULL,
+      published_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS history_summary_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      schema_version INTEGER NOT NULL,
+      status TEXT NOT NULL,
       task_count INTEGER NOT NULL DEFAULT 0,
       task_max_id INTEGER NOT NULL DEFAULT 0,
-      task_updated_at TEXT,
       result_count INTEGER NOT NULL DEFAULT 0,
       result_max_id INTEGER NOT NULL DEFAULT 0,
-      data_json TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      started_at TEXT,
+      completed_at TEXT,
+      last_error TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS seller_campaign_create_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      store_name TEXT,
+      site_id TEXT,
+      site_name TEXT,
+      promotion_type TEXT NOT NULL DEFAULT 'SELLER_CAMPAIGN',
+      promotion_name TEXT,
+      start_date TEXT,
+      finish_date TEXT,
+      selected INTEGER NOT NULL DEFAULT 1,
+      request_status TEXT NOT NULL,
+      promotion_id TEXT,
+      http_status INTEGER,
+      error_cn TEXT,
+      error_raw TEXT,
+      rechecked INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_promo_tasks_id_desc
@@ -170,6 +219,16 @@ function migrate(database) {
       ON promo_action_results(task_id, account_id, promotion_id, promotion_type, action, item_id, id);
     CREATE INDEX IF NOT EXISTS idx_promo_action_results_task_status_item
       ON promo_action_results(task_id, status, item_id, account_id, promotion_id, promotion_type, action, id);
+    CREATE INDEX IF NOT EXISTS idx_history_batch_summaries_sort
+      ON history_batch_summaries(schema_version, sort_created_at DESC, summary_id DESC);
+    CREATE INDEX IF NOT EXISTS idx_history_batch_summaries_action_time
+      ON history_batch_summaries(schema_version, action, mode, sort_created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_seller_campaign_create_results_run_id
+      ON seller_campaign_create_results(run_id, id);
+    CREATE INDEX IF NOT EXISTS idx_seller_campaign_create_results_account_site
+      ON seller_campaign_create_results(account_id, site_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_account_profiles_fetched_at
+      ON account_profiles(fetched_at DESC);
 
     CREATE TABLE IF NOT EXISTS promo_item_fetch_states (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,6 +244,41 @@ function migrate(database) {
       updated_at TEXT NOT NULL,
       UNIQUE(account_id, promotion_id, promotion_type, item_status)
     );
+
+    CREATE TABLE IF NOT EXISTS activity_cache_states (
+      account_id TEXT NOT NULL,
+      site_id TEXT NOT NULL DEFAULT '',
+      promotion_id TEXT NOT NULL DEFAULT '',
+      promotion_type TEXT NOT NULL DEFAULT '',
+      catalog_checked_at TEXT,
+      items_full_checked_at TEXT,
+      dirty INTEGER NOT NULL DEFAULT 0,
+      expired INTEGER NOT NULL DEFAULT 0,
+      continuity TEXT NOT NULL DEFAULT 'continuous',
+      event_cursor TEXT,
+      last_error TEXT,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (account_id, site_id, promotion_id, promotion_type)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_activity_cache_due
+      ON activity_cache_states(account_id, site_id, dirty, continuity, catalog_checked_at, items_full_checked_at);
+
+    CREATE TABLE IF NOT EXISTS activity_callback_events (
+      event_id TEXT PRIMARY KEY,
+      schema_version TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      site_id TEXT NOT NULL,
+      promotion_id TEXT NOT NULL DEFAULT '',
+      promotion_type TEXT NOT NULL DEFAULT '',
+      cursor TEXT,
+      previous_cursor TEXT,
+      gap INTEGER NOT NULL DEFAULT 0,
+      received_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_activity_callback_scope
+      ON activity_callback_events(account_id, site_id, promotion_id, promotion_type, received_at);
 
     CREATE TABLE IF NOT EXISTS cycle_states (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,6 +304,28 @@ function migrate(database) {
   addColumnIfMissing(database, 'promo_items', 'site_id', 'TEXT');
   addColumnIfMissing(database, 'promo_items', 'logistic_type', 'TEXT');
   addColumnIfMissing(database, 'promo_items', 'source', 'TEXT');
+  addColumnIfMissing(database, 'promo_tasks', 'execution_group_id', 'TEXT');
+  addColumnIfMissing(database, 'promo_tasks', 'execution_job_id', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'topic', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'resource', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'remote_user_id', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'child_user_id', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'application_id', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'outcome', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'resource_status', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'raw_json', 'TEXT');
+  addColumnIfMissing(database, 'seller_campaign_create_results', 'child_user_id', 'TEXT');
+  addColumnIfMissing(database, 'seller_campaign_create_results', 'detection_status', 'TEXT');
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_promo_tasks_execution_group
+      ON promo_tasks(execution_group_id, id);
+    CREATE INDEX IF NOT EXISTS idx_promo_tasks_execution_job
+      ON promo_tasks(execution_job_id, id);
+    CREATE INDEX IF NOT EXISTS idx_activity_callback_remote
+      ON activity_callback_events(remote_user_id, child_user_id, site_id, received_at);
+    CREATE INDEX IF NOT EXISTS idx_seller_campaign_create_results_route_name
+      ON seller_campaign_create_results(account_id, child_user_id, site_id, promotion_name, created_at);
+  `);
 }
 
 function addColumnIfMissing(database, table, column, type) {
@@ -233,4 +349,21 @@ export function get(sql, params = []) {
 
 export function run(sql, params = []) {
   return getDb().prepare(sql).run(...params);
+}
+
+export function transaction(callback) {
+  const database = getDb();
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const result = callback(database);
+    database.exec('COMMIT');
+    return result;
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      // Preserve the original transaction error.
+    }
+    throw error;
+  }
 }

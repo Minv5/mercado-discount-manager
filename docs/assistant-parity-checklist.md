@@ -18,10 +18,10 @@
 | 输出结果 | 输出目录生成 shops/sites、activities、preview tasks、precheck results、history CSV/JSON | 已补齐 | 不输出 token/secret | `/api/export/workspace` |
 | 店铺站点列表 | 账号、child_user_id、site_id、logistic_type、活动数展示和导出 | 已有并可导出 | 无 | 站点概览 + 导出 |
 | 错误中文化 | 常见 Mercado 错误和本地阻断原因中文展示 | 已有并扩展 | 新错误需持续补充映射 | 单元测试/页面日志 |
-| 页面工作流 | 设置、判断今日、预览今日、提交执行预检、加载活动、筛选取消预览、筛选取消预检、导出/打开结果目录 | 已补齐 | 浏览器无法直接打开本机目录，只展示路径并生成导出文件 | 页面验证 |
+| 本地服务根页面 | 仅显示服务状态和桌面授权返回说明 | 已收敛 | 旧浏览器工作台已退役，不提供计划、提交、SMART 或压测入口 | 静态页面测试 |
 | 测试并发 | 只读活动/商品读取支持 1、2、3、4、5、8、10、15、20 档位压测；真实写入执行器支持受限并发 | 已补齐机制 | 读取并发使用上次只读压测建议；写入并发展示区分当前设置、已验证稳定档和日常建议。真实测试线程已回传 350 两次稳定，日常建议保守 300-320；这仍不是 Mercado 平台最大值。 | `mapLimited`/只读压测接口 + fake executor 测试 |
 | 折扣设置 | 设置默认自建 5%、官方 6%；操作区可单次覆盖自建/官方折扣；价格规则可选择直接活动价 | 已补齐 | 单次输入优先于设置默认值；直接活动价绕过百分比计算但仍做边界检查 | 设置保存、今日预览、dry-run |
-| 新建活动 | Seller Campaign 创建预检：填写站点、child_user_id、名称、开始/结束时间、sub_type，生成官方 request preview 和 409 主管确认包 | 已补齐预检 | 真实创建属于外部写入，本轮不执行 Mercado POST；最大周期 14 天 | `/api/promotion-creation/status` + `/api/promotion-creation/precheck` + 页面预检 |
+| 新建活动 | Seller Campaign 创建预检：填写站点、child_user_id、名称、开始/结束时间、sub_type，生成官方 request preview 和 409 主管确认包 | 已补齐预检 | 真实创建属于外部写入；结束日期按官网日历口径限制在开始日期所在月份内 | `/api/promotion-creation/status` + `/api/promotion-creation/precheck` + 页面预检 |
 
 ## 不应补的圆佑依赖
 

@@ -1,19 +1,43 @@
 import { decideCycleAction, nextDiscountFor } from './cycle.js';
 import { promotionKey } from './planner.js';
+import { ordinaryPromotions } from './promotionDomain.js';
 
-export function decideToday({ promotions, cycleStatesByPromotion = new Map(), startedCountsByPromotion = new Map(), today = new Date() }) {
-  const rows = promotions.map((promotion) => {
+const INCOMPLETE_FINAL_STATUSES = new Set(['partial_or_failed', 'cancelled', 'canceled']);
+
+export function decideToday({ promotions, cycleStatesByPromotion = new Map(), startedCountsByPromotion = new Map(), globalCycle = null, today = new Date() }) {
+  const ordinary = ordinaryPromotions(promotions);
+  const hasGlobalCycle = globalCycle?.source === 'latest_effective_update' && Boolean(globalCycle?.source_time);
+  const globalCancelCycle = hasGlobalCycle
+    && Number(globalCycle.base_seller_discount) >= 10
+    && Number(globalCycle.base_official_discount) >= 10
+    && localDateNumber(globalCycle.source_time) < localDateNumber(today)
+    && ordinary.some((promotion) => Number(startedCountsByPromotion.get(promotionKey(promotion)) || 0) > 0);
+  const rows = ordinary.map((promotion) => {
     const key = promotionKey(promotion);
     const state = cycleStatesByPromotion.get(key) || null;
     const startedCount = Number(startedCountsByPromotion.get(key) || 0);
     const lastDiscount = state?.seller_discount_percent ?? state?.official_discount_percent;
-    const discount = nextDiscountFor({
+    const activityDiscount = nextDiscountFor({
       promotionType: promotion.promotion_type,
       lastDiscount,
-      lastStatus: state?.status === 'completed' ? 'completed' : state?.status
+      lastStatus: state?.status === 'completed' ? 'completed' : state?.status,
+      advanceAfterIncomplete: Boolean(INCOMPLETE_FINAL_STATUSES.has(state?.status) && state?.updated_at && !sameLocalDate(state.updated_at, today))
     });
-    const cycleDecision = decideCycleAction({ promotionType: promotion.promotion_type, currentDiscount: discount, hasStartedItems: startedCount > 0 });
-    const action = cycleDecision.action === 'cancel' ? 'cancel' : startedCount > 0 ? 'update' : 'enroll';
+    const cycleDecision = decideCycleAction({
+      promotionType: promotion.promotion_type,
+      currentDiscount: activityDiscount,
+      lastDiscount,
+      lastUpdatedAt: state?.updated_at,
+      today,
+      hasStartedItems: startedCount > 0
+    });
+    const discount = hasGlobalCycle
+      ? Number(String(promotion.promotion_type || '').toUpperCase() === 'SELLER_CAMPAIGN'
+        ? globalCycle.seller_discount : globalCycle.official_discount)
+      : activityDiscount;
+    const action = hasGlobalCycle
+      ? globalCancelCycle ? 'cancel' : 'update'
+      : cycleDecision.action === 'cancel' ? 'cancel' : startedCount > 0 ? 'update' : 'enroll';
     return {
       promotion,
       state,
@@ -22,7 +46,11 @@ export function decideToday({ promotions, cycleStatesByPromotion = new Map(), st
       discount,
       completedToday: stateCompletedToday(state, today, action),
       incompleteToday: stateIncompleteToday(state, today),
-      reason: cycleDecision.action === 'cancel'
+      reason: hasGlobalCycle
+        ? globalCancelCycle
+          ? '上一有效真实更新已完成10%/10%，且当前仍有 started 商品，本次应批量取消折扣'
+          : '按上一有效真实更新批次推进，本次应批量更新折扣'
+        : cycleDecision.action === 'cancel'
         ? '最近完整折扣已到 10，本次应批量取消折扣'
         : startedCount > 0
           ? '有 started 商品，本次应批量更新折扣'
@@ -73,18 +101,25 @@ function chooseAction(rows) {
 function stateCompletedToday(state, today, action) {
   if (!state?.updated_at) return false;
   if (!sameLocalDate(state.updated_at, today)) return false;
+  if (state.status === 'cancelled_complete') return true;
   if (action === 'cancel') return state.status === 'cancelled_complete';
   return state.status === 'completed';
 }
 
 function stateIncompleteToday(state, today) {
-  return Boolean(state?.updated_at && sameLocalDate(state.updated_at, today) && state.status === 'partial_or_failed');
+  return Boolean(state?.updated_at && sameLocalDate(state.updated_at, today) && INCOMPLETE_FINAL_STATUSES.has(state.status));
 }
 
 function sameLocalDate(value, today) {
   const a = new Date(value);
   const b = new Date(today);
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
+function localDateNumber(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return Number.NaN;
+  return date.getFullYear() * 10000 + (date.getMonth() + 1) * 100 + date.getDate();
 }
 
 function summaryReason({ allSelectedCompleted, incompleteRows, priorityAction, maxDiscount }) {

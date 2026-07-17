@@ -8,6 +8,7 @@ $PayloadZip = Join-Path $PayloadDir 'payload.zip'
 $DistDir = Join-Path $ProjectRoot 'dist-full'
 $ProjectFile = Join-Path $StandaloneDir 'MercadoDiscountManager.Standalone.csproj'
 $Desktop = [Environment]::GetFolderPath('Desktop')
+$InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\MercadoDiscountManager'
 $AppName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6298,0x6263,0x7BA1,0x5BB6))
 $FullExeName = "$AppName-$([string]::Concat([char[]](0x5B8C,0x6574,0x7248))).exe"
 $DesktopExeName = "$AppName.exe"
@@ -52,9 +53,14 @@ function Test-SameFileContent {
     return $false
   }
 
-  $sourceHash = Get-FileHash -Algorithm SHA256 -LiteralPath $Source
-  $destinationHash = Get-FileHash -Algorithm SHA256 -LiteralPath $Destination
-  return $sourceHash.Hash -eq $destinationHash.Hash
+  try {
+    $sourceHash = Get-FileHash -Algorithm SHA256 -LiteralPath $Source
+    $destinationHash = Get-FileHash -Algorithm SHA256 -LiteralPath $Destination
+    return $sourceHash.Hash -eq $destinationHash.Hash
+  }
+  catch {
+    return $false
+  }
 }
 
 $nodeCommand = Get-Command node -ErrorAction Stop
@@ -104,9 +110,21 @@ Get-ChildItem -LiteralPath $DistDir -Filter '*.xml' -File -ErrorAction SilentlyC
   Remove-Item -Force
 
 $desktopExe = Join-Path $Desktop $DesktopExeName
-if (-not (Test-SameFileContent -Source $fullExe -Destination $desktopExe)) {
-  Invoke-FileOperationWithRetry "Copy desktop exe" {
-    Copy-Item -LiteralPath $fullExe -Destination $desktopExe -Force
+$installExe = Join-Path $InstallDir $DesktopExeName
+New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+if (-not (Test-SameFileContent -Source $fullExe -Destination $installExe)) {
+  Invoke-FileOperationWithRetry "Copy install exe" {
+    try {
+      Copy-Item -LiteralPath $fullExe -Destination $installExe -Force
+    }
+    catch {
+      [System.IO.File]::Copy($fullExe, $installExe, $true)
+    }
+  }
+}
+if (Test-Path -LiteralPath $desktopExe) {
+  Invoke-FileOperationWithRetry "Remove desktop exe" {
+    Remove-Item -LiteralPath $desktopExe -Force
   }
 }
 $desktopFullExe = Join-Path $Desktop $FullExeName
@@ -115,10 +133,19 @@ if (Test-Path -LiteralPath $desktopFullExe) {
     Remove-Item -LiteralPath $desktopFullExe -Force
   }
 }
+$desktopShortcut = Join-Path $Desktop "$AppName.lnk"
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($desktopShortcut)
+$shortcut.TargetPath = $installExe
+$shortcut.WorkingDirectory = $InstallDir
+$shortcut.IconLocation = $installExe
+$shortcut.Save()
 
 [pscustomobject]@{
   Exe = $fullExe
   Length = (Get-Item -LiteralPath $fullExe).Length
-  DesktopExe = $desktopExe
+  InstallExe = $installExe
+  DesktopShortcut = $desktopShortcut
+  DesktopExeRemoved = -not (Test-Path -LiteralPath $desktopExe)
   PayloadZip = $PayloadZip
 }

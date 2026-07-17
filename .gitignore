@@ -1,5 +1,7 @@
 # Dependencies
 node_modules/
+__pycache__/
+*.pyc
 
 # Local runtime data, credentials, logs, exports, and databases
 data/
@@ -21,6 +23,12 @@ bin/
 obj/
 dist/
 dist-full/
+dist-pyside/
+release-backups/
+desktop-pyside/build-release/
+desktop-pyside/runtime-staging/
+desktop-pyside/install-validation/
+data/validation-evidence/
 launcher/bin/
 launcher/obj/
 standalone/bin/
@@ -42,6 +50,8 @@ tmp-*.png
 *-visual.png
 *-final.png
 screenshots/
+tmp-decompile-program/
+desktop-pyside/*-smoke*.png
 
 # Generated icon exploration assets
 standalone/assets/icon/candidates/**

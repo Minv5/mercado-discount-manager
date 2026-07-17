@@ -106,7 +106,7 @@ export async function executePlannedRowsWithConcurrency({
 
   async function executeRow(row, { finalRetry = false } = {}) {
     if (shouldCancel?.()) {
-      const reason = '执行任务已停止，未开始的商品已跳过';
+      const reason = '执行任务已停止，未开始的商品留待下次继续';
       await onItemEvent?.({ type: 'item_cancelled_before_start', row, status: 'skipped', reason });
       await saveResult?.({
         taskId,

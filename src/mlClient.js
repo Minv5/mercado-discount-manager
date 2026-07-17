@@ -17,12 +17,22 @@ export function buildAuthorizationUrl({ authDomain = DEFAULT_AUTH_DOMAIN, client
 }
 
 export class MercadoLibreClient {
-  constructor({ accessToken = null, userId = null, callerId = null, apiBaseUrl = API_BASE_URL, marketplace = false } = {}) {
+  constructor({
+    accessToken = null,
+    userId = null,
+    callerId = null,
+    apiBaseUrl = API_BASE_URL,
+    marketplace = false,
+    readScheduler = null,
+    readAccountId = null,
+  } = {}) {
     this.accessToken = accessToken;
     this.userId = userId;
     this.callerId = callerId || userId;
     this.apiBaseUrl = apiBaseUrl;
     this.marketplace = marketplace;
+    this.readScheduler = readScheduler;
+    this.readAccountId = String(readAccountId || userId || callerId || '__global__');
   }
 
   async exchangeCode({ clientId, clientSecret, code, redirectUri, codeVerifier }) {
@@ -49,21 +59,115 @@ export class MercadoLibreClient {
     return this.request('/users/me');
   }
 
-  async getPromotions() {
-    return this.request(`/seller-promotions/users/${encodeURIComponent(this.userId)}?app_version=${APP_VERSION}`);
-  }
-
-  async getMarketplaceUsers(merchantId) {
-    return this.request(`/marketplace/users/${encodeURIComponent(merchantId)}`);
-  }
-
-  async getMarketplacePromotions(childUserId) {
-    return this.request(`/marketplace/seller-promotions/users/${encodeURIComponent(childUserId)}`, {
-      headers: { version: APP_VERSION, 'X-Caller-Id': String(childUserId) }
+  async getPromotions({ userId = this.userId, callerId = this.callerId, includeVersionHeader = false, signal = null } = {}) {
+    const headers = {};
+    if (callerId) headers['X-Caller-Id'] = String(callerId);
+    if (includeVersionHeader) headers.version = APP_VERSION;
+    return this.request(`/seller-promotions/users/${encodeURIComponent(userId)}?app_version=${APP_VERSION}`, {
+      headers,
+      signal,
     });
   }
 
-  async getPromotionItems({ promotionId, promotionType, status, limit = 50, offset = 0, searchAfter = null }) {
+  async getMarketplaceUsers(merchantId, { signal = null } = {}) {
+    return this.request(`/marketplace/users/${encodeURIComponent(merchantId)}`, { signal });
+  }
+
+  async getMarketplacePromotions(childUserId, {
+    callerId = this.callerId || childUserId,
+    limit = 50,
+    maxPages = 100,
+    signal = null,
+  } = {}) {
+    const safeLimit = Math.max(1, Math.min(50, Math.floor(Number(limit) || 50)));
+    const safeMaxPages = Math.max(1, Math.floor(Number(maxPages) || 100));
+    const promotions = new Map();
+    const seenSearchAfter = new Set();
+    let offset = 0;
+    let searchAfter = null;
+    let total = null;
+    let pages = 0;
+    let fetchedRows = 0;
+    let lastPaging = {};
+    let lastData = {};
+
+    while (pages < safeMaxPages) {
+      const path = new URL(`/marketplace/seller-promotions/users/${encodeURIComponent(childUserId)}`, this.apiBaseUrl);
+      path.searchParams.set('limit', String(safeLimit));
+      if (searchAfter) path.searchParams.set('searchAfter', searchAfter);
+      else path.searchParams.set('offset', String(offset));
+      const data = await this.request(path, {
+        headers: { version: APP_VERSION, 'X-Caller-Id': String(callerId || childUserId) },
+        signal,
+      });
+      lastData = data && typeof data === 'object' ? data : {};
+      const rows = extractPromotions(data);
+      const paging = data?.paging && typeof data.paging === 'object' ? data.paging : {};
+      lastPaging = paging;
+      pages += 1;
+      fetchedRows += rows.length;
+      for (const promotion of rows) {
+        const key = marketplacePromotionIdentity(promotion);
+        if (!promotions.has(key)) promotions.set(key, promotion);
+      }
+
+      const pageTotal = Number(paging.total);
+      if (Number.isFinite(pageTotal) && pageTotal >= 0) total = pageTotal;
+      if (total !== null && fetchedRows >= total) break;
+      if (!rows.length) break;
+
+      const nextSearchAfter = String(paging.searchAfter ?? paging.search_after ?? '').trim();
+      if (nextSearchAfter && !seenSearchAfter.has(nextSearchAfter)) {
+        seenSearchAfter.add(nextSearchAfter);
+        searchAfter = nextSearchAfter;
+        continue;
+      }
+
+      const pageOffset = Number(paging.offset);
+      const pageLimit = Number(paging.limit);
+      const nextOffset = (Number.isFinite(pageOffset) ? pageOffset : offset)
+        + (Number.isFinite(pageLimit) && pageLimit > 0 ? pageLimit : safeLimit);
+      if (nextOffset <= offset) break;
+      offset = nextOffset;
+      searchAfter = null;
+      if (total === null && rows.length < safeLimit) break;
+    }
+
+    return {
+      ...lastData,
+      results: [...promotions.values()],
+      paging: {
+        ...lastPaging,
+        offset: 0,
+        limit: safeLimit,
+        total: total ?? promotions.size,
+        fetched: promotions.size,
+        pages,
+        complete: total === null ? true : fetchedRows >= total
+      }
+    };
+  }
+
+  async getPromotionDetail({
+    promotionId,
+    promotionType,
+    userId = this.userId,
+    signal = null,
+  } = {}) {
+    const prefix = this.marketplace ? '/marketplace/seller-promotions' : '/seller-promotions';
+    const path = new URL(`${prefix}/promotions/${encodeURIComponent(promotionId)}`, this.apiBaseUrl);
+    path.searchParams.set('promotion_type', String(promotionType || '').toUpperCase());
+    path.searchParams.set('app_version', APP_VERSION);
+    if (this.marketplace && userId) path.searchParams.set('user_id', String(userId));
+    return this.request(path, {
+      headers: this.marketplace ? { version: APP_VERSION } : {},
+      signal,
+      readKind: 'detail',
+      readKey: `promotion-detail|${String(userId || '')}|${String(promotionType || '').toUpperCase()}|${String(promotionId || '')}`,
+    });
+  }
+
+  async getPromotionItems({ promotionId, promotionType, status, limit = 50, offset = 0, searchAfter = null, signal = null }) {
     const safeLimit = clampPromotionItemLimit(limit, promotionType);
     const prefix = this.marketplace ? '/marketplace/seller-promotions' : '/seller-promotions';
     const path = new URL(`${prefix}/promotions/${encodeURIComponent(promotionId)}/items`, this.apiBaseUrl);
@@ -74,19 +178,19 @@ export class MercadoLibreClient {
     else path.searchParams.set('offset', String(offset));
     path.searchParams.set('app_version', APP_VERSION);
     if (status) path.searchParams.set('status', status);
-    return this.request(path, this.marketplace ? { headers: { version: APP_VERSION } } : {});
+    return this.request(path, this.marketplace ? { headers: { version: APP_VERSION }, signal } : { signal });
   }
 
-  async searchMarketplaceUserItems({ userId = this.userId, status = null, limit = 50, scrollId = null, searchType = 'scan' } = {}) {
+  async searchMarketplaceUserItems({ userId = this.userId, status = null, limit = 50, scrollId = null, searchType = 'scan', signal = null } = {}) {
     const path = new URL(`/marketplace/users/${encodeURIComponent(userId)}/items/search`, this.apiBaseUrl);
     path.searchParams.set('limit', String(clampLimit(limit)));
     if (searchType) path.searchParams.set('search_type', searchType);
     if (status && status !== 'all') path.searchParams.set('status', status);
     if (scrollId) path.searchParams.set('scroll_id', String(scrollId));
-    return this.request(path, { headers: { version: APP_VERSION } });
+    return this.request(path, { headers: { version: APP_VERSION }, signal });
   }
 
-  async scanMarketplaceUserItems({ userId = this.userId, status = 'active', limit = 50, maxItems = 'all', maxPages = 500 } = {}) {
+  async scanMarketplaceUserItems({ userId = this.userId, status = 'active', limit = 50, maxItems = 'all', maxPages = 500, signal = null } = {}) {
     const maxToCollect = normalizeMaxItems(maxItems);
     const ids = [];
     const seen = new Set();
@@ -96,7 +200,7 @@ export class MercadoLibreClient {
     let duplicateCount = 0;
     let stopReason = null;
     while (ids.length < maxToCollect && pagesRead < maxPages) {
-      const data = await this.searchMarketplaceUserItems({ userId, status, limit, scrollId, searchType: 'scan' });
+      const data = await this.searchMarketplaceUserItems({ userId, status, limit, scrollId, searchType: 'scan', signal });
       pagesRead += 1;
       const results = Array.isArray(data?.results) ? data.results : [];
       total = data?.paging?.total ?? total;
@@ -140,9 +244,28 @@ export class MercadoLibreClient {
     };
   }
 
-  async getMarketplaceItem(itemId) {
+  async getMarketplaceItem(itemId, { signal = null } = {}) {
     return this.request(`/marketplace/items/${encodeURIComponent(itemId)}`, {
-      headers: { version: APP_VERSION }
+      headers: { version: APP_VERSION },
+      signal,
+      readKind: 'detail',
+    });
+  }
+
+  async getNotificationResource(resourcePath, { signal = null } = {}) {
+    const safePath = String(resourcePath || '').trim();
+    if (!safePath.startsWith('/') || safePath.includes('://') || safePath.includes('..')) {
+      throw new Error('活动通知资源地址无效');
+    }
+    if (!safePath.startsWith('/marketplace/seller-promotions/promotions/')
+        && !safePath.startsWith('/marketplace/items/')) {
+      throw new Error('活动通知资源类型不受支持');
+    }
+    return this.request(safePath, {
+      headers: { version: APP_VERSION },
+      signal,
+      readKind: 'detail',
+      readKey: `activity-webhook|${safePath}`,
     });
   }
 
@@ -154,7 +277,8 @@ export class MercadoLibreClient {
     maxItems = 5000,
     maxPages = 500,
     maxConsecutiveEmptyPages = 25,
-    maxTotalEmptyPages = 120
+    maxTotalEmptyPages = 120,
+    signal = null,
   }) {
     const pageLimit = clampPromotionItemLimit(limit, promotionType);
     const maxToCollect = normalizeMaxItems(maxItems);
@@ -173,7 +297,7 @@ export class MercadoLibreClient {
     let lastSearchAfter = null;
     let stopReason = null;
     while (collected.length < maxToCollect && pagesRead < maxPages) {
-      const data = await this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset, searchAfter });
+      const data = await this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset, searchAfter, signal });
       pagesRead += 1;
       const resultValue = data?.results;
       const results = Array.isArray(resultValue) ? resultValue : Array.isArray(data) ? data : [];
@@ -326,6 +450,35 @@ export class MercadoLibreClient {
     return this.request(path, { method: 'DELETE', headers: this.marketplace ? { version: APP_VERSION } : {} });
   }
 
+  async createSellerCampaign({
+    childUserId = this.userId,
+    callerId = this.callerId,
+    clientUserId = callerId,
+    name,
+    startDate,
+    finishDate,
+    subType = 'FLEXIBLE_PERCENTAGE',
+    signal = null,
+  }) {
+    const path = `/marketplace/seller-promotions/seller-campaign/${encodeURIComponent(childUserId)}`;
+    const headers = { version: APP_VERSION };
+    if (callerId) headers['X-Caller-Id'] = String(callerId);
+    if (clientUserId) headers['X-Client-Id'] = String(clientUserId);
+    return this.request(path, {
+      method: 'POST',
+      body: {
+        promotion_type: 'SELLER_CAMPAIGN',
+        name,
+        sub_type: subType,
+        start_date: startDate,
+        finish_date: finishDate
+      },
+      headers,
+      signal,
+      includeResponseMeta: true
+    });
+  }
+
   async request(pathOrUrl, options = {}) {
     const url = typeof pathOrUrl === 'string' && pathOrUrl.startsWith('http')
       ? pathOrUrl
@@ -338,11 +491,24 @@ export class MercadoLibreClient {
     Object.assign(headers, options.headers || {});
     if (options.body) headers['Content-Type'] = 'application/json';
 
-    return requestJson(url, {
+    const requestOptions = {
       method: options.method || 'GET',
       headers,
-      body: options.body ? JSON.stringify(options.body) : undefined
-    }, 1, { includeMeta: Boolean(options.includeResponseMeta) });
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: options.signal || undefined,
+    };
+    const method = String(requestOptions.method || 'GET').toUpperCase();
+    if (method === 'GET' && this.readScheduler) {
+      const caller = String(headers['X-Caller-Id'] || this.callerId || '');
+      const key = String(options.readKey || `${method}|${url}|caller=${caller}`);
+      return this.readScheduler.schedule({
+        accountId: this.readAccountId,
+        key,
+        kind: options.readKind || 'read',
+        signal: options.signal || null,
+      }, () => requestJson(url, requestOptions, 1, { includeMeta: Boolean(options.includeResponseMeta), externalRetry: true }));
+    }
+    return requestJson(url, requestOptions, 1, { includeMeta: Boolean(options.includeResponseMeta) });
   }
 }
 
@@ -370,6 +536,24 @@ export function extractPromotions(data) {
         : [];
 }
 
+export function mergePromotionsByIdentity(...groups) {
+  const merged = new Map();
+  for (const group of groups) {
+    for (const promotion of Array.isArray(group) ? group : []) {
+      const key = marketplacePromotionIdentity(promotion);
+      if (!merged.has(key)) merged.set(key, promotion);
+    }
+  }
+  return [...merged.values()];
+}
+
+function marketplacePromotionIdentity(promotion = {}) {
+  const id = String(promotion.id || promotion.promotion_id || promotion.deal_id || '').trim();
+  const type = String(promotion.promotion_type || promotion.type || '').trim().toUpperCase();
+  if (id) return `${type || 'UNKNOWN'}|${id}`;
+  return `${type || 'UNKNOWN'}|${JSON.stringify(promotion)}`;
+}
+
 async function postForm(url, fields) {
   const body = new URLSearchParams();
   for (const [key, value] of Object.entries(fields)) {
@@ -389,15 +573,25 @@ async function requestJson(url, options, attempt = 1, meta = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(url, { ...options, signal: options.signal || controller.signal });
+    const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+    const response = await fetch(url, { ...options, signal });
     const text = await response.text();
     const body = text ? safeJson(text) : null;
     if (!response.ok) {
-      if ([429, 500, 502, 503, 504].includes(response.status) && attempt < 3) {
+      if (!meta.externalRetry && [429, 500, 502, 503, 504].includes(response.status) && attempt < 3) {
         await delay(300 * attempt);
         return requestJson(url, options, attempt + 1, meta);
       }
-      throw new ApiError(`Mercado Libre API ${response.status}`, response.status, body || text);
+      const error = new ApiError(`Mercado Libre API ${response.status}`, response.status, body || text);
+      const retryAfter = response.headers.get('retry-after');
+      if (retryAfter) {
+        const seconds = Number(retryAfter);
+        const date = Date.parse(retryAfter);
+        error.retryAfterMs = Number.isFinite(seconds)
+          ? Math.max(0, seconds * 1_000)
+          : Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+      }
+      throw error;
     }
     if (meta.includeMeta) {
       return {
@@ -410,7 +604,10 @@ async function requestJson(url, options, attempt = 1, meta = {}) {
     return body;
   } catch (error) {
     if (error?.name === 'AbortError') {
-      throw new ApiError('Mercado Libre API 请求超时', 504, { timeout_ms: REQUEST_TIMEOUT_MS });
+      if (options.signal?.aborted) throw error;
+      const timeoutError = new ApiError('Mercado Libre API 请求超时', 504, { timeout_ms: REQUEST_TIMEOUT_MS });
+      timeoutError.code = 'ETIMEDOUT';
+      throw timeoutError;
     }
     throw error;
   } finally {

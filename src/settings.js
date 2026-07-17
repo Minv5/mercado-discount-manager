@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR, STANDALONE_AUTH_DIR } from './config.js';
 import { normalizeConcurrency, normalizeWriteConcurrency } from './concurrency.js';
+import { normalizeOperatingSites } from './operatingSites.js';
 
 export const SETTINGS_PATH = path.join(DATA_DIR, 'settings.json');
 
@@ -16,6 +17,7 @@ export const DEFAULT_SETTINGS = {
   previewConcurrency: 2,
   writeConcurrency: 2,
   storeAliases: {},
+  operatingSites: {},
   defaultFilters: {
     siteIds: [],
     promotionTypes: [],
@@ -30,7 +32,7 @@ export const DEFAULT_SETTINGS = {
 
 export function readSettings() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(SETTINGS_PATH)) return { ...DEFAULT_SETTINGS, defaultFilters: { ...DEFAULT_SETTINGS.defaultFilters }, storeAliases: {} };
+  if (!fs.existsSync(SETTINGS_PATH)) return { ...DEFAULT_SETTINGS, defaultFilters: { ...DEFAULT_SETTINGS.defaultFilters }, storeAliases: {}, operatingSites: {} };
   const parsed = safeJson(fs.readFileSync(SETTINGS_PATH, 'utf8'));
   return normalizeSettings({ ...DEFAULT_SETTINGS, ...parsed, defaultFilters: { ...DEFAULT_SETTINGS.defaultFilters, ...(parsed.defaultFilters || {}) } });
 }
@@ -56,6 +58,7 @@ export function normalizeSettings(input) {
     previewConcurrency: normalizeConcurrency(input.previewConcurrency, DEFAULT_SETTINGS.previewConcurrency),
     writeConcurrency: normalizeWriteConcurrency(input.writeConcurrency, DEFAULT_SETTINGS.writeConcurrency),
     storeAliases: normalizeStoreAliases(input.storeAliases || {}),
+    operatingSites: normalizeOperatingSites(input.operatingSites || {}),
     defaultFilters: normalizeDefaultFilters(input.defaultFilters || {})
   };
 }

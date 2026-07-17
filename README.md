@@ -1,22 +1,22 @@
-# 美客多折扣管家
+# 美客多活动助手
 
 本项目是直接对接 Mercado Libre 官方 API 的本地桌面程序。双击 exe 后会打开独立工作台窗口，后台使用本机服务承载数据和接口；不依赖圆佑 DLL、圆佑 GUI、圆佑接口、任务队列或网页坐标点击。
 
 ## 运行
 
-双击桌面上的完整单文件：
+从当前用户开始菜单打开“美客多活动助手”快捷方式，启动正式 PySide 工作台：
 
 ```text
-美客多折扣管家.exe
+美客多活动助手.exe
 ```
 
-项目内完整 exe 输出在：
+项目内正式候选是完整 one-dir 目录：
 
 ```text
-dist-full/美客多折扣管家-完整版.exe
+dist-pyside/美客多活动助手/
 ```
 
-这个 exe 内置 Node.js、桌面窗口壳和程序文件，不依赖项目目录里的 `node_modules` 或系统 Node。运行时会把内置服务解压到：
+目录内包含桌面程序、Qt 依赖、经 SHA256 锁定的 Node 和业务服务文件。发布或安装时必须整体复制目录，不能只复制主 EXE。运行数据继续位于：
 
 ```text
 %LOCALAPPDATA%/MercadoDiscountManagerStandalone
@@ -28,17 +28,55 @@ dist-full/美客多折扣管家-完整版.exe
 npm start
 ```
 
-后台服务地址仅用于维护排查，日常使用直接打开桌面 exe：
+后台服务地址仅用于维护排查，日常使用从开始菜单打开程序：
 
 ```text
 http://127.0.0.1:28758
 ```
 
+该地址的根页面只显示本地服务状态，不提供计划、提交或其它业务操作。OAuth 回调仍由本地服务处理，桌面授权流程不受影响。
+
+## 活动变化回调
+
+活动变化回调默认关闭。启用时由独立公网回调服务将已验证 Mercado 通知转换为内部 schema v2，并通过本机 HMAC 签名发送到 `/api/integrations/activity-callback`。运行环境需要同时提供 `MDM_ACTIVITY_CALLBACK_ENABLED=1`、指向仓库外共享密钥文件的 `MDM_ACTIVITY_CALLBACK_SECRET_FILE` 和当前 Mercado 应用标识 `MDM_ACTIVITY_CALLBACK_APPLICATION_ID`。明文 `MDM_ACTIVITY_CALLBACK_SECRET` 只保留测试兼容，正式部署不使用。
+
+通知归属只按 `account_id + child_user_id + site_id` 解析，店铺显示名不参与路由。资源 GET 失败或身份无法确认时不会使用旧商品缓存；事件由上游持久队列重试。回调只负责精确标脏或站点目录失效，不替代每日目录、三日商品完整校准及提交前 live 复核。
+
+## Legacy 回退版
+
+`standalone/` WinForms 源码和旧安装版仅作为回退保留，不再承担正式产品功能对齐、日常 Quick/RealWrite 验证或默认发布。只有明确维护回退版本时才使用：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode Release -AllowPackageMutation -PackageTarget Legacy
+```
+
+正式产品、默认验证和发布目标均为 PySide。
+
 ## 验证
 
 ```powershell
-npm test
+# 日常验证：语法和 JS/PySide 测试；服务未运行时 health 记为 SKIP
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode Quick
+
+# 真实写入前验证：所有 required 检查强制执行，health 必须通过；不会调用 Mercado 写接口
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode RealWrite
+
+# 发布验证会生成 PySide 候选包并执行隔离安装/回滚测试，必须显式允许产物变更
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode Release -AllowPackageMutation -PackageTarget PySide
 ```
+
+验证结果只在控制台显示 `PASS`、`FAIL`、`SKIP` 摘要。完整输出保存在
+`data/validation-evidence/<run_id>/`；输入文件 SHA256 和 Node、.NET、Python 等环境指纹都未变化时，
+Quick 模式可安全跳过已经成功的检查。Release 和 RealWrite 模式不会复用 Quick 缓存。
+
+失败时只展开指定检查的末尾 120 行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -ShowFailure <run_id> -Check npm-test -Tail 120
+```
+
+只有明确需要完整原始输出时才追加 `-Full`。Quick 默认不打包、不启动或停止服务，所有模式都不会调用
+Mercado 写接口；`REAL_SUBMIT`、主管确认、业务预检和真实写入保护仍由现有业务流程负责。
 
 ## 当前工作台能力
 
@@ -53,7 +91,7 @@ npm test
 - 支持报名、更新、取消的 dry-run 计划；真实提交必须强确认。
 - 支持 Seller Campaign 创建活动预检，能生成官方创建请求预览；真实创建仍属于外部写入，必须经过最终确认。
 - 如果平台返回 `total > 0` 但不返回商品明细，程序会标记为 `api_incomplete/blocking`，不会当作“无商品”放行报名。
-- 输入 `REAL_SUBMIT` 后，单活动和批量真实执行会调用 Mercado 写接口；执行前必须核对账号、站点、活动、商品状态、折扣和商品数量。
+- 当前桌面只通过持久化 execution job 执行真实报名、更新和取消；旧同步写入口返回 410。execution job 仍必须通过 `REAL_SUBMIT` 确认门，并在执行前核对账号、站点、活动、商品状态、折扣和商品数量。
 - 支持执行历史和 CSV 导出。
 - 支持基于 5%/6%、完整执行递增、最高 10%、10% 后取消的周期建议。
 

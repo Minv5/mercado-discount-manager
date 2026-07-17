@@ -1,26 +1,15 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { all, get, nowIso, run } from './db.js';
+import { all, get, nowIso, run, transaction } from './db.js';
 import { decryptSecret, encryptSecret } from './security.js';
 import { filterPromotions, normalizeItem, normalizePromotion, promotionKey, summarizeSites } from './planner.js';
 import { readSettings } from './settings.js';
-import { DATA_DIR } from './config.js';
+import { storeNameForAccount } from './storeNameDomain.js';
+import { RESULT_CONTRACT_VERSION, summarizeResultContractRows } from './executionResultContract.js';
 
-const TASK_SUMMARY_CACHE_MS = 30_000;
-const TASK_SUMMARY_CACHE_VERSION = 'v4';
-const taskSummaryCache = new Map();
+const TASK_SUMMARY_CANONICAL_LIMIT = 300;
+const HISTORY_SUMMARY_SCHEMA_VERSION = 1;
 
 function cloneJson(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
-}
-
-export function clearTaskSummaryCache() {
-  taskSummaryCache.clear();
-  try {
-    run('DELETE FROM history_task_summary_cache');
-  } catch {
-    // Cache invalidation must never block the user operation.
-  }
 }
 
 function taskSummaryStamp() {
@@ -33,44 +22,6 @@ function taskSummaryStamp() {
     result_count: Number(result.count || 0),
     result_max_id: Number(result.max_id || 0)
   };
-}
-
-function sameTaskSummaryStamp(left, right) {
-  return Number(left?.task_count || 0) === Number(right?.task_count || 0)
-    && Number(left?.task_max_id || 0) === Number(right?.task_max_id || 0)
-    && String(left?.task_updated_at || '') === String(right?.task_updated_at || '')
-    && Number(left?.result_count || 0) === Number(right?.result_count || 0)
-    && Number(left?.result_max_id || 0) === Number(right?.result_max_id || 0);
-}
-
-function loadPersistentTaskSummaryCache(cacheKey, stamp) {
-  const row = get('SELECT * FROM history_task_summary_cache WHERE cache_key = ?', [cacheKey]);
-  if (!row) return null;
-  if (!sameTaskSummaryStamp(row, stamp)) return null;
-  try {
-    const rows = JSON.parse(row.data_json);
-    return Array.isArray(rows) ? rows : null;
-  } catch {
-    return null;
-  }
-}
-
-function savePersistentTaskSummaryCache(cacheKey, stamp, rows) {
-  run(
-    `INSERT OR REPLACE INTO history_task_summary_cache
-      (cache_key, task_count, task_max_id, task_updated_at, result_count, result_max_id, data_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      cacheKey,
-      stamp.task_count,
-      stamp.task_max_id,
-      stamp.task_updated_at,
-      stamp.result_count,
-      stamp.result_max_id,
-      JSON.stringify(rows),
-      nowIso()
-    ]
-  );
 }
 
 export function saveOAuthState(stateRecord) {
@@ -214,11 +165,49 @@ export function getAccountSecrets(accountId) {
   };
 }
 
+export function getAccountProfile(accountId) {
+  return get(
+    `SELECT account_id, provider, display_name, site_id, fetched_at, source
+     FROM account_profiles WHERE account_id = ?`,
+    [String(accountId)]
+  ) || null;
+}
+
+export function listAccountProfiles() {
+  return all(
+    `SELECT account_id, provider, display_name, site_id, fetched_at, source
+     FROM account_profiles ORDER BY fetched_at DESC`
+  );
+}
+
+export function saveAccountProfile(profile) {
+  if (!profile?.account_id || !profile?.display_name) return null;
+  run(
+    `INSERT INTO account_profiles (account_id, provider, display_name, site_id, fetched_at, source)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(account_id) DO UPDATE SET
+       provider = excluded.provider,
+       display_name = excluded.display_name,
+       site_id = excluded.site_id,
+       fetched_at = excluded.fetched_at,
+       source = excluded.source`,
+    [
+      String(profile.account_id),
+      String(profile.provider || 'mercadolibre'),
+      String(profile.display_name),
+      profile.site_id ? String(profile.site_id) : null,
+      String(profile.fetched_at || nowIso()),
+      String(profile.source || 'users_me')
+    ]
+  );
+  return getAccountProfile(profile.account_id);
+}
+
 export function saveCampaigns(accountId, promotions, context = {}) {
   const rows = promotions.map(normalizePromotion);
   const now = nowIso();
-  for (const promo of rows) {
-    run(
+  transaction((database) => {
+    const statement = database.prepare(
       `INSERT INTO promo_campaigns
         (account_id, promotion_id, promotion_type, merchant_id, child_user_id, site_id, logistic_type,
          name, status, start_date, finish_date, raw_json, updated_at)
@@ -233,8 +222,10 @@ export function saveCampaigns(accountId, promotions, context = {}) {
           start_date = excluded.start_date,
           finish_date = excluded.finish_date,
           raw_json = excluded.raw_json,
-          updated_at = excluded.updated_at`,
-      [
+          updated_at = excluded.updated_at`
+    );
+    for (const promo of rows) {
+      statement.run(
         String(accountId),
         promo.promotion_id,
         promo.promotion_type,
@@ -248,10 +239,36 @@ export function saveCampaigns(accountId, promotions, context = {}) {
         promo.finish_date,
         JSON.stringify(promo.raw),
         now
-      ]
-    );
-  }
+      );
+    }
+  });
   return rows;
+}
+
+export function markCampaignsCatalogRemoved({ accountId, childUserId, siteId, promotions = [] } = {}) {
+  const rows = Array.isArray(promotions) ? promotions : [];
+  if (!accountId || !childUserId || !siteId || !rows.length) return 0;
+  const updatedAt = nowIso();
+  let changed = 0;
+  transaction((database) => {
+    const statement = database.prepare(
+      `UPDATE promo_campaigns
+       SET status = 'catalog_removed', updated_at = ?
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ?`
+    );
+    for (const promotion of rows) {
+      changed += Number(statement.run(
+        updatedAt,
+        String(accountId),
+        String(childUserId),
+        String(siteId).toUpperCase(),
+        String(promotion.promotion_id || promotion.id || ''),
+        String(promotion.promotion_type || promotion.type || '').toUpperCase(),
+      ).changes || 0);
+    }
+  });
+  return changed;
 }
 
 export function listCampaigns(accountId) {
@@ -300,6 +317,16 @@ export function updateMarketplaceSitePromotionStatus({ accountId, childUserId, c
   );
 }
 
+export function invalidateMarketplaceSiteCatalog({ accountId, childUserId, siteId } = {}) {
+  if (!accountId || !childUserId || !siteId) return 0;
+  return Number(run(
+    `UPDATE marketplace_sites
+     SET last_promotion_status = 'dirty', last_error = NULL, updated_at = ?
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?`,
+    [nowIso(), String(accountId), String(childUserId), String(siteId).toUpperCase()]
+  ).changes || 0);
+}
+
 export function listMarketplaceSites(accountId) {
   return all(
     `SELECT account_id, child_user_id, site_id, logistic_type, last_promotion_status, last_promotion_count, last_error, raw_json, updated_at
@@ -307,6 +334,14 @@ export function listMarketplaceSites(accountId) {
      WHERE account_id = ?
      ORDER BY site_id, logistic_type, child_user_id`,
     [String(accountId)]
+  );
+}
+
+export function listAllMarketplaceSites() {
+  return all(
+    `SELECT account_id, child_user_id, site_id, logistic_type, last_promotion_status, last_promotion_count, last_error, raw_json, updated_at
+     FROM marketplace_sites
+     ORDER BY account_id, site_id, logistic_type, child_user_id`
   );
 }
 
@@ -371,15 +406,14 @@ export function saveItems(accountId, promotionId, promotionType, items, context 
     return item;
   });
   const now = nowIso();
-  if (context.replaceStatus) {
-    run(
-      `DELETE FROM promo_items
+  transaction((database) => {
+    if (context.replaceStatus) {
+      database.prepare(
+        `DELETE FROM promo_items
        WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND status = ?`,
-      [String(accountId), promotionId, promotionType, String(context.replaceStatus)]
-    );
-  }
-  for (const item of rows) {
-    run(
+      ).run(String(accountId), promotionId, promotionType, String(context.replaceStatus));
+    }
+    const statement = database.prepare(
       `INSERT INTO promo_items
         (account_id, promotion_id, promotion_type, child_user_id, site_id, logistic_type, item_id, status,
          currency_id, original_price, price, suggested_discounted_price, min_discounted_price,
@@ -398,8 +432,10 @@ export function saveItems(accountId, promotionId, promotionType, items, context 
           max_discounted_price = excluded.max_discounted_price,
           source = excluded.source,
           raw_json = excluded.raw_json,
-          updated_at = excluded.updated_at`,
-      [
+          updated_at = excluded.updated_at`
+    );
+    for (const item of rows) {
+      statement.run(
         String(accountId),
         promotionId,
         promotionType,
@@ -417,9 +453,9 @@ export function saveItems(accountId, promotionId, promotionType, items, context 
         context.source || item.raw?.source || 'seller_promotions_api',
         JSON.stringify(item.raw),
         now
-      ]
-    );
-  }
+      );
+    }
+  });
   return rows;
 }
 
@@ -466,6 +502,171 @@ export function getItemFetchState(accountId, promotionId, promotionType, itemSta
   );
 }
 
+export function getActivityCacheState(accountId, siteId = '', promotionId = '', promotionType = '') {
+  return get(
+    `SELECT * FROM activity_cache_states
+     WHERE account_id = ? AND site_id = ? AND promotion_id = ? AND promotion_type = ?`,
+    [String(accountId), String(siteId || '').toUpperCase(), String(promotionId || ''), String(promotionType || '').toUpperCase()]
+  );
+}
+
+export function listPreparationReadStates(accountIds = []) {
+  const ids = [...new Set((accountIds || []).map((value) => String(value || '').trim()).filter(Boolean))];
+  if (!ids.length) return { activity_cache_states: [], item_fetch_states: [], db_batch_queries: 0 };
+  const placeholders = ids.map(() => '?').join(', ');
+  return {
+    activity_cache_states: all(
+      `SELECT * FROM activity_cache_states WHERE account_id IN (${placeholders})`,
+      ids,
+    ),
+    item_fetch_states: all(
+      `SELECT * FROM promo_item_fetch_states WHERE account_id IN (${placeholders})`,
+      ids,
+    ),
+    db_batch_queries: 2,
+  };
+}
+
+export function saveActivityCacheState({ accountId, siteId = '', promotionId = '', promotionType = '', ...changes }) {
+  const current = getActivityCacheState(accountId, siteId, promotionId, promotionType) || {};
+  const row = {
+    catalog_checked_at: changes.catalogCheckedAt ?? current.catalog_checked_at ?? null,
+    items_full_checked_at: changes.itemsFullCheckedAt ?? current.items_full_checked_at ?? null,
+    dirty: changes.dirty == null ? Number(current.dirty || 0) : Number(Boolean(changes.dirty)),
+    expired: changes.expired == null ? Number(current.expired || 0) : Number(Boolean(changes.expired)),
+    continuity: String(changes.continuity ?? current.continuity ?? 'continuous'),
+    event_cursor: changes.eventCursor ?? current.event_cursor ?? null,
+    last_error: changes.lastError ?? current.last_error ?? null,
+  };
+  run(
+    `INSERT INTO activity_cache_states
+      (account_id, site_id, promotion_id, promotion_type, catalog_checked_at, items_full_checked_at,
+       dirty, expired, continuity, event_cursor, last_error, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(account_id, site_id, promotion_id, promotion_type) DO UPDATE SET
+       catalog_checked_at = excluded.catalog_checked_at,
+       items_full_checked_at = excluded.items_full_checked_at,
+       dirty = excluded.dirty,
+       expired = excluded.expired,
+       continuity = excluded.continuity,
+       event_cursor = excluded.event_cursor,
+       last_error = excluded.last_error,
+       updated_at = excluded.updated_at`,
+    [String(accountId), String(siteId || '').toUpperCase(), String(promotionId || ''), String(promotionType || '').toUpperCase(),
+      row.catalog_checked_at, row.items_full_checked_at, row.dirty, row.expired, row.continuity,
+      row.event_cursor, row.last_error, nowIso()]
+  );
+  return getActivityCacheState(accountId, siteId, promotionId, promotionType);
+}
+
+export function markActivityCacheDirty({ accountId, siteId = '', promotionId = '', promotionType = '', eventCursor = null, gap = false }) {
+  return saveActivityCacheState({
+    accountId, siteId, promotionId, promotionType, dirty: true,
+    continuity: gap ? 'gap' : undefined, eventCursor,
+  });
+}
+
+export function hasActivityCallbackEvent(eventId) {
+  return Boolean(get('SELECT 1 AS found FROM activity_callback_events WHERE event_id = ?', [String(eventId)]));
+}
+
+export function saveActivityCallbackEvent(event) {
+  run(
+    `INSERT OR IGNORE INTO activity_callback_events
+      (event_id, schema_version, account_id, site_id, promotion_id, promotion_type, cursor, previous_cursor, gap, received_at,
+       topic, resource, remote_user_id, child_user_id, application_id, outcome, resource_status, raw_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [event.event_id, event.schema_version, event.account_id, event.site_id, event.promotion_id || '',
+      event.promotion_type || '', event.cursor || null, event.previous_cursor || null, Number(Boolean(event.gap)), event.received_at || nowIso(),
+      event.topic || null, event.resource || null, event.remote_user_id || null, event.child_user_id || null,
+      event.application_id || null, event.outcome || null, event.resource_status || null, event.raw_json || null]
+  );
+}
+
+export function listVerifiedActivityCallbackPromotionMappings({
+  accountId,
+  childUserId,
+  siteId,
+  promotionType = 'SELLER_CAMPAIGN',
+} = {}) {
+  return all(
+    `SELECT event_id, account_id, child_user_id, site_id, promotion_id, promotion_type,
+            outcome, resource_status, received_at
+     FROM activity_callback_events
+     WHERE schema_version = '2'
+       AND account_id = ? AND child_user_id = ? AND site_id = ?
+       AND promotion_id <> '' AND promotion_type = ?
+       AND outcome = 'activity_dirty'
+     ORDER BY received_at DESC`,
+    [String(accountId || ''), String(childUserId || ''), String(siteId || '').toUpperCase(), String(promotionType || '').toUpperCase()]
+  );
+}
+
+export function listSellerCampaignRecoveryCandidates({ accountId, childUserId, siteId, name } = {}) {
+  const routeParams = [String(accountId || ''), String(childUserId || ''), String(siteId || '').toUpperCase(), String(name || '')];
+  const campaigns = all(
+    `SELECT account_id, child_user_id, site_id, promotion_id, promotion_type, name, status, finish_date, updated_at
+     FROM promo_campaigns
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+       AND promotion_type = 'SELLER_CAMPAIGN' AND name = ?
+     ORDER BY updated_at DESC`,
+    routeParams
+  );
+  const createResults = all(
+    `SELECT account_id, child_user_id, site_id, promotion_id, promotion_type,
+            promotion_name AS name, request_status AS status, finish_date, updated_at
+     FROM seller_campaign_create_results
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+       AND promotion_type = 'SELLER_CAMPAIGN' AND promotion_name = ? AND promotion_id <> ''
+     ORDER BY updated_at DESC`,
+    routeParams
+  );
+  const unique = new Map();
+  for (const row of [...campaigns, ...createResults]) {
+    const promotionId = String(row.promotion_id || '');
+    if (promotionId && !unique.has(promotionId)) unique.set(promotionId, row);
+  }
+  return [...unique.values()];
+}
+
+export function listHiddenSellerCampaignsForRoute({ accountId, childUserId, siteId } = {}) {
+  return all(
+    `SELECT account_id, child_user_id, site_id, promotion_name, promotion_id,
+            request_status, detection_status, created_at, updated_at
+     FROM seller_campaign_create_results
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+       AND request_status = 'duplicate_name_hidden'
+     ORDER BY updated_at DESC`,
+    [String(accountId || ''), String(childUserId || ''), String(siteId || '').toUpperCase()]
+  );
+}
+
+export function listHiddenSellerCampaignsForAccount(accountId) {
+  return all(
+    `SELECT account_id, child_user_id, site_id, promotion_name, promotion_id,
+            request_status, detection_status, created_at, updated_at
+     FROM seller_campaign_create_results
+     WHERE account_id = ? AND request_status = 'duplicate_name_hidden'
+     ORDER BY updated_at DESC`,
+    [String(accountId || '')]
+  );
+}
+
+export function recordActivityCatalogCalibration({ accountId, siteId = '', checkedAt = nowIso(), error = null }) {
+  return saveActivityCacheState({
+    accountId, siteId, catalogCheckedAt: error ? undefined : checkedAt,
+    dirty: Boolean(error), continuity: error ? 'gap' : 'continuous', lastError: error,
+  });
+}
+
+export function recordActivityItemsCalibration({ accountId, siteId = '', promotionId, promotionType, checkedAt = nowIso(), error = null }) {
+  return saveActivityCacheState({
+    accountId, siteId, promotionId, promotionType,
+    itemsFullCheckedAt: error ? undefined : checkedAt,
+    dirty: Boolean(error), continuity: error ? 'gap' : 'continuous', lastError: error,
+  });
+}
+
 export function listItems(accountId, promotionId, promotionType, status) {
   const params = [String(accountId), promotionId, promotionType];
   let sql = `SELECT * FROM promo_items WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?`;
@@ -494,14 +695,14 @@ export function listItemFetchStatesForPromotions(accountId, promotions, status) 
   return map;
 }
 
-export function createTask({ accountId, promotionId, promotionType, action, mode, discountPercent, directPrice, plan }) {
-  clearTaskSummaryCache();
+export function createTask({ accountId, promotionId, promotionType, action, mode, discountPercent, directPrice, plan, executionGroupId = null, executionJobId = null }) {
   const now = nowIso();
   const result = run(
     `INSERT INTO promo_tasks
       (account_id, promotion_id, promotion_type, action, mode, discount_percent, direct_price, status,
-       total_count, success_count, failed_count, skipped_count, empty_count, completed, summary_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)`,
+       total_count, success_count, failed_count, skipped_count, empty_count, completed, summary_json,
+       execution_group_id, execution_job_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       String(accountId),
       promotionId,
@@ -521,6 +722,8 @@ export function createTask({ accountId, promotionId, promotionType, action, mode
         skipped: plan.skipped,
         priceMode: plan.priceMode
       }),
+      executionGroupId ? String(executionGroupId) : null,
+      executionJobId ? String(executionJobId) : null,
       now,
       now
     ]
@@ -529,33 +732,34 @@ export function createTask({ accountId, promotionId, promotionType, action, mode
 }
 
 export function savePlanResults({ taskId, accountId, promotionId, promotionType, action, mode, plan }) {
-  clearTaskSummaryCache();
-  for (const row of plan.rows) {
-    run(
-      `INSERT INTO promo_action_results
-        (task_id, account_id, promotion_id, promotion_type, item_id, action, mode, status, deal_price,
-         top_deal_price, error_cn, error_raw, response_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)`,
-      [
-        taskId,
-        String(accountId),
-        promotionId,
-        promotionType,
-        row.item.item_id || '',
-        row.action || action,
-        mode,
-        row.status,
-        row.deal_price,
-        row.status === 'skipped' ? row.reason : null,
-        JSON.stringify({ reason: row.reason, item: row.item.raw }),
-        nowIso()
-      ]
-    );
-  }
+  transaction(() => {
+    for (const row of plan.rows) {
+      run(
+        `INSERT INTO promo_action_results
+          (task_id, account_id, promotion_id, promotion_type, item_id, action, mode, status, deal_price,
+           top_deal_price, error_cn, error_raw, response_json, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)`,
+        [
+          taskId,
+          String(accountId),
+          promotionId,
+          promotionType,
+          row.item.item_id || '',
+          row.action || action,
+          mode,
+          row.status,
+          row.deal_price,
+          row.status === 'skipped' ? row.reason : null,
+          JSON.stringify({ reason: row.reason, item: row.item.raw }),
+          nowIso()
+        ]
+      );
+    }
+    publishHistorySummaryForTask(taskId);
+  });
 }
 
 export function saveExecutionResult({ taskId, accountId, promotionId, promotionType, itemId, action, mode, status, dealPrice, errorCn, errorRaw, response }) {
-  clearTaskSummaryCache();
   run(
     `INSERT INTO promo_action_results
       (task_id, account_id, promotion_id, promotion_type, item_id, action, mode, status, deal_price,
@@ -579,31 +783,37 @@ export function saveExecutionResult({ taskId, accountId, promotionId, promotionT
   );
 }
 
-export function finishTask(taskId, counts, status = 'completed', completed = true) {
-  clearTaskSummaryCache();
-  run(
-    `UPDATE promo_tasks SET status = ?, success_count = ?, failed_count = ?, skipped_count = ?,
-      completed = ?, summary_json = ?, updated_at = ? WHERE id = ?`,
-    [
-      status,
-      counts.success || 0,
-      counts.failed || 0,
-      counts.skipped || 0,
-      completed ? 1 : 0,
-      JSON.stringify(counts),
-      nowIso(),
-      taskId
-    ]
-  );
+export function finishTask(taskId, counts, status = 'completed', completed = true, options = {}) {
+  transaction(() => {
+    run(
+      `UPDATE promo_tasks SET status = ?, success_count = ?, failed_count = ?, skipped_count = ?,
+        completed = ?, summary_json = ?, updated_at = ? WHERE id = ?`,
+      [
+        status,
+        counts.success || 0,
+        counts.failed || 0,
+        counts.skipped || 0,
+        completed ? 1 : 0,
+        JSON.stringify(counts),
+        nowIso(),
+        taskId
+      ]
+    );
+    if (options.publishHistory !== false) publishHistorySummaryForTask(taskId);
+  });
 }
 
 export function deleteTasks(taskIds = []) {
   const ids = [...new Set(taskIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
   if (!ids.length) return { deleted: 0 };
-  clearTaskSummaryCache();
   const placeholders = ids.map(() => '?').join(',');
   run(`DELETE FROM promo_action_results WHERE task_id IN (${placeholders})`, ids);
   const result = run(`DELETE FROM promo_tasks WHERE id IN (${placeholders})`, ids);
+  const state = get('SELECT schema_version, status FROM history_summary_state WHERE id = 1');
+  if (Number(state?.schema_version || 0) === HISTORY_SUMMARY_SCHEMA_VERSION
+    && String(state?.status || '') === 'complete') {
+    backfillHistoryBatchSummaries({ force: true });
+  }
   return { deleted: result.changes || 0 };
 }
 
@@ -618,46 +828,240 @@ export function listResults(limit = 300) {
 }
 
 export function listTaskSummaries(limit = 300, options = {}) {
-  const settings = readSettings();
   const requested = Math.max(Number(limit) || 20, 1);
   const includeDetails = options.includeDetails !== false;
-  const cacheKey = includeDetails ? '' : `main:${requested}:${TASK_SUMMARY_CACHE_VERSION}`;
-  const stamp = cacheKey ? taskSummaryStamp() : null;
-  if (cacheKey) {
-    const cached = taskSummaryCache.get(cacheKey);
-    if (cached
-      && Date.now() - cached.createdAt <= TASK_SUMMARY_CACHE_MS
-      && sameTaskSummaryStamp(cached.stamp, stamp)) {
-      return cloneJson(cached.rows);
-    }
-    const persistent = loadPersistentTaskSummaryCache(cacheKey, stamp);
-    if (persistent) {
-      taskSummaryCache.set(cacheKey, { createdAt: Date.now(), stamp, rows: cloneJson(persistent) });
-      return cloneJson(persistent);
-    }
-  }
-  let fetchLimit = Math.max(requested * 24, 480);
-  let summaries = [];
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const rows = fetchTaskSummaryRows(fetchLimit, settings);
-    summaries = buildLegacyTaskSummaries(rows, requested, { includeDetails });
-    if (summaries.length >= requested || rows.length < fetchLimit) {
-      if (cacheKey) {
-        taskSummaryCache.set(cacheKey, { createdAt: Date.now(), stamp, rows: cloneJson(summaries) });
-        savePersistentTaskSummaryCache(cacheKey, stamp, summaries);
-      }
-      return summaries;
-    }
-    fetchLimit *= 2;
-  }
-  if (cacheKey) {
-    taskSummaryCache.set(cacheKey, { createdAt: Date.now(), stamp, rows: cloneJson(summaries) });
-    savePersistentTaskSummaryCache(cacheKey, stamp, summaries);
-  }
-  return summaries;
+  ensureHistoryBatchSummariesReady();
+  const summaries = all(
+    `SELECT data_json
+     FROM history_batch_summaries
+     WHERE schema_version = ?
+     ORDER BY sort_created_at DESC, summary_id DESC
+     LIMIT ?`,
+    [HISTORY_SUMMARY_SCHEMA_VERSION, requested]
+  ).map((row) => JSON.parse(row.data_json));
+  if (!includeDetails) return summaries;
+  return summaries.map((summary) => ({
+    ...summary,
+    details: listTaskDetails(summary.task_ids || [summary.id])
+  }));
 }
 
-function fetchTaskSummaryRows(fetchLimit, settings) {
+export function buildLegacyHistoryBaseline(limit = 300) {
+  const requested = Math.max(Number(limit) || TASK_SUMMARY_CANONICAL_LIMIT, 1);
+  const settings = readSettings();
+  const rows = fetchTaskSummaryRows(null, settings);
+  return buildLegacyTaskSummaries(rows, requested, { includeDetails: false });
+}
+
+export function backfillHistoryBatchSummaries({ force = false } = {}) {
+  const existing = get('SELECT * FROM history_summary_state WHERE id = 1');
+  if (!force
+    && Number(existing?.schema_version || 0) === HISTORY_SUMMARY_SCHEMA_VERSION
+    && String(existing?.status || '') === 'complete') {
+    const count = Number(get(
+      'SELECT COUNT(*) AS count FROM history_batch_summaries WHERE schema_version = ?',
+      [HISTORY_SUMMARY_SCHEMA_VERSION]
+    )?.count || 0);
+    return { status: 'complete', summary_count: count, reused: true };
+  }
+
+  const startedAt = nowIso();
+  run(
+    `INSERT INTO history_summary_state (id, schema_version, status, started_at, completed_at, last_error)
+     VALUES (1, ?, 'building', ?, NULL, NULL)
+     ON CONFLICT(id) DO UPDATE SET
+       schema_version = excluded.schema_version,
+       status = 'building',
+       started_at = excluded.started_at,
+       completed_at = NULL,
+       last_error = NULL`,
+    [HISTORY_SUMMARY_SCHEMA_VERSION, startedAt]
+  );
+  try {
+    const settings = readSettings();
+    const taskRows = fetchTaskSummaryRows(null, settings);
+    const summaries = buildLegacyTaskSummaries(taskRows, Math.max(taskRows.length, 1), { includeDetails: false });
+    const stamp = taskSummaryStamp();
+    transaction(() => {
+      run('DELETE FROM history_batch_summaries WHERE schema_version = ?', [HISTORY_SUMMARY_SCHEMA_VERSION]);
+      for (const summary of summaries) writeMaterializedSummary(summary);
+      run(
+        `UPDATE history_summary_state SET
+           schema_version = ?, status = 'complete', task_count = ?, task_max_id = ?,
+           result_count = ?, result_max_id = ?, completed_at = ?, last_error = NULL
+         WHERE id = 1`,
+        [
+          HISTORY_SUMMARY_SCHEMA_VERSION,
+          stamp.task_count,
+          stamp.task_max_id,
+          stamp.result_count,
+          stamp.result_max_id,
+          nowIso()
+        ]
+      );
+    });
+    return { status: 'complete', summary_count: summaries.length, reused: false };
+  } catch (error) {
+    run(
+      `UPDATE history_summary_state SET status = 'failed', last_error = ?, completed_at = ? WHERE id = 1`,
+      [String(error?.message || error).slice(0, 1000), nowIso()]
+    );
+    throw error;
+  }
+}
+
+function ensureHistoryBatchSummariesReady() {
+  const state = get('SELECT schema_version, status FROM history_summary_state WHERE id = 1');
+  if (Number(state?.schema_version || 0) === HISTORY_SUMMARY_SCHEMA_VERSION
+    && String(state?.status || '') === 'complete') return;
+  backfillHistoryBatchSummaries();
+}
+
+export function publishHistorySummaryForTask(taskId) {
+  const state = get('SELECT schema_version, status FROM history_summary_state WHERE id = 1');
+  if (Number(state?.schema_version || 0) !== HISTORY_SUMMARY_SCHEMA_VERSION
+    || String(state?.status || '') !== 'complete') {
+    return { published: false, reason: 'materialization_not_ready' };
+  }
+  const task = get('SELECT id, action, mode, created_at FROM promo_tasks WHERE id = ?', [Number(taskId)]);
+  if (!task) return { published: false, reason: 'task_not_found' };
+  const settings = readSettings();
+  const rows = fetchTaskSummaryRows(null, settings, {
+    action: task.action,
+    day: String(task.created_at || '').slice(0, 10)
+  });
+  const summaries = buildLegacyTaskSummaries(rows, rows.length || 1, {
+    includeDetails: false,
+    targetTaskId: Number(taskId)
+  });
+  const summary = summaries.find((row) => (row.task_ids || [row.id]).map(Number).includes(Number(taskId)));
+  if (!summary) return { published: false, reason: 'summary_not_found' };
+  const taskIds = materializedTaskIds(summary);
+  const overlappingKeys = all(
+    'SELECT summary_key, task_ids_json FROM history_batch_summaries WHERE schema_version = ?',
+    [HISTORY_SUMMARY_SCHEMA_VERSION]
+  ).filter((row) => parseTaskIds(row.task_ids_json).some((id) => taskIds.includes(id)))
+    .map((row) => row.summary_key);
+  for (const key of overlappingKeys) {
+    run('DELETE FROM history_batch_summaries WHERE summary_key = ?', [key]);
+  }
+  writeMaterializedSummary(summary);
+  const stamp = taskSummaryStamp();
+  run(
+    `UPDATE history_summary_state SET
+       task_count = ?, task_max_id = ?, result_count = ?, result_max_id = ?, completed_at = ?
+     WHERE id = 1`,
+    [stamp.task_count, stamp.task_max_id, stamp.result_count, stamp.result_max_id, nowIso()]
+  );
+  return { published: true, summary_key: materializedSummaryKey(summary) };
+}
+
+export function publishHistorySummaryForExecutionGroup(executionGroupId) {
+  const groupId = String(executionGroupId || '');
+  if (!groupId) return { published: false, reason: 'execution_group_required' };
+  const state = get('SELECT schema_version, status FROM history_summary_state WHERE id = 1');
+  if (Number(state?.schema_version || 0) !== HISTORY_SUMMARY_SCHEMA_VERSION
+    || String(state?.status || '') !== 'complete') {
+    return { published: false, reason: 'materialization_not_ready' };
+  }
+  const settings = readSettings();
+  const rows = fetchTaskSummaryRows(null, settings, { executionGroupId: groupId });
+  if (!rows.length) return { published: false, reason: 'group_tasks_not_found' };
+  const summary = buildExecutionGroupSummaryRow(groupId, rows, { includeDetails: false, skipActionResults: false });
+  transaction(() => {
+    run('DELETE FROM history_batch_summaries WHERE summary_key = ?', [`v${HISTORY_SUMMARY_SCHEMA_VERSION}:execution-group:${groupId}`]);
+    writeMaterializedSummary(summary);
+    const stamp = taskSummaryStamp();
+    run(
+      `UPDATE history_summary_state SET
+         task_count = ?, task_max_id = ?, result_count = ?, result_max_id = ?, completed_at = ?
+       WHERE id = 1`,
+      [stamp.task_count, stamp.task_max_id, stamp.result_count, stamp.result_max_id, nowIso()]
+    );
+  });
+  return { published: true, summary_key: materializedSummaryKey(summary) };
+}
+
+function writeMaterializedSummary(summary) {
+  const taskIds = materializedTaskIds(summary);
+  run(
+    `INSERT OR REPLACE INTO history_batch_summaries
+      (summary_key, schema_version, summary_id, action, mode, status, sort_created_at,
+       sort_updated_at, task_ids_json, data_json, published_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      materializedSummaryKey(summary),
+      HISTORY_SUMMARY_SCHEMA_VERSION,
+      Number(summary.id || Math.max(0, ...taskIds)),
+      String(summary.action || ''),
+      String(summary.mode || ''),
+      String(summary.status || ''),
+      String(summary.created_at || summary.updated_at || ''),
+      String(summary.updated_at || summary.created_at || ''),
+      JSON.stringify(taskIds),
+      JSON.stringify(summary),
+      nowIso()
+    ]
+  );
+}
+
+function materializedTaskIds(summary) {
+  return [...new Set((summary.task_ids || [summary.id])
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id) && id > 0))].sort((a, b) => a - b);
+}
+
+function materializedSummaryKey(summary) {
+  if (summary.execution_group_id) {
+    return `v${HISTORY_SUMMARY_SCHEMA_VERSION}:execution-group:${summary.execution_group_id}`;
+  }
+  return `v${HISTORY_SUMMARY_SCHEMA_VERSION}:${materializedTaskIds(summary).join(',')}`;
+}
+
+function parseTaskIds(value) {
+  try {
+    const parsed = JSON.parse(value || '[]');
+    return Array.isArray(parsed) ? parsed.map(Number).filter(Number.isFinite) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function listGlobalDiscountUpdateSummaries(limit = 300) {
+  const settings = readSettings();
+  const requested = Math.max(Number(limit) || TASK_SUMMARY_CANONICAL_LIMIT, 1);
+  const rows = fetchTaskSummaryRows(Math.max(requested * 24, 480), settings, {
+    action: 'update',
+    mode: 'real'
+  });
+  return buildLegacyTaskSummaries(rows, requested, {
+    includeDetails: false,
+    skipActionResults: true
+  });
+}
+
+function fetchTaskSummaryRows(fetchLimit, settings, filters = {}) {
+  const where = [];
+  const params = [];
+  if (filters.action) {
+    where.push('t.action = ?');
+    params.push(String(filters.action));
+  }
+  if (filters.mode) {
+    where.push('t.mode = ?');
+    params.push(String(filters.mode));
+  }
+  if (filters.day) {
+    where.push("substr(t.created_at, 1, 10) = ?");
+    params.push(String(filters.day));
+  }
+  if (filters.executionGroupId) {
+    where.push('t.execution_group_id = ?');
+    params.push(String(filters.executionGroupId));
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const limitSql = Number.isFinite(Number(fetchLimit)) && Number(fetchLimit) > 0 ? 'LIMIT ?' : '';
+  if (limitSql) params.push(Number(fetchLimit));
   return all(
     `SELECT
        t.*,
@@ -675,22 +1079,47 @@ function fetchTaskSummaryRows(fetchLimit, settings) {
       AND p.promotion_type = t.promotion_type
      LEFT JOIN oauth_tokens o
        ON o.account_id = t.account_id
-     ORDER BY t.id DESC LIMIT ?`,
-    [fetchLimit]
+     ${whereSql}
+     ORDER BY t.id DESC ${limitSql}`,
+    params
   ).map((row) => ({
     ...row,
-    store_name: storeDisplayName(row.account_id, row.account_display_name, settings.storeAliases),
+    store_name: storeNameForAccount({ accountId: row.account_id, rawDisplayName: row.account_display_name, storeAliases: settings.storeAliases }),
     site_name: siteDisplayName(row.site_id)
   }));
 }
 
 export function buildLegacyTaskSummaries(rows = [], limit = 300, options = {}) {
   const includeDetails = options.includeDetails !== false;
+  const skipActionResults = options.skipActionResults === true;
+  const targetTaskId = Number(options.targetTaskId || 0);
   const ordered = [...rows].sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
-  const batchRows = ordered.filter(isBatchTaskRow);
-  if (!batchRows.length) return ordered.slice(0, limit);
+  const explicitGroups = new Map();
+  for (const row of ordered) {
+    const groupId = String(row.execution_group_id || '');
+    if (!groupId) continue;
+    const bucket = explicitGroups.get(groupId) || [];
+    bucket.push(row);
+    explicitGroups.set(groupId, bucket);
+  }
+  const explicitSummaries = [...explicitGroups.entries()].map(([groupId, groupRows]) =>
+    buildExecutionGroupSummaryRow(groupId, groupRows, { includeDetails, skipActionResults }));
+  const legacyOrdered = ordered.filter((row) => !row.execution_group_id);
+  if (targetTaskId) {
+    const explicit = explicitSummaries.find((row) => (row.task_ids || []).map(Number).includes(targetTaskId));
+    if (explicit) return [explicit];
+  }
+  const batchRows = legacyOrdered.filter(isBatchTaskRow);
+  if (!batchRows.length) {
+    const standalone = targetTaskId
+      ? legacyOrdered.filter((row) => Number(row.id || 0) === targetTaskId)
+      : legacyOrdered;
+    return [...explicitSummaries, ...standalone.map((row) => decorateTaskSummaryRow(row, { skipActionResults }))]
+      .sort((a, b) => dateMs(b.created_at) - dateMs(a.created_at) || Number(b.id || 0) - Number(a.id || 0))
+      .slice(0, limit);
+  }
 
-  const nonBatchRows = ordered.filter((row) => !isBatchTaskRow(row));
+  const nonBatchRows = legacyOrdered.filter((row) => !isBatchTaskRow(row));
   const windows = batchRows
     .map((batch) => buildBatchWindow(batch, batchRows, nonBatchRows))
     .sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
@@ -707,18 +1136,58 @@ export function buildLegacyTaskSummaries(rows = [], limit = 300, options = {}) {
   }
   attachOrphanDetailsToBatchGroups(groups, nonBatchRows);
 
+  if (targetTaskId) {
+    const targetGroup = groups.find((group) => groupTaskIds(group).includes(targetTaskId));
+    if (targetGroup) return [buildBatchSummaryRow(targetGroup, { includeDetails, skipActionResults })];
+    const targetRow = ordered.find((row) => Number(row.id || 0) === targetTaskId);
+    return targetRow ? [decorateTaskSummaryRow(targetRow, { skipActionResults })] : [];
+  }
+
   const coveredTaskIds = new Set();
   const summaryRows = groups.map((group) => {
-    const row = buildBatchSummaryRow(group, { includeDetails });
+    const row = buildBatchSummaryRow(group, { includeDetails, skipActionResults });
     for (const id of row.task_ids || []) coveredTaskIds.add(Number(id));
     return row;
   });
   const uncovered = nonBatchRows.filter((row) => !coveredTaskIds.has(Number(row.id || 0)));
-  const outputRows = applyLatestEnrollLiveVerification([...summaryRows, ...uncovered]);
+  const outputRows = [...explicitSummaries, ...summaryRows, ...uncovered];
   return outputRows
     .sort((a, b) => dateMs(b.created_at) - dateMs(a.created_at) || Number(b.id || 0) - Number(a.id || 0))
     .slice(0, limit)
-    .map(decorateTaskSummaryRow);
+    .map((row) => decorateTaskSummaryRow(row, { skipActionResults }));
+}
+
+function buildExecutionGroupSummaryRow(groupId, rows, options = {}) {
+  const batchRows = rows.filter(isBatchTaskRow);
+  const details = rows.filter((row) => !isBatchTaskRow(row));
+  if (!batchRows.length) {
+    const first = [...details].sort((a, b) => Number(b.id || 0) - Number(a.id || 0))[0] || {};
+    return { ...decorateTaskSummaryRow(first, options), execution_group_id: groupId };
+  }
+  const windows = batchRows.map((batch) => {
+    const accountDetails = details.filter((row) => String(row.account_id || '') === String(batch.account_id || ''));
+    const times = [batch, ...accountDetails].map((row) => dateMs(row.created_at)).filter(Number.isFinite);
+    return {
+      batch,
+      details: accountDetails,
+      startMs: times.length ? Math.min(...times) : dateMs(batch.created_at),
+      endMs: times.length ? Math.max(...times) : dateMs(batch.created_at),
+    };
+  });
+  const summary = buildBatchSummaryRow({
+    windows,
+    startMs: Math.min(...windows.map((row) => row.startMs)),
+    endMs: Math.max(...windows.map((row) => row.endMs)),
+  }, options);
+  return { ...summary, execution_group_id: groupId };
+}
+
+function groupTaskIds(group) {
+  return [...new Set([
+    ...(group.windows || []).flatMap((window) => [window.batch, ...(window.details || [])]),
+    ...(group.orphanDetails || []),
+    ...(group.coverageOnlyDetails || [])
+  ].map((row) => Number(row?.id || 0)).filter(Boolean))];
 }
 
 export function listTaskDetails(taskIds = []) {
@@ -747,7 +1216,7 @@ export function listTaskDetails(taskIds = []) {
     ids
   ).map((row) => taskDetail({
     ...row,
-    store_name: storeDisplayName(row.account_id, row.account_display_name, settings.storeAliases),
+    store_name: storeNameForAccount({ accountId: row.account_id, rawDisplayName: row.account_display_name, storeAliases: settings.storeAliases }),
     site_name: siteDisplayName(row.site_id)
   }));
 }
@@ -792,6 +1261,7 @@ function canMergeBatchWindows(left, right) {
 
 function buildBatchSummaryRow(group, options = {}) {
   const includeDetails = options.includeDetails !== false;
+  const skipActionResults = options.skipActionResults === true;
   const windows = group.windows;
   const batchRows = windows.map((window) => window.batch);
   const orphanDetails = group.orphanDetails || [];
@@ -802,19 +1272,28 @@ function buildBatchSummaryRow(group, options = {}) {
   const primaryDetails = details.filter((row) => String(row.mode || '') === primaryMode);
   const summaryDetails = primaryDetails.length ? primaryDetails : details;
   const taskIds = [...new Set([...batchRows, ...details, ...coverageOnlyDetails].map((row) => Number(row.id || 0)).filter(Boolean))];
-  const uniqueWriteSummary = summarizeUniqueActionResultsForTaskIds(summaryDetails.map((row) => row.id));
+  const uniqueWriteSummary = skipActionResults
+    ? emptyUniqueActionSummary(false)
+    : summarizeUniqueActionResultsForTaskIds(summaryDetails.map((row) => row.id));
+  const contractTaskIds = summaryDetails
+    .filter((row) => Number(parseSummary(row.summary_json).result_contract_version || 0) >= RESULT_CONTRACT_VERSION)
+    .map((row) => row.id);
+  const contractSummary = skipActionResults || !contractTaskIds.length
+    ? null
+    : summarizeResultContractForTaskIds(contractTaskIds);
   const useUniqueWriteSummary = uniqueWriteSummary.hasRows && uniqueWriteSummary.total > 0;
   const failureReasons = useUniqueWriteSummary
     ? uniqueWriteSummary.failure_reasons
-    : summarizeFailureReasonsForTaskIds(summaryDetails.map((row) => row.id));
+    : (skipActionResults ? [] : summarizeFailureReasonsForTaskIds(summaryDetails.map((row) => row.id)));
   const skippedReasons = useUniqueWriteSummary
     ? uniqueWriteSummary.skipped_reasons
-    : summarizeSkippedReasonsForTaskIds(summaryDetails.map((row) => row.id));
+    : (skipActionResults ? [] : summarizeSkippedReasonsForTaskIds(summaryDetails.map((row) => row.id)));
   const fallbackSkippedReasons = mergeSkippedReasons(batchRows.flatMap((row) => parseSummary(row.summary_json).skipped_reasons || []));
   const topSkippedReasons = skippedReasons.length ? skippedReasons : fallbackSkippedReasons;
   const fallbackReasons = mergeFailureReasons(batchRows.flatMap((row) => parseSummary(row.summary_json).failure_reasons || []));
   const topReasons = failureReasons.length ? failureReasons : fallbackReasons;
   const primaryOrphanDetails = orphanDetails.filter((row) => String(row.mode || '') === primaryMode);
+  const latestUpdatedAt = latestTaskTime([...batchRows, ...summaryDetails]);
   const rawSuccess = sum(batchRows, 'success_count') + sum(primaryOrphanDetails, 'success_count');
   const rawFailed = sum(batchRows, 'failed_count') + sum(primaryOrphanDetails, 'failed_count');
   const rawSkipped = sum(batchRows, 'skipped_count') + sum(primaryOrphanDetails, 'skipped_count');
@@ -832,8 +1311,16 @@ function buildBatchSummaryRow(group, options = {}) {
     planned: sumSummary(batchRows, 'planned') + sum(primaryOrphanDetails, 'success_count'),
     total: rawSuccess + rawFailed + rawSkipped
   };
+  if (contractSummary) {
+    countedSummary.success = contractSummary.success;
+    countedSummary.failed = contractSummary.failed;
+    countedSummary.skipped = contractSummary.skipped;
+    countedSummary.planned = contractSummary.relation_count;
+    countedSummary.total = contractSummary.relation_count;
+  }
   const processedTotal = countedSummary.success + countedSummary.failed + countedSummary.skipped;
   const candidatePoolTotal = Math.max(rawTotal, countedSummary.total, processedTotal);
+  const isCancelAction = String(first.action || '') === 'cancel';
   const summary = {
     ...countedSummary,
     total: processedTotal,
@@ -849,9 +1336,17 @@ function buildBatchSummaryRow(group, options = {}) {
     promotions_total: sumSummary(batchRows, 'promotions_total') + primaryOrphanDetails.length || summaryDetails.length,
     failure_reasons: topReasons,
     skipped_reasons: topSkippedReasons,
-    seller_activity_text: discountText(summaryDetails.filter(isSellerCampaignTask).map((row) => row.discount_percent)),
-    official_activity_text: discountText(summaryDetails.filter((row) => !isSellerCampaignTask(row)).map((row) => row.discount_percent))
+    seller_activity_text: isCancelAction ? '' : discountText(summaryDetails.filter(isSellerCampaignTask).map((row) => row.discount_percent)),
+    official_activity_text: isCancelAction ? '' : discountText(summaryDetails.filter((row) => !isSellerCampaignTask(row)).map((row) => row.discount_percent))
   };
+  Object.assign(summary, contractSummary || {
+    relation_count: null,
+    unique_item_count: null,
+    activity_failure_count: null,
+    request_success_count: null,
+    live_verified_removed_count: null,
+    pending_verification_count: null,
+  });
   const stores = [...new Set([...batchRows, ...details].map((row) => row.store_name).filter(Boolean))];
   const sites = [...new Set(details.map((row) => row.site_name).filter(Boolean))];
   return {
@@ -866,19 +1361,26 @@ function buildBatchSummaryRow(group, options = {}) {
     store_name: scopeText(stores, '多个店铺'),
     action: first.action,
     mode: first.mode,
-    status: deriveBatchStatus(batchRows),
+    updated_at: latestUpdatedAt || first.updated_at || first.created_at,
+    status: deriveBatchStatus([...batchRows, ...summaryDetails]),
     total_count: String(first.action || '') === 'enroll' ? summary.enrolled_count : summary.total,
     success_count: String(first.action || '') === 'enroll' ? summary.enrolled_count : summary.success,
     failed_count: summary.failed,
     skipped_count: summary.skipped,
     empty_count: sum(batchRows, 'empty_count'),
-    completed: batchRows.every((row) => Number(row.completed || 0) === 1) ? 1 : 0,
+    completed: [...batchRows, ...summaryDetails].every((row) => Number(row.completed || 0) === 1) ? 1 : 0,
     summary_json: JSON.stringify(summary),
     short_failure_reason: shortFailureReason(topReasons, summary.skipped, summary.blocked, summary.failed, topSkippedReasons),
     full_failure_reasons: fullFailureReasonRows(topReasons),
     planned_count: summary.planned,
     blocked_count: summary.blocked,
     promotions_total: summary.promotions_total,
+    relation_count: summary.relation_count,
+    unique_item_count: summary.unique_item_count,
+    activity_failure_count: summary.activity_failure_count,
+    request_success_count: summary.request_success_count,
+    live_verified_removed_count: summary.live_verified_removed_count,
+    pending_verification_count: summary.pending_verification_count,
     seller_activity_text: summary.seller_activity_text,
     official_activity_text: summary.official_activity_text,
     detail_count: details.length,
@@ -886,69 +1388,28 @@ function buildBatchSummaryRow(group, options = {}) {
   };
 }
 
-function applyLatestEnrollLiveVerification(rows) {
-  const verification = loadLatestEnrollLiveVerification();
-  if (!verification || verification.enrolled_count <= 0) return rows;
-  const latestEnroll = rows
-    .filter((row) => String(row.action || '') === 'enroll' && String(row.mode || '') === 'real')
-    .sort((a, b) => dateMs(b.created_at) - dateMs(a.created_at) || Number(b.id || 0) - Number(a.id || 0))[0];
-  if (!latestEnroll) return rows;
-  const summary = parseSummary(latestEnroll.summary_json);
-  const apiSuccess = Number(latestEnroll.success_count || summary.api_success_count || summary.success || 0);
-  latestEnroll.total_count = verification.enrolled_count;
-  latestEnroll.success_count = verification.enrolled_count;
-  latestEnroll.summary_json = JSON.stringify({
-    ...summary,
-    api_success_count: apiSuccess,
-    enrolled_count: verification.enrolled_count,
-    live_verified_enrolled_count: verification.enrolled_count,
-    live_started_pending_before: verification.before_count,
-    live_started_pending_after: verification.after_count,
-    live_verification_source: verification.source,
-    live_verification_note: `主表商品数使用 live started+pending 增量 ${verification.enrolled_count}；接口成功数 ${apiSuccess}。`,
-    main_quantity_type: '已报名商品数',
-    main_quantity_note: '主表商品数按 live 回查确认的已报名/上架成功数显示；候选池、处理数、失败和跳过在详情中查看。'
-  });
-  return rows;
+function latestTaskTime(rows) {
+  const latest = rows
+    .map((row) => row?.updated_at || row?.created_at)
+    .filter((value) => Number.isFinite(dateMs(value)))
+    .sort((a, b) => dateMs(b) - dateMs(a))[0];
+  return latest || null;
 }
 
-function loadLatestEnrollLiveVerification() {
-  try {
-    const refreshPath = path.join(DATA_DIR, 'tmp-live-enroll-refresh-summary.json');
-    const postPath = path.join(DATA_DIR, 'tmp-live-enroll-post-summary.json');
-    if (!fs.existsSync(refreshPath) || !fs.existsSync(postPath)) return null;
-    const before = sumStartedPending(readJsonFile(refreshPath));
-    const after = sumStartedPending(readJsonFile(postPath));
-    const enrolled = after - before;
-    if (!Number.isFinite(enrolled) || enrolled <= 0) return null;
-    return {
-      before_count: before,
-      after_count: after,
-      enrolled_count: enrolled,
-      source: 'tmp-live-enroll-refresh-summary.json -> tmp-live-enroll-post-summary.json'
-    };
-  } catch {
-    return null;
-  }
-}
-
-function readJsonFile(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
-}
-
-function sumStartedPending(rows) {
-  if (!Array.isArray(rows)) return 0;
-  return rows
-    .filter((row) => ['started', 'pending'].includes(String(row.status || '')))
-    .reduce((total, row) => total + Number(row.saved_count || 0), 0);
-}
-
-function decorateTaskSummaryRow(row) {
+function decorateTaskSummaryRow(row, options = {}) {
+  const skipActionResults = options.skipActionResults === true;
   const summary = parseSummary(row.summary_json);
   const reasons = mergeFailureReasons(summary.failure_reasons || []);
-  const skippedReasons = summary.skipped_reasons || summarizeSkippedReasonsForTaskIds([row.id]);
+  const skippedReasons = summary.skipped_reasons
+    || (skipActionResults ? [] : summarizeSkippedReasonsForTaskIds([row.id]));
   return {
     ...row,
+    relation_count: row.relation_count ?? summary.relation_count ?? null,
+    unique_item_count: row.unique_item_count ?? summary.unique_item_count ?? null,
+    activity_failure_count: row.activity_failure_count ?? summary.activity_failure_count ?? null,
+    request_success_count: row.request_success_count ?? summary.request_success_count ?? null,
+    live_verified_removed_count: row.live_verified_removed_count ?? summary.live_verified_removed_count ?? null,
+    pending_verification_count: row.pending_verification_count ?? summary.pending_verification_count ?? null,
     short_failure_reason: row.short_failure_reason || shortFailureReason(
       reasons,
       Number(row.skipped_count || summary.skipped || 0),
@@ -1010,6 +1471,12 @@ function taskDetail(row) {
     promotion_id: row.promotion_id,
     promotion_type: row.promotion_type,
     promotion_name: row.promotion_name,
+    relation_count: summary.relation_count ?? null,
+    unique_item_count: summary.unique_item_count ?? null,
+    activity_failure_count: summary.activity_failure_count ?? null,
+    request_success_count: summary.request_success_count ?? null,
+    live_verified_removed_count: summary.live_verified_removed_count ?? null,
+    pending_verification_count: summary.pending_verification_count ?? null,
     action: row.action,
     mode: row.mode,
     total_count: detailTotal,
@@ -1129,6 +1596,21 @@ function summarizeUniqueActionResultsForTaskIds(taskIds = []) {
   return summary;
 }
 
+function summarizeResultContractForTaskIds(taskIds = []) {
+  const ids = [...new Set(taskIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
+  if (!ids.length) return null;
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = all(
+    `SELECT account_id, promotion_id, promotion_type, item_id, action, status, error_cn, error_raw, response_json
+     FROM promo_action_results
+     WHERE task_id IN (${placeholders})
+       AND status IN ('success', 'failed', 'skipped', 'activity_failed', 'request_success', 'live_verified_removed', 'live_still_started', 'pending_verification')
+     ORDER BY id ASC`,
+    ids,
+  );
+  return summarizeResultContractRows(rows);
+}
+
 export function summarizeUniqueFinalActionResults(rows = []) {
   const finalByItem = new Map();
   const summary = emptyUniqueActionSummary(false);
@@ -1144,10 +1626,10 @@ export function summarizeUniqueFinalActionResults(rows = []) {
       summary.total += count;
       if (status === 'skipped') {
         summary.skipped += count;
-        skippedReasons.push({ ...classifySkippedReason(row.error_raw || row.response_json || row.error_cn), count });
+        skippedReasons.push({ ...classifySkippedReason(row.error_raw || row.response_json || row.error_cn, { action: row.action }), count });
       } else if (status === 'failed') {
         summary.failed += count;
-        failureReasons.push({ ...classifyFailureReason(row.error_raw || row.response_json || row.error_cn), count });
+        failureReasons.push({ ...classifyFailureReason(row.error_raw || row.response_json || row.error_cn, { action: row.action }), count });
       }
       continue;
     }
@@ -1168,10 +1650,10 @@ export function summarizeUniqueFinalActionResults(rows = []) {
       summary.success += 1;
     } else if (status === 'skipped') {
       summary.skipped += 1;
-      skippedReasons.push({ ...classifySkippedReason(row.error_raw || row.response_json || row.error_cn), count: 1 });
+      skippedReasons.push({ ...classifySkippedReason(row.error_raw || row.response_json || row.error_cn, { action: row.action }), count: 1 });
     } else {
       summary.failed += 1;
-      failureReasons.push({ ...classifyFailureReason(row.error_raw || row.response_json || row.error_cn), count: 1 });
+      failureReasons.push({ ...classifyFailureReason(row.error_raw || row.response_json || row.error_cn, { action: row.action }), count: 1 });
     }
   }
   summary.failure_reasons = mergeFailureReasons(failureReasons);
@@ -1182,6 +1664,9 @@ export function summarizeUniqueFinalActionResults(rows = []) {
 function nonItemResultCount(row = {}) {
   const text = [row.error_cn, row.error_raw, row.response_json].filter(Boolean).join(' ');
   const patterns = [
+    /平台还有\s*(\d+)\s*个已报名商品未返回明细/,
+    /还有\s*(\d+)\s*个已报名商品/,
+    /(\d+)\s*个已报名商品未返回明细/,
     /平台还有\s*(\d+)\s*个候选未返回明细/,
     /还有\s*(\d+)\s*个候选/,
     /(\d+)\s*个候选未返回明细/
@@ -1302,6 +1787,7 @@ function shortFailureReasonName(reason = '') {
   if (text === '缺少活动报价ID') return '缺报价ID';
   if (text === '平台接口超时') return '超时';
   if (text === '候选明细不完整') return '候选不完整';
+  if (text === '已报名商品明细不完整') return '已报名明细不完整';
   if (text === '折扣比例不符合要求') return '折扣比例';
   return text.replace(/\s+/g, '').slice(0, 8);
 }
@@ -1313,17 +1799,24 @@ function fullFailureReasonName(reason = '') {
   return text;
 }
 
-function classifySkippedReason(reason) {
+function classifySkippedReason(reason, context = {}) {
   const text = cleanFailureText(reason);
   const raw = text.toLowerCase();
+  const action = String(context.action || '').toLowerCase();
+  if (/未开始的商品.*留待下次继续|未开始的商品已跳过|执行任务已停止/.test(raw)) {
+    return { reason: '未执行待继续' };
+  }
   if (/当前活动价已等于目标价|已是目标价格|already matches target/.test(raw)) {
     return { reason: '已是目标价格' };
   }
   if (/高于最高允许价|低于最低允许价|超出平台范围|min_discounted_price|max_discounted_price|price range/.test(raw)) {
     return { reason: '活动价超出平台范围' };
   }
+  if (/已报名商品明细不完整|已报名商品未返回明细|started 商品未返回明细/.test(raw)) {
+    return { reason: '已报名商品明细不完整' };
+  }
   if (/候选明细不完整|候选未返回明细/.test(raw)) {
-    return { reason: '候选明细不完整' };
+    return { reason: action === 'cancel' ? '已报名商品明细不完整' : '候选明细不完整' };
   }
   if (/无可处理|未读取到/.test(raw)) {
     return { reason: '无可处理商品' };
@@ -1331,9 +1824,10 @@ function classifySkippedReason(reason) {
   return { reason: '其他跳过' };
 }
 
-export function classifyFailureReason(reason) {
+export function classifyFailureReason(reason, context = {}) {
   const text = cleanFailureText(reason);
   const raw = text.toLowerCase();
+  const action = String(context.action || '').toLowerCase();
   if (/invalid access token|unauthorized|\"status\":401|\b401\b/.test(raw)) {
     return { reason: '授权中途失效', sent_to_api: true, suggestion: '刷新授权后重跑失败商品' };
   }
@@ -1356,7 +1850,7 @@ export function classifyFailureReason(reason) {
     return { reason: '网络失败', sent_to_api: true, suggestion: '网络或平台连接失败，稍后重跑失败商品' };
   }
   if (/invalid_parameter|bad_request|请求参数不符合平台要求/.test(raw)) {
-    return { reason: '请求参数不符合平台要求', sent_to_api: true, suggestion: '刷新活动商品后重跑，仍失败则检查活动报价参数' };
+    return { reason: '请求参数不符合平台要求', sent_to_api: true, suggestion: '重新读取该活动商品后再处理；仍失败则检查活动报价参数' };
   }
   if (/credible|discounted price is not credible|折扣价不被平台认可/.test(raw)) {
     return { reason: '折扣价不被平台认可', sent_to_api: true, suggestion: '调整折扣或价格边界后重跑' };
@@ -1365,12 +1859,18 @@ export function classifyFailureReason(reason) {
     return { reason: '折扣比例不符合要求', sent_to_api: true, suggestion: '提高折扣幅度或按平台要求调整活动价' };
   }
   if (/offer|活动报价/.test(raw)) {
-    return { reason: '缺少活动报价ID', sent_to_api: true, suggestion: '刷新候选明细/活动报价后重跑' };
+    return { reason: '缺少活动报价ID', sent_to_api: true, suggestion: '重新读取该活动商品和活动报价后再处理' };
   }
   if (/candidate 商品未读取到|无可处理商品/.test(raw)) {
     return { reason: '未读取到可处理候选商品', sent_to_api: false, suggestion: '先刷新活动商品或检查筛选范围' };
   }
+  if (/平台还有.*已报名商品未返回明细|已报名商品明细不完整|已报名商品未返回明细|started 商品未返回明细/.test(raw)) {
+    return { reason: '已报名商品明细不完整', sent_to_api: false, suggestion: '重新读取该活动已报名商品；若仍无明细，说明平台未返回可取消商品明细' };
+  }
   if (/平台还有.*候选未返回明细|候选未返回明细|候选明细不完整/.test(raw)) {
+    if (action === 'cancel') {
+      return { reason: '已报名商品明细不完整', sent_to_api: false, suggestion: '重新读取该活动已报名商品；若仍无明细，说明平台未返回可取消商品明细' };
+    }
     return { reason: '候选明细不完整', sent_to_api: false, suggestion: '等待平台返回明细或用人工导入/库存兜底' };
   }
   if (!text) return { reason: '其他失败', sent_to_api: true, suggestion: '查看详情后处理' };
@@ -1494,20 +1994,6 @@ function dateMs(value) {
 
 function dayKey(ms) {
   return ms ? new Date(ms).toISOString().slice(0, 10) : '';
-}
-
-function storeDisplayName(accountId, displayName, aliases = {}) {
-  const alias = aliases?.[String(accountId || '')];
-  if (alias && String(alias).trim()) return String(alias).trim();
-  if (String(accountId || '') === '2651442567') return '湖北店';
-  if (String(accountId || '') === '3332096437') return '湖南店';
-  if (String(accountId || '') === '3408885754') return '广东店';
-  const raw = String(displayName || '').trim();
-  const upper = raw.toUpperCase();
-  if (upper.includes('HUBEI') || raw.includes('湖北')) return '湖北店';
-  if (upper.includes('HUNAN') || raw.includes('湖南')) return '湖南店';
-  if (upper.includes('GUANGDONG') || upper.includes('GUANGZHOU') || upper.includes('GD') || raw.includes('广东')) return '广东店';
-  return raw && raw !== String(accountId || '') ? raw : `账号 ${accountId || ''}`.trim();
 }
 
 function siteDisplayName(siteId) {

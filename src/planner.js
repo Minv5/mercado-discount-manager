@@ -1,3 +1,5 @@
+import { PROMOTION_BUCKETS, promotionBucket } from './promotionDomain.js';
+
 export const ACTIONS = new Set(['enroll', 'update', 'cancel']);
 export const CANDIDATE_INCOMPLETE_STATUSES = new Set(['api_incomplete', 'api_incomplete_marketplace_candidate']);
 export const PARTIAL_FETCH_STATUSES = new Set(['partial', 'partial_api_sparse_marketplace_candidate']);
@@ -5,17 +7,25 @@ export const INVENTORY_FALLBACK_READY_STATUSES = new Set(['inventory_scan_fallba
 export const NOT_FULL_FETCH_STATUS = 'not_full_fetch';
 
 export function defaultDiscountForPromotion(promotionType) {
-  return String(promotionType || '').toUpperCase() === 'SELLER_CAMPAIGN' ? 5 : 6;
+  const bucket = promotionBucket(promotionType);
+  if (bucket === PROMOTION_BUCKETS.seller) return 5;
+  if (bucket === PROMOTION_BUCKETS.official) return 6;
+  return null;
 }
 
 export function discountForPromotion(promotionType, options = {}) {
-  const type = String(promotionType || '').toUpperCase();
-  if (type === 'SELLER_CAMPAIGN') return numberOrNull(options.sellerDiscountPercent) ?? 5;
-  return numberOrNull(options.officialDiscountPercent) ?? 6;
+  const bucket = promotionBucket(promotionType);
+  if (bucket === PROMOTION_BUCKETS.seller) return numberOrNull(options.sellerDiscountPercent) ?? 5;
+  if (bucket === PROMOTION_BUCKETS.official) return numberOrNull(options.officialDiscountPercent) ?? 6;
+  return null;
 }
 
 export function normalizePromotion(raw) {
   return {
+    account_id: raw.account_id || raw.accountId || '',
+    child_user_id: raw.child_user_id || raw.childUserId || '',
+    site_id: raw.site_id || raw.siteId || '',
+    logistic_type: raw.logistic_type || raw.logisticType || '',
     promotion_id: raw.promotion_id || raw.id,
     promotion_type: raw.promotion_type || raw.type,
     name: raw.name || raw.title || '',
@@ -131,16 +141,19 @@ export function filterPromotions(promotions, filters = {}) {
   const keywords = splitFilter(filters.keywords || filters.name);
   const sellerActivityNames = splitFilter(filters.sellerActivityNames || filters.sellerActivityName).map(normalizeActivityName);
   const officialActivityNames = splitFilter(filters.officialActivityNames || filters.officialActivityName).map(normalizeActivityName);
+  const ordinarySelectorActive = Boolean(filters.excludeSeller || filters.excludeOfficial || sellerActivityNames.length || officialActivityNames.length);
   return promotions.filter((promo) => {
     const type = String(promo.promotion_type || '').toUpperCase();
     const activityName = normalizeActivityName(activityDisplayName(promo));
+    const bucket = promotionBucket(type);
     if (siteIds.length && !siteIds.includes(String(promo.site_id || ''))) return false;
     if (promotionTypes.length && !promotionTypes.includes(type)) return false;
     if (filters.status && promo.status !== filters.status) return false;
-    if (filters.excludeSeller && type === 'SELLER_CAMPAIGN') return false;
-    if (filters.excludeOfficial && type !== 'SELLER_CAMPAIGN') return false;
-    if (type === 'SELLER_CAMPAIGN' && sellerActivityNames.length && !sellerActivityNames.includes(activityName)) return false;
-    if (type !== 'SELLER_CAMPAIGN' && officialActivityNames.length && !officialActivityNames.includes(activityName)) return false;
+    if (ordinarySelectorActive && ![PROMOTION_BUCKETS.seller, PROMOTION_BUCKETS.official].includes(bucket)) return false;
+    if (filters.excludeSeller && bucket === PROMOTION_BUCKETS.seller) return false;
+    if (filters.excludeOfficial && bucket === PROMOTION_BUCKETS.official) return false;
+    if (bucket === PROMOTION_BUCKETS.seller && sellerActivityNames.length && !sellerActivityNames.includes(activityName)) return false;
+    if (bucket === PROMOTION_BUCKETS.official && officialActivityNames.length && !officialActivityNames.includes(activityName)) return false;
     if (keywords.length) {
       const text = `${promo.name || ''} ${promo.promotion_id || ''}`.toLowerCase();
       if (!keywords.some((keyword) => text.includes(keyword.toLowerCase()))) return false;
@@ -210,12 +223,15 @@ export function buildBatchPlans({
     const fetchState = fetchStatesByPromotion.get(key);
     const items = itemsByPromotion.get(key) || [];
     const fetchInfo = fetchCompleteness(fetchState, items.length);
-    if (CANDIDATE_INCOMPLETE_STATUSES.has(fetchState?.detail_status)) {
+    if (isBlockingLiveRead(fetchState)) {
+      const liveReadFailure = ['error', 'unreadable'].includes(String(fetchState?.detail_status || '').toLowerCase());
       plans.push({
         promotion,
         blocked: true,
         detail_status: fetchState.detail_status,
-        warning: candidateIncompleteWarning(fetchState.warning, fetchState.detail_status),
+        warning: liveReadFailure
+          ? `活动商品实时读取失败，已阻断旧缓存进入执行计划：${fetchState?.warning || '无法确认平台当前商品状态'}`
+          : candidateIncompleteWarning(fetchState.warning, fetchState.detail_status),
         fetchState,
         fetch_info: fetchInfo,
         plan: { promotion, action, priceMode, discountPercent: null, directPrice: null, total: 0, planned: 0, skipped: 0, rows: [] }
@@ -280,8 +296,19 @@ export function buildBatchPlans({
   };
 }
 
+function isBlockingLiveRead(fetchState) {
+  const status = String(fetchState?.detail_status || '').toLowerCase();
+  return status === 'error' || status === 'unreadable' || CANDIDATE_INCOMPLETE_STATUSES.has(fetchState?.detail_status);
+}
+
 export function promotionKey(promotion) {
-  return `${promotion.account_id || ''}|${promotion.promotion_id}|${promotion.promotion_type}`;
+  return [
+    promotion.account_id || promotion.accountId || '',
+    promotion.child_user_id || promotion.childUserId || '',
+    String(promotion.site_id || promotion.siteId || '').toUpperCase(),
+    promotion.promotion_id || promotion.promotionId || '',
+    String(promotion.promotion_type || promotion.promotionType || '').toUpperCase(),
+  ].join('|');
 }
 
 function planSkip(item, reason) {

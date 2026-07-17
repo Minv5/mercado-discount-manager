@@ -1,4 +1,5 @@
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,11 +7,22 @@ import { HOST, PORT, DEFAULT_AUTH_DOMAIN, DATA_DIR } from './config.js';
 import { buildBatchConfirmationPackage, buildConfirmationPackage } from './confirmationPackage.js';
 import { exportWorkspace } from './exporter.js';
 import { queryFiltersFromSearchParams } from './filterQuery.js';
-import { CANDIDATE_INCOMPLETE_STATUSES, buildBatchPlans, buildPlan, normalizeItem, roundMoney, validateDealPrice } from './planner.js';
+import { CANDIDATE_INCOMPLETE_STATUSES, buildBatchPlans, buildPlan, filterPromotions, normalizeItem, promotionKey, roundMoney, validateDealPrice } from './planner.js';
+import { ordinaryPromotions, promotionBucketCounts } from './promotionDomain.js';
+import { activityCatalogDecision, activityItemsDecision, isActivityExpired, nextNonPeakCalibrationAt } from './activityChangeCache.js';
+import { activityCallbackConfig, createActivityCallbackAdapter } from './activityCallbackAdapter.js';
+import { createActivityWebhookConsumer } from './activityWebhookConsumer.js';
 import { buildCandidateIncompleteResolution, buildManualCandidateDraftRows, parseManualCandidateItemIds } from './candidateResolution.js';
 import { MAX_READ_CONCURRENCY, MAX_WRITE_CONCURRENCY, mapLimited, mapLimitedWithCap, normalizeConcurrency, normalizeConcurrencyWithCap, normalizeWriteConcurrency } from './concurrency.js';
+import { BALANCED_READ_PROFILES, buildReadConcurrencyReport, createBalancedReadScheduler } from './balancedReadScheduler.js';
 import { createAsyncLimiter, executePlannedRowsWithConcurrency } from './executor.js';
-import { filterItemsByRequestedIds, requestedItemFilterErrorMessage } from './executionItemFilter.js';
+import {
+  filterItemsByConfirmedScope,
+  filterItemsByRequestedIds,
+  filterPromotionsByConfirmedScope,
+  hasConfirmedExecutionScope,
+  requestedItemFilterErrorMessage,
+} from './executionItemFilter.js';
 import {
   INVENTORY_FALLBACK_ITEM_STATUS,
   INVENTORY_FALLBACK_READY_STATUS,
@@ -20,12 +32,36 @@ import {
 } from './inventoryFallback.js';
 import { decideCycleAction, getCycleState, markCycleAfterTask, nextDiscountFor } from './cycle.js';
 import { ApiError, toChineseError } from './errors.js';
-import { MercadoLibreClient, buildAuthorizationUrl, extractMarketplaceUsers, extractPromotions } from './mlClient.js';
+import { MercadoLibreClient, buildAuthorizationUrl, extractMarketplaceUsers, extractPromotions, mergePromotionsByIdentity } from './mlClient.js';
+import { accountProfileRecord } from './accountProfiles.js';
+import {
+  HIDDEN_SELLER_CAMPAIGN_MESSAGE,
+  HIDDEN_SELLER_CAMPAIGN_STATUS,
+  applyHiddenSellerCampaignSkip,
+  isDuplicateSellerCampaignNameError,
+  recoverDuplicateSellerCampaign,
+  resolveHiddenSellerCampaignTargets,
+} from './sellerCampaignDuplicateRecovery.js';
+import {
+  accountRouteKey,
+  assertAccountRouteAllowed,
+  bindActivitiesToAccountRoute,
+  bindActivityToAccountRoute,
+  normalizeAccountRoute,
+} from './accountRouteIdentity.js';
+import {
+  reconcileActivityCatalog,
+  requireAuthoritativeActivityCatalogRead,
+  selectMarketplaceUsersForCatalogRoutes,
+  sellerCampaignWriteThroughPromotion,
+  summarizeActivityCatalogRouteReads,
+} from './activityCatalogReconcile.js';
+import { resolveStoreIdentity } from './storeNameDomain.js';
 import { prepareOAuthStartFromConfig } from './oauthConfig.js';
 import { parseOAuthCallbackInput, selectCodeOnlyOAuthState } from './oauthCallback.js';
 import { PROMOTION_CREATION_STATUS } from './promotionCreationStatus.js';
-import { buildSellerCampaignCreateConfirmation } from './promotionCreation.js';
-import { buildRealEnrollSmokeConfirmation, buildRealEnrollSmokeExecuteDisabled, listRealEnrollSmokeTargets, REAL_ENROLL_SMOKE_POLICY } from './realEnrollSmokeTest.js';
+import { buildSellerCampaignBatchCreatePrecheck, buildSellerCampaignCreateConfirmation, summarizeSellerCampaignLiveSites } from './promotionCreation.js';
+import { buildRealEnrollSmokeConfirmation, listRealEnrollSmokeTargets, REAL_ENROLL_SMOKE_POLICY } from './realEnrollSmokeTest.js';
 import { realSubmitProtection } from './protection.js';
 import { createPkcePair, createState } from './security.js';
 import { SMART_REAL_TEST_RELEASE_POLICY, SMART_REAL_TEST_TARGET, buildSingleItemRealTestConfirmation } from './smartRealTest.js';
@@ -46,8 +82,12 @@ import {
   finishTask,
   getAccount,
   getAccountSecrets,
+  getAccountProfile,
   getCampaign,
   getItemFetchState,
+  getActivityCacheState,
+  hasActivityCallbackEvent,
+  listAllMarketplaceSites,
   listStoredAccounts,
   listCampaigns,
   listCampaignsFiltered,
@@ -56,33 +96,97 @@ import {
   listItemFetchStatesForPromotions,
   listItems,
   listItemsForPromotions,
+  listGlobalDiscountUpdateSummaries,
+  listHiddenSellerCampaignsForAccount,
+  listHiddenSellerCampaignsForRoute,
   listPendingOAuthStates,
+  listPreparationReadStates,
   listResults,
   listTaskDetails,
   listTaskSummaries,
   listSiteSummaries,
+  listSellerCampaignRecoveryCandidates,
+  listVerifiedActivityCallbackPromotionMappings,
+  invalidateMarketplaceSiteCatalog,
+  markCampaignsCatalogRemoved,
   saveMarketplaceSites,
   deleteItemsBySource,
   saveCampaigns,
   saveExecutionResult,
   saveItemFetchState,
+  recordActivityCatalogCalibration,
+  recordActivityItemsCalibration,
+  markActivityCacheDirty,
+  saveActivityCacheState,
+  saveActivityCallbackEvent,
   saveItems,
   saveOAuthState,
   savePlanResults,
   saveTokenAccount,
+  saveAccountProfile,
   updateMarketplaceSitePromotionStatus,
-  updateAccountToken
+  updateAccountToken,
+  publishHistorySummaryForExecutionGroup
 } from './repository.js';
 import { getDb } from './db.js';
 import { buildSubmitPayloadPreview, requireExecutableSubmitPayload, requireItemStatus } from './promotionPayload.js';
 import { readSettings, saveSettings } from './settings.js';
+import { filterByOperatingSites, hasOperatingSiteScope, mergeOperatingSiteEvidence, operatingSiteIds } from './operatingSites.js';
 import { decideToday } from './today.js';
+import { buildGlobalTodayDiscount } from './globalTodayDiscount.js';
+import { createExecutionJobPersistence } from './executionJobPersistence.js';
+import { readAuditText } from './executionAudit.js';
+import {
+  ACTIVE_EXECUTION_GROUP_STATUSES,
+  TERMINAL_EXECUTION_GROUP_STATUSES,
+  createExecutionGroupPersistence,
+  executionGroupBusinessScope,
+  summarizeExecutionGroup
+} from './executionGroupPersistence.js';
+import { PRODUCT_BUILD_INFO, PRODUCT_DISPLAY_NAME } from './productContract.js';
+import {
+  ACTIVE_SUBMISSION_STATES,
+  cancelSubmissionCommit,
+  claimSubmissionPreparation,
+  commitSubmission,
+  createSubmissionPersistence,
+  loadAllEffectiveSubmissions,
+  loadEffectiveSubmission,
+  refreshSubmissionDeadline,
+  resumePausedSubmission,
+  runSubmissionPreparation,
+  submissionRequestFingerprint,
+  submissionScopeHash,
+} from './submissionPersistence.js';
+import {
+  activityIdentityKey,
+  activityReadKey,
+  confirmedExecutionScopeFacts,
+  createConfirmedExecutionScope,
+  forceReadKeysForStatus,
+  reconcileConfirmedExecutionScope,
+} from './submissionScopeFreeze.js';
+import { buildFinalRevalidationPlan } from './finalRevalidationPlan.js';
+import {
+  CANCEL_RESULT_STATUS,
+  RESULT_CONTRACT_VERSION,
+  buildCancelResultContract,
+  stableContractCounts,
+  summarizeLiveReadRows
+} from './executionResultContract.js';
+import { createSameDayConfirmationStore, sameDayCompletionGate } from './sameDayCompletionGate.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const batchFetchJobs = new Map();
 const inventoryFallbackJobs = new Map();
 const executionJobs = new Map();
+const executionGroups = new Map();
+const submissionPreparationTasks = new Map();
+const submissionCommitTasks = new Map();
+const submissionCommitControllers = new Map();
+const submissionRecoveryAuditAt = new Map();
+const PRE_GROUP_SUBMISSION_STATES = new Set(['committing', 'creating', 'created', 'starting']);
 const sharedWriteLimiters = new Map();
 const writeBenchmarkJobs = new Map();
 let nextBatchFetchJobId = 1;
@@ -93,10 +197,55 @@ const CONCURRENCY_BENCHMARK_PATH = path.join(DATA_DIR, 'concurrency-benchmark-re
 const WRITE_BENCHMARK_JOB_DIR = path.join(DATA_DIR, 'write-benchmark-jobs');
 const WRITE_BENCHMARK_JOB_INDEX_PATH = path.join(WRITE_BENCHMARK_JOB_DIR, 'index.json');
 const EXECUTION_JOB_EVENT_DIR = path.join(DATA_DIR, 'execution-job-events');
+const EXECUTION_JOB_STATE_DIR = path.join(DATA_DIR, 'execution-job-states');
+const EXECUTION_GROUP_STATE_DIR = path.join(DATA_DIR, 'execution-group-states');
+const SUBMISSION_STATE_DIR = path.join(DATA_DIR, 'execution-submissions');
+const SAME_DAY_CONFIRMATION_STATE_DIR = path.join(DATA_DIR, 'execution-submission-confirmations');
+const executionEventFileDescriptors = new Map();
+const executionJobPersistence = createExecutionJobPersistence({ stateDir: EXECUTION_JOB_STATE_DIR, publicJob: publicExecutionJob });
+const executionGroupPersistence = createExecutionGroupPersistence({ stateDir: EXECUTION_GROUP_STATE_DIR });
+const submissionPersistence = createSubmissionPersistence({ stateDir: SUBMISSION_STATE_DIR });
+const sameDayConfirmationStore = createSameDayConfirmationStore({ stateDir: SAME_DAY_CONFIRMATION_STATE_DIR });
+const SERVER_INSTANCE_ID = `node-${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
+const activityWebhookConsumer = createActivityWebhookConsumer({
+  listMarketplaceSites: listAllMarketplaceSites,
+  listAccounts: listAccountsForUi,
+  createResourceClient: async (route) => {
+    const account = await ensureUsableAccount(route.account_id);
+    return new MercadoLibreClient({
+      accessToken: account.accessToken,
+      userId: route.child_user_id,
+      callerId: route.child_user_id,
+      marketplace: true,
+      readAccountId: route.account_id,
+    });
+  },
+  markDirty: markActivityCacheDirty,
+  invalidateCatalog: invalidateMarketplaceSiteCatalog,
+});
+const activityCallbackAdapter = createActivityCallbackAdapter({
+  config: activityCallbackConfig(),
+  hasEvent: hasActivityCallbackEvent,
+  saveEvent: saveActivityCallbackEvent,
+  getCacheState: getActivityCacheState,
+  markDirty: markActivityCacheDirty,
+  consumeEvent: activityWebhookConsumer,
+});
+for (const group of executionGroupPersistence.loadAll()) executionGroups.set(String(group.id), group);
 const READ_BENCHMARK_LEVELS = [1, 2, 3, 4, 5, 8, 10, 15, 20];
 const WRITE_BENCHMARK_LEVELS = [1, 2, 3, 5, 8, 10, 15, 20];
 const READ_BENCHMARK_MAX_CONCURRENCY = 20;
 const WRITE_BENCHMARK_MAX_CONCURRENCY = 10000;
+const LEGACY_SYNC_WRITE_ROUTES = new Set([
+  '/api/execute',
+  '/api/batch/execute',
+  '/api/today/execute',
+  '/api/today/precheck',
+  '/api/cancel/filtered/precheck',
+  '/api/real-enroll-smoke/execute',
+  '/api/concurrency-benchmark/write/execute',
+]);
+const LEGACY_SYNC_WRITE_MESSAGE = '旧版同步执行入口已停用，请使用当前桌面版后台执行任务。';
 const LATEST_WRITE_BENCHMARK_STATUS = {
   tool_status: '后台压测工具已启用逐商品落盘',
   source: '真实测试线程最新回传',
@@ -113,6 +262,13 @@ const LATEST_WRITE_BENCHMARK_STATUS = {
 };
 
 getDb();
+for (const group of executionGroups.values()) {
+  if (String(group.status || '') === 'interrupted') {
+    publishHistorySummaryForExecutionGroup(group.id);
+    const submission = submissionPersistence.findBySubmissionId(group.client_submission_id);
+    if (submission) submissionPersistence.update(submission.id, { state: 'terminal', group_id: group.id, group: publicExecutionGroup(group), error: group.error });
+  }
+}
 
 const server = http.createServer(async (req, res) => {
   const startedAt = Date.now();
@@ -138,15 +294,147 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`美客多折扣管家已启动：http://${HOST}:${PORT}`);
+  console.log(`${PRODUCT_DISPLAY_NAME}已启动：http://${HOST}:${PORT}`);
+  setImmediate(() => resumePersistedExecutionSubmissions());
+  scheduleLowFrequencyActivityCalibration();
 });
+
+function scheduleLowFrequencyActivityCalibration() {
+  const next = nextNonPeakCalibrationAt();
+  const timer = setTimeout(async () => {
+    try {
+      await runLowFrequencyActivityCalibration();
+    } catch (error) {
+      console.error(`活动缓存低频校准未完成：${toChineseError(error)}`);
+    } finally {
+      scheduleLowFrequencyActivityCalibration();
+    }
+  }, Math.max(1_000, next.getTime() - Date.now()));
+  timer.unref?.();
+}
+
+async function runLowFrequencyActivityCalibration() {
+  const settings = readSettings();
+  for (const summary of listAccountsForUi()) {
+    const account = await ensureUsableAccount(summary.account_id);
+    const catalog = await refreshActivityCatalogForPrepare({ account, settings, readConcurrency: Math.min(2, normalizeConcurrency(settings.readConcurrency)) });
+    const promotions = listOperatingCampaignsFiltered(account.account_id, {}, settings)
+      .filter((promotion) => !catalog.blocked_site_ids.has(String(promotion.site_id || '').toUpperCase()));
+    await mapLimited(promotions, 2, async (campaign) => {
+      for (const status of ['candidate', 'started']) {
+        const cacheState = getActivityCacheState(account.account_id, campaign.site_id, campaign.promotion_id, campaign.promotion_type);
+        const fetchState = getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, status);
+        if (!activityItemsDecision({ promotion: campaign, cacheState, fetchState }).refresh) continue;
+        await fetchAndSavePromotionItemsForCampaign({ account, campaign, status, maxItems: 'all', fetchMode: 'full' });
+      }
+    });
+  }
+}
+
+async function resumePersistedExecutionSubmissions() {
+  for (const persisted of loadAllEffectiveSubmissions({
+    store: submissionPersistence,
+    onAbort: (prepare) => abortExecutionSubmissionCommit(prepare.id, 'commit_lease_expired'),
+  })) {
+    let prepare = persisted;
+    if (!prepare) continue;
+    if (prepare.state === 'preparing') {
+      scheduleExecutionSubmissionPreparation(prepare.id);
+      continue;
+    }
+    if (prepare.state === 'creating') {
+      const recovered = await recoverCreatingSubmission(prepare);
+      if (!recovered) continue;
+      prepare = recovered;
+    }
+    if (!['committing', 'created', 'starting'].includes(prepare.state) || !prepare.commit_confirmed) continue;
+    scheduleExecutionSubmissionCommit(prepare.id, {
+        confirmText: 'REAL_SUBMIT',
+        createConfirmText: prepare.create_confirmed ? 'CREATE_SELLER_CAMPAIGN' : '',
+      }, { recover: true }).catch((error) => {
+        console.error(`恢复已确认提交未完成：${submissionApiErrorMessage(error)}`);
+      });
+  }
+}
+
+async function recoverCreatingSubmission(prepare) {
+  const expected = {
+    version: prepare.version,
+    state: 'creating',
+    commit_lease_id: prepare.commit_lease_id || '',
+  };
+  try {
+    await buildExecutionSubmissionSnapshot(prepare.request);
+    const latest = submissionPersistence.load(prepare.id);
+    if (!latest
+        || latest.version !== expected.version
+        || latest.state !== expected.state
+        || String(latest.commit_lease_id || '') !== String(expected.commit_lease_id || '')) return null;
+    const selected = prepare.seller_input?.selected_targets || [];
+    const missing = selected.filter((target) => {
+      const campaigns = listOperatingCampaignsFiltered(target.account_id, {
+        siteIds: [target.site_id],
+        promotionTypes: ['SELLER_CAMPAIGN'],
+        sellerActivityNames: prepare.seller_input?.name ? [prepare.seller_input.name] : [],
+      }, readSettings());
+      return campaigns.length === 0;
+    });
+    if (missing.length) {
+      submissionPersistence.compareAndSwap(prepare.id, expected, {
+        state: 'failed',
+        error: '程序重启后未能回查到全部已请求创建的自建活动，已阻断商品执行且不会重复创建。',
+        failure_code: 'SELLER_CREATION_RECHECK_REQUIRED',
+        commit_lease_id: null,
+        commit_lease_owner: null,
+        commit_lease_expires_at: null,
+      });
+      return null;
+    }
+    const recovered = submissionPersistence.compareAndSwap(prepare.id, expected, {
+      state: 'created',
+      creation_result: { ok: true, recovered_by_live_recheck: true, created_count: selected.length, failed_count: 0, recheck_missing_count: 0 },
+      commit_lease_id: null,
+      commit_lease_owner: null,
+      commit_lease_expires_at: null,
+    });
+    return recovered.ok ? recovered.prepare : null;
+  } catch (error) {
+    submissionPersistence.compareAndSwap(prepare.id, expected, {
+      state: 'failed',
+      error: `程序重启后无法确认活动创建结果，已阻断商品执行且不会重复创建：${toChineseError(error)}`,
+      failure_code: 'SELLER_CREATION_RECHECK_FAILED',
+      commit_lease_id: null,
+      commit_lease_owner: null,
+      commit_lease_expires_at: null,
+    });
+    return null;
+  }
+}
 
 async function handleApi(req, res) {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   const method = req.method || 'GET';
 
   if (method === 'GET' && url.pathname === '/api/health') {
-    return sendJson(res, 200, { ok: true, service: '美客多折扣管家', time: new Date().toISOString() });
+    return sendJson(res, 200, {
+      ok: true,
+      service: PRODUCT_DISPLAY_NAME,
+      display_name: PRODUCT_DISPLAY_NAME,
+      product: PRODUCT_BUILD_INFO.product,
+      protocol_version: PRODUCT_BUILD_INFO.protocol_version,
+      build_fingerprint: PRODUCT_BUILD_INFO.build_fingerprint,
+      time: new Date().toISOString(),
+    });
+  }
+
+  if (method === 'POST' && LEGACY_SYNC_WRITE_ROUTES.has(url.pathname)) {
+    return sendJson(res, 410, { ok: false, error: LEGACY_SYNC_WRITE_MESSAGE, retired: true });
+  }
+
+  if (method === 'POST' && url.pathname === '/api/integrations/activity-callback') {
+    const result = await activityCallbackAdapter.accept(await readJson(req), req.headers['x-mdm-signature']);
+    if (result.status === 'disabled') return sendJson(res, 404, { ok: false, error: '活动变化回调接入未启用。', callback_enabled: false });
+    return sendJson(res, result.status === 'duplicate' ? 200 : 202, { ok: true, ...result });
   }
 
   if (method === 'GET' && url.pathname === '/api/settings') {
@@ -171,15 +459,6 @@ async function handleApi(req, res) {
     const plan = buildWriteConcurrencyBenchmarkPlan({ account, input: body });
     saveConcurrencyBenchmarkResult('write_plan', plan);
     return sendJson(res, 409, { ok: false, disabled: true, confirmation_required: true, plan });
-  }
-
-  if (method === 'POST' && url.pathname === '/api/concurrency-benchmark/write/execute') {
-    await readJson(req);
-    return sendJson(res, 409, {
-      ok: false,
-      disabled: true,
-      error: '旧同步真实写入压测接口已停用；请使用 /api/concurrency-benchmark/write/jobs/start 启动后台 job，避免客户端超时后丢失逐商品结果。'
-    });
   }
 
   if (method === 'POST' && url.pathname === '/api/concurrency-benchmark/write/jobs/start') {
@@ -277,11 +556,6 @@ async function handleApi(req, res) {
     });
   }
 
-  if (method === 'POST' && url.pathname === '/api/real-enroll-smoke/execute') {
-    const body = await readJson(req);
-    return sendJson(res, 409, buildRealEnrollSmokeExecuteDisabled(body));
-  }
-
   if (method === 'POST' && url.pathname === '/api/promotion-creation/precheck') {
     const body = await readJson(req);
     return sendJson(res, 409, {
@@ -290,6 +564,73 @@ async function handleApi(req, res) {
       error: 'Seller Campaign 创建活动本轮只生成请求预览和主管确认包，不执行 Mercado POST。',
       confirmation_package: buildSellerCampaignCreateConfirmation(body)
     });
+  }
+
+  if (method === 'POST' && url.pathname === '/api/promotion-creation/seller-campaign/batch-precheck') {
+    const body = await readJson(req);
+    const accountIds = normalizeAccountIdList(body.accountIds || body.account_ids || body.accountId || body.account_id);
+    if (!accountIds.length) return sendJson(res, 400, { ok: false, error: '缺少店铺账号范围。' });
+    const filters = body.filters || {};
+    const settings = readSettings();
+    const targets = await buildLiveSellerCampaignCreateTargets({ accountIds, filters, settings });
+    const hasTargetSelections = hasSellerCampaignTargetSelections(body);
+    const selectedTargets = filterSellerCampaignCreateTargets(targets, normalizeSellerCampaignTargetSelections(body), hasTargetSelections);
+    const notSelectedTargets = sellerCampaignNotSelectedTargets(targets, selectedTargets, hasTargetSelections);
+    const precheck = buildSellerCampaignBatchCreatePrecheck({
+      targets: selectedTargets,
+      name: body.name,
+      startDate: body.startDate ?? body.start_date,
+      finishDate: body.finishDate ?? body.finish_date
+    });
+    return sendJson(res, 200, { ...precheck, deprecated: true });
+  }
+
+  if (method === 'POST' && url.pathname === '/api/promotion-creation/seller-campaign/batch-create') {
+    const body = await readJson(req);
+    if (String(body.confirmText || body.confirm_text || '') !== 'CREATE_SELLER_CAMPAIGN') {
+      return sendJson(res, 409, {
+        ok: false,
+        confirmation_required: true,
+        error: '真实创建自建活动前必须确认目标清单。'
+      });
+    }
+    const accountIds = normalizeAccountIdList(body.accountIds || body.account_ids || body.accountId || body.account_id);
+    if (!accountIds.length) return sendJson(res, 400, { ok: false, error: '缺少店铺账号范围。' });
+    const filters = body.filters || {};
+    const settings = readSettings();
+    const targets = await buildLiveSellerCampaignCreateTargets({ accountIds, filters, settings });
+    const hasTargetSelections = hasSellerCampaignTargetSelections(body);
+    const selectedTargets = filterSellerCampaignCreateTargets(targets, normalizeSellerCampaignTargetSelections(body), hasTargetSelections);
+    const notSelectedTargets = sellerCampaignNotSelectedTargets(targets, selectedTargets, hasTargetSelections);
+    const precheck = buildSellerCampaignBatchCreatePrecheck({
+      targets: selectedTargets,
+      name: body.name,
+      startDate: body.startDate ?? body.start_date,
+      finishDate: body.finishDate ?? body.finish_date
+    });
+    if ((precheck.validation_errors || []).length) {
+      return sendJson(res, 400, {
+        ok: false,
+        promotion_type: 'SELLER_CAMPAIGN',
+        error: '自建活动创建参数未通过预检。',
+        validation_errors: precheck.validation_errors,
+        existing: publicSellerCampaignTargets(precheck.existing),
+        missing: publicSellerCampaignTargets(precheck.confirmed_absent || []),
+        confirmed_absent: publicSellerCampaignTargets(precheck.confirmed_absent || []),
+        needs_manual_review: publicSellerCampaignTargets(precheck.needs_manual_review || []),
+        unreadable: precheck.unreadable || []
+      });
+    }
+    const result = await createMissingSellerCampaigns({
+      missingTargets: precheck.confirmed_absent || [],
+      existingTargets: precheck.existing,
+      notSelectedTargets,
+      unreadableTargets: precheck.unreadable || [],
+      name: body.name,
+      startDate: body.startDate ?? body.start_date,
+      finishDate: body.finishDate ?? body.finish_date
+    });
+    return sendJson(res, (result.failed_count > 0 || result.recheck_missing_count > 0 || result.unreadable_count > 0) ? 207 : 200, { ...result, deprecated: true });
   }
 
   if (method === 'GET' && url.pathname === '/api/candidate-incomplete/status') {
@@ -378,6 +719,26 @@ async function handleApi(req, res) {
     return sendJson(res, 200, { ok: true, accounts: listAccountsForUi() });
   }
 
+  if (method === 'GET' && url.pathname === '/api/accounts/profiles/refresh') {
+    const requested = normalizeAccountIdList(url.searchParams.get('accountIds') || url.searchParams.get('accountId'));
+    const accountIds = requested.length ? requested : listAccountsForUi().map((account) => String(account.account_id));
+    const results = await mapLimited(accountIds, Math.min(3, Math.max(1, accountIds.length)), async (accountId) => {
+      try {
+        const account = await refreshAccountProfile(accountId);
+        return { account_id: accountId, ok: true, account };
+      } catch (error) {
+        return { account_id: accountId, ok: false, error: toChineseError(error) };
+      }
+    });
+    return sendJson(res, 200, {
+      ok: true,
+      refreshed: results.filter((row) => row.ok).length,
+      failed: results.filter((row) => !row.ok).length,
+      results,
+      accounts: listAccountsForUi()
+    });
+  }
+
   const verifyAccountMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/verify$/);
   if (method === 'POST' && verifyAccountMatch) {
     const account = await ensureUsableAccount(verifyAccountMatch[1]);
@@ -422,14 +783,30 @@ async function handleApi(req, res) {
 
   const listPromosMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/promotions$/);
   if (method === 'GET' && listPromosMatch) {
-    return sendJson(res, 200, { ok: true, promotions: listCampaignsFiltered(listPromosMatch[1], queryFiltersFromSearchParams(url.searchParams)) });
+    return sendJson(res, 200, { ok: true, promotions: listOperatingCampaignsFiltered(listPromosMatch[1], queryFiltersFromSearchParams(url.searchParams)) });
   }
 
   const sitesMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/sites$/);
   if (method === 'GET' && sitesMatch) {
     const account = await ensureUsableAccount(sitesMatch[1]);
     if (account.site_id === 'CBT') await discoverAndSaveMarketplaceSites(account);
-    return sendJson(res, 200, { ok: true, sites: listSiteSummaries(sitesMatch[1]) });
+    const settings = readSettings();
+    const allSites = listSiteSummaries(sitesMatch[1]);
+    const includeAll = url.searchParams.get('includeAll') === 'true' || url.searchParams.get('includeAll') === '1';
+    if (includeAll && (url.searchParams.get('probeBusiness') === 'true' || url.searchParams.get('probeBusiness') === '1')) {
+      const evidence = await inspectOperatingSiteEvidence({ account, sites: allSites, settings });
+      return sendJson(res, 200, { ok: true, configured: hasOperatingSiteScope(settings, sitesMatch[1]), sites: evidence });
+    }
+    const sites = includeAll ? allSites : filterByOperatingSites(allSites, settings, sitesMatch[1]);
+    const allowed = operatingSiteIds(settings, sitesMatch[1]);
+    return sendJson(res, 200, {
+      ok: true,
+      configured: allowed !== null,
+      sites: sites.map((site) => ({
+        ...site,
+        operating: allowed === null || allowed.has(String(site.site_id || '').toUpperCase())
+      }))
+    });
   }
 
   const fetchItemsMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/promotions\/([^/]+)\/([^/]+)\/items\/fetch$/);
@@ -585,7 +962,7 @@ async function handleApi(req, res) {
     const { accountId } = requireFields(body, ['accountId']);
     const settings = readSettings();
     const account = await ensureUsableAccount(accountId);
-    const promotions = listCampaignsFiltered(account.account_id, body.filters || {});
+    const promotions = listOperatingCampaignsFiltered(account.account_id, body.filters || {}, settings);
     const status = requireItemStatus(body.itemStatus || 'candidate');
     const fetchMode = body.fetchMode === 'full' ? 'full' : 'sample';
     const maxItems = fetchMode === 'full' ? 'all' : Number(body.maxItems || settings.maxItemsPerPromotion || 50);
@@ -643,37 +1020,180 @@ async function handleApi(req, res) {
     return sendJson(res, 200, { ok: true, job });
   }
 
-  if (method === 'POST' && url.pathname === '/api/execution/jobs/start') {
+  if (method === 'POST' && url.pathname === '/api/execution/submissions/prepare') {
     const body = await readJson(req);
-    requireFields(body, ['accountId']);
-    const settings = readSettings();
-    const requestedWriteConcurrency = body.writeConcurrency;
-    const requestedGlobalWriteConcurrency = body.globalWriteConcurrency;
-    const normalizedWriteConcurrency = normalizeWriteConcurrency(body.writeConcurrency, settings.writeConcurrency);
-    const normalizedGlobalWriteConcurrency = normalizeConcurrencyWithCap(body.globalWriteConcurrency ?? normalizedWriteConcurrency, normalizedWriteConcurrency, MAX_WRITE_CONCURRENCY);
-    const request = {
-      ...body,
-      requestedWriteConcurrency,
-      requestedGlobalWriteConcurrency,
-      writeConcurrency: normalizedWriteConcurrency,
-      globalWriteConcurrency: normalizedGlobalWriteConcurrency
-    };
-    if (!request.prepareOnly) {
-      const protection = realSubmitProtection({ ...request, mode: request.mode || 'real' }, { batch: true });
-      if (!protection.allowed) return sendJson(res, protection.status, { ok: false, ...protection });
+    try {
+      const result = prepareExecutionSubmission(body);
+      const status = result.prepare.state === 'preparing' ? 202 : 200;
+      return sendJson(res, status, { ok: true, reused: result.reused, prepare_id: result.prepare.id, prepare: publicExecutionSubmission(result.prepare) });
+    } catch (error) {
+      return sendJson(res, error.status || 500, { ok: false, code: error.code || null, error: submissionApiErrorMessage(error), details: error.details || null });
     }
-    const job = createExecutionJob(request);
-    runExecutionJob(job.id);
-    return sendJson(res, 202, { ok: true, job: publicExecutionJob(job) });
+  }
+
+  if (method === 'POST' && url.pathname === '/api/execution/submissions/same-day-confirmations/cancel') {
+    const body = await readJson(req);
+    try {
+      sameDayConfirmationStore.cancel(body.confirmation_token);
+      return sendJson(res, 200, { ok: true, state: 'cancelled' });
+    } catch (error) {
+      return sendJson(res, error.status || 500, { ok: false, code: error.code || null, error: submissionApiErrorMessage(error) });
+    }
+  }
+
+  const submissionUpdateMatch = url.pathname.match(/^\/api\/execution\/submissions\/([^/]+)\/seller-input$/);
+  if (method === 'POST' && submissionUpdateMatch) {
+    const body = await readJson(req);
+    try {
+      const prepare = updateExecutionSubmissionSellerInput(submissionUpdateMatch[1], body);
+      return sendJson(res, 200, { ok: true, prepare: publicExecutionSubmission(prepare) });
+    } catch (error) {
+      return sendJson(res, error.status || 500, { ok: false, code: error.code || null, error: toChineseError(error), details: error.details || null });
+    }
+  }
+
+  const submissionCommitMatch = url.pathname.match(/^\/api\/execution\/submissions\/([^/]+)\/commit$/);
+  if (method === 'POST' && submissionCommitMatch) {
+    const body = await readJson(req);
+    try {
+      const result = await commitExecutionSubmission(submissionCommitMatch[1], body);
+      return sendJson(res, result.reused ? 200 : 202, {
+        ok: true,
+        accepted: result.accepted === true,
+        reused: result.reused,
+        prepare: publicExecutionSubmission(result.prepare),
+        group: result.group ? publicExecutionGroup(result.group) : null,
+      });
+    } catch (error) {
+      const current = submissionPersistence.load(submissionCommitMatch[1]);
+      return sendJson(res, error.status || 500, {
+        ok: false,
+        code: error.code || null,
+        error: submissionApiErrorMessage(error),
+        details: error.details || null,
+        prepare_id: current?.id || submissionCommitMatch[1],
+        state: current?.state || null,
+      });
+    }
+  }
+
+  const submissionCancelMatch = url.pathname.match(/^\/api\/execution\/submissions\/([^/]+)\/cancel$/);
+  if (method === 'POST' && submissionCancelMatch) {
+    const prepare = loadEffectiveSubmission({ store: submissionPersistence, prepareId: submissionCancelMatch[1] });
+    if (!prepare) return sendJson(res, 404, { ok: false, error: '未找到本次准备结果。' });
+    if (['preparing', 'prepared', 'reconfirm_required'].includes(String(prepare.state || ''))) {
+      const nextState = prepare.state === 'preparing' ? 'cancelled' : 'paused';
+      const message = nextState === 'cancelled' ? '用户已停止本次准备。' : '本次准备已暂停，可在有效期内按相同范围恢复。';
+      const cancelled = submissionPersistence.update(prepare.id, {
+        state: nextState, error: null,
+        progress: { ...(prepare.progress || {}), stage: nextState, message },
+      });
+      return sendJson(res, 200, { ok: true, prepare: publicExecutionSubmission(cancelled) });
+    }
+    if (['committing', 'creating', 'created', 'starting'].includes(String(prepare.state || '')) && !prepare.group_id) {
+      const cancelled = cancelSubmissionCommit({
+        store: submissionPersistence,
+        prepareId: prepare.id,
+        onAbort: () => abortExecutionSubmissionCommit(prepare.id, 'user_cancelled'),
+      });
+      if (cancelled.changed) return sendJson(res, 200, { ok: true, prepare: publicExecutionSubmission(cancelled.prepare) });
+      return sendJson(res, 409, { ok: false, code: 'COMMIT_STATE_CHANGED', error: '提交状态刚刚发生变化，正在重新读取结果。' });
+    }
+    if (prepare.group_id) {
+      const group = executionGroups.get(String(prepare.group_id)) || executionGroupPersistence.load(prepare.group_id);
+      if (group) {
+        requestExecutionGroupCancel(group);
+        return sendJson(res, 200, { ok: true, prepare: publicExecutionSubmission(prepare), group: publicExecutionGroup(group) });
+      }
+    }
+    return sendJson(res, 409, { ok: false, error: '本次提交已进入执行阶段，不能按准备取消。' });
+  }
+
+  if (method === 'GET' && url.pathname === '/api/execution/submissions/active') {
+    const prepare = loadAllEffectiveSubmissions({
+      store: submissionPersistence,
+      onAbort: (row) => abortExecutionSubmissionCommit(row.id, 'commit_lease_expired'),
+    })
+      .filter((row) => ACTIVE_SUBMISSION_STATES.has(String(row.state || '')))
+      .sort((left, right) => String(right.updated_at || '').localeCompare(String(left.updated_at || '')))[0] || null;
+    return sendJson(res, 200, { ok: true, active: Boolean(prepare), prepare: prepare ? publicExecutionSubmission(prepare) : null });
+  }
+
+  const submissionMatch = url.pathname.match(/^\/api\/execution\/submissions\/([^/]+)$/);
+  if (method === 'GET' && submissionMatch) {
+    const prepare = loadEffectiveSubmission({
+      store: submissionPersistence,
+      prepareId: submissionMatch[1],
+      onAbort: (row) => abortExecutionSubmissionCommit(row.id, 'commit_lease_expired'),
+    });
+    if (!prepare) return sendJson(res, 404, { ok: false, error: '未找到本次准备结果。' });
+    recordSubmissionRecoveryPoll(prepare);
+    return sendJson(res, 200, { ok: true, prepare: publicExecutionSubmission(prepare) });
+  }
+
+  if (method === 'POST' && url.pathname === '/api/execution/groups/start') {
+    return sendJson(res, 410, { ok: false, retired: true, error: '执行组只能由已确认的提交准备启动。' });
+  }
+
+  if (method === 'GET' && url.pathname === '/api/execution/groups/active') {
+    const group = executionGroupPersistence.active();
+    if (group) executionGroups.set(String(group.id), group);
+    return sendJson(res, 200, { ok: true, active: Boolean(group), group: group ? publicExecutionGroup(group) : null });
+  }
+
+  const executionGroupCancelMatch = url.pathname.match(/^\/api\/execution\/groups\/([^/]+)\/cancel$/);
+  if (method === 'POST' && executionGroupCancelMatch) {
+    const group = executionGroups.get(executionGroupCancelMatch[1]) || executionGroupPersistence.load(executionGroupCancelMatch[1]);
+    if (!group) return sendJson(res, 404, { ok: false, error: '未找到执行组。' });
+    requestExecutionGroupCancel(group);
+    return sendJson(res, 200, { ok: true, group: publicExecutionGroup(group) });
+  }
+
+  const executionGroupMatch = url.pathname.match(/^\/api\/execution\/groups\/([^/]+)$/);
+  if (method === 'GET' && executionGroupMatch) {
+    const group = executionGroups.get(executionGroupMatch[1]) || executionGroupPersistence.load(executionGroupMatch[1]);
+    if (!group) return sendJson(res, 404, { ok: false, error: '未找到执行组。' });
+    executionGroups.set(String(group.id), group);
+    return sendJson(res, 200, {
+      ok: true,
+      group: publicExecutionGroup(group, { compact: url.searchParams.get('compact') === '1' })
+    });
+  }
+
+  if (method === 'POST' && url.pathname === '/api/execution/jobs/start') {
+    return sendJson(res, 410, { ok: false, retired: true, error: '单账号执行入口已停用，请使用当前桌面版执行组。' });
+  }
+
+  if (method === 'GET' && url.pathname === '/api/execution/jobs/active') {
+    const activeStatuses = new Set(['queued', 'running', 'stopping']);
+    const execution = [...executionJobs.values()]
+      .filter((job) => activeStatuses.has(String(job.status || '').toLowerCase()))
+      .map(publicExecutionJob);
+    const benchmarks = [...writeBenchmarkJobs.values()]
+      .filter((job) => activeStatuses.has(String(job.status || '').toLowerCase()))
+      .map(publicWriteBenchmarkJob);
+    return sendJson(res, 200, {
+      ok: true,
+      active: execution.length + benchmarks.length > 0,
+      execution_jobs: execution,
+      benchmark_jobs: benchmarks,
+      execution_groups: [...executionGroups.values()]
+        .filter((group) => ACTIVE_EXECUTION_GROUP_STATUSES.has(String(group.status || '')))
+        .map(publicExecutionGroup),
+    });
   }
 
   const executionJobCancelMatch = url.pathname.match(/^\/api\/execution\/jobs\/([^/]+)\/cancel$/);
   if (method === 'POST' && executionJobCancelMatch) {
     const job = executionJobs.get(executionJobCancelMatch[1]);
     if (!job) return sendJson(res, 404, { ok: false, error: '未找到执行任务。' });
+    if (job.request?.executionGroupId) {
+      return sendJson(res, 410, { ok: false, retired: true, error: '组内任务只能通过执行组统一停止。' });
+    }
     job.cancel_requested = true;
     appendExecutionJobLog(job, '已收到停止请求，未开始的商品会尽快跳过。');
     appendExecutionJobEvent(job, { type: 'stop_requested', reason: '用户请求停止执行 job。' });
+    persistExecutionJob(job);
     return sendJson(res, 200, { ok: true, job: publicExecutionJob(job) });
   }
 
@@ -694,15 +1214,18 @@ async function handleApi(req, res) {
 
   const executionJobMatch = url.pathname.match(/^\/api\/execution\/jobs\/([^/]+)$/);
   if (method === 'GET' && executionJobMatch) {
-    const job = executionJobs.get(executionJobMatch[1]);
+    const jobId = executionJobMatch[1];
+    const job = executionJobs.get(jobId) || loadPersistedExecutionJob(jobId);
     if (!job) return sendJson(res, 404, { ok: false, error: '未找到执行任务。' });
+    executionJobs.set(job.id, job);
     return sendJson(res, 200, { ok: true, job: publicExecutionJob(job) });
   }
 
   if (method === 'POST' && url.pathname === '/api/batch/plan') {
     const body = await readJson(req);
     const { accountId, action } = requireFields(body, ['accountId', 'action']);
-    const promotions = listCampaignsFiltered(accountId, body.filters || {});
+    const settings = readSettings();
+    const promotions = listOperatingCampaignsFiltered(accountId, body.filters || {}, settings);
     const itemStatus = requireItemStatus(body.itemStatus || actionDefaultStatus(action));
     const itemsByPromotion = listItemsForPromotions(accountId, promotions, itemStatus);
     const fetchStatesByPromotion = planningFetchStates(accountId, promotions, itemStatus, Boolean(body.allowInventoryFallback));
@@ -737,64 +1260,11 @@ async function handleApi(req, res) {
     return sendJson(res, 200, { ok: true, itemStatus, taskIds, batch });
   }
 
-  if (method === 'POST' && url.pathname === '/api/batch/execute') {
-    const body = await readJson(req);
-    const { accountId, action } = requireFields(body, ['accountId', 'action']);
-    const settings = readSettings();
-    const request = { ...body, writeConcurrency: normalizeWriteConcurrency(body.writeConcurrency, settings.writeConcurrency) };
-    const itemStatus = requireItemStatus(body.itemStatus || actionDefaultStatus(action));
-    const protection = realSubmitProtection(request, { batch: true });
-    if (!protection.allowed) return sendJson(res, protection.status, { ok: false, ...protection });
-    const account = await ensureUsableAccount(accountId);
-    const promotionPrep = await preparePromotionsForExecution({ account, filters: body.filters || {} });
-    if (!promotionPrep.promotions.length) {
-      return sendJson(res, 409, {
-        ok: false,
-        error: '未找到匹配活动。已尝试自动读取活动列表，请检查店铺、站点、自建/官方活动筛选。',
-        prepare: promotionPrep.summary
-      });
-    }
-    const itemPrep = await prepareItemsForExecution({
-      account,
-      promotions: promotionPrep.promotions,
-      action,
-      itemStatus,
-      settings,
-      request
-    });
-    const promotions = promotionPrep.promotions;
-    const allowInventoryFallback = body.allowInventoryFallback !== false;
-    const itemsByPromotion = listItemsForPromotions(account.account_id, promotions, itemStatus);
-    const fetchStatesByPromotion = planningFetchStates(account.account_id, promotions, itemStatus, allowInventoryFallback);
-    const batch = buildBatchPlans({
-      action,
-      promotions,
-      itemsByPromotion,
-      fetchStatesByPromotion,
-      priceMode: body.priceMode || 'discount',
-      sellerDiscountPercent: Number(body.sellerDiscountPercent ?? 5),
-      officialDiscountPercent: Number(body.officialDiscountPercent ?? 6),
-      directPrice: body.directPrice === null || body.directPrice === undefined || body.directPrice === '' ? null : Number(body.directPrice),
-      requireFullFetch: Boolean(body.requireFullFetch),
-      sampleOnly: action === 'enroll' ? body.sampleOnly !== false : Boolean(body.sampleOnly),
-      allowInventoryFallback
-    });
-    const execution = await executeBatchPlans({
-      account,
-      action,
-      itemStatus,
-      batch,
-      request: { ...request, action, allowInventoryFallback, requireFullFetch: Boolean(body.requireFullFetch), sampleOnly: action === 'enroll' ? body.sampleOnly !== false : Boolean(body.sampleOnly), prepare: { promotions: promotionPrep.summary, items: itemPrep.summary } },
-      writeConcurrency: request.writeConcurrency
-    });
-    return sendJson(res, 200, { ok: true, message: '真实执行已完成。', action, itemStatus, prepare: { promotions: promotionPrep.summary, items: itemPrep.summary }, execution });
-  }
-
   if (method === 'POST' && url.pathname === '/api/cancel/filtered/preview') {
     const body = await readJson(req);
     const { accountId } = requireFields(body, ['accountId']);
     const settings = readSettings();
-    const promotions = listCampaignsFiltered(accountId, body.filters || {});
+    const promotions = listOperatingCampaignsFiltered(accountId, body.filters || {}, settings);
     const itemStatus = requireItemStatus(body.itemStatus || 'started');
     const itemsByPromotion = listItemsForPromotions(accountId, promotions, itemStatus);
     const fetchStatesByPromotion = listItemFetchStatesForPromotions(accountId, promotions, itemStatus);
@@ -811,63 +1281,20 @@ async function handleApi(req, res) {
     return sendJson(res, 200, { ok: true, action: 'cancel', itemStatus, taskIds, batch });
   }
 
-  if (method === 'POST' && url.pathname === '/api/cancel/filtered/precheck') {
-    const body = await readJson(req);
-    const { accountId } = requireFields(body, ['accountId']);
-    const settings = readSettings();
-    const request = { ...body, writeConcurrency: normalizeWriteConcurrency(body.writeConcurrency, settings.writeConcurrency) };
-    const itemStatus = requireItemStatus(body.itemStatus || 'started');
-    const protection = realSubmitProtection({ ...request, mode: request.mode || 'real' }, { batch: true });
-    if (!protection.allowed) return sendJson(res, protection.status, { ok: false, ...protection });
-    const account = await ensureUsableAccount(accountId);
-    const promotionPrep = await preparePromotionsForExecution({ account, filters: body.filters || {} });
-    if (!promotionPrep.promotions.length) {
-      return sendJson(res, 409, {
-        ok: false,
-        error: '未找到匹配活动。已尝试自动读取活动列表，请检查店铺、站点、活动筛选。',
-        prepare: promotionPrep.summary
-      });
-    }
-    const itemPrep = await prepareItemsForExecution({
-      account,
-      promotions: promotionPrep.promotions,
-      action: 'cancel',
-      itemStatus,
-      settings,
-      request
-    });
-    const promotions = promotionPrep.promotions;
-    const itemsByPromotion = listItemsForPromotions(account.account_id, promotions, itemStatus);
-    const fetchStatesByPromotion = listItemFetchStatesForPromotions(account.account_id, promotions, itemStatus);
-    const batch = buildBatchPlans({ action: 'cancel', promotions, itemsByPromotion, fetchStatesByPromotion });
-    const execution = await executeBatchPlans({
-      account,
-      action: 'cancel',
-      itemStatus,
-      batch,
-      request: { ...request, action: 'cancel', prepare: { promotions: promotionPrep.summary, items: itemPrep.summary } },
-      writeConcurrency: request.writeConcurrency
-    });
-    return sendJson(res, 200, { ok: true, message: '筛选取消真实执行已完成。', action: 'cancel', itemStatus, prepare: { promotions: promotionPrep.summary, items: itemPrep.summary }, execution });
-  }
-
-  if (method === 'POST' && url.pathname === '/api/execute') {
-    const body = await readJson(req);
-    return executeAction(res, body);
-  }
-
   if (method === 'POST' && url.pathname === '/api/today/decision') {
     const body = await readJson(req);
-    const { accountId } = requireFields(body, ['accountId']);
-    const promotions = listCampaignsFiltered(accountId, body.filters || readSettings().defaultFilters);
-    return sendJson(res, 200, { ok: true, decision: buildTodayDecision(accountId, promotions) });
+    const settings = readSettings();
+    const accountIds = [...new Set((body.accountIds || [body.accountId]).map(String).filter(Boolean))];
+    if (!accountIds.length) requireFields(body, ['accountId']);
+    const promotions = accountIds.flatMap((accountId) => listOperatingCampaignsFiltered(accountId, body.filters || settings.defaultFilters, settings));
+    return sendJson(res, 200, { ok: true, decision: buildTodayDecisionForScope(accountIds, promotions) });
   }
 
   if (method === 'POST' && url.pathname === '/api/today/preview') {
     const body = await readJson(req);
     const { accountId } = requireFields(body, ['accountId']);
     const settings = readSettings();
-    const promotions = listCampaignsFiltered(accountId, body.filters || settings.defaultFilters);
+    const promotions = listOperatingCampaignsFiltered(accountId, body.filters || settings.defaultFilters, settings);
     const decision = buildTodayDecision(accountId, promotions);
     const action = decision.action;
     const itemStatus = requireItemStatus(body.itemStatus || actionDefaultStatus(action));
@@ -887,74 +1314,6 @@ async function handleApi(req, res) {
     });
     const taskIds = saveBatchPlanTasks({ accountId, action, batch });
     return sendJson(res, 200, { ok: true, decision, itemStatus, taskIds, batch });
-  }
-
-  if (method === 'POST' && (url.pathname === '/api/today/precheck' || url.pathname === '/api/today/execute')) {
-    const body = await readJson(req);
-    const { accountId } = requireFields(body, ['accountId']);
-    const settings = readSettings();
-    const request = { ...body, writeConcurrency: normalizeWriteConcurrency(body.writeConcurrency, settings.writeConcurrency) };
-    const protection = realSubmitProtection({ ...request, mode: request.mode || 'real' }, { batch: true });
-    if (!protection.allowed) return sendJson(res, protection.status, { ok: false, ...protection });
-    const account = await ensureUsableAccount(accountId);
-    const promotionPrep = await preparePromotionsForExecution({ account, filters: body.filters || settings.defaultFilters });
-    if (!promotionPrep.promotions.length) {
-      return sendJson(res, 409, {
-        ok: false,
-        error: '未找到匹配活动。已尝试自动读取活动列表，请检查店铺、站点、自建/官方活动筛选。',
-        prepare: promotionPrep.summary
-      });
-    }
-    const promotions = promotionPrep.promotions;
-    const decision = buildTodayDecision(account.account_id, promotions);
-    const action = decision.action;
-    const itemStatus = requireItemStatus(body.itemStatus || actionDefaultStatus(action));
-    const itemPrep = await prepareItemsForExecution({
-      account,
-      promotions,
-      action,
-      itemStatus,
-      settings,
-      request
-    });
-    const itemsByPromotion = listItemsForPromotions(account.account_id, promotions, itemStatus);
-    const fetchStatesByPromotion = listItemFetchStatesForPromotions(account.account_id, promotions, itemStatus);
-    const batch = buildBatchPlans({
-      action,
-      promotions,
-      itemsByPromotion,
-      fetchStatesByPromotion,
-      priceMode: body.priceMode || 'discount',
-      sellerDiscountPercent: Number(body.sellerDiscountPercent ?? settings.sellerDefaultDiscount),
-      officialDiscountPercent: Number(body.officialDiscountPercent ?? settings.officialDefaultDiscount),
-      directPrice: body.directPrice === null || body.directPrice === undefined || body.directPrice === '' ? null : Number(body.directPrice),
-      requireFullFetch: Boolean(body.requireFullFetch),
-      sampleOnly: action === 'enroll' ? body.sampleOnly !== false : Boolean(body.sampleOnly)
-    });
-    if (decision.already_completed) {
-      return sendJson(res, 409, {
-        ok: false,
-        error: '今天已完整执行，默认不重复提交。',
-        today_decision: decision
-      });
-    }
-    const execution = await executeBatchPlans({
-      account,
-      action,
-      itemStatus,
-      batch,
-      request: { ...request, action, requireFullFetch: Boolean(body.requireFullFetch), sampleOnly: action === 'enroll' ? body.sampleOnly !== false : Boolean(body.sampleOnly), prepare: { promotions: promotionPrep.summary, items: itemPrep.summary } },
-      writeConcurrency: request.writeConcurrency
-    });
-    return sendJson(res, 200, {
-      ok: true,
-      message: '今日真实执行已完成。',
-      today_decision: decision,
-      action,
-      itemStatus,
-      prepare: { promotions: promotionPrep.summary, items: itemPrep.summary },
-      execution
-    });
   }
 
   if (method === 'POST' && url.pathname === '/api/cycle/decision') {
@@ -981,6 +1340,15 @@ async function handleApi(req, res) {
     return sendJson(res, 200, {
       ok: true,
       tasks: listTaskSummaries(Number(url.searchParams.get('limit') || 300), { includeDetails })
+    });
+  }
+
+  if (method === 'GET' && url.pathname === '/api/today/global-discount') {
+    const settings = readSettings();
+    const tasks = listGlobalDiscountUpdateSummaries(300);
+    return sendJson(res, 200, {
+      ok: true,
+      discount: buildGlobalTodayDiscount({ tasks, settings, today: new Date() })
     });
   }
 
@@ -1088,7 +1456,8 @@ async function handleOAuthCallback(req, res) {
   if (!code || !state) return sendHtml(res, 400, '<h1>授权失败</h1><p>缺少 code 或 state。</p>');
   try {
     const completedAccount = await completeOAuthAuthorization({ code, state });
-    return sendHtml(res, 200, `<h1>授权成功</h1><p>账号 ${escapeHtml(completedAccount.display_name || completedAccount.account_id)} 已保存。可以回到折扣管家继续操作。</p>`);
+    const storeName = storeIdentityForAccount(completedAccount.account_id, completedAccount).store_name;
+    return sendHtml(res, 200, `<h1>授权成功</h1><p>${escapeHtml(storeName)}已保存。可以回到折扣管家继续操作。</p>`);
   } catch (error) {
     return sendHtml(res, error.status || 500, `<h1>授权失败</h1><p>${escapeHtml(error.message || '授权保存失败')}</p>`);
   }
@@ -1358,7 +1727,7 @@ async function completeOAuthAuthorization({ code, state }) {
   });
   const authed = new MercadoLibreClient({ accessToken: token.access_token, userId: token.user_id });
   const profile = await authed.getMe();
-  return saveTokenAccount({
+  const account = saveTokenAccount({
     token,
     profile,
     clientId: record.clientId,
@@ -1366,6 +1735,9 @@ async function completeOAuthAuthorization({ code, state }) {
     redirectUri: record.redirectUri,
     authDomain: record.authDomain
   });
+  const cached = accountProfileRecord({ accountId: account.account_id, provider: account.provider, profile, source: 'users_me' });
+  if (cached) saveAccountProfile(cached);
+  return account;
 }
 
 async function executeAction(res, body) {
@@ -1492,7 +1864,7 @@ async function executeAction(res, body) {
       action,
       mode: 'real',
       status: 'failed',
-      errorCn: `平台还有 ${unreadable} 个候选未返回明细，本次未执行。`
+      errorCn: unreadableItemDetailMessage({ action, itemStatus, count: unreadable })
     });
   }
   let recheck = null;
@@ -1535,11 +1907,22 @@ async function executeAction(res, body) {
   });
 }
 
-async function recheckAndCancelRemainingStarted({ client, accountId, campaign, promotionId, promotionType, action, taskId, writeConcurrency, maxRounds, counts, executionJobId, shouldCancel }) {
+async function recheckAndCancelRemainingStarted({ client, accountId, campaign, promotionId, promotionType, action, taskId, writeConcurrency, maxRounds, counts, saveResult = saveExecutionResult, executionJobId, shouldCancel }) {
   const rounds = [];
   for (let round = 1; round <= maxRounds; round += 1) {
-    if (shouldCancel?.()) return { remainingStarted: null, rounds, completed: false, cancelled: true };
-    const after = await client.fetchAllPromotionItems({ promotionId, promotionType, status: 'started', maxItems: 5000 });
+    if (shouldCancel?.()) return { remainingStarted: null, remainingItemIds: null, rounds, completed: false, cancelled: true };
+    let after;
+    try {
+      after = await client.fetchAllPromotionItems({ promotionId, promotionType, status: 'started', maxItems: 5000 });
+    } catch (error) {
+      return {
+        remainingStarted: null,
+        remainingItemIds: null,
+        rounds,
+        completed: false,
+        read_error: toChineseError(error),
+      };
+    }
     saveItems(accountId, promotionId, promotionType, after.results, {
       childUserId: campaign?.child_user_id,
       siteId: campaign?.site_id,
@@ -1548,7 +1931,7 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
       itemStatus: 'started'
     });
     rounds.push({ round, remainingStarted: after.results.length });
-    if (after.results.length === 0) return { remainingStarted: 0, rounds, completed: true };
+    if (after.results.length === 0) return { remainingStarted: 0, remainingItemIds: [], rounds, completed: true };
     if (String(promotionType || '').toUpperCase() === 'SMART') {
       for (const item of after.results) {
         appendExecutionItemAuditEvent(executionJobId, {
@@ -1562,7 +1945,7 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
           reason: 'SMART取消验证只做只读回查，不自动重试剩余商品'
         });
       }
-      return { remainingStarted: after.results.length, rounds, completed: false, smart_cancel_no_auto_retry: true };
+      return { remainingStarted: after.results.length, remainingItemIds: after.results.map((item) => String(item.item_id || item.id || '')).filter(Boolean), rounds, completed: false, smart_cancel_no_auto_retry: true };
     }
     if (round === maxRounds) {
       for (const item of after.results) {
@@ -1577,7 +1960,7 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
           reason: '取消后仍处于 started'
         });
       }
-      return { remainingStarted: after.results.length, rounds, completed: false };
+      return { remainingStarted: after.results.length, remainingItemIds: after.results.map((item) => String(item.item_id || item.id || '')).filter(Boolean), rounds, completed: false };
     }
 
     const retryPlan = buildPlan({
@@ -1596,7 +1979,7 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
       writeConcurrency,
       shouldCancel,
       executeOne: ({ row, itemId }) => executeOnePlanned(client, action, campaign, row, { itemId, promotionId, promotionType }),
-      saveResult: saveExecutionResult,
+      saveResult,
       toErrorText: toChineseError,
       classifyError: classifyExecutionWriteError,
       onItemEvent: (event) => appendExecutionItemAuditEvent(executionJobId, {
@@ -1608,11 +1991,8 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
         retryRound: round
       })
     });
-    counts.success += retry.counts.success;
-    counts.failed += retry.counts.failed;
-    counts.skipped += retry.counts.skipped;
   }
-  return { remainingStarted: null, rounds, completed: false };
+  return { remainingStarted: null, remainingItemIds: null, rounds, completed: false };
 }
 
 function executeOne(client, action, input) {
@@ -1692,29 +2072,930 @@ function writeItemPath(client, itemId) {
 
 function listAccountsForUi() {
   const stored = listStoredAccounts().map((account) => ({ ...account, auth_source: 'local' }));
-  if (!hasStandaloneAuth()) return stored;
-  const standalone = standaloneAccountSummary();
-  if (!standalone) return stored;
-  const exists = stored.some((account) => String(account.account_id) === String(standalone.account_id));
-  return exists ? stored : [standalone, ...stored];
+  const settings = readSettings();
+  let accounts = stored;
+  if (hasStandaloneAuth()) {
+    const standalone = standaloneAccountSummary();
+    if (standalone && !stored.some((account) => String(account.account_id) === String(standalone.account_id))) {
+      accounts = [standalone, ...stored];
+    }
+  }
+  return accounts.map((account) => {
+    const profile = getAccountProfile(account.account_id);
+    const identity = resolveStoreIdentity({
+      accountId: account.account_id,
+      account,
+      profile,
+      storeAliases: settings.storeAliases,
+      standaloneNickname: account.profile?.nickname,
+    });
+    return {
+      ...account,
+      display_name: identity.raw_display_name,
+      ...identity,
+      site_id: profile?.site_id || account.site_id || null,
+      profile_fetched_at: profile?.fetched_at || null,
+      profile_source: profile?.source || null
+    };
+  });
+}
+
+async function refreshAccountProfile(accountId) {
+  const account = await ensureUsableAccount(accountId);
+  const profile = account.profile || await new MercadoLibreClient({
+    accessToken: account.accessToken,
+    userId: account.account_id
+  }).getMe();
+  const record = accountProfileRecord({
+    accountId: account.account_id,
+    provider: account.provider || 'mercadolibre',
+    profile,
+    source: 'users_me'
+  });
+  if (record) saveAccountProfile(record);
+  return publicAccount({ ...account, display_name: profile.nickname || account.display_name, site_id: profile.site_id || account.site_id });
+}
+
+function normalizeAccountIdList(value) {
+  const raw = Array.isArray(value) ? value : String(value || '').split(',');
+  return [...new Set(raw.map((item) => String(item || '').trim()).filter(Boolean))];
+}
+
+function hasSellerCampaignTargetSelections(body = {}) {
+  return Array.isArray(body.targetSelections)
+    || Array.isArray(body.target_selections)
+    || Array.isArray(body.selectedTargets)
+    || Array.isArray(body.selected_targets);
+}
+
+function normalizeSellerCampaignTargetSelections(body = {}) {
+  const raw = body.targetSelections || body.target_selections || body.selectedTargets || body.selected_targets || [];
+  return (Array.isArray(raw) ? raw : [])
+    .map((entry) => ({
+      account_id: String(entry?.accountId ?? entry?.account_id ?? '').trim(),
+      child_user_id: String(entry?.childUserId ?? entry?.child_user_id ?? '').trim(),
+      site_id: String(entry?.siteId ?? entry?.site_id ?? '').trim().toUpperCase()
+    }))
+    .filter((entry) => entry.account_id && entry.child_user_id && entry.site_id);
+}
+
+function filterSellerCampaignCreateTargets(targets = [], selections = [], hasSelections = false) {
+  if (!hasSelections) return targets;
+  const allowed = new Set(selections.map(accountRouteKey));
+  return targets.filter((target) => allowed.has(accountRouteKey(target)));
+}
+
+function sellerCampaignTargetKey(target = {}) {
+  return accountRouteKey(target);
+}
+
+function sellerCampaignNotSelectedTargets(targets = [], selectedTargets = [], hasSelections = false) {
+  if (!hasSelections) return [];
+  const selected = new Set(selectedTargets.map(sellerCampaignTargetKey));
+  return targets.filter((target) => !selected.has(sellerCampaignTargetKey(target)));
+}
+
+async function buildLiveSellerCampaignCreateTargets({ accountIds = [], filters = {}, settings = {}, catalogRefreshByAccount = null, signal = null, checkpoint = null, readScheduler = null } = {}) {
+  const targetGroups = await Promise.all(accountIds.map(async (accountId) => {
+    const targets = [];
+    const safeAccountId = String(accountId || '');
+    if (!safeAccountId) return targets;
+    const liveStatusByRoute = new Map();
+    try {
+      checkpoint?.();
+      const account = await ensureUsableAccount(safeAccountId);
+      checkpoint?.();
+      const preparedCatalog = catalogRefreshByAccount instanceof Map ? catalogRefreshByAccount.get(safeAccountId) : null;
+      const fetched = preparedCatalog || await refreshActivityCatalogForPrepare({ account, filters, settings, signal, checkpoint, readScheduler });
+      checkpoint?.();
+      for (const [routeKey, summary] of activityCatalogSellerStatus(safeAccountId, fetched, filters, settings)) liveStatusByRoute.set(routeKey, summary);
+    } catch (error) {
+      if (signal?.aborted
+          || String(error?.code || '').startsWith('COMMIT_')
+          || String(error?.code || '').startsWith('SUBMISSION_')
+          || String(error?.code || '').startsWith('ACTIVITY_ACCOUNT_ROUTE_')) throw error;
+      const cachedTargets = sellerCampaignCreateTargetsForAccount({ accountId: safeAccountId, filters, settings });
+      for (const target of cachedTargets) {
+        targets.push({
+          ...target,
+          hasSellerCampaign: false,
+          detection_status: 'unreadable',
+          detection_message: `无法确认该店铺站点是否已有自建活动：${toChineseError(error)}`
+        });
+      }
+      return targets;
+    }
+    targets.push(...sellerCampaignCreateTargetsForAccount({ accountId: safeAccountId, filters, settings, liveStatusByRoute }));
+    return targets;
+  }));
+  return targetGroups.flat();
+}
+
+async function recoverHiddenSellerCampaignsForPreparedAccount({
+  account,
+  filters = {},
+  settings = {},
+  catalogRefresh,
+  signal = null,
+  checkpoint = null,
+  readScheduler = null,
+} = {}) {
+  const accountId = String(account?.account_id || '');
+  if (!accountId) return [];
+  const liveStatusByRoute = activityCatalogSellerStatus(accountId, catalogRefresh, filters, settings);
+  const targets = sellerCampaignCreateTargetsForAccount({ accountId, filters, settings, liveStatusByRoute });
+  if (!targets.some((target) => target.detection_status === HIDDEN_SELLER_CAMPAIGN_STATUS)) return targets;
+  const clients = new Map();
+  return resolveHiddenSellerCampaignTargets({
+    targets,
+    recoverByName: async (target, name) => {
+      checkpoint?.();
+      const route = normalizeAccountRoute(target);
+      const clientKey = accountRouteKey(route);
+      let client = clients.get(clientKey);
+      if (!client) {
+        client = new MercadoLibreClient({
+          accessToken: account.accessToken,
+          userId: route.child_user_id,
+          callerId: accountId,
+          marketplace: true,
+          readScheduler,
+          readAccountId: accountId,
+        });
+        clients.set(clientKey, client);
+      }
+      const recovery = await recoverDuplicateSellerCampaign({
+        target: route,
+        name,
+        forceCatalogRefresh: async () => listCampaignsFiltered(accountId, {
+          siteIds: [route.site_id], promotionTypes: ['SELLER_CAMPAIGN'],
+        }).filter((campaign) => accountRouteKey(campaign) === accountRouteKey(route)),
+        listHistoricalCandidates: async () => listSellerCampaignRecoveryCandidates({
+          accountId, childUserId: route.child_user_id, siteId: route.site_id, name,
+        }),
+        listWebhookCandidates: async () => listVerifiedActivityCallbackPromotionMappings({
+          accountId, childUserId: route.child_user_id, siteId: route.site_id, promotionType: 'SELLER_CAMPAIGN',
+        }),
+        readPromotionDetail: async (candidate) => {
+          checkpoint?.();
+          const detail = await client.getPromotionDetail({
+            promotionId: candidate.promotion_id,
+            promotionType: 'SELLER_CAMPAIGN',
+            userId: route.child_user_id,
+            signal,
+          });
+          checkpoint?.();
+          return bindActivityToAccountRoute(extractSellerCampaignDetail(detail, candidate.promotion_id), route);
+        },
+      });
+      if (recovery.status !== 'existing' || !recovery.promotion_id || !recovery.promotion) return recovery;
+      saveCampaigns(accountId, [recovery.promotion], {
+        merchantId: accountId,
+        childUserId: route.child_user_id,
+        siteId: route.site_id,
+        logisticType: target.logistic_type || null,
+      });
+      markActivityCacheDirty({
+        accountId,
+        siteId: route.site_id,
+        promotionId: recovery.promotion_id,
+        promotionType: 'SELLER_CAMPAIGN',
+      });
+      return recovery;
+    },
+  });
+}
+
+function sellerCampaignCreateTargetsForAccount({ accountId, filters = {}, settings = {}, liveStatusByRoute = null } = {}) {
+  const safeAccountId = String(accountId || '');
+  if (!safeAccountId) return [];
+  const selectedSites = new Set(
+    (Array.isArray(filters.siteIds) ? filters.siteIds : String(filters.siteId || '').split(','))
+      .map((siteId) => String(siteId || '').trim())
+      .filter(Boolean)
+  );
+  const sites = filterByOperatingSites(listSiteSummaries(safeAccountId), settings, safeAccountId)
+    .filter((site) => !selectedSites.size || selectedSites.has(String(site.site_id || '')));
+  const siteMap = new Map();
+  for (const site of sites) {
+    const siteId = String(site.site_id || '').trim();
+    if (!siteId) continue;
+    const current = siteMap.get(siteId);
+    if (!current) {
+      siteMap.set(siteId, site);
+      continue;
+    }
+    siteMap.set(siteId, mergeSellerCampaignCreateSite(current, site));
+  }
+  const sellerCampaigns = listOperatingCampaignsFiltered(safeAccountId, {
+    siteIds: [...siteMap.keys()],
+    promotionTypes: ['SELLER_CAMPAIGN']
+  });
+  const sellerByRoute = new Map();
+  for (const campaign of sellerCampaigns) {
+    const routeKey = accountRouteKey({
+      account_id: safeAccountId,
+      child_user_id: campaign.child_user_id,
+      site_id: campaign.site_id,
+    });
+    const current = sellerByRoute.get(routeKey) || [];
+    current.push(campaign);
+    sellerByRoute.set(routeKey, current);
+  }
+  const hiddenByRoute = new Map();
+  for (const hidden of listHiddenSellerCampaignsForAccount(safeAccountId)) {
+    const routeKey = accountRouteKey(hidden);
+    const current = hiddenByRoute.get(routeKey) || [];
+    current.push(hidden);
+    hiddenByRoute.set(routeKey, current);
+  }
+  const account = getAccount(safeAccountId) || listAccountsForUi().find((row) => String(row.account_id) === safeAccountId) || { account_id: safeAccountId };
+  const storeName = storeIdentityForAccount(safeAccountId, account, settings).store_name;
+  return [...siteMap.values()].map((site) => {
+    const siteId = String(site.site_id || '');
+    const route = normalizeAccountRoute({ account_id: safeAccountId, child_user_id: site.child_user_id, site_id: siteId });
+    const existing = sellerByRoute.get(accountRouteKey(route)) || [];
+    const hidden = hiddenByRoute.get(accountRouteKey(route)) || [];
+    const live = liveStatusByRoute instanceof Map ? liveStatusByRoute.get(accountRouteKey(route)) : null;
+    const detection = sellerCampaignDetectionForSite({ live, existing, hidden });
+    return {
+      ...route,
+      store_name: storeName,
+      site_id: siteId,
+      site_name: siteDisplayName(siteId),
+      promotion_type: 'SELLER_CAMPAIGN',
+      hasSellerCampaign: detection.status === 'existing',
+      existing_seller_campaign_count: detection.count,
+      detection_status: detection.status,
+      detection_message: detection.message,
+      hidden_activity_names: detection.hidden_activity_names || []
+    };
+  });
+}
+
+function sellerCampaignDetectionForSite({ live = null, existing = [], hidden = [] } = {}) {
+  if (!live) {
+    if (existing.length > 0) return { status: 'existing', count: existing.length, message: '本地活动列表已有自建活动。' };
+    if (hidden.length > 0) {
+      return {
+        status: HIDDEN_SELLER_CAMPAIGN_STATUS,
+        count: hidden.length,
+        hidden_activity_names: [...new Set(hidden.map((row) => String(row.promotion_name || '')).filter(Boolean))],
+        message: HIDDEN_SELLER_CAMPAIGN_MESSAGE,
+      };
+    }
+    return { status: 'visibility_unknown', count: 0, message: '接口未读取到自建活动，不代表后台不存在；本次禁止自动创建。' };
+  }
+  const sellerCount = Number(live.seller_campaign_count || 0);
+  if (sellerCount > 0) {
+    return { status: 'existing', count: sellerCount, message: '实时接口已读取到自建活动。' };
+  }
+  if (hidden.length > 0) {
+    return {
+      status: HIDDEN_SELLER_CAMPAIGN_STATUS,
+      count: hidden.length,
+      hidden_activity_names: [...new Set(hidden.map((row) => String(row.promotion_name || '')).filter(Boolean))],
+      message: HIDDEN_SELLER_CAMPAIGN_MESSAGE,
+    };
+  }
+  const okCount = Number(live.ok_count || 0);
+  if (okCount > 0) {
+    return { status: 'visibility_unknown', count: 0, message: '接口未读取到自建活动，不代表后台不存在；本次禁止自动创建。' };
+  }
+  const message = Array.isArray(live.errors) && live.errors.length
+    ? `无法确认该店铺站点是否已有自建活动：${live.errors[0]}`
+    : '无法确认该店铺站点是否已有自建活动。';
+  return { status: 'unreadable', count: 0, message };
+}
+
+function mergeSellerCampaignCreateSite(current = {}, next = {}) {
+  const preferred = sellerCampaignCreateSiteScore(next) > sellerCampaignCreateSiteScore(current) ? next : current;
+  return {
+    ...current,
+    child_user_id: preferred.child_user_id || current.child_user_id || next.child_user_id,
+    logistic_type: preferred.logistic_type || current.logistic_type || next.logistic_type,
+    last_promotion_status: preferred.last_promotion_status || current.last_promotion_status || next.last_promotion_status,
+    last_error: preferred.last_error || current.last_error || next.last_error,
+    updated_at: preferred.updated_at || current.updated_at || next.updated_at,
+    total: Number(current.total || 0) + Number(next.total || 0),
+    last_promotion_count: Math.max(Number(current.last_promotion_count || 0), Number(next.last_promotion_count || 0))
+  };
+}
+
+function sellerCampaignCreateSiteScore(site = {}) {
+  const logisticType = String(site.logistic_type || '').toLowerCase();
+  let score = 0;
+  score += Number(site.last_promotion_count || 0) * 1000;
+  score += Number(site.total || 0) * 100;
+  if (logisticType === 'remote') score += 50;
+  if (logisticType === 'fulfillment') score -= 50;
+  if (site.child_user_id) score += 10;
+  if (String(site.last_promotion_status || '').toLowerCase() === 'ok') score += 5;
+  return score;
+}
+
+async function createMissingSellerCampaigns({
+  runId: requestedRunId = null,
+  missingTargets = [],
+  existingTargets = [],
+  notSelectedTargets = [],
+  unreadableTargets = [],
+  name,
+  startDate,
+  finishDate,
+  signal = null,
+  checkpoint = null,
+  onProgress = null,
+  readScheduler = null,
+} = {}) {
+  assertSellerCampaignCreateTargetRoutes(missingTargets);
+  const runId = requestedRunId || `seller-campaign-create-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const created = [];
+  const failed = [];
+  const recheckMissing = [];
+  const apiSucceeded = [];
+  const recoveredExisting = [];
+  const hiddenWithoutVisibleId = [];
+  const accountsToRefresh = new Map();
+  const emitProgress = (phase) => onProgress?.({
+    run_id: runId,
+    phase,
+    target_count: missingTargets.length,
+    api_succeeded_count: apiSucceeded.length,
+    failed_count: failed.length,
+    recheck_missing_count: recheckMissing.length,
+    created_count: created.length,
+    recovered_existing_count: recoveredExisting.length,
+    existing_without_visible_id_count: hiddenWithoutVisibleId.length,
+  });
+  for (const target of existingTargets) {
+    saveSellerCampaignCreateResult({
+      runId,
+      target,
+      name,
+      startDate,
+      finishDate,
+      selected: true,
+      requestStatus: 'already_exists',
+      rechecked: true
+    });
+  }
+  for (const target of notSelectedTargets) {
+    saveSellerCampaignCreateResult({
+      runId,
+      target,
+      name,
+      startDate,
+      finishDate,
+      selected: false,
+      requestStatus: 'not_selected'
+    });
+  }
+  for (const target of unreadableTargets) {
+    saveSellerCampaignCreateResult({
+      runId,
+      target,
+      name,
+      startDate,
+      finishDate,
+      selected: true,
+      requestStatus: 'unreadable_blocked',
+      errorCn: target.error || target.detection_message || '无法确认该店铺站点是否已有自建活动，已阻断创建。'
+    });
+  }
+  for (const target of missingTargets) {
+    checkpoint?.();
+    const accountId = String(target.account_id || '');
+    const childUserId = String(target.child_user_id || '');
+    const siteId = String(target.site_id || '');
+    const publicTarget = publicSellerCampaignTarget(target);
+    if (!accountId || !childUserId || !siteId) {
+      failed.push({ ...publicTarget, error: '店铺站点资料不完整，未发送创建请求。' });
+      saveSellerCampaignCreateResult({
+        runId,
+        target,
+        name,
+        startDate,
+        finishDate,
+        selected: true,
+        requestStatus: 'failed',
+        errorCn: '店铺站点资料不完整，未发送创建请求。'
+      });
+      emitProgress('target_blocked');
+      continue;
+    }
+    let requestSent = false;
+    let responseRecorded = false;
+    let account = null;
+    let client = null;
+    try {
+      checkpoint?.();
+      account = await ensureUsableAccount(accountId);
+      checkpoint?.();
+      accountsToRefresh.set(accountId, account);
+      const callerUserId = String(account.account_id || accountId);
+      client = new MercadoLibreClient({
+        accessToken: account.accessToken,
+        userId: childUserId,
+        callerId: callerUserId,
+        marketplace: true
+      });
+      saveSellerCampaignCreateResult({
+        runId,
+        target,
+        name,
+        startDate,
+        finishDate,
+        selected: true,
+        requestStatus: 'request_sending'
+      });
+      emitProgress('request_sending');
+      checkpoint?.();
+      requestSent = true;
+      const response = await client.createSellerCampaign({
+        childUserId,
+        callerId: callerUserId,
+        clientUserId: callerUserId,
+        name,
+        startDate,
+        finishDate,
+        subType: 'FLEXIBLE_PERCENTAGE',
+        signal,
+      });
+      const body = response?.body ?? response;
+      const promotionId = extractCreatedSellerCampaignId(body);
+      const entry = {
+        target,
+        publicTarget,
+        promotionId,
+        httpStatus: response?.http_status || null
+      };
+      apiSucceeded.push(entry);
+      saveSellerCampaignCreateResult({
+        runId,
+        target,
+        name,
+        startDate,
+        finishDate,
+        selected: true,
+        requestStatus: 'api_success_pending_recheck',
+        promotionId,
+        httpStatus: entry.httpStatus
+      });
+      responseRecorded = true;
+      invalidateMarketplaceSiteCatalog({ accountId, childUserId, siteId });
+      if (promotionId) {
+        try {
+          const writeThrough = sellerCampaignWriteThroughPromotion({
+            route: { account_id: accountId, child_user_id: childUserId, site_id: siteId },
+            promotionId,
+            name,
+            startDate,
+            finishDate,
+            response: body,
+          });
+          saveCampaigns(accountId, [writeThrough], {
+            merchantId: accountId,
+            childUserId,
+            siteId,
+            logisticType: target.logistic_type || null,
+          });
+          markActivityCacheDirty({
+            accountId,
+            siteId,
+            promotionId: writeThrough.promotion_id,
+            promotionType: writeThrough.promotion_type,
+          });
+          entry.writeThrough = true;
+        } catch (writeThroughError) {
+          entry.writeThroughError = toChineseError(writeThroughError);
+        }
+      }
+      emitProgress('api_response_saved');
+      checkpoint?.();
+    } catch (error) {
+      if (signal?.aborted || String(error?.code || '').startsWith('COMMIT_') || String(error?.code || '').startsWith('SUBMISSION_')) {
+        if (requestSent && !responseRecorded) {
+          saveSellerCampaignCreateResult({
+            runId,
+            target,
+            name,
+            startDate,
+            finishDate,
+            selected: true,
+            requestStatus: 'request_outcome_unknown',
+            errorCn: '创建请求已发出但响应未确认，后续必须先实时回查，程序不会自动重复创建。'
+          });
+        }
+        throw error;
+      }
+      if (requestSent && isDuplicateSellerCampaignNameError(error) && account && client) {
+        responseRecorded = true;
+        const route = { account_id: accountId, child_user_id: childUserId, site_id: siteId };
+        const recovery = await recoverDuplicateSellerCampaign({
+          target: route,
+          name,
+          forceCatalogRefresh: async () => {
+            checkpoint?.();
+            await fetchAndSavePromotions(account, {
+              routes: [route],
+              signal,
+              checkpoint,
+              readScheduler,
+            });
+            checkpoint?.();
+            return listCampaignsFiltered(accountId, { siteIds: [siteId], promotionTypes: ['SELLER_CAMPAIGN'] })
+              .filter((campaign) => accountRouteKey(campaign) === accountRouteKey(route));
+          },
+          listHistoricalCandidates: async () => listSellerCampaignRecoveryCandidates({
+            accountId, childUserId, siteId, name,
+          }),
+          listWebhookCandidates: async () => listVerifiedActivityCallbackPromotionMappings({
+            accountId, childUserId, siteId, promotionType: 'SELLER_CAMPAIGN',
+          }),
+          readPromotionDetail: async (candidate) => {
+            checkpoint?.();
+            const detail = await client.getPromotionDetail({
+              promotionId: candidate.promotion_id,
+              promotionType: 'SELLER_CAMPAIGN',
+              userId: childUserId,
+              signal,
+            });
+            checkpoint?.();
+            return bindActivityToAccountRoute(extractSellerCampaignDetail(detail, candidate.promotion_id), route);
+          },
+        });
+        if (recovery.status === 'existing' && recovery.promotion_id) {
+          if (recovery.promotion) {
+            saveCampaigns(accountId, [recovery.promotion], {
+              merchantId: accountId,
+              childUserId,
+              siteId,
+              logisticType: target.logistic_type || null,
+            });
+          }
+          recoveredExisting.push({
+            ...publicTarget,
+            status: 'existing_recovered',
+            detection_status: 'existing',
+            promotion_type: 'SELLER_CAMPAIGN',
+            promotion_name: String(name || ''),
+            promotion_id: recovery.promotion_id,
+            recovery_source: recovery.recovery_source,
+            rechecked: true,
+          });
+          saveSellerCampaignCreateResult({
+            runId,
+            target,
+            name,
+            startDate,
+            finishDate,
+            selected: true,
+            requestStatus: 'duplicate_name_recovered',
+            promotionId: recovery.promotion_id,
+            httpStatus: error?.status || null,
+            errorRaw: safeSellerCampaignCreateError(error),
+            rechecked: true,
+            detectionStatus: 'existing',
+          });
+          emitProgress('duplicate_name_recovered');
+          continue;
+        }
+        const hidden = {
+          ...publicTarget,
+          status: HIDDEN_SELLER_CAMPAIGN_STATUS,
+          detection_status: HIDDEN_SELLER_CAMPAIGN_STATUS,
+          detection_reason: 'duplicate_name_hidden',
+          detection_message: HIDDEN_SELLER_CAMPAIGN_MESSAGE,
+          promotion_type: 'SELLER_CAMPAIGN',
+          promotion_name: String(name || ''),
+          promotion_id: '',
+          rechecked: false,
+        };
+        hiddenWithoutVisibleId.push(hidden);
+        saveSellerCampaignCreateResult({
+          runId,
+          target,
+          name,
+          startDate,
+          finishDate,
+          selected: true,
+          requestStatus: 'duplicate_name_hidden',
+          httpStatus: error?.status || null,
+          errorCn: HIDDEN_SELLER_CAMPAIGN_MESSAGE,
+          errorRaw: safeSellerCampaignCreateError(error),
+          rechecked: false,
+          detectionStatus: HIDDEN_SELLER_CAMPAIGN_STATUS,
+        });
+        emitProgress('duplicate_name_hidden');
+        continue;
+      }
+      failed.push({ ...publicTarget, error: toChineseError(error), details: safeSellerCampaignCreateError(error) });
+      saveSellerCampaignCreateResult({
+        runId,
+        target,
+        name,
+        startDate,
+        finishDate,
+        selected: true,
+        requestStatus: 'failed',
+        errorCn: toChineseError(error),
+        errorRaw: safeSellerCampaignCreateError(error)
+      });
+      emitProgress('request_failed');
+    }
+  }
+  const refreshedAccounts = new Set();
+  const refreshErrors = new Map();
+  for (const [accountId, account] of accountsToRefresh) {
+    try {
+      checkpoint?.();
+      await fetchAndSavePromotions(account, { signal, checkpoint, readScheduler });
+      checkpoint?.();
+      refreshedAccounts.add(accountId);
+    } catch (error) {
+      if (signal?.aborted || String(error?.code || '').startsWith('COMMIT_') || String(error?.code || '').startsWith('SUBMISSION_')) throw error;
+      refreshErrors.set(accountId, toChineseError(error));
+    }
+  }
+  for (const entry of apiSucceeded) {
+    checkpoint?.();
+    const accountId = String(entry.target.account_id || '');
+    const siteId = String(entry.target.site_id || '');
+    const rechecked = refreshedAccounts.has(accountId)
+      ? findSellerCampaignAfterCreate({
+          accountId,
+          childUserId: entry.target.child_user_id,
+          siteId,
+          name,
+          promotionId: entry.promotionId,
+        })
+      : null;
+    const promotionId = rechecked?.promotion_id || entry.promotionId || '';
+    if (rechecked) {
+      created.push({
+        ...entry.publicTarget,
+        status: 'created',
+        promotion_type: 'SELLER_CAMPAIGN',
+        promotion_name: String(name || ''),
+        promotion_id: promotionId,
+        rechecked: true,
+        http_status: entry.httpStatus
+      });
+      saveSellerCampaignCreateResult({
+        runId,
+        target: entry.target,
+        name,
+        startDate,
+        finishDate,
+        selected: true,
+        requestStatus: 'created',
+        promotionId,
+        httpStatus: entry.httpStatus,
+        rechecked: true
+      });
+      emitProgress('target_rechecked');
+      continue;
+    }
+    const error = refreshErrors.get(accountId)
+      ? `接口已返回成功，但刷新该店铺活动失败：${refreshErrors.get(accountId)}。`
+      : '接口已返回成功，但刷新活动后未在该店铺站点找到新自建活动。';
+    recheckMissing.push({
+      ...entry.publicTarget,
+      status: 'api_success_recheck_missing',
+      promotion_type: 'SELLER_CAMPAIGN',
+      promotion_name: String(name || ''),
+      promotion_id: promotionId,
+      rechecked: false,
+      http_status: entry.httpStatus,
+      error
+    });
+    saveSellerCampaignCreateResult({
+      runId,
+      target: entry.target,
+      name,
+      startDate,
+      finishDate,
+      selected: true,
+      requestStatus: 'api_success_recheck_missing',
+      promotionId,
+      httpStatus: entry.httpStatus,
+      errorCn: error,
+      rechecked: false
+    });
+    emitProgress('target_recheck_missing');
+  }
+  emitProgress('completed');
+  return {
+    ok: failed.length === 0 && recheckMissing.length === 0,
+    run_id: runId,
+    mode: 'real',
+    action: 'create_seller_campaign',
+    promotion_type: 'SELLER_CAMPAIGN',
+    creates_official_activity: false,
+    writes_external_state: apiSucceeded.length > 0,
+    existing_count: existingTargets.length,
+    to_create_count: missingTargets.length,
+    not_selected_count: notSelectedTargets.length,
+    unreadable_count: unreadableTargets.length,
+    created_count: created.length,
+    recovered_existing_count: recoveredExisting.length,
+    existing_without_visible_id_count: hiddenWithoutVisibleId.length,
+    failed_count: failed.length,
+    recheck_missing_count: recheckMissing.length,
+    existing: publicSellerCampaignTargets(existingTargets),
+    to_create: publicSellerCampaignTargets(missingTargets),
+    not_selected: publicSellerCampaignTargets(notSelectedTargets),
+    unreadable: unreadableTargets,
+    created,
+    recovered_existing: recoveredExisting,
+    existing_without_visible_id: hiddenWithoutVisibleId,
+    duplicate_name_hidden: hiddenWithoutVisibleId,
+    messages: hiddenWithoutVisibleId.length ? [
+      `${HIDDEN_SELLER_CAMPAIGN_MESSAGE}（${hiddenWithoutVisibleId.length} 个店铺站点）；其余活动继续。`,
+    ] : [],
+    failed,
+    recheck_missing: recheckMissing,
+    refreshed_account_count: refreshedAccounts.size
+  };
+}
+
+function assertSellerCampaignCreateTargetRoutes(targets = []) {
+  const routesByAccount = new Map();
+  for (const target of targets || []) {
+    const accountId = String(target?.account_id || '');
+    if (!routesByAccount.has(accountId)) {
+      routesByAccount.set(accountId, listSiteSummaries(accountId).map((site) => ({
+        account_id: accountId,
+        child_user_id: site.child_user_id,
+        site_id: site.site_id,
+      })));
+    }
+    assertAccountRouteAllowed(target, routesByAccount.get(accountId));
+  }
+}
+
+function saveSellerCampaignCreateResult({
+  runId,
+  target = {},
+  name,
+  startDate,
+  finishDate,
+  selected = true,
+  requestStatus,
+  promotionId = '',
+  httpStatus = null,
+  errorCn = '',
+  errorRaw = null,
+  rechecked = false,
+  detectionStatus = null,
+} = {}) {
+  try {
+    const now = new Date().toISOString();
+    getDb().prepare(`
+      INSERT INTO seller_campaign_create_results (
+        run_id, account_id, child_user_id, store_name, site_id, site_name, promotion_type,
+        promotion_name, start_date, finish_date, selected, request_status,
+        promotion_id, http_status, error_cn, error_raw, rechecked, detection_status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      String(runId || ''),
+      String(target.account_id || ''),
+      String(target.child_user_id || ''),
+      String(target.store_name || ''),
+      String(target.site_id || ''),
+      String(target.site_name || siteDisplayName(target.site_id || '')),
+      'SELLER_CAMPAIGN',
+      String(name || ''),
+      startDate ? String(startDate) : null,
+      finishDate ? String(finishDate) : null,
+      selected ? 1 : 0,
+      String(requestStatus || 'unknown'),
+      String(promotionId || ''),
+      Number.isFinite(Number(httpStatus)) ? Number(httpStatus) : null,
+      String(errorCn || ''),
+      errorRaw ? JSON.stringify(errorRaw) : null,
+      rechecked ? 1 : 0,
+      detectionStatus ? String(detectionStatus) : null,
+      now,
+      now
+    );
+  } catch (error) {
+    console.warn('[seller-campaign-create] 保存内部记录失败:', error?.message || error);
+  }
+}
+
+function publicSellerCampaignTargets(targets = []) {
+  return (Array.isArray(targets) ? targets : []).map(publicSellerCampaignTarget);
+}
+
+function publicSellerCampaignTarget(target = {}) {
+  return {
+    account_id: String(target.account_id || ''),
+    child_user_id: String(target.child_user_id || ''),
+    store_name: String(target.store_name || ''),
+    site_id: String(target.site_id || ''),
+    site_name: String(target.site_name || siteDisplayName(target.site_id || '')),
+    promotion_type: 'SELLER_CAMPAIGN',
+    existing_seller_campaign_count: Number(target.existing_seller_campaign_count || 0)
+  };
+}
+
+function findSellerCampaignAfterCreate({ accountId, childUserId, siteId, name, promotionId }) {
+  const campaigns = listCampaignsFiltered(accountId, { siteIds: [siteId], promotionTypes: ['SELLER_CAMPAIGN'] });
+  const routed = campaigns.filter((campaign) => accountRouteKey(campaign) === accountRouteKey({
+    account_id: accountId,
+    child_user_id: childUserId,
+    site_id: siteId,
+  }));
+  const byId = promotionId ? routed.find((campaign) => String(campaign.promotion_id || campaign.id || '') === String(promotionId)) : null;
+  if (byId) return normalizeCreatedSellerCampaign(byId);
+  const wantedName = String(name || '').trim();
+  const byName = routed
+    .filter((campaign) => String(campaign.name || campaign.promotion_name || '').trim() === wantedName)
+    .sort((a, b) => String(b.updated_at || b.raw_json?.date_updated || b.raw_json?.last_updated || '').localeCompare(String(a.updated_at || a.raw_json?.date_updated || a.raw_json?.last_updated || '')))[0];
+  return byName ? normalizeCreatedSellerCampaign(byName) : null;
+}
+
+function normalizeCreatedSellerCampaign(campaign = {}) {
+  return {
+    promotion_id: String(campaign.promotion_id || campaign.id || ''),
+    name: String(campaign.name || campaign.promotion_name || ''),
+    site_id: String(campaign.site_id || ''),
+    promotion_type: String(campaign.promotion_type || '').toUpperCase()
+  };
+}
+
+function extractCreatedSellerCampaignId(body) {
+  if (!body || typeof body !== 'object') return '';
+  const direct = body.promotion_id || body.id || body.promotionId;
+  if (direct) return String(direct);
+  const nested = body.promotion || body.result || body.data;
+  if (nested && typeof nested === 'object') return extractCreatedSellerCampaignId(nested);
+  return '';
+}
+
+function extractSellerCampaignDetail(input, fallbackPromotionId = '') {
+  const body = input?.body && typeof input.body === 'object' ? input.body : input;
+  const candidate = body?.promotion && typeof body.promotion === 'object'
+    ? body.promotion
+    : body?.result && typeof body.result === 'object'
+      ? body.result
+      : body?.data && typeof body.data === 'object'
+        ? body.data
+        : body;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    const error = new ApiError('平台未返回可验证的自建活动详情。', 422);
+    error.code = 'SELLER_CAMPAIGN_DETAIL_INVALID';
+    throw error;
+  }
+  return {
+    ...candidate,
+    promotion_id: String(candidate.promotion_id || candidate.id || fallbackPromotionId || ''),
+    promotion_type: String(candidate.promotion_type || candidate.type || 'SELLER_CAMPAIGN').toUpperCase(),
+  };
+}
+
+function safeSellerCampaignCreateError(error) {
+  const body = error?.body && typeof error.body === 'object'
+    ? sanitizeSellerCampaignCreateErrorBody(error.body)
+    : error?.body || null;
+  return {
+    status: error?.status || null,
+    message: error?.message || '',
+    body
+  };
+}
+
+function sanitizeSellerCampaignCreateErrorBody(body) {
+  if (!body || typeof body !== 'object') return body;
+  const result = {};
+  for (const key of ['message', 'error', 'status', 'cause', 'error_description', 'department', 'code']) {
+    if (Object.hasOwn(body, key)) result[key] = body[key];
+  }
+  return Object.keys(result).length ? result : body;
+}
+
+function storeIdentityForAccount(accountId, account = {}, settings = readSettings()) {
+  return resolveStoreIdentity({
+    accountId,
+    account,
+    profile: getAccountProfile(accountId) || account.profile || {},
+    storeAliases: settings?.storeAliases || {},
+  });
 }
 
 function publicAccount(account) {
+  const identity = storeIdentityForAccount(account.account_id, account);
   return {
     account_id: String(account.account_id),
-    display_name: publicAccountDisplayName(account),
+    display_name: identity.raw_display_name,
+    ...identity,
     site_id: account.site_id,
     token_type: account.token_type,
     expires_at: account.expires_at,
     auth_source: account.authSource || account.auth_source || 'local'
   };
-}
-
-function publicAccountDisplayName(account) {
-  const accountId = String(account.account_id || '');
-  const displayName = String(account.display_name || '').trim();
-  if (!displayName || displayName.toLowerCase().startsWith('standalone ')) return `账号 ${accountId}`;
-  return displayName;
 }
 
 function actionDefaultStatus(action) {
@@ -1724,14 +3005,14 @@ function actionDefaultStatus(action) {
   return 'candidate';
 }
 
-function createExecutionJob(request) {
-  const id = createExecutionJobId();
+function createExecutionJob(request, options = {}) {
+  const id = options.id || createExecutionJobId();
   const runId = `${id}-${Math.random().toString(36).slice(2, 10)}`;
   const job = {
     id,
     run_id: runId,
     event_file_key: runId,
-    status: 'queued',
+    status: options.status || 'queued',
     cancel_requested: false,
     request: { ...request },
     request_summary: {
@@ -1743,7 +3024,10 @@ function createExecutionJob(request) {
       requestedWriteConcurrency: request.requestedWriteConcurrency ?? request.writeConcurrency,
       writeConcurrency: request.writeConcurrency,
       requestedGlobalWriteConcurrency: request.globalWriteConcurrency,
-      globalWriteConcurrency: request.globalWriteConcurrency
+      globalWriteConcurrency: request.globalWriteConcurrency,
+      executionGroupId: request.executionGroupId || null,
+      storeName: request.storeName || request.selectedStoreName || '',
+      selectedSiteName: request.selectedSiteName || ''
     },
     started_at: new Date().toISOString(),
     finished_at: null,
@@ -1767,12 +3051,1254 @@ function createExecutionJob(request) {
   executionJobs.set(id, job);
   appendExecutionJobLog(job, '执行任务已创建。');
   appendExecutionJobEvent(job, { type: 'job_created', request_summary: job.request_summary });
+  persistExecutionJob(job);
   return job;
 }
 
 function createExecutionJobId() {
   const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '');
   return `exec-${stamp}-${process.pid}-${nextExecutionJobId++}`;
+}
+
+function createExecutionGroupId() {
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '');
+  return `exec-group-${stamp}-${process.pid}-${nextExecutionJobId++}`;
+}
+
+function executionGroupChildSnapshot(job) {
+  return {
+    job_id: job.id,
+    account_id: String(job.request_summary?.accountId || ''),
+    store_name: job.request_summary?.storeName || '',
+    site_name: job.request_summary?.selectedSiteName || '',
+    status: job.status,
+    started_at: job.started_at,
+    finished_at: job.finished_at,
+    progress: job.progress,
+    request_summary: job.request_summary,
+    logs: job.logs,
+    userLogs: job.userLogs,
+    result: job.result,
+    error: job.error
+  };
+}
+
+function publicExecutionGroup(group, { compact = false } = {}) {
+  const result = group.result || summarizeExecutionGroup(group);
+  const compactResult = {};
+  for (const field of [
+    'action', 'store_count', 'total', 'success', 'failed', 'skipped',
+    'relation_count', 'unique_item_count', 'activity_failure_count',
+    'request_success_count', 'live_verified_removed_count', 'pending_verification_count'
+  ]) compactResult[field] = result?.[field] ?? null;
+  return {
+    id: group.id,
+    client_submission_id: group.client_submission_id,
+    status: group.status,
+    action: group.action,
+    cancel_requested: Boolean(group.cancel_requested),
+    created_at: group.created_at,
+    updated_at: group.updated_at,
+    finished_at: group.finished_at,
+    global_peak_in_flight: Number(group.global_peak_in_flight || 0),
+    scope: executionGroupBusinessScope(group),
+    children: compact ? [] : (group.children || []).map((child) => ({ ...child })),
+    result: compact ? compactResult : result,
+    error: group.error || null
+  };
+}
+
+function requestExecutionGroupCancel(group) {
+  if (TERMINAL_EXECUTION_GROUP_STATUSES.has(String(group.status || ''))) return group;
+  group.cancel_requested = true;
+  group.status = 'stopping';
+  for (const child of group.children || []) {
+    const job = executionJobs.get(String(child.job_id)) || loadPersistedExecutionJob(child.job_id);
+    if (!job || TERMINAL_EXECUTION_GROUP_STATUSES.has(String(job.status || ''))) continue;
+    executionJobs.set(job.id, job);
+    job.cancel_requested = true;
+    if (job.status === 'queued') job.status = 'stopping';
+    appendExecutionJobLog(job, '执行组已收到停止请求，未开始的商品会尽快跳过。');
+    appendExecutionJobEvent(job, { type: 'group_stop_requested', group_id: group.id });
+    persistExecutionJob(job);
+  }
+  executionGroupPersistence.persist(group);
+  return group;
+}
+
+function createExecutionPrepareId() {
+  return `prepare-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function publicExecutionSubmission(prepare = {}) {
+  const publicTarget = (target = {}) => ({
+    account_id: String(target.account_id || ''),
+    child_user_id: String(target.child_user_id || ''),
+    store_name: target.store_name || '',
+    site_id: target.site_id || '',
+    site_name: target.site_name || siteDisplayName(target.site_id),
+    detection_status: target.detection_status || '',
+    detection_message: target.detection_message || '',
+    existing_seller_campaign_count: Number(target.existing_seller_campaign_count || 0),
+    hidden_activity_names: Array.isArray(target.hidden_activity_names) ? target.hidden_activity_names.map(String) : [],
+  });
+  return {
+    id: prepare.id,
+    prepare_id: prepare.id,
+    client_submission_id: prepare.client_submission_id,
+    state: prepare.state,
+    scope_hash: prepare.scope_hash,
+    scope_version: prepare.scope_version,
+    resolved_action: prepare.resolved_action,
+    discounts: prepare.discounts || {},
+    activity_buckets: prepare.activity_buckets || {},
+    excluded_buckets: prepare.excluded_buckets || {},
+    targets: prepare.targets || [],
+    seller_detection: {
+      existing: (prepare.seller_detection?.existing || []).map(publicTarget),
+      existing_without_visible_id: (prepare.seller_detection?.existing_without_visible_id || []).map(publicTarget),
+      duplicate_name_hidden: (prepare.seller_detection?.existing_without_visible_id || []).map(publicTarget),
+      confirmed_absent: (prepare.seller_detection?.confirmed_absent || []).map(publicTarget),
+      needs_manual_review: (prepare.seller_detection?.needs_manual_review || []).map(publicTarget),
+      visibility_unknown: (prepare.seller_detection?.needs_manual_review || []).map(publicTarget),
+      unreadable: (prepare.seller_detection?.unreadable || []).map(publicTarget),
+    },
+    live_read: prepare.live_read || { rows: [], readable_count: 0, blocked_count: 0, all_blocked: false },
+    seller_input: prepare.seller_input ? {
+      name: prepare.seller_input.name || '',
+      start_date: prepare.seller_input.start_date || null,
+      finish_date: prepare.seller_input.finish_date || null,
+      selected_targets: (prepare.seller_input.selected_targets || []).map(publicTarget),
+      validation_errors: prepare.seller_input.validation_errors || [],
+    } : null,
+    confirmation_summary: prepare.confirmation_summary || '',
+    creation_result: prepare.creation_result ? {
+      created_count: Number(prepare.creation_result.created_count || 0),
+      recovered_existing_count: Number(prepare.creation_result.recovered_existing_count || 0),
+      existing_without_visible_id_count: Number(prepare.creation_result.existing_without_visible_id_count || 0),
+      existing_without_visible_id: (prepare.creation_result.existing_without_visible_id || []).map(publicTarget),
+      messages: Array.isArray(prepare.creation_result.messages) ? prepare.creation_result.messages.map(String) : [],
+    } : null,
+    reconfirm_changes: prepare.reconfirm_changes || [],
+    scope_adjustments: prepare.scope_adjustments ? {
+      messages: prepare.scope_adjustments.messages || [],
+      auto_removed_item_count: Number(prepare.scope_adjustments.auto_removed_item_count || 0),
+      excluded_new_item_count: Number(prepare.scope_adjustments.excluded_new_item_count || 0),
+      removed_activity_count: Number(prepare.scope_adjustments.removed_activity_count || 0),
+      blocked_activity_count: Number(prepare.scope_adjustments.blocked_activity_count || 0),
+    } : null,
+    expires_at: prepare.expires_at,
+    group_id: prepare.group_id || null,
+    group: prepare.group ? publicExecutionGroup(prepare.group) : null,
+    error: prepare.error || null,
+    progress: {
+      stage: String(prepare.progress?.stage || prepare.state || ''),
+      percent: Math.max(0, Math.min(100, Number(prepare.progress?.percent || 0))),
+      completed: Math.max(0, Number(prepare.progress?.completed || 0)),
+      total: Math.max(0, Number(prepare.progress?.total || 0)),
+      message: String(prepare.progress?.message || ''),
+      current_store: String(prepare.progress?.current_store || ''),
+      current_site: String(prepare.progress?.current_site || ''),
+      current_activity: String(prepare.progress?.current_activity || ''),
+    },
+  };
+}
+
+function selectedActivityRoutes(account, filters = {}, settings = {}) {
+  const requested = [
+    ...(Array.isArray(filters.siteIds) ? filters.siteIds : []),
+    ...String(filters.siteId || '').split(','),
+  ].map((value) => String(value || '').trim().toUpperCase()).filter(Boolean);
+  const requestedSet = new Set(requested);
+  const operating = filterByOperatingSites(listSiteSummaries(account.account_id), settings, account.account_id)
+    .filter((site) => !requestedSet.size || requestedSet.has(String(site.site_id || '').trim().toUpperCase()))
+    .map((site) => normalizeAccountRoute({
+      account_id: account.account_id,
+      child_user_id: site.child_user_id || (String(account.site_id || '').toUpperCase() === 'CBT' ? '' : account.account_id),
+      site_id: site.site_id,
+    }, { requireComplete: false }))
+    .filter((route) => route.account_id && route.child_user_id && route.site_id);
+  if (operating.length) return [...new Map(operating.map((route) => [accountRouteKey(route), route])).values()];
+  if (String(account.site_id || '').toUpperCase() !== 'CBT') {
+    const siteId = requested[0] || String(account.site_id || '').toUpperCase();
+    return siteId ? [normalizeAccountRoute({ account_id: account.account_id, child_user_id: account.account_id, site_id: siteId })] : [];
+  }
+  return [];
+}
+
+async function refreshActivityCatalogForPrepare({ account, filters = {}, settings = {}, readConcurrency = null, signal = null, checkpoint = null, readScheduler = null } = {}) {
+  const selectedRoutes = selectedActivityRoutes(account, filters, settings);
+  const liveCatalogSiteIds = [...new Set(selectedRoutes.map((route) => route.site_id).filter(Boolean))];
+  let fetched = null;
+  let fetchError = null;
+  try {
+    checkpoint?.();
+    fetched = await fetchAndSavePromotions(account, {
+      readConcurrency: readConcurrency ?? settings.readConcurrency,
+      siteIds: liveCatalogSiteIds.length ? liveCatalogSiteIds : null,
+      routes: selectedRoutes,
+      signal,
+      checkpoint,
+      readScheduler,
+    });
+    checkpoint?.();
+  } catch (error) {
+    if (signal?.aborted
+        || String(error?.code || '').startsWith('COMMIT_')
+        || String(error?.code || '').startsWith('SUBMISSION_')
+        || String(error?.code || '').startsWith('ACTIVITY_ACCOUNT_ROUTE_')) throw error;
+    fetchError = toChineseError(error);
+    for (const siteId of liveCatalogSiteIds) {
+      recordActivityCatalogCalibration({ accountId: account.account_id, siteId, error: fetchError });
+    }
+  }
+  const resultRows = String(account.site_id || '').toUpperCase() === 'CBT'
+    ? (fetched?.children || [])
+    : fetched ? [{
+        account_id: account.account_id,
+        child_user_id: account.account_id,
+        site_id: selectedRoutes[0]?.site_id || account.site_id,
+        status: 'ok',
+        total: fetched.total,
+        catalog_revision: fetched.catalog_revision,
+        catalog_changes: fetched.catalog_changes,
+      }] : [];
+  const routeReads = summarizeActivityCatalogRouteReads({
+    expectedRoutes: selectedRoutes,
+    results: resultRows.map((row) => ({ account_id: account.account_id, ...row })),
+    error: fetchError,
+  });
+  const refreshedRouteKeys = routeReads.refreshed_route_keys;
+  const blockedRouteKeys = routeReads.blocked_route_keys;
+  const errorsByRoute = routeReads.errors_by_route;
+  const catalogIdentityChanges = resultRows.flatMap((row) => (
+    Array.isArray(row?.catalog_changes?.identities) ? row.catalog_changes.identities : []
+  ));
+  const blockedSiteIds = new Set([...blockedRouteKeys].map((key) => key.split('|')[2]).filter(Boolean));
+  return {
+    account_id: String(account.account_id),
+    routes: selectedRoutes,
+    site_ids: liveCatalogSiteIds,
+    refreshed_route_keys: refreshedRouteKeys,
+    blocked_route_keys: blockedRouteKeys,
+    errors_by_route: errorsByRoute,
+    catalog_identity_changes: catalogIdentityChanges,
+    refreshed_site_ids: new Set([...refreshedRouteKeys].map((key) => key.split('|')[2]).filter(Boolean)),
+    cached_site_ids: new Set(),
+    blocked_site_ids: blockedSiteIds,
+    fetch_result: fetched,
+  };
+}
+
+function activityCatalogSellerStatus(accountId, refresh = {}, filters = {}, settings = {}) {
+  const rows = new Map();
+  const targets = sellerCampaignCreateTargetsForAccount({ accountId, filters, settings });
+  for (const target of targets) {
+    const siteId = String(target.site_id || '').toUpperCase();
+    const routeKey = accountRouteKey(target);
+    if (refresh.blocked_route_keys?.has(routeKey)) {
+      rows.set(routeKey, { ok_count: 0, error_count: 1, seller_campaign_count: 0, errors: [refresh.errors_by_route?.get(routeKey) || '活动目录读取失败，本次不使用旧缓存。'] });
+      continue;
+    }
+    if (!refresh.refreshed_route_keys?.has(routeKey)) {
+      rows.set(routeKey, { ok_count: 0, error_count: 1, seller_campaign_count: 0, errors: ['活动目录尚未完成校准。'] });
+      continue;
+    }
+    const sellerCount = listOperatingCampaignsFiltered(accountId, { siteId, promotionTypes: ['SELLER_CAMPAIGN'] }, settings)
+      .filter((campaign) => accountRouteKey(campaign) === routeKey).length;
+    rows.set(routeKey, { ok_count: 1, error_count: 0, seller_campaign_count: sellerCount, errors: [] });
+  }
+  return rows;
+}
+
+async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () => {}, context = {}) {
+  const accountIds = normalizeAccountIdList(input.accountIds || input.account_ids || input.accountId || input.account_id);
+  if (!accountIds.length) throw new ApiError('请选择至少一个店铺账号。', 400);
+  const finalRevalidation = context.finalRevalidation === true;
+  reportProgress({
+    stage: finalRevalidation ? 'final_catalog' : 'accounts',
+    percent: 2,
+    completed: 0,
+    total: accountIds.length,
+    message: finalRevalidation ? '正在执行提交前轻量活动目录复核' : '正在核对店铺和活动范围',
+  });
+  const settings = readSettings();
+  const readScheduler = context.readScheduler || createBalancedReadScheduler(BALANCED_READ_PROFILES.prepare);
+  const operationReadCache = context.operationReadCache || new Map();
+  const filters = input.filters || {};
+  const storeNames = {};
+  const accountsById = new Map();
+  const promotions = [];
+  const catalogRefreshByAccount = new Map();
+  let accountRefreshCompleted = 0;
+  await Promise.all(accountIds.map(async (accountId) => {
+    context.checkpoint?.();
+    const account = await ensureUsableAccount(accountId);
+    context.checkpoint?.();
+    accountsById.set(String(accountId), account);
+    storeNames[accountId] = storeIdentityForAccount(accountId, account, settings).store_name;
+    reportProgress({
+      stage: 'accounts', percent: 5 + Math.floor((accountRefreshCompleted / Math.max(1, accountIds.length)) * 25),
+      completed: accountRefreshCompleted,
+      total: accountIds.length,
+      message: finalRevalidation ? '提交前正在核对活动目录' : '正在刷新店铺活动',
+      current_store: storeNames[accountId],
+    });
+    const catalogRefresh = await refreshActivityCatalogForPrepare({
+      account,
+      filters,
+      settings,
+      readConcurrency: normalizeConcurrency(input.readConcurrency ?? settings.readConcurrency),
+      signal: context.signal,
+      checkpoint: context.checkpoint,
+      readScheduler,
+    });
+    context.checkpoint?.();
+    catalogRefreshByAccount.set(String(accountId), catalogRefresh);
+    await recoverHiddenSellerCampaignsForPreparedAccount({
+      account,
+      filters,
+      settings,
+      catalogRefresh,
+      signal: context.signal,
+      checkpoint: context.checkpoint,
+      readScheduler,
+    });
+    context.checkpoint?.();
+    const allowedRoutes = listSiteSummaries(accountId).map((site) => ({
+      account_id: String(accountId),
+      child_user_id: String(site.child_user_id || ''),
+      site_id: String(site.site_id || ''),
+    })).filter((route) => route.child_user_id && route.site_id);
+    const accountPromotions = listOperatingCampaignsFiltered(accountId, {
+      siteId: filters.siteId,
+      siteIds: filters.siteIds,
+    }, settings).filter((promotion) => !catalogRefresh.blocked_route_keys.has(accountRouteKey({
+      account_id: accountId,
+      child_user_id: promotion.child_user_id,
+      site_id: promotion.site_id,
+    })));
+    promotions.push(...accountPromotions.map((row) => {
+      const route = normalizeAccountRoute({
+        account_id: String(accountId),
+        child_user_id: row.child_user_id || (String(account.site_id || '').toUpperCase() === 'CBT' ? '' : account.account_id),
+        site_id: row.site_id || account.site_id,
+      });
+      if (String(account.site_id || '').toUpperCase() === 'CBT') assertAccountRouteAllowed(route, allowedRoutes);
+      return bindActivityToAccountRoute(row, route);
+    }));
+    accountRefreshCompleted += 1;
+    reportProgress({
+      stage: 'accounts', percent: 5 + Math.floor((accountRefreshCompleted / Math.max(1, accountIds.length)) * 25),
+      completed: accountRefreshCompleted, total: accountIds.length, message: '店铺活动已刷新', current_store: storeNames[accountId],
+    });
+  }));
+  const requested = String(input.requested_action || input.requestedAction || input.action || 'auto').toLowerCase();
+  const selected = ordinaryPromotions(filterPromotions(promotions, filters));
+  const readStateSnapshot = buildPreparationReadStateSnapshot(accountIds);
+  const resolvedAction = requested === 'auto'
+    ? String(buildTodayDecisionForScope(accountIds, selected).action || '')
+    : ['enroll', 'update', 'cancel'].includes(requested) ? requested : (() => { throw new ApiError('不支持的执行动作。', 400); })();
+  const rawRevalidateKeys = (context.revalidateTargetKeys || []).map(String).filter(Boolean);
+  const revalidationPlan = finalRevalidation
+    ? buildFinalRevalidationPlan({
+        confirmedScope: context.previousSnapshot?.confirmed_execution_scope,
+        currentPromotions: selected,
+        catalogRefreshes: [...catalogRefreshByAccount.values()],
+        action: resolvedAction,
+        explicitTargetKeys: rawRevalidateKeys,
+        getCacheState: (promotion) => preparationActivityCacheState(readStateSnapshot, promotion),
+        getFetchState: (promotion, status) => preparationItemFetchState(readStateSnapshot, promotion, status),
+        getFallbackState: (promotion) => preparationItemFetchState(readStateSnapshot, promotion, INVENTORY_FALLBACK_ITEM_STATUS),
+      })
+    : null;
+  const revalidateIdentityKeys = revalidationPlan?.item_read_identity_keys || new Set(rawRevalidateKeys
+    .filter((key) => !key.startsWith('__'))
+    .map(activityIdentityKey)
+    .filter((key) => key.split('|').length === 5 && key.split('|').every(Boolean)));
+  const scopeReviewIdentityKeys = revalidationPlan?.scope_review_identity_keys || revalidateIdentityKeys;
+  const targetedRevalidate = finalRevalidation || (rawRevalidateKeys.length > 0
+    && revalidateIdentityKeys.size === rawRevalidateKeys.length);
+  const promotionIsTargeted = (promotion) => {
+    if (!targetedRevalidate) return true;
+    return scopeReviewIdentityKeys.has(activityIdentityKey(promotion));
+  };
+  const promotionNeedsItemRead = (promotion) => {
+    if (!targetedRevalidate) return true;
+    return revalidateIdentityKeys.has(activityIdentityKey(promotion));
+  };
+  const priorLiveRows = targetedRevalidate ? (context.previousSnapshot?.live_read?.rows || []) : [];
+  const unchangedPriorLiveRows = priorLiveRows.filter((row) => !promotionIsTargeted(row)).map((row) => ({ ...row }));
+  const startedLiveReadRows = [];
+  const selectedForLiveRead = targetedRevalidate ? selected.filter(promotionNeedsItemRead) : selected;
+  if (finalRevalidation) {
+    const reasonCount = Object.values(revalidationPlan.reasons_by_identity || {}).flat().length;
+    reportProgress({
+      stage: 'final_targeted',
+      percent: 34,
+      completed: 0,
+      total: revalidationPlan.total_activity_count,
+      message: revalidateIdentityKeys.size
+        ? `提交前定向复核：活动 ${revalidateIdentityKeys.size}/${revalidationPlan.total_activity_count}，变化原因 ${reasonCount} 项`
+        : `提交前轻量复核完成：活动目录无变化，商品活动复核 0/${revalidationPlan.total_activity_count}`,
+    });
+  }
+  let startedActivitiesCompleted = 0;
+  const reportActivityProgress = (stage, event, completedBase, percentBase, percentSpan) => {
+    if (event.type !== 'item_fetch_done' && event.type !== 'item_fetch_start') return completedBase;
+    const completed = event.type === 'item_fetch_done' ? completedBase + 1 : completedBase;
+    reportProgress({
+      stage,
+      percent: percentBase + Math.floor((completed / Math.max(1, selectedForLiveRead.length)) * percentSpan),
+      completed,
+      total: selectedForLiveRead.length,
+      message: finalRevalidation
+        ? `提交前定向复核：${stage === 'started' ? '已报名商品' : '可报名商品'} ${completed}/${selectedForLiveRead.length}`
+        : stage === 'started' ? '正在核对已报名商品' : '正在核对可报名商品',
+      current_store: storeNames[event.promotion?.account_id || ''] || '',
+      current_site: String(event.promotion?.site_id || ''),
+      current_activity: String(event.promotion_id || ''),
+    });
+    return completed;
+  };
+  let startedCompleted = 0;
+  await Promise.all(accountIds.map(async (accountId) => {
+    const accountPromotions = selectedForLiveRead.filter((promotion) => String(promotion.account_id || '') === String(accountId));
+    if (!accountPromotions.length) return;
+    reportProgress({
+      stage: 'started', percent: 35 + Math.floor((startedCompleted / Math.max(1, accountIds.length)) * 25),
+      completed: startedCompleted, total: accountIds.length, message: '正在核对已报名商品', current_store: storeNames[accountId],
+    });
+    const prep = await prepareItemsForExecution({
+      account: accountsById.get(String(accountId)),
+      promotions: accountPromotions,
+      action: 'update',
+      itemStatus: 'started',
+      settings,
+      request: { ...input, fetchMode: 'full', maxItems: 'all', allowInventoryFallback: false },
+      signal: context.signal,
+      checkpoint: context.checkpoint,
+      readScheduler,
+      operationReadCache,
+      readStateSnapshot,
+      forceReadKeys: forceReadKeysForStatus(revalidateIdentityKeys, 'started'),
+      onProgress: (event) => {
+        startedActivitiesCompleted = reportActivityProgress('started', event, startedActivitiesCompleted, 35, 25);
+      },
+    });
+    context.checkpoint?.();
+    startedLiveReadRows.push(...submissionLiveReadRows(accountId, prep.summary.rows));
+    startedCompleted += 1;
+  }));
+  const sellerTargets = resolvedAction === 'enroll' && !filters.excludeSeller
+    ? await buildLiveSellerCampaignCreateTargets({ accountIds, filters, settings, catalogRefreshByAccount, signal: context.signal, checkpoint: context.checkpoint, readScheduler })
+    : [];
+  context.checkpoint?.();
+  reportProgress({ stage: 'seller', percent: 65, completed: 0, total: sellerTargets.length, message: '正在核对自建活动状态' });
+  const sellerDetection = {
+    existing: sellerTargets.filter((target) => target.detection_status === 'existing'),
+    existing_without_visible_id: sellerTargets.filter((target) => target.detection_status === HIDDEN_SELLER_CAMPAIGN_STATUS),
+    confirmed_absent: sellerTargets.filter((target) => target.detection_status === 'confirmed_absent'),
+    needs_manual_review: sellerTargets.filter((target) => target.detection_status === 'visibility_unknown'),
+    unreadable: sellerTargets.filter((target) => target.detection_status === 'unreadable'),
+  };
+  const discounts = {
+    seller: Number(input.sellerDiscountPercent ?? settings.sellerDefaultDiscount ?? 5),
+    official: Number(input.officialDiscountPercent ?? settings.officialDefaultDiscount ?? 6),
+  };
+  const liveReadRows = resolvedAction === 'enroll'
+    ? [...unchangedPriorLiveRows]
+    : [...unchangedPriorLiveRows, ...startedLiveReadRows];
+  if (resolvedAction === 'enroll') {
+    let itemAccountsCompleted = 0;
+    let candidateActivitiesCompleted = 0;
+    await Promise.all(accountIds.map(async (accountId) => {
+      const accountPromotions = selectedForLiveRead.filter((promotion) => String(promotion.account_id || '') === String(accountId));
+      if (!accountPromotions.length) return;
+      reportProgress({
+        stage: 'items', percent: 70 + Math.floor((itemAccountsCompleted / Math.max(1, accountIds.length)) * 22),
+        completed: itemAccountsCompleted, total: accountIds.length, message: '正在核对可报名商品', current_store: storeNames[accountId],
+      });
+      const prep = await prepareItemsForExecution({
+        account: accountsById.get(String(accountId)),
+        promotions: accountPromotions,
+        action: resolvedAction,
+        itemStatus: actionDefaultStatus(resolvedAction),
+        settings,
+        request: { ...input, fetchMode: 'full', maxItems: 'all' },
+        signal: context.signal,
+        checkpoint: context.checkpoint,
+        readScheduler,
+        operationReadCache,
+        readStateSnapshot,
+        forceReadKeys: forceReadKeysForStatus(revalidateIdentityKeys, 'candidate'),
+        onProgress: (event) => {
+          candidateActivitiesCompleted = reportActivityProgress('items', event, candidateActivitiesCompleted, 70, 22);
+        },
+      });
+      context.checkpoint?.();
+      const startedByPromotion = new Map(startedLiveReadRows
+        .filter((row) => row.account_id === String(accountId))
+        .map((row) => [`${row.promotion_type}|${row.promotion_id}`, row]));
+      liveReadRows.push(...submissionLiveReadRows(accountId, prep.summary.rows).map((row) => ({
+        ...row,
+        blocked: row.blocked || startedByPromotion.get(`${row.promotion_type}|${row.promotion_id}`)?.blocked === true,
+      })));
+      itemAccountsCompleted += 1;
+    }));
+  }
+  const catalogBlockedRoutes = [...catalogRefreshByAccount.values()].flatMap((refresh) => (
+    [...(refresh.blocked_route_keys || [])].map((routeKey) => {
+      const [accountId, childUserId, siteId] = routeKey.split('|');
+      return {
+        account_id: accountId,
+        child_user_id: childUserId,
+        site_id: siteId,
+        message: refresh.errors_by_route?.get(routeKey) || '活动目录读取失败，本次不使用旧缓存。',
+      };
+    })
+  ));
+  const itemLiveRead = summarizeLiveReadRows(liveReadRows, selected.length);
+  const liveRead = {
+    ...itemLiveRead,
+    catalog_blocked_routes: catalogBlockedRoutes,
+    blocked_count: Number(itemLiveRead.blocked_count || 0) + catalogBlockedRoutes.length,
+    all_blocked: Number(itemLiveRead.readable_count || 0) === 0
+      && (Number(itemLiveRead.blocked_count || 0) + catalogBlockedRoutes.length) > 0,
+  };
+  const observedExecutionScope = buildSnapshotExecutionScope({
+    action: resolvedAction,
+    promotions: selected,
+    liveRead,
+    sellerDetection,
+    previousSnapshot: context.previousSnapshot,
+    targetedRevalidate,
+    promotionIsTargeted,
+    blockedIdentityKeys: revalidationPlan?.blocked_identity_keys || new Set(),
+  });
+  const observedTargetIdentityKeys = finalRevalidation
+    ? new Set(observedExecutionScope.activities.map(activityIdentityKey))
+    : null;
+  const targetSource = finalRevalidation
+    ? selected.filter((promotion) => observedTargetIdentityKeys.has(activityIdentityKey(promotion)))
+    : selected;
+  const targets = targetSource.map((promotion) => ({
+    account_id: String(promotion.account_id || ''),
+    child_user_id: String(promotion.child_user_id || ''),
+    promotion_id: String(promotion.promotion_id || ''),
+    promotion_type: String(promotion.promotion_type || '').toUpperCase(),
+    site_id: String(promotion.site_id || ''),
+    status: String(promotion.status || ''),
+    updated_at: promotion.updated_at || null,
+  })).sort((a, b) => promotionKey(a).localeCompare(promotionKey(b)));
+  const scopeFacts = {
+    account_ids: accountIds,
+    filters,
+    resolved_action: resolvedAction,
+    discounts,
+    targets,
+    seller_detection: Object.fromEntries(Object.entries(sellerDetection).map(([key, rows]) => [key, rows.map(sellerCampaignTargetKey).sort()])),
+    live_read: liveRead.rows.map((row) => ({
+      account_id: row.account_id,
+      promotion_id: row.promotion_id,
+      promotion_type: row.promotion_type,
+      status: row.status,
+      detail_status: row.detail_status,
+      platform_total: row.platform_total,
+      saved_count: row.saved_count,
+    })).sort((left, right) => `${promotionKey(left)}|${left.status}`.localeCompare(`${promotionKey(right)}|${right.status}`)),
+  };
+  const selectedBucketCounts = promotionBucketCounts(targetSource);
+  const scopeBucketCounts = promotionBucketCounts(promotions);
+  const activityBuckets = { seller: selectedBucketCounts.seller, official: selectedBucketCounts.official };
+  const excludedBuckets = { smart: scopeBucketCounts.smart, lightning: scopeBucketCounts.lightning, other: scopeBucketCounts.other };
+  reportProgress({ stage: 'finalizing', percent: 96, completed: accountIds.length, total: accountIds.length, message: '正在生成最终确认范围' });
+  return {
+    accountIds,
+    storeNames,
+    filters,
+    resolved_action: resolvedAction,
+    discounts,
+    targets,
+    activity_buckets: activityBuckets,
+    excluded_buckets: excludedBuckets,
+    seller_detection: sellerDetection,
+    live_read: liveRead,
+    read_concurrency: buildReadConcurrencyReport({
+      schedulerSnapshot: typeof readScheduler?.snapshot === 'function' ? readScheduler.snapshot() : {},
+      localWorkConcurrency: Math.min(6, Math.max(1, accountIds.length)),
+      localDbBatchQueries: readStateSnapshot.db_batch_queries,
+    }),
+    observed_execution_scope: observedExecutionScope,
+    confirmed_execution_scope: observedExecutionScope,
+    revalidation_plan: revalidationPlan ? {
+      total_activity_count: revalidationPlan.total_activity_count,
+      item_read_activity_count: revalidationPlan.item_read_identity_keys.size,
+      scope_review_activity_count: revalidationPlan.scope_review_identity_keys.size,
+      blocked_activity_count: revalidationPlan.blocked_identity_keys.size,
+      removed_activity_count: revalidationPlan.removed_identity_keys.size,
+      excluded_new_activity_count: revalidationPlan.excluded_new_activity_count,
+      reasons_by_identity: revalidationPlan.reasons_by_identity,
+    } : null,
+    scope_facts: scopeFacts,
+    scope_hash: executionSubmissionScopeHash(observedExecutionScope, discounts),
+    confirmation_summary: `${actionDisplayName(resolvedAction)}：店铺 ${accountIds.length} 个，站点范围 ${input.selectedSiteName || '全部站点'}，自建活动 ${activityBuckets.seller} 个，官方活动 ${activityBuckets.official} 个${resolvedAction === 'cancel' ? '' : `，自建折扣 ${discounts.seller}%，官方折扣 ${discounts.official}%`}；SMART 排除 ${excludedBuckets.smart} 个，限时活动排除 ${excludedBuckets.lightning} 个，其它排除 ${excludedBuckets.other} 个。`,
+    group_request: {
+      ...input,
+      accountIds,
+      storeNames,
+      action: resolvedAction,
+      requested_action: resolvedAction,
+      filters: { ...filters, promotionTypes: ['SELLER_CAMPAIGN', 'DEAL'] },
+      sellerDiscountPercent: discounts.seller,
+      officialDiscountPercent: discounts.official,
+      confirmedExecutionScope: observedExecutionScope,
+      confirmText: 'REAL_SUBMIT',
+      prepareOnly: false,
+    },
+  };
+}
+
+function submissionLiveReadRows(accountId, rows = []) {
+  return (rows || []).map((row) => ({
+    account_id: String(accountId),
+    child_user_id: String(row.child_user_id || ''),
+    site_id: row.site_id || null,
+    promotion_id: row.promotion_id || null,
+    promotion_type: String(row.promotion_type || '').toUpperCase(),
+    detail_status: row.detail_status || null,
+    platform_total: row.platform_total ?? null,
+    saved_count: row.saved_count ?? null,
+    blocked: row.detail_status === 'error' || row.detail_status === 'unreadable',
+  }));
+}
+
+function executionSubmissionScopeHash(scope = {}, discounts = {}) {
+  return submissionScopeHash({
+    execution_scope: confirmedExecutionScopeFacts(scope),
+    discounts: {
+      seller: Number(discounts?.seller ?? 0),
+      official: Number(discounts?.official ?? 0),
+    },
+  });
+}
+
+function sellerDetectionStates(sellerDetection = {}) {
+  const states = {};
+  for (const [status, targets] of Object.entries(sellerDetection || {})) {
+    for (const target of targets || []) states[sellerCampaignTargetKey(target)] = status;
+  }
+  return states;
+}
+
+function buildSnapshotExecutionScope({
+  action = '',
+  promotions = [],
+  liveRead = {},
+  sellerDetection = {},
+  previousSnapshot = null,
+  targetedRevalidate = false,
+  promotionIsTargeted = () => true,
+  blockedIdentityKeys = new Set(),
+} = {}) {
+  const itemStatus = actionDefaultStatus(action);
+  const previousScope = previousSnapshot?.observed_execution_scope || previousSnapshot?.confirmed_execution_scope || null;
+  const previousActivities = new Map((previousScope?.activities || []).map((activity) => [activityIdentityKey(activity), activity]));
+  const liveByIdentity = new Map((liveRead.rows || []).map((row) => [activityIdentityKey(row), row]));
+  const activities = [];
+  const observedIdentityKeys = new Set();
+  for (const promotion of promotions || []) {
+    const identity = activityIdentityKey(promotion);
+    if (targetedRevalidate && !promotionIsTargeted(promotion)) {
+      const previous = previousActivities.get(identity);
+      if (previous) {
+        activities.push(previous);
+        observedIdentityKeys.add(identity);
+      }
+      continue;
+    }
+    const live = liveByIdentity.get(identity) || null;
+    const blocked = !live || live.status === 'blocked' || live.blocked === true;
+    const itemIds = blocked ? [] : listItems(
+      promotion.account_id,
+      promotion.promotion_id,
+      promotion.promotion_type,
+      itemStatus,
+    ).map((item) => String(item.item_id ?? item.itemId ?? item.id ?? '')).filter(Boolean);
+    activities.push({
+      ...promotion,
+      item_status: itemStatus,
+      item_ids: itemIds,
+      platform_total: live?.platform_total ?? null,
+      saved_count: live?.saved_count ?? null,
+      detail_status: live?.detail_status ?? 'unreadable',
+      blocked,
+    });
+    observedIdentityKeys.add(identity);
+  }
+  if (targetedRevalidate) {
+    for (const key of blockedIdentityKeys || []) {
+      if (observedIdentityKeys.has(key)) continue;
+      const previous = previousActivities.get(key);
+      if (!previous) continue;
+      activities.push({
+        ...previous,
+        item_ids: [],
+        platform_total: null,
+        saved_count: null,
+        detail_status: 'unreadable',
+        blocked: true,
+      });
+      observedIdentityKeys.add(key);
+    }
+  }
+  return createConfirmedExecutionScope({
+    action,
+    activities,
+    sellerCreateTargetKeys: previousScope?.seller_create_target_keys || [],
+    sellerTargetStates: sellerDetectionStates(sellerDetection),
+  });
+}
+
+function resolveSubmissionGlobalAction(actions = []) {
+  const unique = [...new Set(actions.map((value) => String(value || '')).filter(Boolean))];
+  if (!unique.length) throw new ApiError('当前范围没有可执行动作。', 409);
+  if (unique.length > 1) {
+    const error = new ApiError('不同店铺站点需要不同动作，请分开选择后重新准备。', 409);
+    error.code = 'ACTION_CONFLICT';
+    error.details = unique;
+    throw error;
+  }
+  return unique[0];
+}
+
+function executionSubmissionPreparedPatch(snapshot, prepare, options = {}) {
+  const preparedAt = new Date();
+  const latestSellerTargets = new Map(Object.values(snapshot.seller_detection || {}).flat().map((target) => [sellerCampaignTargetKey(target), target]));
+  const selectedSellerTargets = (prepare.seller_input?.selected_targets || [])
+    .map((target) => latestSellerTargets.get(sellerCampaignTargetKey(target)) || target)
+    .filter((target) => String(target.detection_status || '') !== 'existing');
+  const sourceScope = options.confirmedScope
+    || snapshot.confirmed_execution_scope
+    || snapshot.observed_execution_scope
+    || createConfirmedExecutionScope({ action: snapshot.resolved_action, activities: [] });
+  const confirmedScope = createConfirmedExecutionScope({
+    action: sourceScope.action || snapshot.resolved_action,
+    activities: sourceScope.activities,
+    sellerCreateTargetKeys: selectedSellerTargets.map(sellerCampaignTargetKey),
+    sellerTargetStates: sourceScope.seller_target_states || sellerDetectionStates(snapshot.seller_detection),
+  });
+  const scopeHash = options.scopeHash || executionSubmissionScopeHash(confirmedScope, snapshot.discounts);
+  const scopeMessages = Array.isArray(options.scopeMessages) ? options.scopeMessages.filter(Boolean) : [];
+  return {
+    scope_hash: scopeHash,
+    scope_version: preparedAt.toISOString(),
+    resolved_action: snapshot.resolved_action,
+    discounts: snapshot.discounts,
+    targets: snapshot.targets,
+    activity_buckets: snapshot.activity_buckets,
+    excluded_buckets: snapshot.excluded_buckets,
+    seller_detection: snapshot.seller_detection,
+    live_read: snapshot.live_read,
+    observed_execution_scope: snapshot.observed_execution_scope || sourceScope,
+    confirmed_execution_scope: confirmedScope,
+    scope_adjustments: options.scopeAdjustments || null,
+    seller_input: prepare.seller_input ? {
+      ...prepare.seller_input,
+      selected_targets: selectedSellerTargets,
+    } : { name: '', start_date: null, finish_date: null, selected_targets: [], validation_errors: [] },
+    confirmation_summary: [snapshot.confirmation_summary, ...scopeMessages].filter(Boolean).join(' '),
+    group_request: {
+      ...snapshot.group_request,
+      confirmedExecutionScope: confirmedScope,
+    },
+    expires_at: new Date(preparedAt.getTime() + 15 * 60 * 1000).toISOString(),
+  };
+}
+
+function scheduleExecutionSubmissionPreparation(prepareId) {
+  const key = String(prepareId || '');
+  if (!key || submissionPreparationTasks.has(key)) return submissionPreparationTasks.get(key) || null;
+  const task = new Promise((resolve) => setImmediate(resolve))
+    .then(() => runSubmissionPreparation({
+      store: submissionPersistence,
+      prepareId: key,
+      buildSnapshot: buildExecutionSubmissionSnapshot,
+      preparedPatch: executionSubmissionPreparedPatch,
+      formatError: toChineseError,
+    }))
+    .finally(() => submissionPreparationTasks.delete(key));
+  submissionPreparationTasks.set(key, task);
+  return task;
+}
+
+function refreshExecutionSubmissionExpiry(prepare) {
+  if (!prepare) return prepare;
+  return refreshSubmissionDeadline({
+    store: submissionPersistence,
+    prepareId: prepare.id,
+    onAbort: () => abortExecutionSubmissionCommit(prepare.id, 'commit_lease_expired'),
+  });
+}
+
+function prepareExecutionSubmission(body = {}) {
+  requireFields(body, ['client_submission_id']);
+  const rawPrior = submissionPersistence.findBySubmissionId(body.client_submission_id);
+  const prior = rawPrior ? loadEffectiveSubmission({
+    store: submissionPersistence,
+    prepareId: rawPrior.id,
+    onAbort: (row) => abortExecutionSubmissionCommit(row.id, 'commit_lease_expired'),
+  }) : null;
+  if (prior) {
+    const incomingFingerprint = submissionRequestFingerprint(body);
+    const priorFingerprint = prior.request_fingerprint || submissionRequestFingerprint(prior.request || {});
+    if (incomingFingerprint !== priorFingerprint) {
+      const error = new ApiError('同一次提交不能更改动作或执行范围，请重新发起。', 409);
+      error.code = 'CLIENT_SUBMISSION_MISMATCH';
+      error.details = { state: prior.state };
+      throw error;
+    }
+    if (prior.state === 'preparing') scheduleExecutionSubmissionPreparation(prior.id);
+    return { prepare: prior, reused: true };
+  }
+  const active = loadAllEffectiveSubmissions({
+    store: submissionPersistence,
+    onAbort: (row) => abortExecutionSubmissionCommit(row.id, 'commit_lease_expired'),
+  })
+    .find((row) => ACTIVE_SUBMISSION_STATES.has(String(row?.state || '')));
+  if (active) {
+    const error = new ApiError('已有一次提交正在准备或等待确认，请先完成当前提交。', 409);
+    error.code = 'ACTIVE_SUBMISSION_EXISTS';
+    throw error;
+  }
+  sameDayCompletionGate({
+    groups: executionGroupPersistence.loadAll(),
+    request: body,
+    confirmationStore: sameDayConfirmationStore,
+  });
+  const request = { ...body };
+  delete request.same_day_confirmation_token;
+  delete request.sameDayConfirmationToken;
+  const resumed = resumePausedSubmission({
+    store: submissionPersistence,
+    request,
+    clientSubmissionId: String(request.client_submission_id),
+  });
+  if (resumed) return resumed;
+  const created = claimSubmissionPreparation({
+    store: submissionPersistence,
+    clientSubmissionId: String(request.client_submission_id),
+    createRecord: () => ({
+    id: createExecutionPrepareId(),
+    client_submission_id: String(request.client_submission_id),
+    state: 'preparing',
+    scope_hash: null,
+    scope_version: null,
+    resolved_action: null,
+    discounts: {},
+    targets: [],
+    activity_buckets: {},
+    excluded_buckets: {},
+    seller_detection: { existing: [], existing_without_visible_id: [], confirmed_absent: [], needs_manual_review: [], unreadable: [] },
+    live_read: { rows: [], readable_count: 0, blocked_count: 0, all_blocked: false },
+    seller_input: { name: '', start_date: null, finish_date: null, selected_targets: [], validation_errors: [] },
+    confirmation_summary: '',
+    request,
+    request_fingerprint: submissionRequestFingerprint(request),
+    group_request: null,
+    expires_at: null,
+    group_id: null,
+    group: null,
+    error: null,
+    progress: { stage: 'queued', percent: 0, completed: 0, total: 0, message: '正在排队核对执行范围' },
+    }),
+  });
+  scheduleExecutionSubmissionPreparation(created.prepare.id);
+  return created;
+}
+
+function updateExecutionSubmissionSellerInput(prepareId, body = {}) {
+  const prepare = loadEffectiveSubmission({ store: submissionPersistence, prepareId });
+  if (!prepare) throw new ApiError('未找到本次准备结果，请重新准备。', 404);
+  if (prepare.state !== 'prepared') throw new ApiError('本次准备已进入提交阶段，不能再修改创建目标。', 409);
+  const selections = normalizeSellerCampaignTargetSelections(body);
+  const allowed = new Map((prepare.seller_detection?.confirmed_absent || []).map((target) => [sellerCampaignTargetKey(target), target]));
+  const selectedTargets = selections.map((entry) => allowed.get(sellerCampaignTargetKey(entry))).filter(Boolean);
+  if (selectedTargets.length !== selections.length) throw new ApiError('所选目标已变化或无法确认，请重新准备。', 409);
+  const precheck = buildSellerCampaignBatchCreatePrecheck({
+    targets: selectedTargets,
+    name: body.name,
+    startDate: body.startDate ?? body.start_date,
+    finishDate: body.finishDate ?? body.finish_date,
+  });
+  const confirmedScope = createConfirmedExecutionScope({
+    action: prepare.confirmed_execution_scope?.action || prepare.resolved_action,
+    activities: prepare.confirmed_execution_scope?.activities || [],
+    sellerCreateTargetKeys: selectedTargets.map(sellerCampaignTargetKey),
+    sellerTargetStates: prepare.confirmed_execution_scope?.seller_target_states || sellerDetectionStates(prepare.seller_detection),
+  });
+  return submissionPersistence.update(prepare.id, {
+    scope_hash: executionSubmissionScopeHash(confirmedScope, prepare.discounts),
+    scope_version: new Date().toISOString(),
+    confirmed_execution_scope: confirmedScope,
+    group_request: { ...(prepare.group_request || {}), confirmedExecutionScope: confirmedScope },
+    seller_input: {
+      name: body.name || '',
+      start_date: body.startDate ?? body.start_date ?? null,
+      finish_date: body.finishDate ?? body.finish_date ?? null,
+      selected_targets: selectedTargets,
+      validation_errors: precheck.validation_errors || [],
+    },
+  });
+}
+
+async function commitExecutionSubmission(prepareId, body = {}) {
+  if (submissionCommitTasks.has(String(prepareId))) {
+    const current = submissionPersistence.load(prepareId);
+    submissionPersistence.appendAudit(prepareId, { type: 'recovery_polled', reason: 'duplicate_commit_post_blocked', state: current?.state || 'committing' });
+    const error = new ApiError('后台正在处理同一次提交，请继续查询当前状态。', 409);
+    error.code = 'COMMIT_IN_PROGRESS';
+    error.details = { prepare_id: String(prepareId), state: current?.state || 'committing' };
+    throw error;
+  }
+  let current = refreshExecutionSubmissionExpiry(submissionPersistence.load(prepareId));
+  if (!current) throw new ApiError('未找到本次准备结果，请重新准备。', 404);
+  if (current.group_id) return { prepare: current, group: current.group || { id: current.group_id }, reused: true, accepted: false };
+  if (String(body.confirmText || body.confirm_text || '') !== 'REAL_SUBMIT') {
+    const error = new ApiError('最终提交需要 REAL_SUBMIT 确认。', 409);
+    error.code = 'REAL_SUBMIT_REQUIRED';
+    throw error;
+  }
+  const selected = current.seller_input?.selected_targets || [];
+  if (selected.length && !current.create_confirmed
+      && String(body.createConfirmText || body.create_confirm_text || '') !== 'CREATE_SELLER_CAMPAIGN') {
+    const error = new ApiError('创建自建活动需要 CREATE_SELLER_CAMPAIGN 确认。', 409);
+    error.code = 'CREATE_CONFIRM_REQUIRED';
+    throw error;
+  }
+  if (!['prepared', 'reconfirm_required'].includes(String(current.state || ''))) {
+    const error = new ApiError('本次准备状态已变化，请查询当前状态。', 409);
+    error.code = current.state === 'expired' ? 'PREPARE_EXPIRED' : 'INVALID_SUBMISSION_STATE';
+    throw error;
+  }
+  const operation = scheduleExecutionSubmissionCommit(prepareId, body, { recover: false });
+  operation.catch((error) => {
+    console.error(`已确认提交后台处理未完成：${submissionApiErrorMessage(error)}`);
+  });
+  current = submissionPersistence.load(prepareId) || current;
+  return { prepare: current, group: null, reused: false, accepted: true };
+}
+
+function abortExecutionSubmissionCommit(prepareId, reason = 'abort_requested') {
+  const controller = submissionCommitControllers.get(String(prepareId));
+  if (controller && !controller.signal.aborted) controller.abort(reason);
+}
+
+function recordSubmissionRecoveryPoll(prepare) {
+  if (!PRE_GROUP_SUBMISSION_STATES.has(String(prepare?.state || ''))) return;
+  const key = String(prepare.id || '');
+  const last = Number(submissionRecoveryAuditAt.get(key) || 0);
+  if (!key || Date.now() - last < 30_000) return;
+  submissionRecoveryAuditAt.set(key, Date.now());
+  submissionPersistence.appendAudit(key, { type: 'recovery_polled', state: prepare.state });
+}
+
+async function revalidateExecutionSubmissionScope(prepare, context = {}, { readScheduler, operationReadCache } = {}) {
+  context.checkpoint?.();
+  const current = await buildExecutionSubmissionSnapshot(prepare.request, context.reportProgress || (() => {}), {
+    ...context,
+    revalidateTargetKeys: context.targetKeys || [],
+    previousSnapshot: prepare,
+    finalRevalidation: true,
+    readScheduler,
+    operationReadCache,
+  });
+  context.checkpoint?.();
+  if (current.live_read?.all_blocked) {
+    const error = new ApiError('所选活动实时读取均失败，本次未启动商品执行。请稍后重新准备。', 409);
+    error.code = 'LIVE_READ_BLOCKED';
+    error.details = current.live_read;
+    throw error;
+  }
+  if (!prepare.confirmed_execution_scope) {
+    const error = new ApiError('当前准备结果缺少冻结范围，请重新准备并确认。', 409);
+    error.code = 'PREPARE_SCOPE_VERSION_REQUIRED';
+    throw error;
+  }
+  const reconciled = reconcileConfirmedExecutionScope({
+    confirmedScope: prepare.confirmed_execution_scope,
+    observedScope: current.observed_execution_scope,
+  });
+  if (reconciled.execution_relation_count === 0 && reconciled.blocked_activity_count > 0) {
+    const error = new ApiError('已确认活动的实时读取失败，本次未启动商品执行。请稍后重新准备。', 409);
+    error.code = 'LIVE_READ_BLOCKED';
+    error.details = { blocked_activity_count: reconciled.blocked_activity_count };
+    throw error;
+  }
+  const confirmedScope = reconciled.requires_reconfirm
+    ? reconciled.reconfirmation_scope
+    : reconciled.execution_scope;
+  const scopeHash = executionSubmissionScopeHash(confirmedScope, current.discounts);
+  const businessChanges = reconciled.messages.length
+    ? reconciled.messages
+    : reconciled.requires_reconfirm ? ['执行动作或活动结构发生变化，需要再次确认'] : [];
+  const scopeAdjustments = {
+    messages: businessChanges,
+    auto_removed_item_count: reconciled.auto_removed_item_count,
+    excluded_new_item_count: reconciled.excluded_new_item_count,
+    removed_activity_count: reconciled.removed_activity_count,
+    blocked_activity_count: reconciled.blocked_activity_count,
+  };
+  return {
+    scope_hash: scopeHash,
+    reconfirm_required: reconciled.requires_reconfirm,
+    execution_relation_count: reconciled.execution_relation_count,
+    changes: businessChanges,
+    changed_target_keys: reconciled.structural_target_keys,
+    prepared_patch: executionSubmissionPreparedPatch(current, prepare, {
+      confirmedScope,
+      scopeHash,
+      scopeMessages: businessChanges,
+      scopeAdjustments,
+    }),
+    revalidation_record: {
+      before: reconciled.before_summaries,
+      after: reconciled.after_summaries,
+      activity_diffs: reconciled.activity_diffs,
+      structural_changes: reconciled.structural_changes,
+      auto_removed_item_count: reconciled.auto_removed_item_count,
+      excluded_new_item_count: reconciled.excluded_new_item_count,
+      removed_activity_count: reconciled.removed_activity_count,
+      blocked_activity_count: reconciled.blocked_activity_count,
+      execution_relation_count: reconciled.execution_relation_count,
+      total_activity_count: Number(current.revalidation_plan?.total_activity_count || 0),
+      item_read_activity_count: Number(current.revalidation_plan?.item_read_activity_count || 0),
+      scope_review_activity_count: Number(current.revalidation_plan?.scope_review_activity_count || 0),
+      revalidation_reasons: current.revalidation_plan?.reasons_by_identity || {},
+    },
+  };
+}
+
+function scheduleExecutionSubmissionCommit(prepareId, body = {}, { recover = false } = {}) {
+  const key = String(prepareId || '');
+  if (!key) return Promise.reject(new ApiError('未找到本次准备结果，请重新准备。', 404));
+  const existing = submissionCommitTasks.get(key);
+  if (existing) return existing;
+  const controller = new AbortController();
+  const readScheduler = createBalancedReadScheduler(BALANCED_READ_PROFILES.prepare);
+  const operationReadCache = new Map();
+  submissionCommitControllers.set(key, controller);
+  let leaseTimer = null;
+  const operation = commitSubmission({
+    store: submissionPersistence,
+    prepareId: key,
+    confirmText: body.confirmText || body.confirm_text,
+    createConfirmText: body.createConfirmText || body.create_confirm_text,
+    leaseOwner: SERVER_INSTANCE_ID,
+    recover,
+    signal: controller.signal,
+    revalidate: (prepare, context = {}) => revalidateExecutionSubmissionScope(prepare, context, { readScheduler, operationReadCache }),
+    revalidateAfterCreation: (prepare, context = {}) => revalidateExecutionSubmissionScope(prepare, context, { readScheduler, operationReadCache }),
+    createSellerCampaigns: async (prepare, context = {}) => {
+      if ((prepare.seller_input?.validation_errors || []).length) {
+        return { ok: false, failed_count: prepare.seller_input.validation_errors.length, validation_errors: prepare.seller_input.validation_errors };
+      }
+      const result = await createMissingSellerCampaigns({
+        runId: context.runId || prepare.creation_run_id,
+        missingTargets: prepare.seller_input?.selected_targets || [],
+        existingTargets: prepare.seller_detection?.existing || [],
+        notSelectedTargets: sellerCampaignNotSelectedTargets(
+          prepare.seller_detection?.confirmed_absent || [],
+          prepare.seller_input?.selected_targets || [],
+          true,
+        ),
+        unreadableTargets: [],
+        name: prepare.seller_input?.name,
+        startDate: prepare.seller_input?.start_date,
+        finishDate: prepare.seller_input?.finish_date,
+        signal: context.signal,
+        checkpoint: context.checkpoint,
+        onProgress: context.persistProgress,
+        readScheduler,
+      });
+      const hiddenTargets = result.existing_without_visible_id || [];
+      const hiddenPatch = hiddenTargets.length ? applyHiddenSellerCampaignSkip(prepare, hiddenTargets) : null;
+      if (hiddenPatch) {
+        hiddenPatch.scope_hash = executionSubmissionScopeHash(hiddenPatch.confirmed_execution_scope, prepare.discounts);
+      }
+      return {
+        ...result,
+        ...(hiddenPatch ? { prepared_patch: hiddenPatch } : {}),
+        ok: Number(result.failed_count || 0) === 0
+          && Number(result.recheck_missing_count || 0) === 0
+          && Number(result.unreadable_count || 0) === 0,
+      };
+    },
+    startGroup: async (prepare, context = {}) => {
+      context.checkpoint?.();
+      return startExecutionGroupInternal({
+        ...prepare.group_request,
+        client_submission_id: prepare.client_submission_id,
+        submission_prepare_id: prepare.id,
+        confirmText: 'REAL_SUBMIT',
+      });
+    },
+  });
+  const leased = submissionPersistence.load(key);
+  if (leased?.commit_lease_expires_at) {
+    const delay = Math.max(1_000, new Date(leased.commit_lease_expires_at).getTime() - Date.now() + 50);
+    leaseTimer = setTimeout(() => refreshExecutionSubmissionExpiry(submissionPersistence.load(key)), delay);
+    leaseTimer.unref?.();
+  }
+  const task = operation.finally(() => {
+    if (leaseTimer) clearTimeout(leaseTimer);
+    submissionCommitTasks.delete(key);
+    submissionCommitControllers.delete(key);
+  });
+  submissionCommitTasks.set(key, task);
+  return task;
+}
+
+async function startExecutionGroupInternal(body = {}) {
+  requireFields(body, ['client_submission_id', 'action']);
+  let accountIds = normalizeAccountIdList(body.accountIds);
+  if (!accountIds.length) throw new ApiError('请选择至少一个店铺账号。', 400);
+  const prior = executionGroupPersistence.findBySubmissionId(body.client_submission_id);
+  if (prior) return publicExecutionGroup(prior);
+  if (hasConfirmedExecutionScope(body)) {
+    const scope = body.confirmedExecutionScope || body.confirmed_execution_scope;
+    if (Number(scope.version || 1) >= 2) {
+      for (const activity of scope.activities || []) {
+        normalizeAccountRoute(activity);
+        if (!accountIds.includes(String(activity.account_id ?? activity.accountId ?? ''))) {
+          const error = new ApiError('最终确认活动归属不在本次店铺范围内，已阻止创建执行组。', 422);
+          error.code = 'ACTIVITY_ACCOUNT_ROUTE_MISMATCH';
+          throw error;
+        }
+      }
+    }
+    const executableAccounts = new Set((scope.activities || [])
+      .filter((activity) => (activity.item_ids || activity.itemIds || []).length > 0)
+      .map((activity) => String(activity.account_id ?? activity.accountId ?? ''))
+      .filter(Boolean));
+    accountIds = accountIds.filter((accountId) => executableAccounts.has(String(accountId)));
+    if (!accountIds.length) {
+      const error = new ApiError('最终核对后没有可执行商品，本次未创建执行组。', 409);
+      error.code = 'NO_CONFIRMED_TARGETS';
+      throw error;
+    }
+    const selectedExecutableAccounts = new Set(accountIds.map(String));
+    const missingRelations = [];
+    for (const activity of scope.activities || []) {
+      if (!selectedExecutableAccounts.has(String(activity.account_id ?? activity.accountId ?? ''))) continue;
+      const available = new Set(listItems(
+        activity.account_id ?? activity.accountId,
+        activity.promotion_id ?? activity.promotionId,
+        activity.promotion_type ?? activity.promotionType,
+        activity.item_status ?? activity.itemStatus,
+      ).map((item) => String(item.item_id ?? item.itemId ?? item.id ?? '').toUpperCase()));
+      for (const itemId of activity.item_ids ?? activity.itemIds ?? []) {
+        if (!available.has(String(itemId || '').toUpperCase())) missingRelations.push(`${activityIdentityKey(activity)}|${itemId}`);
+      }
+    }
+    if (missingRelations.length) {
+      const error = new ApiError('最终确认商品在本地验证结果中已发生变化，本次未创建执行组。请重新准备。', 409);
+      error.code = 'CONFIRMED_SCOPE_CHANGED';
+      error.details = { missing_relation_count: missingRelations.length };
+      throw error;
+    }
+  }
+  const settings = readSettings();
+  const normalizedWriteConcurrency = normalizeWriteConcurrency(body.writeConcurrency, settings.writeConcurrency);
+  const commonRequest = {
+    ...body,
+    accountIds,
+    requestedWriteConcurrency: body.writeConcurrency,
+    requestedGlobalWriteConcurrency: body.globalWriteConcurrency,
+    writeConcurrency: normalizedWriteConcurrency,
+    globalWriteConcurrency: normalizeConcurrencyWithCap(body.globalWriteConcurrency ?? normalizedWriteConcurrency, normalizedWriteConcurrency, MAX_WRITE_CONCURRENCY),
+  };
+  const protection = realSubmitProtection({ ...commonRequest, mode: commonRequest.mode || 'real' }, { batch: true });
+  if (!protection.allowed) throw new ApiError(protection.error || '真实执行确认未通过。', protection.status || 409);
+  const groupId = createExecutionGroupId();
+  const storeNames = body.storeNames && typeof body.storeNames === 'object' ? body.storeNames : {};
+  const jobs = accountIds.map((accountId) => createExecutionJob({
+    ...commonRequest,
+    accountId,
+    storeName: storeNames[accountId] || '',
+    selectedStoreName: storeNames[accountId] || '',
+    executionGroupId: groupId,
+  }));
+  const createdAt = new Date().toISOString();
+  const group = {
+    id: groupId,
+    client_submission_id: String(body.client_submission_id),
+    submission_prepare_id: body.submission_prepare_id || null,
+    status: 'queued', action: String(body.action), request: commonRequest,
+    children: jobs.map((job) => executionGroupChildSnapshot(job)),
+    created_at: createdAt, updated_at: createdAt, finished_at: null,
+    cancel_requested: false, global_peak_in_flight: 0, result: null, error: null,
+  };
+  try {
+    executionGroupPersistence.create(group);
+  } catch (error) {
+    for (const job of jobs) executionJobs.delete(job.id);
+    throw error;
+  }
+  executionGroups.set(group.id, group);
+  setImmediate(() => runExecutionGroup(group.id).catch((error) => failExecutionGroup(group.id, error)));
+  return publicExecutionGroup(group);
+}
+
+async function runExecutionGroup(groupId) {
+  const group = executionGroups.get(String(groupId)) || executionGroupPersistence.load(groupId);
+  if (!group || TERMINAL_EXECUTION_GROUP_STATUSES.has(String(group.status || ''))) return;
+  group.status = 'running';
+  executionGroupPersistence.persist(group);
+  const jobs = (group.children || []).map((child) => executionJobs.get(String(child.job_id)) || loadPersistedExecutionJob(child.job_id)).filter(Boolean);
+  await Promise.all(jobs.map(async (job) => {
+    executionJobs.set(job.id, job);
+    try {
+      await runExecutionJob(job.id);
+    } catch (error) {
+      failExecutionJob(job, error);
+    } finally {
+      executionGroupPersistence.updateChild(group.id, job);
+    }
+  }));
+  const current = executionGroups.get(String(group.id)) || executionGroupPersistence.load(group.id) || group;
+  const childStatuses = (current.children || []).map((child) => String(child.status || ''));
+  if (current.cancel_requested || childStatuses.includes('cancelled')) current.status = 'cancelled';
+  else if (childStatuses.includes('interrupted')) current.status = 'interrupted';
+  else if (childStatuses.includes('failed')) current.status = 'failed';
+  else current.status = 'completed';
+  current.finished_at = new Date().toISOString();
+  current.result = summarizeExecutionGroup(current);
+  current.global_peak_in_flight = Math.max(
+    Number(current.global_peak_in_flight || 0),
+    Number(sharedWriteLimiters.get(String(current.id))?.maxActive || 0)
+  );
+  executionGroupPersistence.persist(current);
+  executionGroups.set(String(current.id), current);
+  sharedWriteLimiters.delete(String(current.id));
+  publishHistorySummaryForExecutionGroup(current.id);
+  const submission = submissionPersistence.findBySubmissionId(current.client_submission_id);
+  if (submission) submissionPersistence.update(submission.id, { state: 'terminal', group_id: current.id, group: publicExecutionGroup(current) });
+}
+
+function failExecutionGroup(groupId, error) {
+  const group = executionGroups.get(String(groupId)) || executionGroupPersistence.load(groupId);
+  if (!group) return;
+  group.status = group.cancel_requested ? 'cancelled' : 'failed';
+  group.finished_at = new Date().toISOString();
+  group.error = toChineseError(error);
+  group.result = summarizeExecutionGroup(group);
+  executionGroupPersistence.persist(group);
+  executionGroups.set(String(group.id), group);
+  sharedWriteLimiters.delete(String(group.id));
+  publishHistorySummaryForExecutionGroup(group.id);
+  const submission = submissionPersistence.findBySubmissionId(group.client_submission_id);
+  if (submission) submissionPersistence.update(submission.id, { state: 'terminal', group_id: group.id, group: publicExecutionGroup(group), error: group.error });
 }
 
 function publicExecutionJob(job) {
@@ -1790,6 +4316,19 @@ function publicExecutionJob(job) {
     result: job.result,
     error: job.error
   };
+}
+
+function persistExecutionJob(job) {
+  executionJobPersistence.persist(job);
+  const groupId = String(job.request?.executionGroupId || job.request_summary?.executionGroupId || '');
+  if (groupId) {
+    const group = executionGroupPersistence.updateChild(groupId, job);
+    if (group) executionGroups.set(String(group.id), group);
+  }
+}
+
+function loadPersistedExecutionJob(jobId) {
+  return executionJobPersistence.load(jobId);
 }
 
 function appendExecutionJobLog(job, message, extra = {}) {
@@ -1820,17 +4359,18 @@ function executionJobEventPath(jobOrId) {
 function findExecutionJobEventPath(jobOrId) {
   const direct = executionJobEventPath(jobOrId);
   if (fs.existsSync(direct)) return direct;
+  if (fs.existsSync(`${direct}.gz`)) return `${direct}.gz`;
   const jobId = typeof jobOrId === 'object' && jobOrId ? jobOrId.id : jobOrId;
   const safeJobId = safeExecutionJobId(jobId);
   if (!safeJobId) return direct;
   try {
     const candidates = fs.readdirSync(EXECUTION_JOB_EVENT_DIR)
-      .filter((name) => name.endsWith('.jsonl'))
-      .filter((name) => name === `${safeJobId}.jsonl` || name.startsWith(`${safeJobId}-`))
+      .filter((name) => name.endsWith('.jsonl') || name.endsWith('.jsonl.gz'))
+      .filter((name) => name === `${safeJobId}.jsonl` || name === `${safeJobId}.jsonl.gz` || name.startsWith(`${safeJobId}-`))
       .map((name) => path.join(EXECUTION_JOB_EVENT_DIR, name))
       .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
     for (const candidate of candidates) {
-      const firstLine = fs.readFileSync(candidate, 'utf8').split(/\r?\n/).find(Boolean);
+      const firstLine = readAuditText(candidate).split(/\r?\n/).find(Boolean);
       if (!firstLine) continue;
       try {
         const event = JSON.parse(firstLine);
@@ -1854,18 +4394,32 @@ function appendExecutionJobEvent(job, event) {
     at: new Date().toISOString(),
     jobId: job.id,
     run_id: job.run_id || null,
+    group_id: job.request?.executionGroupId || job.request_summary?.executionGroupId || null,
     ...event
   };
-  fs.appendFileSync(executionJobEventPath(job), `${JSON.stringify(row)}\n`, 'utf8');
+  const eventPath = executionJobEventPath(job);
+  let descriptor = executionEventFileDescriptors.get(eventPath);
+  if (descriptor === undefined) {
+    descriptor = fs.openSync(eventPath, 'a');
+    executionEventFileDescriptors.set(eventPath, descriptor);
+  }
+  fs.writeSync(descriptor, `${JSON.stringify(row)}\n`, null, 'utf8');
   job.last_event_at = row.at;
   return row;
 }
+
+process.on('exit', () => {
+  for (const descriptor of executionEventFileDescriptors.values()) {
+    try { fs.closeSync(descriptor); } catch { /* Process exit cleanup only. */ }
+  }
+  executionEventFileDescriptors.clear();
+});
 
 function readExecutionJobEvents(jobId, limit = 5000) {
   const job = executionJobs.get(String(jobId));
   const file = findExecutionJobEventPath(job || jobId);
   try {
-    const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean);
+    const lines = readAuditText(file).split(/\r?\n/).filter(Boolean);
     const safeLimit = Math.max(1, Math.min(50000, Math.floor(Number(limit) || 5000)));
     const events = lines.slice(-safeLimit).map((line) => {
       try {
@@ -1980,7 +4534,7 @@ function appendExecutionItemAuditEvent(jobId, {
     item: {
       taskId: taskId ?? null,
       accountId: String(account?.account_id || ''),
-      storeName: account?.storeName || account?.display_name || account?.nickname || '',
+      storeName: account?.storeName || storeIdentityForAccount(account?.account_id, account || {}).store_name,
       siteId: promotion?.site_id || item.site_id || '',
       siteName: siteDisplayName(promotion?.site_id || item.site_id || ''),
       promotionId: promotion?.promotion_id || '',
@@ -2098,6 +4652,46 @@ function siteDisplayName(siteId = '') {
   return map[String(siteId || '').toUpperCase()] || (siteId ? `站点 ${siteId}` : '全部站点');
 }
 
+async function inspectOperatingSiteEvidence({ account, sites = [], settings = readSettings() } = {}) {
+  const storeName = storeIdentityForAccount(account.account_id, account, settings).store_name;
+  const rows = await mapLimited(sites, Math.min(10, normalizeConcurrency(settings.readConcurrency || 2)), async (site) => {
+    const childUserId = String(site.child_user_id || '').trim();
+    const base = {
+      account_id: String(account.account_id),
+      store_name: storeName,
+      site_id: String(site.site_id || '').trim().toUpperCase(),
+      site_name: siteDisplayName(site.site_id),
+      activity_count: Number(site.total || site.last_promotion_count || 0),
+      child_user_id: childUserId,
+      logistic_type: String(site.logistic_type || '')
+    };
+    if (!childUserId) return { ...base, active_probe_ok: false, active_listing_count: 0 };
+    try {
+      const client = new MercadoLibreClient({
+        accessToken: account.accessToken,
+        userId: childUserId,
+        callerId: childUserId,
+        marketplace: true
+      });
+      const response = await client.searchMarketplaceUserItems({ userId: childUserId, status: 'active', limit: 1, searchType: 'scan' });
+      return {
+        ...base,
+        active_probe_ok: true,
+        active_listing_count: Math.max(0, Number(response?.paging?.total ?? (response?.results || []).length) || 0)
+      };
+    } catch {
+      return { ...base, active_probe_ok: false, active_listing_count: 0 };
+    }
+  });
+  return mergeOperatingSiteEvidence(rows, settings);
+}
+
+function listOperatingCampaignsFiltered(accountId, filters = {}, settings = readSettings()) {
+  return filterByOperatingSites(listCampaignsFiltered(accountId, filters), settings, accountId)
+    .filter((promotion) => !['catalog_removed', 'finished', 'ended', 'closed'].includes(String(promotion.status || '').toLowerCase()))
+    .filter((promotion) => !isActivityExpired(promotion));
+}
+
 function actionDisplayName(action = '') {
   return {
     enroll: '批量报活动',
@@ -2148,7 +4742,7 @@ function businessScope({ storeName, promotion, siteId } = {}) {
 function readCompletenessText(event = {}) {
   const platformTotal = numberOrNull(event.platform_total);
   const savedCount = numberOrNull(event.saved_count) ?? 0;
-  const base = `平台候选 ${platformTotal ?? '-'}，已读取 ${savedCount}`;
+  const base = `平台商品 ${platformTotal ?? '-'}，已读取 ${savedCount}`;
   if (event.error || event.blocked) return `${base}，读取异常`;
   if (event.is_full_fetch) return `${base}，已完整读取`;
   if (event.sample_only) return `${base}，样本读取`;
@@ -2160,8 +4754,8 @@ function businessReasonText(reason = '') {
   const raw = String(reason || '');
   const text = (/[\u4e00-\u9fff]/.test(raw) ? raw : toChineseError(raw)).replace(/_/g, ' ');
   return text
-    .replace(/\bapi incomplete marketplace candidate\b/gi, '候选明细不完整')
-    .replace(/\bpartial api sparse marketplace candidate\b/gi, '平台候选明细读取不完整')
+    .replace(/\bapi incomplete marketplace candidate\b/gi, '商品明细不完整')
+    .replace(/\bpartial api sparse marketplace candidate\b/gi, '平台商品明细读取不完整')
     .replace(/\bparameters unconfirmed\b/gi, '活动参数未确认')
     .replace(/\brunning\b/gi, '执行中')
     .replace(/\bpartial or failed\b/gi, '部分完成/有失败')
@@ -2238,7 +4832,8 @@ function formatPlanUserProgress(entry, action, storeName) {
 
 function appendSiteActivityUserLogs(job, account, filters, storeName) {
   const siteIds = new Set(Array.isArray(filters.siteIds) ? filters.siteIds.map(String) : String(filters.siteId || '').split(',').filter(Boolean));
-  const sites = listSiteSummaries(account.account_id).filter((site) => !siteIds.size || siteIds.has(String(site.site_id || '')));
+  const sites = filterByOperatingSites(listSiteSummaries(account.account_id), readSettings(), account.account_id)
+    .filter((site) => !siteIds.size || siteIds.has(String(site.site_id || '')));
   appendExecutionUserLog(job, '加载店铺站点列表...');
   if (!sites.length) {
     appendExecutionUserLog(job, '店铺站点列表完成');
@@ -2323,7 +4918,14 @@ function displayProgressTotal(event = {}) {
   );
 }
 
-function saveBatchExecutionSummaryTask({ account, action, execution, completed }) {
+function executionTaskIdentity(request = {}) {
+  return {
+    executionGroupId: request.executionGroupId || null,
+    executionJobId: request.executionJobId || null
+  };
+}
+
+function saveBatchExecutionSummaryTask({ account, action, execution, completed, request = {} }) {
   const plan = {
     total: execution.total || 0,
     planned: execution.success || 0,
@@ -2339,7 +4941,8 @@ function saveBatchExecutionSummaryTask({ account, action, execution, completed }
     mode: 'real',
     discountPercent: null,
     directPrice: null,
-    plan
+    plan,
+    ...executionTaskIdentity(request)
   });
   finishTask(taskId, {
     success: execution.success || 0,
@@ -2349,17 +4952,53 @@ function saveBatchExecutionSummaryTask({ account, action, execution, completed }
     planned: execution.success || 0,
     total: execution.total || 0,
     promotions_total: execution.promotions_total || 0,
+    result_contract_version: execution.result_contract_version || RESULT_CONTRACT_VERSION,
+    relation_count: execution.relation_count ?? execution.total ?? 0,
+    unique_item_count: execution.unique_item_count ?? null,
+    activity_failure_count: execution.activity_failure_count ?? 0,
+    request_success_count: execution.request_success_count ?? 0,
+    live_verified_removed_count: execution.live_verified_removed_count ?? 0,
+    pending_verification_count: execution.pending_verification_count ?? 0,
     failure_reasons: summarizeExecutionFailureReasons(execution)
-  }, completed && !execution.cancelled && (execution.failed || 0) === 0 ? 'completed' : execution.cancelled ? 'cancelled' : 'partial_or_failed', completed);
+  }, completed && !execution.cancelled && (execution.failed || 0) === 0 && (execution.activity_failure_count || 0) === 0
+    ? 'completed'
+    : execution.cancelled ? 'cancelled' : 'partial_or_failed', completed, {
+    publishHistory: !request.executionGroupId
+  });
   return taskId;
 }
 
 function failExecutionJob(job, error) {
+  if (job.request?.executionGroupId && !job.batch_task_id) {
+    const plan = { total: 0, planned: 0, skipped: 0, priceMode: 'batch', rows: [] };
+    const taskId = createTask({
+      accountId: job.request.accountId,
+      promotionId: '__BATCH__',
+      promotionType: 'BATCH',
+      action: job.request.action || 'auto',
+      mode: 'real',
+      discountPercent: null,
+      directPrice: null,
+      plan,
+      ...executionTaskIdentity({ ...job.request, executionJobId: job.id })
+    });
+    finishTask(taskId, {
+      success: 0,
+      failed: 0,
+      skipped: 0,
+      planned: 0,
+      total: 0,
+      promotions_total: 0,
+      failure_reasons: [{ reason: toChineseError(error), count: 1 }]
+    }, 'failed', false, { publishHistory: false });
+    job.batch_task_id = Number(taskId);
+  }
   job.status = job.cancel_requested ? 'cancelled' : 'failed';
   job.error = toChineseError(error);
   job.finished_at = new Date().toISOString();
   appendExecutionUserLog(job, job.status === 'cancelled' ? '执行任务已停止。' : `执行失败：${job.error}`);
   appendExecutionJobLog(job, job.status === 'cancelled' ? '执行任务已停止。' : `执行任务失败：${job.error}`);
+  persistExecutionJob(job);
 }
 
 async function runExecutionJob(jobId) {
@@ -2368,13 +5007,14 @@ async function runExecutionJob(jobId) {
   job.status = 'running';
   job.progress.stage = 'starting';
   appendExecutionJobLog(job, '开始准备执行。');
+  persistExecutionJob(job);
   try {
     const request = job.request;
     const settings = readSettings();
     const account = await ensureUsableAccount(request.accountId);
     const filters = request.filters || settings.defaultFilters || {};
     const jobStartedMs = Date.now();
-    const storeName = request.storeName || request.selectedStoreName || account.nickname || account.display_name || '当前店铺';
+    const storeName = request.storeName || request.selectedStoreName || storeIdentityForAccount(account.account_id, account, settings).store_name;
     const selectedSiteName = request.selectedSiteName || (filters.siteId ? siteDisplayName(filters.siteId) : '全部站点');
     const jobReadConcurrency = normalizeConcurrency(request.readConcurrency, settings.readConcurrency);
     const jobSiteConcurrency = normalizeConcurrency(request.siteConcurrency ?? request.readConcurrency, settings.readConcurrency);
@@ -2397,7 +5037,24 @@ async function runExecutionJob(jobId) {
     appendExecutionJobLog(job, `筛选：${describeFilters(filters)}；商品读取策略：${request.fetchMode === 'sample' ? `样本 ${request.maxItems || settings.maxItemsPerPromotion || 50}/活动` : '全量读取，平台 partial 时记录可见子集'}。`);
     appendExecutionUserLog(job, `并发读取站点活动：店铺站点并发=${jobSiteConcurrency}，读取并发=${jobReadConcurrency}。`);
     appendExecutionJobLog(job, `刷新并匹配活动，读取并发 ${jobReadConcurrency}。`);
-    const promotionPrep = await preparePromotionsForExecution({ account, filters, settings, request });
+    const frozenScope = hasConfirmedExecutionScope(request);
+    const promotionPrep = frozenScope
+      ? (() => {
+          const localPromotions = ordinaryPromotions(listOperatingCampaignsFiltered(account.account_id, filters || {}, settings));
+          const filtered = filterPromotionsByConfirmedScope({ accountId: account.account_id, promotions: localPromotions, request });
+          return {
+            promotions: filtered.promotions,
+            confirmed_scope_missing_activity_keys: filtered.missingActivityKeys,
+            summary: {
+              stages: ['使用最终确认并已实时复核的活动范围，不再扩大或重新全量读取。'],
+              fetched: false,
+              matched_before_fetch: localPromotions.length,
+              matched_after_fetch: filtered.promotions.length,
+              total_after_fetch: localPromotions.length,
+            },
+          };
+        })()
+      : await preparePromotionsForExecution({ account, filters, settings, request });
     for (const line of promotionPrep.summary.stages || []) appendExecutionJobLog(job, line);
     appendSiteActivityUserLogs(job, account, filters, storeName);
     const promotions = promotionPrep.promotions;
@@ -2410,6 +5067,9 @@ async function runExecutionJob(jobId) {
     if (promotions.length > 30) appendExecutionJobLog(job, `活动列表较多，仅展示前 30 个，其余 ${promotions.length - 30} 个继续处理。`);
     if (!promotions.length) {
       throw new Error('未找到匹配活动。请检查店铺、站点、自建/官方活动筛选。');
+    }
+    if ((promotionPrep.confirmed_scope_missing_activity_keys || []).length) {
+      throw new ApiError('最终确认活动已不在本地验证范围中，本次未执行商品。请重新准备。', 409);
     }
 
     let action = request.action || '';
@@ -2429,50 +5089,79 @@ async function runExecutionJob(jobId) {
     job.progress.stage = 'items';
     appendExecutionUserLog(job, `开始读取${itemStatusDisplayName(itemStatus)}：活动 ${promotions.length} 个，读取并发=${jobReadConcurrency}。`);
     appendExecutionJobLog(job, `读取 ${itemStatus} 商品，活动 ${promotions.length} 个。`);
-    const itemPrep = await prepareItemsForExecution({
-      account,
-      promotions,
-      action,
-      itemStatus,
-      settings,
-      request,
-      shouldCancel: () => job.cancel_requested,
-      onProgress: (event) => {
-        if (event.total) job.progress.total_promotions = event.total;
-        if (event.type === 'item_fetch_start') {
-          job.progress.stage = 'items';
-          appendExecutionUserLog(job, `${businessScope({ storeName, promotion: event.promotion })}：读取${itemStatusDisplayName(itemStatus)}。`);
-          appendExecutionJobLog(job, `读取商品 ${event.index + 1}/${event.total}：${event.promotion_id} ${event.promotion_type}`);
+    const itemPrep = frozenScope
+      ? {
+          summary: {
+            action,
+            itemStatus,
+            fetchMode: 'confirmed_scope',
+            readConcurrency: 0,
+            promotions: promotions.length,
+            platform_total: 0,
+            saved_count: (request.confirmedExecutionScope?.activities || request.confirmed_execution_scope?.activities || [])
+              .filter((activity) => String(activity.account_id ?? activity.accountId ?? '') === String(account.account_id))
+              .reduce((sum, activity) => sum + (activity.item_ids ?? activity.itemIds ?? []).length, 0),
+            failed_promotions: 0,
+            fallback_promotions: 0,
+            rows: [],
+            stages: ['使用最终确认商品关系，不再进行同级全量读取。'],
+          },
+          rows: [],
         }
-        if (event.type === 'item_fetch_done') {
-          job.progress.completed_promotions += 1;
-          job.progress.platform_total += Number(event.platform_total || 0);
-          job.progress.saved_count += Number(event.saved_count || 0);
-          if (event.error || event.blocked) job.progress.failed_promotions += 1;
-          appendExecutionUserLog(job, `${businessScope({ storeName, promotion: event.promotion })}：${readCompletenessText(event)}。`);
-          appendExecutionJobLog(job, `商品读取完成 ${event.index + 1}/${event.total}：${event.promotion_id}，${formatFetchProgress(event)}`);
-        }
-        if (event.type === 'inventory_fallback_start') {
-          appendExecutionUserLog(job, `${businessScope({ storeName, promotion: event.promotion })}：候选明细不完整，尝试从库存商品补充可读候选。`);
-          appendExecutionJobLog(job, `自建活动候选异常，启用库存兜底：${event.promotion_id}`);
-        }
-        if (event.type === 'inventory_fallback_done') {
-          appendExecutionUserLog(job, `${businessScope({ storeName, promotion: event.promotion })}：库存补充完成，可读商品 ${event.saved_count ?? 0} 个。`);
-          appendExecutionJobLog(job, `库存兜底完成：${event.promotion_id}，可读 ${event.saved_count ?? 0}。`);
-        }
-      }
-    });
+      : await prepareItemsForExecution({
+          account,
+          promotions,
+          action,
+          itemStatus,
+          settings,
+          request,
+          shouldCancel: () => job.cancel_requested,
+          onProgress: (event) => {
+            if (event.total) job.progress.total_promotions = event.total;
+            if (event.type === 'item_fetch_start') {
+              job.progress.stage = 'items';
+              appendExecutionUserLog(job, `${businessScope({ storeName, promotion: event.promotion })}：读取${itemStatusDisplayName(itemStatus)}。`);
+              appendExecutionJobLog(job, `读取商品 ${event.index + 1}/${event.total}：${event.promotion_id} ${event.promotion_type}`);
+            }
+            if (event.type === 'item_fetch_done') {
+              job.progress.completed_promotions += 1;
+              job.progress.platform_total += Number(event.platform_total || 0);
+              job.progress.saved_count += Number(event.saved_count || 0);
+              if (event.error || event.blocked) job.progress.failed_promotions += 1;
+              appendExecutionUserLog(job, `${businessScope({ storeName, promotion: event.promotion })}：${readCompletenessText(event)}。`);
+              appendExecutionJobLog(job, `商品读取完成 ${event.index + 1}/${event.total}：${event.promotion_id}，${formatFetchProgress(event)}`);
+            }
+            if (event.type === 'inventory_fallback_start') {
+              appendExecutionUserLog(job, `${businessScope({ storeName, promotion: event.promotion })}：候选明细不完整，尝试从库存商品补充可读候选。`);
+              appendExecutionJobLog(job, `自建活动候选异常，启用库存兜底：${event.promotion_id}`);
+            }
+            if (event.type === 'inventory_fallback_done') {
+              appendExecutionUserLog(job, `${businessScope({ storeName, promotion: event.promotion })}：库存补充完成，可读商品 ${event.saved_count ?? 0} 个。`);
+              appendExecutionJobLog(job, `库存兜底完成：${event.promotion_id}，可读 ${event.saved_count ?? 0}。`);
+            }
+          }
+        });
     for (const line of itemPrep.summary.stages || []) appendExecutionJobLog(job, line);
 
     if (job.cancel_requested) {
       job.status = 'cancelled';
       job.finished_at = new Date().toISOString();
       appendExecutionJobLog(job, '执行任务已在写入前停止。');
+      persistExecutionJob(job);
       return;
     }
 
     const allowInventoryFallback = request.allowInventoryFallback !== false;
     let itemsByPromotion = listItemsForPromotions(account.account_id, promotions, itemStatus);
+    const confirmedFilter = filterItemsByConfirmedScope({ accountId: account.account_id, promotions, itemsByPromotion, request });
+    if (confirmedFilter.hasFilter) {
+      if (confirmedFilter.missingRelations.length) {
+        throw new ApiError('最终确认商品已不在本地验证范围中，本次未执行商品。请重新准备。', 409);
+      }
+      itemsByPromotion = confirmedFilter.itemsByPromotion;
+      job.progress.confirmed_relation_count = confirmedFilter.matchedRelationCount;
+      appendExecutionJobLog(job, `最终确认范围：商品关系 ${confirmedFilter.matchedRelationCount} 条；新增活动和新增候选未纳入。`);
+    }
     const itemFilter = filterItemsByRequestedIds({ promotions, itemsByPromotion, request });
     if (itemFilter.hasFilter) {
       job.progress.target_item_ids = itemFilter.requestedItemIds;
@@ -2533,6 +5222,7 @@ async function runExecutionJob(jobId) {
       };
       appendExecutionUserLog(job, `只读准备完成：活动 ${batch.plans.length} 个，商品 ${batch.totals.total}，可执行 ${batch.totals.planned}，跳过 ${batch.totals.skipped}。`);
       appendExecutionJobLog(job, '只读准备完成，未执行 Mercado 写接口。');
+      persistExecutionJob(job);
       return;
     }
 
@@ -2582,7 +5272,25 @@ async function runExecutionJob(jobId) {
       execution.target_item_ids = itemFilter.requestedItemIds;
       execution.itemIds_filtered_count = itemFilter.matchedItemIds.length;
     }
-    const batchTaskId = saveBatchExecutionSummaryTask({ account, action, execution, completed: !execution.cancelled && Number(execution.failed || 0) === 0 });
+    for (const promotionResult of execution.promotions || []) {
+      if (Number(promotionResult.success || 0) <= 0 && Number(promotionResult.request_success_count || 0) <= 0) continue;
+      markActivityCacheDirty({
+        accountId: account.account_id,
+        siteId: promotionResult.site_id || '',
+        promotionId: promotionResult.promotion_id,
+        promotionType: promotionResult.promotion_type,
+      });
+    }
+    const batchTaskId = saveBatchExecutionSummaryTask({
+      account,
+      action,
+      execution,
+      completed: !execution.cancelled
+        && Number(execution.failed || 0) === 0
+        && Number(execution.activity_failure_count || 0) === 0,
+      request,
+    });
+    job.batch_task_id = Number(batchTaskId);
     job.status = execution.cancelled ? 'cancelled' : 'completed';
     job.progress.stage = job.status;
     job.finished_at = new Date().toISOString();
@@ -2603,17 +5311,29 @@ async function runExecutionJob(jobId) {
     appendExecutionUserLog(job, execution.cancelled
       ? `执行任务已按规则停止：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，已保存结果。`
       : `${actionDisplayName(action)}完成：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，用时 ${formatDuration(Date.now() - jobStartedMs)}。`);
+    persistExecutionJob(job);
   } catch (error) {
     failExecutionJob(job, error);
   }
 }
 
 function buildTodayDecision(accountId, promotions) {
-  return decideToday({
-    promotions,
-    cycleStatesByPromotion: listCycleStatesForPromotions(accountId, promotions),
-    startedCountsByPromotion: listItemCountsForPromotions(accountId, promotions, 'started')
+  return buildTodayDecisionForScope([accountId], promotions);
+}
+
+function buildTodayDecisionForScope(accountIds, promotions) {
+  const cycleStatesByPromotion = new Map();
+  const startedCountsByPromotion = new Map();
+  for (const accountId of accountIds) {
+    const scoped = promotions.filter((promotion) => String(promotion.account_id || '') === String(accountId));
+    for (const [key, value] of listCycleStatesForPromotions(accountId, scoped)) cycleStatesByPromotion.set(key, value);
+    for (const [key, value] of listItemCountsForPromotions(accountId, scoped, 'started')) startedCountsByPromotion.set(key, value);
+  }
+  const globalCycle = buildGlobalTodayDiscount({
+    tasks: listGlobalDiscountUpdateSummaries(300),
+    settings: readSettings(),
   });
+  return decideToday({ promotions, cycleStatesByPromotion, startedCountsByPromotion, globalCycle });
 }
 
 async function executeBatchPlans({ account, action, itemStatus, batch, request, writeConcurrency, globalWriteConcurrency, activityConcurrency, onProgress, shouldCancel }) {
@@ -2640,6 +5360,13 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
     failed: 0,
     skipped: 0,
     blocked: 0,
+    result_contract_version: RESULT_CONTRACT_VERSION,
+    relation_count: 0,
+    unique_item_count: 0,
+    activity_failure_count: 0,
+    request_success_count: 0,
+    live_verified_removed_count: 0,
+    pending_verification_count: 0,
     writeConcurrency: normalizedWriteConcurrency,
     activityConcurrency: normalizedActivityConcurrency,
     globalWriteConcurrency: normalizedGlobalWriteConcurrency,
@@ -2649,6 +5376,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
     promotions: []
   };
   const shouldStop = () => Boolean(stopReason) || Boolean(shouldCancel?.());
+  const summaryUniqueItems = new Set();
   const requestStop = (reason, details = null) => {
     if (stopReason) return;
     stopReason = reason || '接口类失败触发停止。';
@@ -2686,7 +5414,8 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         mode: 'real',
         discountPercent: plan.discountPercent,
         directPrice: plan.directPrice,
-        plan
+        plan,
+        ...executionTaskIdentity(request)
       });
       saveExecutionResult({
         taskId,
@@ -2696,12 +5425,12 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         itemId: '',
         action,
         mode: 'real',
-        status: 'failed',
+        status: 'activity_failed',
         errorCn: reason
       });
-      finishTask(taskId, { success: 0, failed: 1, skipped: 0, blocked: 1 }, 'blocked', false);
+      finishTask(taskId, { success: 0, failed: 0, skipped: 0, blocked: 1, activity_failure_count: 1, result_contract_version: RESULT_CONTRACT_VERSION }, 'blocked', false, { publishHistory: false });
       summary.blocked += 1;
-      summary.failed += 1;
+      summary.activity_failure_count += 1;
       summary.promotions.push({
         site_id: promotion.site_id,
         promotion_id: promotion.promotion_id,
@@ -2711,7 +5440,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         taskId,
         total: 0,
         success: 0,
-        failed: 1,
+        failed: 0,
         skipped: 0
       });
       onProgress?.({
@@ -2723,7 +5452,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         promotion,
         total_items: 0,
         success: 0,
-        failed: 1,
+        failed: 0,
         skipped: 0,
         activityConcurrency: normalizedActivityConcurrency,
         writeConcurrency: normalizedWriteConcurrency
@@ -2738,7 +5467,8 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       mode: 'real',
       discountPercent: plan.discountPercent,
       directPrice: plan.directPrice,
-      plan
+      plan,
+      ...executionTaskIdentity(request)
     });
     if (plan.total === 0) {
       const reason = `${itemStatus} 商品未读取到或当前筛选下无可处理商品。`;
@@ -2750,12 +5480,12 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         itemId: '',
         action,
         mode: 'real',
-        status: 'failed',
+        status: 'activity_failed',
         errorCn: reason
       });
-      const counts = { success: 0, failed: 1, skipped: 0 };
-      finishTask(taskId, counts, 'empty_or_failed', false);
-      summary.failed += 1;
+      const counts = { success: 0, failed: 0, skipped: 0, activity_failure_count: 1, result_contract_version: RESULT_CONTRACT_VERSION };
+      finishTask(taskId, counts, 'empty_or_failed', false, { publishHistory: false });
+      summary.activity_failure_count += 1;
       summary.promotions.push({
         site_id: promotion.site_id,
         child_user_id: promotion.child_user_id,
@@ -2764,7 +5494,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         taskId,
         total: 0,
         success: 0,
-        failed: 1,
+        failed: 0,
         skipped: 0,
         completed: false,
         reason
@@ -2778,7 +5508,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         promotion,
         total_items: 0,
         success: 0,
-        failed: 1,
+        failed: 0,
         skipped: 0,
         activityConcurrency: normalizedActivityConcurrency,
         writeConcurrency: normalizedWriteConcurrency
@@ -2816,7 +5546,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       }
       const skipped = (plan.rows || []).filter((row) => row.status === 'planned').length;
       const counts = { success: 0, failed: 0, skipped };
-      finishTask(taskId, counts, 'blocked', false);
+      finishTask(taskId, counts, 'blocked', false, { publishHistory: false });
       summary.total += plan.total;
       summary.skipped += skipped;
       summary.promotions.push({
@@ -2866,6 +5596,16 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       });
     }
     let client = makeWriteClient(account, promotion);
+    const cancelOutcomes = [];
+    const persistExecutionOutcome = (result) => {
+      const persisted = action === 'cancel' && result?.status === 'success'
+        ? { ...result, status: CANCEL_RESULT_STATUS.requestSuccess }
+        : result;
+      if (action === 'cancel' && String(result?.itemId || '').trim()) {
+        cancelOutcomes.push({ item_id: String(result.itemId), status: persisted.status });
+      }
+      return saveExecutionResult(persisted);
+    };
     const execution = await executePlannedRowsWithConcurrency({
       plan,
       action,
@@ -2890,7 +5630,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
           dealPrice
         }
       }),
-      saveResult: saveExecutionResult,
+      saveResult: persistExecutionOutcome,
       toErrorText: toChineseError,
       classifyError: classifyExecutionWriteError,
       onStopRequested: ({ error, errorCn, classifiedError }) => {
@@ -2955,7 +5695,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       fallbackSavedCount: plan.total
     });
     if (unreadable > 0) {
-      counts.failed += unreadable;
+      counts.activity_failure_count = Number(counts.activity_failure_count || 0) + 1;
       saveExecutionResult({
         taskId,
         accountId: account.account_id,
@@ -2964,8 +5704,8 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         itemId: '',
         action,
         mode: 'real',
-        status: 'failed',
-        errorCn: `平台还有 ${unreadable} 个候选未返回明细，本次未执行。`
+        status: 'activity_failed',
+        errorCn: unreadableItemDetailMessage({ action, itemStatus, count: unreadable })
       });
     }
     let recheck = null;
@@ -2980,14 +5720,78 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         taskId,
         writeConcurrency: normalizedWriteConcurrency,
         maxRounds: readSettings().cancelMaxRounds,
-        counts
-        ,
+        counts,
+        saveResult: persistExecutionOutcome,
         executionJobId: request?.executionJobId,
         shouldCancel: shouldStop
       });
     }
-    const completed = counts.failed === 0 && plan.rows.length + unreadable === counts.success + counts.skipped;
-    finishTask(taskId, counts, completed ? 'completed' : 'partial_or_failed', completed);
+    let resultContract = null;
+    const activityFailureCount = Number(counts.activity_failure_count || 0);
+    if (action === 'cancel') {
+      resultContract = buildCancelResultContract({
+        plannedItemIds: (plan.rows || []).map((row) => row.item?.item_id).filter(Boolean),
+        outcomes: cancelOutcomes,
+        recheck: {
+          completed: recheck?.completed === true,
+          remainingItemIds: recheck?.remainingItemIds,
+        },
+      });
+      const rowByItemId = new Map((plan.rows || []).map((row) => [String(row.item?.item_id || ''), row]));
+      for (const [itemId, status] of Object.entries(resultContract.final_status_by_item)) {
+        const row = rowByItemId.get(itemId);
+        saveExecutionResult({
+          taskId,
+          accountId: account.account_id,
+          promotionId: promotion.promotion_id,
+          promotionType: promotion.promotion_type,
+          itemId,
+          action,
+          mode: 'real',
+          status,
+          dealPrice: row?.deal_price,
+          errorCn: status === CANCEL_RESULT_STATUS.pendingVerification
+            ? '取消请求已提交，尚未完成平台实时回查确认'
+            : status === CANCEL_RESULT_STATUS.liveStillStarted
+              ? '取消请求已提交，但实时回查仍为已报名状态'
+              : null,
+        });
+        appendExecutionItemAuditEvent(request?.executionJobId, {
+          type: 'item_cancel_final_state',
+          account,
+          promotion,
+          taskId,
+          action,
+          row: row || { item: { item_id: itemId } },
+          status,
+          sentToApi: cancelOutcomes.some((outcome) => outcome.item_id === itemId && outcome.status === CANCEL_RESULT_STATUS.requestSuccess),
+        });
+      }
+      Object.assign(counts, {
+        success: resultContract.counts.success,
+        failed: resultContract.counts.failed,
+        skipped: resultContract.counts.skipped,
+        ...stableContractCounts({
+          relationCount: resultContract.counts.relation_count,
+          uniqueItemCount: resultContract.counts.unique_item_count,
+        }),
+        ...resultContract.counts,
+        activity_failure_count: activityFailureCount,
+        result_contract_version: RESULT_CONTRACT_VERSION,
+      });
+    } else {
+      Object.assign(counts, {
+        relation_count: plan.total,
+        unique_item_count: new Set((plan.rows || []).map((row) => row.item?.item_id).filter(Boolean)).size,
+        activity_failure_count: activityFailureCount,
+        request_success_count: 0,
+        live_verified_removed_count: 0,
+        pending_verification_count: 0,
+        result_contract_version: RESULT_CONTRACT_VERSION,
+      });
+    }
+    const completed = counts.failed === 0 && Number(counts.activity_failure_count || 0) === 0 && plan.rows.length === counts.success + counts.skipped;
+    finishTask(taskId, counts, completed ? 'completed' : 'partial_or_failed', completed, { publishHistory: false });
     markCycleAfterTask({
       accountId: account.account_id,
       promotionId: promotion.promotion_id,
@@ -2997,6 +5801,16 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       completed
     });
     summary.total += plan.total;
+    summary.relation_count += Number(counts.relation_count || plan.total || 0);
+    for (const row of plan.rows || []) {
+      const itemId = String(row.item?.item_id || '').trim();
+      if (itemId) summaryUniqueItems.add(`${account.account_id}|${itemId}`);
+    }
+    summary.unique_item_count = summaryUniqueItems.size;
+    summary.request_success_count += Number(counts.request_success_count || 0);
+    summary.live_verified_removed_count += Number(counts.live_verified_removed_count || 0);
+    summary.pending_verification_count += Number(counts.pending_verification_count || 0);
+    summary.activity_failure_count += Number(counts.activity_failure_count || 0);
     summary.success += counts.success;
     summary.failed += counts.failed;
     summary.skipped += counts.skipped;
@@ -3012,6 +5826,13 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       skipped: counts.skipped,
       unreadable_candidates: unreadable,
       recheck,
+      result_contract_version: RESULT_CONTRACT_VERSION,
+      relation_count: Number(counts.relation_count || plan.total || 0),
+      unique_item_count: Number(counts.unique_item_count || 0),
+      activity_failure_count: Number(counts.activity_failure_count || 0),
+      request_success_count: Number(counts.request_success_count || 0),
+      live_verified_removed_count: Number(counts.live_verified_removed_count || 0),
+      pending_verification_count: Number(counts.pending_verification_count || 0),
       completed,
       writeConcurrency: execution.writeConcurrency,
       maxActive: execution.maxActive,
@@ -3044,8 +5865,27 @@ function getSharedWriteLimiter(groupId, limit, onActiveChange) {
   const key = String(groupId || '');
   if (!key) return createAsyncLimiter(limit);
   const existing = sharedWriteLimiters.get(key);
-  if (existing && existing.limit === limit) return existing;
-  const limiter = createAsyncLimiter(limit, { onActiveChange });
+  if (existing) {
+    if (existing.limit !== limit) throw new Error('同一执行组的全局写入并发必须一致。');
+    if (onActiveChange) existing.listeners.add(onActiveChange);
+    return existing;
+  }
+  const listeners = new Set(onActiveChange ? [onActiveChange] : []);
+  const limiter = createAsyncLimiter(limit, {
+    onActiveChange: (state) => {
+      for (const listener of listeners) listener(state);
+      const group = executionGroups.get(key) || executionGroupPersistence.load(key);
+      if (group) {
+        const nextPeak = Math.max(Number(group.global_peak_in_flight || 0), Number(state.maxActive || 0));
+        if (nextPeak > Number(group.global_peak_in_flight || 0)) {
+          group.global_peak_in_flight = nextPeak;
+          executionGroupPersistence.persist(group);
+        }
+        executionGroups.set(key, group);
+      }
+    }
+  });
+  limiter.listeners = listeners;
   sharedWriteLimiters.set(key, limiter);
   return limiter;
 }
@@ -3060,6 +5900,13 @@ function unreadableCandidateCount({ action, itemStatus, fetchInfo, fetchState, f
   const isIncomplete = CANDIDATE_INCOMPLETE_STATUSES.has(fetchInfo?.detail_status || fetchState?.detail_status);
   const isPartial = Boolean(fetchInfo?.sample_only || fetchInfo?.partial_readable_subset || fetchState?.detail_status === 'partial_api_sparse_marketplace_candidate');
   return isIncomplete || isPartial ? missing : 0;
+}
+
+function unreadableItemDetailMessage({ action, itemStatus, count } = {}) {
+  const normalizedAction = String(action || '').toLowerCase();
+  const normalizedStatus = String(itemStatus || '').toLowerCase();
+  const itemLabel = normalizedAction === 'cancel' || normalizedStatus === 'started' ? '已报名商品' : '候选';
+  return `平台还有 ${count} 个${itemLabel}未返回明细，本次未执行。`;
 }
 
 function numberOrNull(value) {
@@ -3094,7 +5941,7 @@ function planningFetchStates(accountId, promotions, itemStatus, allowInventoryFa
     if (!isSellerCampaign(promotion)) continue;
     const fallbackState = getItemFetchState(accountId, promotion.promotion_id, promotion.promotion_type, INVENTORY_FALLBACK_ITEM_STATUS);
     if (!fallbackState) continue;
-    const key = `${promotion.account_id || ''}|${promotion.promotion_id}|${promotion.promotion_type}`;
+    const key = promotionKey(promotion);
     states.set(key, {
       ...fallbackState,
       source_detail_status: fallbackState.detail_status
@@ -3108,7 +5955,7 @@ function validateRequestedSmartCancelItems({ promotions = [], itemsByPromotion =
   const invalid = [];
   for (const promotion of promotions) {
     if (String(promotion.promotion_type || '').toUpperCase() !== 'SMART') continue;
-    const items = itemsByPromotion.get(`${promotion.account_id || ''}|${promotion.promotion_id}|${promotion.promotion_type}`) || [];
+    const items = itemsByPromotion.get(promotionKey(promotion)) || [];
     for (const item of items) {
       const evidence = smartCancelFieldEvidence({ promotion, item });
       if (!evidence.offer_id || !evidence.offer_id_is_started_offer) {
@@ -3131,7 +5978,8 @@ async function preparePromotionsForExecution({ account, filters = {}, settings =
     matched_after_fetch: 0,
     total_after_fetch: 0
   };
-  let promotions = listCampaignsFiltered(account.account_id, filters || {});
+  let promotions = listOperatingCampaignsFiltered(account.account_id, filters || {}, settings);
+  if (request.executionGroupId || request.submissionPrepareId || request.submission_prepare_id) promotions = ordinaryPromotions(promotions);
   summary.matched_before_fetch = promotions.length;
   const localTotal = listCampaigns(account.account_id).length;
   if (localTotal === 0 || promotions.length === 0) {
@@ -3140,7 +5988,8 @@ async function preparePromotionsForExecution({ account, filters = {}, settings =
     summary.fetch_result = { total: fetched.total, children: fetched.children };
     summary.max_active = fetched.maxActive || 0;
     summary.stages.push(`并发读取站点活动完成：读取并发 ${readConcurrency}，活动 ${fetched.total} 个。`);
-    promotions = listCampaignsFiltered(account.account_id, filters || {});
+    promotions = listOperatingCampaignsFiltered(account.account_id, filters || {}, settings);
+    if (request.executionGroupId || request.submissionPrepareId || request.submission_prepare_id) promotions = ordinaryPromotions(promotions);
   } else {
     summary.stages.push(`使用本地活动缓存：匹配 ${promotions.length} 个；如需重新读取站点活动，将使用读取并发 ${readConcurrency}。`);
   }
@@ -3150,7 +5999,69 @@ async function preparePromotionsForExecution({ account, filters = {}, settings =
   return { promotions, summary };
 }
 
-async function prepareItemsForExecution({ account, promotions, action, itemStatus, settings, request = {}, onProgress, shouldCancel }) {
+function operationActivityReadKey(accountId, campaign = {}, status = '') {
+  return activityReadKey({ ...campaign, account_id: accountId }, status);
+}
+
+function buildPreparationReadStateSnapshot(accountIds = []) {
+  const rows = listPreparationReadStates(accountIds);
+  const activityCacheStates = new Map((rows.activity_cache_states || []).map((row) => [
+    preparationActivityStateKey(row),
+    row,
+  ]));
+  const itemFetchStates = new Map((rows.item_fetch_states || []).map((row) => [
+    preparationItemStateKey(row, row.item_status),
+    row,
+  ]));
+  return {
+    activity_cache_states: activityCacheStates,
+    item_fetch_states: itemFetchStates,
+    db_batch_queries: Number(rows.db_batch_queries || 0),
+  };
+}
+
+function preparationActivityStateKey(value = {}) {
+  return [
+    String(value.account_id || ''),
+    String(value.site_id || '').toUpperCase(),
+    String(value.promotion_id || ''),
+    String(value.promotion_type || '').toUpperCase(),
+  ].join('|');
+}
+
+function preparationItemStateKey(value = {}, status = '') {
+  return [
+    String(value.account_id || ''),
+    String(value.promotion_id || ''),
+    String(value.promotion_type || '').toUpperCase(),
+    String(status || '').toLowerCase(),
+  ].join('|');
+}
+
+function preparationActivityCacheState(snapshot, promotion) {
+  return snapshot?.activity_cache_states?.get(preparationActivityStateKey(promotion)) || null;
+}
+
+function preparationItemFetchState(snapshot, promotion, status) {
+  return snapshot?.item_fetch_states?.get(preparationItemStateKey(promotion, status)) || null;
+}
+
+async function prepareItemsForExecution({
+  account,
+  promotions,
+  action,
+  itemStatus,
+  settings,
+  request = {},
+  onProgress,
+  shouldCancel,
+  signal = null,
+  checkpoint = null,
+  readScheduler = null,
+  operationReadCache = null,
+  readStateSnapshot = null,
+  forceReadKeys = null,
+}) {
   const fetchMode = request.fetchMode === 'sample' ? 'sample' : 'full';
   const maxItems = fetchMode === 'full' ? 'all' : Number(request.maxItems || settings.maxItemsPerPromotion || 50);
   const readConcurrency = normalizeConcurrency(request.readConcurrency ?? settings.readConcurrency);
@@ -3172,7 +6083,8 @@ async function prepareItemsForExecution({ account, promotions, action, itemStatu
     return { summary, rows: [] };
   }
   summary.stages.push(`读取 ${itemStatus} 商品：活动 ${promotions.length} 个。`);
-  const rows = await mapLimited(promotions, readConcurrency, async (campaign, index) => {
+  const worker = async (campaign, index) => {
+    checkpoint?.();
     if (shouldCancel?.()) throw new Error('执行任务已停止。');
     onProgress?.({
       type: 'item_fetch_start',
@@ -3182,7 +6094,45 @@ async function prepareItemsForExecution({ account, promotions, action, itemStatu
       promotion_type: campaign.promotion_type,
       promotion: campaign
     });
-    const row = await fetchAndSavePromotionItemsForCampaign({ account, campaign, status: itemStatus, maxItems, fetchMode });
+    const cacheState = readStateSnapshot
+      ? preparationActivityCacheState(readStateSnapshot, { ...campaign, account_id: account.account_id })
+      : getActivityCacheState(account.account_id, campaign.site_id, campaign.promotion_id, campaign.promotion_type);
+    const fetchState = readStateSnapshot
+      ? preparationItemFetchState(readStateSnapshot, { ...campaign, account_id: account.account_id }, itemStatus)
+      : getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, itemStatus);
+    const fallbackState = itemStatus === 'candidate' && isSellerCampaign(campaign)
+      ? (readStateSnapshot
+          ? preparationItemFetchState(readStateSnapshot, { ...campaign, account_id: account.account_id }, INVENTORY_FALLBACK_ITEM_STATUS)
+          : getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, INVENTORY_FALLBACK_ITEM_STATUS))
+      : null;
+    const operationKey = operationActivityReadKey(account.account_id, campaign, itemStatus);
+    const operationCached = operationReadCache?.get(operationKey) || null;
+    const forceRefresh = forceReadKeys instanceof Set && forceReadKeys.has(operationKey);
+    const cacheDecision = forceRefresh
+      ? { refresh: true, reason: 'reconfirm_changed_target' }
+      : fetchMode === 'full'
+      ? activityItemsDecision({ promotion: campaign, cacheState, fetchState, fallbackState })
+      : { refresh: true, reason: 'sample_requested' };
+    const effectiveState = cacheDecision.effective_state ? fallbackState : fetchState;
+    const row = (!forceRefresh && operationCached) || (cacheDecision.refresh
+      ? await fetchAndSavePromotionItemsForCampaign({ account, campaign, status: itemStatus, maxItems, fetchMode, signal, checkpoint, readScheduler })
+      : batchFetchRow(campaign, itemStatus, {
+          total: Number(effectiveState?.platform_total ?? effectiveState?.saved_count ?? 0),
+          saved: Number(effectiveState?.saved_count || 0),
+          platform_total: effectiveState?.platform_total ?? effectiveState?.saved_count ?? 0,
+          saved_count: Number(effectiveState?.saved_count || 0),
+          is_full_fetch: true,
+          sample_only: false,
+          fetch_mode: 'cache',
+          detail_status: cacheDecision.effective_state || effectiveState?.detail_status || 'ok',
+          blocked: false,
+          cache_reused: true,
+          note: cacheDecision.reason === 'verified_composite_cache'
+            ? '使用三日内已验证的 candidate 与库存兜底合成缓存。'
+            : '使用三日内已验证完整活动商品缓存。',
+        }));
+    operationReadCache?.set(operationKey, row);
+    checkpoint?.();
     if (
       action === 'enroll'
       && itemStatus === 'candidate'
@@ -3204,7 +6154,11 @@ async function prepareItemsForExecution({ account, promotions, action, itemStatu
         listingStatus: request.listingStatus || 'all',
         detailConcurrency: readConcurrency,
         sellerDiscountPercent: Number(request.sellerDiscountPercent ?? settings.sellerDefaultDiscount ?? 5),
-        maxScanItems: request.maxScanItems || 'all'
+        maxScanItems: request.maxScanItems || 'all',
+        signal,
+        checkpoint,
+        readScheduler,
+        operationReadCache,
       });
       const combined = { ...row, fallback };
       onProgress?.({
@@ -3239,8 +6193,9 @@ async function prepareItemsForExecution({ account, promotions, action, itemStatu
         stop_reason: fallback?.stop_reason || row?.stop_reason || null,
         note: fallback?.note || row?.note || null,
         error: fallback?.error || row?.error || null,
-        blocked: Boolean(fallback?.blocked || row?.blocked)
+        blocked: Boolean(fallback?.blocked)
       });
+      operationReadCache?.set(operationKey, combined);
       return combined;
     }
     onProgress?.({
@@ -3261,7 +6216,10 @@ async function prepareItemsForExecution({ account, promotions, action, itemStatu
       blocked: Boolean(row?.blocked)
     });
     return row;
-  });
+  };
+  const rows = readScheduler
+    ? await Promise.all(promotions.map(worker))
+    : await mapLimited(promotions, readConcurrency, worker);
   for (const row of rows) {
     const fallback = row?.fallback || null;
     const effective = fallback || row;
@@ -3271,13 +6229,16 @@ async function prepareItemsForExecution({ account, promotions, action, itemStatu
     if (fallback) summary.fallback_promotions += 1;
     summary.rows.push({
       site_id: row?.site_id || null,
+      child_user_id: row?.child_user_id || null,
       promotion_id: row?.promotion_id || null,
       promotion_type: row?.promotion_type || null,
+      status: itemStatus,
       platform_total: effective?.platform_total ?? effective?.total ?? null,
       saved_count: effective?.saved_count ?? effective?.saved ?? null,
       detail_status: effective?.detail_status || null,
       note: effective?.note || row?.note || row?.error || null,
-      fallback_used: Boolean(fallback)
+      fallback_used: Boolean(fallback),
+      blocked: fallback ? Boolean(fallback.blocked) : Boolean(row?.blocked),
     });
   }
   if (summary.saved_count === 0) {
@@ -3288,48 +6249,269 @@ async function prepareItemsForExecution({ account, promotions, action, itemStatu
   return { summary, rows };
 }
 
-async function fetchAndSavePromotions(account, { readConcurrency = readSettings().readConcurrency } = {}) {
+async function readMarketplacePromotionsForChild({ account, childId, siteId, signal = null, checkpoint = null, readScheduler = null }) {
+  const parentCallerId = String(account.account_id || '').trim();
+  const targetChildId = String(childId || '').trim();
+  const route = normalizeAccountRoute({ account_id: parentCallerId, child_user_id: targetChildId, site_id: siteId });
+  const sources = [
+    {
+      source: 'read_promotions_parent_caller',
+      authoritative: true,
+      marketplace: true,
+      callerId: parentCallerId || targetChildId,
+      read: async () => {
+        const client = new MercadoLibreClient({
+          accessToken: account.accessToken,
+          userId: targetChildId,
+          callerId: parentCallerId || targetChildId,
+          marketplace: true,
+          readScheduler,
+          readAccountId: account.account_id,
+        });
+        return client.getMarketplacePromotions(targetChildId, { callerId: parentCallerId || targetChildId, signal });
+      }
+    },
+    {
+      source: 'read_promotions_child_caller',
+      authoritative: true,
+      marketplace: true,
+      callerId: targetChildId,
+      read: async () => {
+        const client = new MercadoLibreClient({
+          accessToken: account.accessToken,
+          userId: targetChildId,
+          callerId: targetChildId,
+          marketplace: true,
+          readScheduler,
+          readAccountId: account.account_id,
+        });
+        return client.getMarketplacePromotions(targetChildId, { callerId: targetChildId, signal });
+      }
+    },
+    {
+      source: 'read_promotions_regular_parent_caller',
+      authoritative: false,
+      marketplace: false,
+      callerId: parentCallerId || targetChildId,
+      read: async () => {
+        const client = new MercadoLibreClient({
+          accessToken: account.accessToken,
+          userId: targetChildId,
+          callerId: parentCallerId || targetChildId,
+          marketplace: false,
+          readScheduler,
+          readAccountId: account.account_id,
+        });
+        return client.getPromotions({ userId: targetChildId, callerId: parentCallerId || targetChildId, includeVersionHeader: true, signal });
+      }
+    }
+  ];
+  const promotionGroups = [];
+  const sourceSummaries = [];
+  const errors = [];
+  const sourceResults = await Promise.all(sources.map(async (source) => {
+    try {
+      checkpoint?.();
+      const data = await source.read();
+      checkpoint?.();
+      const promotions = bindActivitiesToAccountRoute(extractPromotions(data), route);
+      return { promotions, summary: {
+        source: source.source,
+        authoritative: source.authoritative,
+        ok: true,
+        total: promotions.length,
+        seller_campaign_count: sellerCampaignPromotionCount(promotions)
+      } };
+    } catch (error) {
+      if (signal?.aborted
+          || String(error?.code || '').startsWith('COMMIT_')
+          || String(error?.code || '').startsWith('SUBMISSION_')
+          || String(error?.code || '').startsWith('ACTIVITY_ACCOUNT_ROUTE_')) throw error;
+      return { error: {
+        source: source.source,
+        authoritative: source.authoritative,
+        ok: false,
+        error: toChineseError(error)
+      } };
+    }
+  }));
+  for (const result of sourceResults) {
+    if (result.promotions) promotionGroups.push(result.promotions);
+    if (result.summary) sourceSummaries.push(result.summary);
+    if (result.error) errors.push(result.error);
+  }
+  requireAuthoritativeActivityCatalogRead([...sourceSummaries, ...errors]);
+  if (!sourceSummaries.length) {
+    const error = errors[0]?.error || '活动读取失败';
+    throw new Error(error);
+  }
+  const promotions = mergePromotionsByIdentity(...promotionGroups);
+  return {
+    promotions,
+    sources: [...sourceSummaries, ...errors],
+    errors
+  };
+}
+
+function cachedActivityCatalogForRoute(route) {
+  const key = accountRouteKey(route);
+  return listCampaigns(route.account_id)
+    .filter((promotion) => String(promotion.status || '').toLowerCase() !== 'catalog_removed')
+    .filter((promotion) => accountRouteKey({
+      account_id: promotion.account_id,
+      child_user_id: promotion.child_user_id,
+      site_id: promotion.site_id,
+    }) === key);
+}
+
+function persistLiveActivityCatalog({ route, promotions, logisticType = null }) {
+  const normalizedRoute = normalizeAccountRoute(route);
+  const reconciled = reconcileActivityCatalog({
+    route: normalizedRoute,
+    cachedPromotions: cachedActivityCatalogForRoute(normalizedRoute),
+    livePromotions: promotions,
+  });
+  const changedRows = [...reconciled.added, ...reconciled.changed];
+  if (changedRows.length) {
+    saveCampaigns(normalizedRoute.account_id, changedRows, {
+      merchantId: normalizedRoute.account_id,
+      childUserId: normalizedRoute.child_user_id,
+      siteId: normalizedRoute.site_id,
+      logisticType,
+    });
+  }
+  if (reconciled.removed.length) {
+    markCampaignsCatalogRemoved({
+      accountId: normalizedRoute.account_id,
+      childUserId: normalizedRoute.child_user_id,
+      siteId: normalizedRoute.site_id,
+      promotions: reconciled.removed,
+    });
+  }
+  for (const change of reconciled.dirty_identities) {
+    const promotion = change.promotion;
+    if (change.reason === 'removed') {
+      saveActivityCacheState({
+        accountId: normalizedRoute.account_id,
+        siteId: normalizedRoute.site_id,
+        promotionId: promotion.promotion_id,
+        promotionType: promotion.promotion_type,
+        dirty: true,
+        expired: true,
+        lastError: '实时活动目录已不再返回该活动。',
+      });
+    } else {
+      markActivityCacheDirty({
+        accountId: normalizedRoute.account_id,
+        siteId: normalizedRoute.site_id,
+        promotionId: promotion.promotion_id,
+        promotionType: promotion.promotion_type,
+      });
+    }
+  }
+  return reconciled;
+}
+
+function sellerCampaignPromotionCount(promotions = []) {
+  return promotions.filter((promotion) => String(promotion?.promotion_type || promotion?.type || '').toUpperCase() === 'SELLER_CAMPAIGN').length;
+}
+
+async function fetchAndSavePromotions(account, {
+  readConcurrency = readSettings().readConcurrency,
+  siteIds = null,
+  routes = null,
+  signal = null,
+  checkpoint = null,
+  readScheduler = null,
+} = {}) {
   const normalizedReadConcurrency = normalizeConcurrency(readConcurrency);
   if (account.site_id === 'CBT') {
-    const marketplaceUsers = await discoverAndSaveMarketplaceSites(account);
+    checkpoint?.();
+    const marketplaceUsers = await discoverAndSaveMarketplaceSites(account, { signal, readScheduler });
+    checkpoint?.();
+    const selectedUsers = selectMarketplaceUsersForCatalogRoutes({
+      accountId: account.account_id,
+      marketplaceUsers,
+      routes,
+      siteIds,
+    });
     let total = 0;
-    const children = await mapLimited(marketplaceUsers, normalizedReadConcurrency, async (child) => {
+    const childWorker = async (child) => {
       const childId = String(child.user_id);
-      const childClient = new MercadoLibreClient({
-        accessToken: account.accessToken,
-        userId: childId,
-        callerId: childId,
-        marketplace: true
-      });
       try {
-        const data = await childClient.getMarketplacePromotions(childId);
-        const promotions = extractPromotions(data);
-        saveCampaigns(account.account_id, promotions, {
-          merchantId: account.account_id,
-          childUserId: childId,
-          siteId: child.site_id,
-          logisticType: child.logistic_type
+        checkpoint?.();
+        const readResult = await readMarketplacePromotionsForChild({ account, childId, siteId: child.site_id, signal, checkpoint, readScheduler });
+        checkpoint?.();
+        const reconciliation = persistLiveActivityCatalog({
+          route: { account_id: account.account_id, child_user_id: childId, site_id: child.site_id },
+          promotions: readResult.promotions,
+          logisticType: child.logistic_type,
         });
+        const promotions = reconciliation.live_promotions;
+        const sellerCampaignCount = sellerCampaignPromotionCount(promotions);
         updateMarketplaceSitePromotionStatus({ accountId: account.account_id, childUserId: childId, count: promotions.length, status: 'ok' });
-        return { child_user_id: childId, site_id: child.site_id, logistic_type: child.logistic_type, total: promotions.length, status: 'ok' };
+        recordActivityCatalogCalibration({ accountId: account.account_id, siteId: child.site_id });
+        return {
+          child_user_id: childId,
+          site_id: child.site_id,
+          logistic_type: child.logistic_type,
+          total: promotions.length,
+          seller_campaign_count: sellerCampaignCount,
+          catalog_revision: reconciliation.revision,
+          catalog_changes: {
+            added: reconciliation.added.length,
+            changed: reconciliation.changed.length,
+            removed: reconciliation.removed.length,
+            identities: reconciliation.dirty_identities.map(({ key, reason }) => ({ key, reason })),
+          },
+          read_sources: readResult.sources,
+          status: 'ok'
+        };
       } catch (error) {
+        if (signal?.aborted
+            || String(error?.code || '').startsWith('COMMIT_')
+            || String(error?.code || '').startsWith('SUBMISSION_')
+            || String(error?.code || '').startsWith('ACTIVITY_ACCOUNT_ROUTE_')) throw error;
         const errorCn = toChineseError(error);
         updateMarketplaceSitePromotionStatus({ accountId: account.account_id, childUserId: childId, count: 0, status: 'error', error: errorCn });
+        recordActivityCatalogCalibration({ accountId: account.account_id, siteId: child.site_id, error: errorCn });
         return { child_user_id: childId, site_id: child.site_id, logistic_type: child.logistic_type, total: 0, status: 'error', error: errorCn };
       }
-    });
+    };
+    const children = readScheduler
+      ? await Promise.all(selectedUsers.map(childWorker))
+      : await mapLimited(selectedUsers, normalizedReadConcurrency, childWorker);
     for (const child of children) total += Number(child?.total || 0);
     return { total, children, readConcurrency: normalizedReadConcurrency, maxActive: children.maxActive || 0 };
   }
-  const client = new MercadoLibreClient({ accessToken: account.accessToken, userId: account.account_id, callerId: account.account_id });
-  const data = await client.getPromotions();
-  const promotions = extractPromotions(data);
-  saveCampaigns(account.account_id, promotions, {
-    merchantId: account.account_id,
-    childUserId: account.account_id,
-    siteId: account.site_id
+  const client = new MercadoLibreClient({
+    accessToken: account.accessToken, userId: account.account_id, callerId: account.account_id,
+    readScheduler, readAccountId: account.account_id,
   });
-  return { total: promotions.length, children: [], readConcurrency: normalizedReadConcurrency, maxActive: 1 };
+  checkpoint?.();
+  const data = await client.getPromotions({ signal });
+  checkpoint?.();
+  const route = {
+    account_id: account.account_id,
+    child_user_id: account.account_id,
+    site_id: account.site_id,
+  };
+  const promotions = bindActivitiesToAccountRoute(extractPromotions(data), route);
+  const reconciliation = persistLiveActivityCatalog({ route, promotions });
+  const sellerCampaignCount = sellerCampaignPromotionCount(promotions);
+  recordActivityCatalogCalibration({ accountId: account.account_id, siteId: account.site_id });
+  return {
+    total: promotions.length,
+    seller_campaign_count: sellerCampaignCount,
+    catalog_revision: reconciliation.revision,
+    catalog_changes: {
+      added: reconciliation.added.length,
+      changed: reconciliation.changed.length,
+      removed: reconciliation.removed.length,
+      identities: reconciliation.dirty_identities.map(({ key, reason }) => ({ key, reason })),
+    },
+    children: [], readConcurrency: normalizedReadConcurrency, maxActive: 1,
+  };
 }
 
 async function runReadConcurrencyBenchmark({ account, input = {} }) {
@@ -3895,7 +7077,7 @@ function buildFakeWriteBenchmarkRows({ job, account, input = {} }) {
   const rows = fakeRows.length ? fakeRows : Array.from({ length: requiredItems }, (_, index) => ({
     itemId: `FAKE-${job.id}-${index + 1}`,
     accountId: account.account_id,
-    storeName: publicAccountDisplayName(account),
+    storeName: storeIdentityForAccount(account.account_id, account).store_name,
     siteId: input.siteId || 'MLM',
     promotionId: input.promotionId || 'FAKE-PROMOTION',
     promotionType: input.promotionType || 'DEAL',
@@ -4106,7 +7288,7 @@ function writeBenchmarkItemBase(job, level, row, index, status) {
     sampleOffset: job.sample_offset,
     sampleIndex: index,
     accountId: String(account.account_id || job.account_id || ''),
-    storeName: publicAccountDisplayName(account),
+    storeName: storeIdentityForAccount(account.account_id, account).store_name,
     siteId: campaign.site_id || '',
     siteName: siteDisplayName(campaign.site_id || ''),
     promotionId: campaign.promotion_id || '',
@@ -4187,7 +7369,7 @@ async function runWriteConcurrencyBenchmark({ account, input = {} }) {
       : '本报告来自小样本真实 Mercado POST 报名压测；不包含全量报名、更新、取消，也不会自动撤销成功报名。',
     account_id: benchmarkAccounts.length === 1 ? String(benchmarkAccounts[0].account_id) : 'multiple',
     account_count: benchmarkAccounts.length,
-    display_name: benchmarkAccounts.length === 1 ? (benchmarkAccounts[0].display_name || benchmarkAccounts[0].profile?.nickname || '') : '多个账号',
+    display_name: benchmarkAccounts.length === 1 ? storeIdentityForAccount(benchmarkAccounts[0].account_id, benchmarkAccounts[0]).store_name : '多个店铺',
     site_id: primaryCampaign?.site_id || null,
     child_user_id: primaryCampaign?.child_user_id || benchmarkAccounts[0]?.account_id || null,
     promotion_id: primaryCampaign?.promotion_id || null,
@@ -4593,7 +7775,7 @@ async function recheckWriteBenchmarkRows(rows) {
     const account = row.account;
     const campaign = row.campaign;
     if (!account || !campaign) continue;
-    const key = `${account.account_id}|${campaign.promotion_id}|${campaign.promotion_type}`;
+    const key = promotionKey({ ...campaign, account_id: account.account_id });
     if (!groups.has(key)) groups.set(key, { account, campaign, itemIds: [] });
     groups.get(key).itemIds.push(row.item.item_id);
   }
@@ -4875,9 +8057,12 @@ function summarizeStoredBenchmark(kind, result) {
   };
 }
 
-async function discoverAndSaveMarketplaceSites(account) {
-  const client = new MercadoLibreClient({ accessToken: account.accessToken, userId: account.account_id, callerId: account.account_id });
-  const marketplaceUsers = extractMarketplaceUsers(await client.getMarketplaceUsers(account.account_id));
+async function discoverAndSaveMarketplaceSites(account, { signal = null, readScheduler = null } = {}) {
+  const client = new MercadoLibreClient({
+    accessToken: account.accessToken, userId: account.account_id, callerId: account.account_id,
+    readScheduler, readAccountId: account.account_id,
+  });
+  const marketplaceUsers = extractMarketplaceUsers(await client.getMarketplaceUsers(account.account_id, { signal }));
   saveMarketplaceSites(account.account_id, marketplaceUsers);
   return marketplaceUsers;
 }
@@ -4934,7 +8119,7 @@ async function runInventoryFallbackJob(jobId, { accountId, filters, listingStatu
   job.status = 'running';
   try {
     const account = await ensureUsableAccount(accountId);
-    const promotions = listCampaignsFiltered(account.account_id, filters || {}).filter(isSellerCampaign);
+    const promotions = listOperatingCampaignsFiltered(account.account_id, filters || {}, readSettings()).filter(isSellerCampaign);
     job.progress.total_promotions = promotions.length;
     const rows = await mapLimited(promotions, readConcurrency, async (campaign) => {
       const row = await scanAndSaveInventoryFallbackForCampaign({
@@ -4960,19 +8145,53 @@ async function runInventoryFallbackJob(jobId, { accountId, filters, listingStatu
   }
 }
 
-async function scanAndSaveInventoryFallbackForCampaign({ account, campaign, listingStatus, detailConcurrency, sellerDiscountPercent, maxScanItems = 'all' }) {
+async function scanAndSaveInventoryFallbackForCampaign({
+  account,
+  campaign,
+  listingStatus,
+  detailConcurrency,
+  sellerDiscountPercent,
+  maxScanItems = 'all',
+  signal = null,
+  checkpoint = null,
+  readScheduler = null,
+  operationReadCache = null,
+}) {
   try {
+    checkpoint?.();
     const targetUserId = campaign.child_user_id || account.account_id;
     const client = new MercadoLibreClient({
       accessToken: account.accessToken,
       userId: targetUserId,
       callerId: targetUserId,
-      marketplace: isMarketplaceCampaign(account, campaign)
+      marketplace: isMarketplaceCampaign(account, campaign),
+      readScheduler,
+      readAccountId: account.account_id,
     });
+    const readStatus = async (status) => {
+      const key = operationActivityReadKey(account.account_id, campaign, status);
+      if (operationReadCache?.has(key)) {
+        const rows = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, status);
+        return { results: rows, total: rows.length, saved: rows.length, detailStatus: 'operation_cache', isFullFetch: true };
+      }
+      const result = await client.fetchAllPromotionItems({
+        promotionId: campaign.promotion_id,
+        promotionType: campaign.promotion_type,
+        status,
+        maxItems: 'all',
+        signal,
+      });
+      operationReadCache?.set(key, batchFetchRow(campaign, status, {
+        total: result.total, saved: result.saved, platform_total: result.total, saved_count: result.saved,
+        detail_status: result.detailStatus, is_full_fetch: result.isFullFetch, blocked: result.blocked,
+      }));
+      return result;
+    };
     const [started, pending] = await Promise.all([
-      client.fetchAllPromotionItems({ promotionId: campaign.promotion_id, promotionType: campaign.promotion_type, status: 'started', maxItems: 'all' }),
-      client.fetchAllPromotionItems({ promotionId: campaign.promotion_id, promotionType: campaign.promotion_type, status: 'pending', maxItems: 'all' })
+      readStatus('started'),
+      readStatus('pending'),
     ]);
+    checkpoint?.();
     saveItems(account.account_id, campaign.promotion_id, campaign.promotion_type, started.results, {
       childUserId: campaign.child_user_id,
       siteId: campaign.site_id,
@@ -4997,8 +8216,12 @@ async function scanAndSaveInventoryFallbackForCampaign({ account, campaign, list
       listingStatus,
       detailConcurrency,
       discountPercent: sellerDiscountPercent,
-      maxScanItems
+      maxScanItems,
+      signal,
+      readScheduler,
+      accountId: account.account_id,
     });
+    checkpoint?.();
     deleteItemsBySource(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate', INVENTORY_FALLBACK_SOURCE);
     saveItems(account.account_id, campaign.promotion_id, campaign.promotion_type, fallback.fallback_rows, {
       childUserId: campaign.child_user_id,
@@ -5037,6 +8260,14 @@ async function scanAndSaveInventoryFallbackForCampaign({ account, campaign, list
       warning: '自建活动 candidate 接口不完整时启用 marketplace 库存扫描兜底；资格以 Mercado 报名接口逐商品返回为准。',
       raw
     });
+    if (fallback.scan_is_full_fetch) {
+      recordActivityItemsCalibration({
+        accountId: account.account_id,
+        siteId: campaign.site_id,
+        promotionId: campaign.promotion_id,
+        promotionType: campaign.promotion_type,
+      });
+    }
     return batchFetchRow(campaign, 'candidate', {
       source: INVENTORY_FALLBACK_SOURCE,
       listing_status: listingStatus || 'all',
@@ -5092,7 +8323,7 @@ async function runBatchFetchJob(jobId, { accountId, filters, itemStatus, fetchMo
   job.status = 'running';
   try {
     const account = await ensureUsableAccount(accountId);
-    const promotions = listCampaignsFiltered(account.account_id, filters || {});
+    const promotions = listOperatingCampaignsFiltered(account.account_id, filters || {}, readSettings());
     job.progress.total_promotions = promotions.length;
     const rows = await mapLimited(promotions, readConcurrency, async (campaign) => {
       const row = await fetchAndSavePromotionItemsForCampaign({ account, campaign, status: itemStatus, maxItems, fetchMode });
@@ -5111,21 +8342,26 @@ async function runBatchFetchJob(jobId, { accountId, filters, itemStatus, fetchMo
   }
 }
 
-async function fetchAndSavePromotionItemsForCampaign({ account, campaign, status, maxItems, fetchMode = 'sample' }) {
+async function fetchAndSavePromotionItemsForCampaign({ account, campaign, status, maxItems, fetchMode = 'sample', signal = null, checkpoint = null, readScheduler = null }) {
   try {
+    checkpoint?.();
     const targetUserId = campaign.child_user_id || account.account_id;
     const client = new MercadoLibreClient({
       accessToken: account.accessToken,
       userId: targetUserId,
       callerId: targetUserId,
-      marketplace: isMarketplaceCampaign(account, campaign)
+      marketplace: isMarketplaceCampaign(account, campaign),
+      readScheduler,
+      readAccountId: account.account_id,
     });
     const result = await client.fetchAllPromotionItems({
       promotionId: campaign.promotion_id,
       promotionType: campaign.promotion_type,
       status,
-      maxItems
+      maxItems,
+      signal,
     });
+    checkpoint?.();
     const existingState = getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, status);
     const preserveExisting = shouldPreserveExistingFetchState({ fetchMode, existingState, nextSaved: result.saved, nextTotal: result.total });
     if (!preserveExisting) {
@@ -5147,6 +8383,14 @@ async function fetchAndSavePromotionItemsForCampaign({ account, campaign, status
         warning: result.warning,
         raw: result.rawSummary
       });
+      if (fetchMode === 'full' && result.isFullFetch && !result.blocked) {
+        recordActivityItemsCalibration({
+          accountId: account.account_id,
+          siteId: campaign.site_id,
+          promotionId: campaign.promotion_id,
+          promotionType: campaign.promotion_type,
+        });
+      }
     }
     const savedCount = preserveExisting ? Number(existingState.saved_count || 0) : result.saved;
     const platformTotal = preserveExisting ? Number(existingState.platform_total ?? result.total ?? savedCount) : result.total;
@@ -5168,7 +8412,15 @@ async function fetchAndSavePromotionItemsForCampaign({ account, campaign, status
       note
     });
   } catch (error) {
+    if (signal?.aborted || String(error?.code || '').startsWith('COMMIT_') || String(error?.code || '').startsWith('SUBMISSION_')) throw error;
     const errorCn = toChineseError(error);
+    recordActivityItemsCalibration({
+      accountId: account.account_id,
+      siteId: campaign.site_id,
+      promotionId: campaign.promotion_id,
+      promotionType: campaign.promotion_type,
+      error: errorCn,
+    });
     saveItemFetchState({
       accountId: account.account_id,
       promotionId: campaign.promotion_id,
@@ -5255,6 +8507,8 @@ async function ensureStandaloneUsable(account) {
   let current = account;
   try {
     const profile = await new MercadoLibreClient({ accessToken: current.accessToken, userId: current.account_id }).getMe();
+    const record = accountProfileRecord({ accountId: current.account_id, provider: current.provider, profile, source: 'users_me' });
+    if (record) saveAccountProfile(record);
     return { ...current, display_name: profile.nickname || current.display_name, site_id: profile.site_id || current.site_id, profile };
   } catch (error) {
     if (!isInvalidTokenError(error)) throw error;
@@ -5262,6 +8516,8 @@ async function ensureStandaloneUsable(account) {
     current = getStandaloneSecrets();
     if (!current) throw new Error('standalone token refresh 后仍无法读取 token');
     const profile = await new MercadoLibreClient({ accessToken: current.accessToken, userId: current.account_id }).getMe();
+    const record = accountProfileRecord({ accountId: current.account_id, provider: current.provider, profile, source: 'users_me' });
+    if (record) saveAccountProfile(record);
     return { ...current, display_name: profile.nickname || current.display_name, site_id: profile.site_id || current.site_id, profile };
   }
 }
@@ -5354,6 +8610,10 @@ function safeDetails(error) {
     message: error?.message,
     body: error?.body
   };
+}
+
+function submissionApiErrorMessage(error) {
+  return error?.code ? String(error.message || '本次操作未继续。') : toChineseError(error);
 }
 
 function escapeHtml(value) {

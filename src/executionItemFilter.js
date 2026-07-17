@@ -1,4 +1,42 @@
 import { promotionKey } from './planner.js';
+import { activityIdentityKey } from './submissionScopeFreeze.js';
+
+function confirmedScopeFromRequest(request = {}) {
+  return request.confirmedExecutionScope ?? request.confirmed_execution_scope ?? null;
+}
+
+export function hasConfirmedExecutionScope(request = {}) {
+  return Boolean(confirmedScopeFromRequest(request));
+}
+
+function confirmedActivitiesForAccount(accountId, request = {}) {
+  const scope = confirmedScopeFromRequest(request);
+  if (!scope) return [];
+  return (Array.isArray(scope.activities) ? scope.activities : [])
+    .filter((activity) => String(activity.account_id ?? activity.accountId ?? '') === String(accountId || ''));
+}
+
+export function filterPromotionsByConfirmedScope({ accountId = '', promotions = [], request = {} } = {}) {
+  if (!hasConfirmedExecutionScope(request)) {
+    return { hasFilter: false, promotions, missingActivityKeys: [] };
+  }
+  const activities = confirmedActivitiesForAccount(accountId, request);
+  const wanted = new Set(activities
+    .filter((activity) => (activity.item_ids ?? activity.itemIds ?? []).length > 0)
+    .map(activityIdentityKey));
+  const matched = new Set();
+  const filtered = (promotions || []).filter((promotion) => {
+    const key = activityIdentityKey({ ...promotion, account_id: promotion.account_id || accountId });
+    if (!wanted.has(key)) return false;
+    matched.add(key);
+    return true;
+  });
+  return {
+    hasFilter: true,
+    promotions: filtered,
+    missingActivityKeys: [...wanted].filter((key) => !matched.has(key)).sort(),
+  };
+}
 
 export function requestedExecutionItemIds(request = {}) {
   const values = [];
@@ -62,6 +100,60 @@ export function filterItemsByRequestedIds({ promotions = [], itemsByPromotion = 
     matchedItemIds: requestedItemIds.filter((itemId) => matched.has(normalizeItemId(itemId))),
     missingItemIds,
     itemsByPromotion: filtered
+  };
+}
+
+export function filterItemsByConfirmedScope({ accountId = '', promotions = [], itemsByPromotion = new Map(), request = {} } = {}) {
+  if (!hasConfirmedExecutionScope(request)) {
+    return {
+      hasFilter: false,
+      requestedRelationCount: 0,
+      matchedRelationCount: 0,
+      missingRelations: [],
+      itemsByPromotion,
+    };
+  }
+  const activities = confirmedActivitiesForAccount(accountId, request);
+  const wantedByActivity = new Map();
+  for (const activity of activities) {
+    wantedByActivity.set(
+      activityIdentityKey(activity),
+      new Set((activity.item_ids ?? activity.itemIds ?? []).map(normalizeItemId).filter(Boolean)),
+    );
+  }
+  const filtered = new Map();
+  const missingRelations = [];
+  const matchedActivityKeys = new Set();
+  const requestedRelationCount = [...wantedByActivity.values()].reduce((sum, itemIds) => sum + itemIds.size, 0);
+  let matchedRelationCount = 0;
+  for (const promotion of promotions) {
+    const key = promotionKey(promotion);
+    const identityKey = activityIdentityKey({ ...promotion, account_id: promotion.account_id || accountId });
+    const wanted = wantedByActivity.get(identityKey) || new Set();
+    if (wantedByActivity.has(identityKey)) matchedActivityKeys.add(identityKey);
+    const matched = new Set();
+    const selected = (itemsByPromotion.get(key) || []).filter((item) => {
+      const itemId = normalizeItemId(itemIdOf(item));
+      if (!wanted.has(itemId)) return false;
+      matched.add(itemId);
+      return true;
+    });
+    matchedRelationCount += matched.size;
+    for (const itemId of wanted) {
+      if (!matched.has(itemId)) missingRelations.push(`${key}|${itemId}`);
+    }
+    filtered.set(key, selected);
+  }
+  for (const [activityKey, wanted] of wantedByActivity) {
+    if (matchedActivityKeys.has(activityKey)) continue;
+    for (const itemId of wanted) missingRelations.push(`${activityKey}|${itemId}`);
+  }
+  return {
+    hasFilter: true,
+    requestedRelationCount,
+    matchedRelationCount,
+    missingRelations,
+    itemsByPromotion: filtered,
   };
 }
 

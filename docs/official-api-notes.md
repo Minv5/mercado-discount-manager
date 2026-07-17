@@ -159,12 +159,12 @@ LIGHTNING `LGH-MLM1000` candidate 小样本：
 - 创建路径：`POST /marketplace/seller-promotions/seller-campaign/{USER_ID}`。
 - Header：`version:v2`。
 - Body：`promotion_type=SELLER_CAMPAIGN`、`name`、`sub_type=FLEXIBLE_PERCENTAGE`、`start_date`、`finish_date`。
-- 最大周期：14 天。
+- 结束日期：按官网日历口径限制在开始日期所在月份内，例如 2026-07-08 开始时最大为 2026-07-31。
 
 当前程序处理：
 
 - 支持填写站点、`child_user_id`、活动名称、`start_date`、`finish_date`、`sub_type`，生成 request preview 和 409 主管确认包。
-- 本地预检检查必填项、ISO 时间格式、结束时间晚于开始时间、周期不超过 14 天。
+- 本地预检检查必填项、ISO 时间格式、结束时间晚于开始时间、结束日期不超过开始月份最后一天。
 - 真实创建活动属于外部写入；本轮即使参数完整也不执行 Mercado POST，只返回预检包。
 
 ## 固定 4 商品真实报名冒烟准备（2026-07-03）
@@ -193,7 +193,7 @@ LIGHTNING `LGH-MLM1000` candidate 小样本：
 - `writeConcurrency`：真实报名、更新、取消的写入并发。界面应区分当前设置值、已验证稳定档和日常建议；当前真实测试线程回传 350 两次稳定，日常建议保守 300-320，仍不得称为 Mercado 平台最大值。
 - 任何本地并发数字都不是 Mercado 官方限制，也不是平台最大值。真实写入可用并发需要从小样本开始验证，遇到 429、超时或失败增多时应降低。
 
-当前产品口径：WinForms 主流程由用户点击“提交执行”并确认后进入真实执行分支；本轮程序线程验证只做只读/API/本地测试，不主动触发 Mercado 写接口。`writeConcurrency` 只表示真实执行分支使用的本地并发设置，不代表 Mercado 平台承诺或实测极限。
+当前产品口径：PySide 桌面主流程由用户点击“提交执行”并确认后进入持久 submission/execution group；WinForms 仅作为 Legacy 回退保留。程序验证不主动触发 Mercado 写接口。`writeConcurrency` 只表示真实执行分支使用的本地并发设置，不代表 Mercado 平台承诺或实测极限。
 
 ## 全量报名口径修正（2026-07-02）
 

@@ -51,16 +51,21 @@ export async function buildSellerCampaignInventoryFallback({
   listingStatus = 'all',
   detailConcurrency = 5,
   discountPercent = 5,
-  maxScanItems = 'all'
+  maxScanItems = 'all',
+  signal = null,
+  readScheduler = null,
+  accountId = null,
 }) {
   if (!isSellerCampaign(promotion)) {
     return skippedFallbackRow(promotion, '仅 SELLER_CAMPAIGN 自建活动支持库存扫描兜底');
   }
   const childUserId = promotion.child_user_id || client.userId;
+  const runFallback = async () => {
   const scan = await client.scanMarketplaceUserItems({
     userId: childUserId,
     status: listingStatus || 'all',
-    maxItems: maxScanItems
+    maxItems: maxScanItems,
+    signal,
   });
   const excludedIds = new Set([
     ...startedItems.map(itemIdFromRow),
@@ -68,13 +73,16 @@ export async function buildSellerCampaignInventoryFallback({
   ].filter(Boolean));
   const existingCandidateIds = new Set(existingCandidateItems.map(itemIdFromRow).filter(Boolean));
   const detailTargetIds = scan.ids.filter((id) => !excludedIds.has(id) && !existingCandidateIds.has(id));
-  const details = await mapLimited(detailTargetIds, normalizeConcurrency(detailConcurrency), async (itemId) => {
+  const readDetail = async (itemId) => {
     try {
-      return { ok: true, itemId, detail: await client.getMarketplaceItem(itemId) };
+      return { ok: true, itemId, detail: await client.getMarketplaceItem(itemId, { signal }) };
     } catch (error) {
       return { ok: false, itemId, error: safeError(error) };
     }
-  });
+  };
+  const details = readScheduler
+    ? await Promise.all(detailTargetIds.map(readDetail))
+    : await mapLimited(detailTargetIds, normalizeConcurrency(detailConcurrency), readDetail);
   const successfulDetails = details.filter((row) => row?.ok && row.detail).map((row) => row.detail);
   const failedDetails = details.filter((row) => row && !row.ok);
   const candidateRows = buildInventoryFallbackCandidateRows({ itemDetails: successfulDetails, promotion, discountPercent });
@@ -106,6 +114,13 @@ export async function buildSellerCampaignInventoryFallback({
       failed_detail_sample: failedDetails.slice(0, 10)
     }
   };
+  };
+  if (!readScheduler) return runFallback();
+  return readScheduler.withFallback({
+    accountId: String(accountId || client.readAccountId || childUserId),
+    key: `${String(promotion?.promotion_id || promotion?.id || '')}|${String(listingStatus || 'all')}`,
+    signal,
+  }, runFallback);
 }
 
 function skippedFallbackRow(promotion, reason) {

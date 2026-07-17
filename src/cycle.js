@@ -1,27 +1,38 @@
 import { get, nowIso, run } from './db.js';
 import { defaultDiscountForPromotion } from './planner.js';
+import { promotionDiscountKind } from './promotionDomain.js';
 
 const MAX_DISCOUNT = 10;
 
 export function classifyPromotionType(promotionType) {
-  const type = String(promotionType || '').toUpperCase();
-  if (type === 'SELLER_CAMPAIGN') return 'seller';
-  return 'official';
+  return promotionDiscountKind(promotionType);
 }
 
-export function nextDiscountFor({ promotionType, lastDiscount, lastStatus }) {
+export function nextDiscountFor({ promotionType, lastDiscount, lastStatus, advanceAfterIncomplete = false }) {
   const base = defaultDiscountForPromotion(promotionType);
+  if (base === null) return null;
   if (!Number.isFinite(Number(lastDiscount))) return base;
-  if (lastStatus !== 'completed') return Number(lastDiscount);
+  if (lastStatus !== 'completed' && !advanceAfterIncomplete) return Number(lastDiscount);
   return Math.min(MAX_DISCOUNT, Number(lastDiscount) + 1);
 }
 
-export function decideCycleAction({ promotionType, currentDiscount, hasStartedItems }) {
-  const discount = Number(currentDiscount ?? defaultDiscountForPromotion(promotionType));
-  if (discount >= MAX_DISCOUNT && hasStartedItems) {
+export function decideCycleAction({ promotionType, currentDiscount, lastDiscount, lastUpdatedAt, today = new Date(), hasStartedItems }) {
+  const base = defaultDiscountForPromotion(promotionType);
+  if (base === null) return { action: 'excluded', discount: null, reason: '该活动类型不参与普通批量折扣流程' };
+  const discount = Number(currentDiscount ?? base);
+  const priorDiscount = Number(lastDiscount);
+  const priorReachedMaximum = Number.isFinite(priorDiscount) && priorDiscount >= MAX_DISCOUNT;
+  const priorCompletedBeforeToday = Boolean(lastUpdatedAt) && localDateNumber(lastUpdatedAt) < localDateNumber(today);
+  if (priorReachedMaximum && priorCompletedBeforeToday && hasStartedItems) {
     return { action: 'cancel', discount, reason: '折扣已到 10%，应进入取消阶段' };
   }
   return { action: 'enroll', discount, reason: '按当前周期折扣报名或补报名' };
+}
+
+function localDateNumber(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return Number.NaN;
+  return date.getFullYear() * 10000 + (date.getMonth() + 1) * 100 + date.getDate();
 }
 
 export function getCycleState(accountId, promotionId, promotionType) {
