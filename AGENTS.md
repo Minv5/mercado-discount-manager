@@ -6,41 +6,21 @@
 本项目遵守 Codex App 全局自定义指令；本文件只记录已验证的项目事实、配置、硬边界和专属流程。正式规则、高风险或长期线程流程按需调用 `$codex-workflow-guard`。
 <!-- CODEX-MANAGED:global-reference:END -->
 
-- 模板版本/提交：codex-rules `66c31aee18fa852433aab770cc5042b7451a26d3`
-- 模板校验：SHA256 `3c12ee67002fe888546de59449cdcd9a9fe20b55c7a37144e724c03bfb834d3d`
-- 受管规则块版本：5
-- 上次同步时间：2026-07-16
+- 模板版本/提交：codex-rules `e5be4b30c227674e163ffcb7eb71f6de89760ff7`
+- 模板校验：SHA256 `73d53f83ad5fc8cd01389bcf44f2e7ecff0a208cbe505872f52098b6b60178b3`
+- 受管规则块版本：6
+- 上次同步时间：2026-07-18
 - 待确认模板冲突：无
 
 ## 2. 项目概览
 
-## 3. 当前状态
+### 迁移保留的项目事实
 
-- 当前阶段：待填写（需求讨论 / 技术选型 / 开发 / 修改 / 测试 / UI 调整 / 打包发布 / 维护）
-
-## 4. 需求与范围
-
-- 需求变更规则：需求、范围、验收标准发生变化时，必须先说明影响，再等待用户确认。
-- 范围核对规则：执行项目任务、规则同步或线程下派前，必须核对用户原话中的对象、范围、边界和禁止项；不得把用户要求从 A 扩大成 A+B。任何范围扩展都必须先说明影响并等待用户确认。
-
-## 5. 技术栈与运行环境
-
-未知项保持空白或标注待确认；不得凭空填写。
-
-## 6. 常用命令
-
+#### 常用命令
 - 日常验证：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode Quick`
 - 真实 Mercado 写入前验证：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode RealWrite`
 - 发布验证：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode Release -AllowPackageMutation -PackageTarget PySide`；仅在已确认打包或安装位置变更时使用。旧 WinForms 回退包仅在明确指定 `-PackageTarget Legacy` 时构建。
 - 查看失败证据：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -ShowFailure <run_id> -Check <check_id> -Tail 120`；仅明确需要完整原始输出时追加 `-Full`。
-
-命令必须来自项目文件、README、脚本配置或用户确认；不能猜测。缺少命令时，先标注待确认。
-
-## 7. 目录结构与关键文件
-
-如果项目结构不同，应按真实结构调整本节。
-
-## 8. 项目边界
 
 ## 9. 开发与修改流程
 
@@ -91,8 +71,5 @@
 <!-- CODEX-MANAGED:evolution-reference:END -->
 
 - 项目规则不会自动静默成长。Codex 只能主动发现事实、流程、约束或经验并提出沉淀建议；建议必须说明写入哪一层、原因、预期效果和副作用，等待用户确认后才能写入。
-
-## 15. 完成标准
-- 产物生命周期收尾已量化并处理或等待确认：
 
 ## 16. 项目专属补充
