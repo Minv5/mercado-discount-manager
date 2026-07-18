@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $DesktopDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $DesktopDir
-$AppName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x52A9,0x624B))
+$AppName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x7BA1,0x5BB6))
 $LegacyAppName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6298,0x6263,0x7BA1,0x5BB6))
 $Candidate = Join-Path $ProjectRoot (Join-Path 'dist-pyside' $AppName)
 $Installer = Join-Path $DesktopDir 'install-release.ps1'

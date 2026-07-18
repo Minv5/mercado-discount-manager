@@ -164,7 +164,7 @@ test('product cleanup is preview-first, path-safe, and gates legacy WinForms sep
   const root = temporaryRoot('mdm-e1-clean-');
   const project = path.join(root, 'project');
   const local = path.join(root, 'local');
-  const currentDist = path.join(project, 'dist-pyside', '美客多活动助手');
+    const currentDist = path.join(project, 'dist-pyside', '美客多活动管家');
   const currentInstall = path.join(local, 'Programs', 'MercadoDiscountManagerPySide');
   for (const target of [
     currentDist,

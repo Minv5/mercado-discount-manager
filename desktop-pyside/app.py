@@ -23,7 +23,7 @@ def create_application(argv: list[str] | None = None) -> QApplication:
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(argv if argv is not None else sys.argv)
     install_windows_unhandled_exception_filter()
-    app.setApplicationName("美客多活动助手")
+    app.setApplicationName("美客多活动管家")
     app.setOrganizationName("MercadoDiscountManager")
     app.setFont(QFont("Microsoft YaHei UI", 10))
     down = str(resource_path("assets/chevron-down.xpm")).replace("\\", "/")

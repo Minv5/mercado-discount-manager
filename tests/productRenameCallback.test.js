@@ -58,7 +58,7 @@ test('activity callback verifies signature, is idempotent and marks only the tar
 });
 
 test('visible product name changes while internal compatibility identity remains stable', () => {
-  assert.equal(PRODUCT_DISPLAY_NAME, '美客多活动助手');
+  assert.equal(PRODUCT_DISPLAY_NAME, '美客多活动管家');
   assert.equal(PRODUCT_ID, 'mercado-discount-manager');
   const config = fs.readFileSync(new URL('../src/config.js', import.meta.url), 'utf8');
   assert.match(config, /28758/);

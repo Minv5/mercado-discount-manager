@@ -15,11 +15,11 @@ class ReleaseModeTests(unittest.TestCase):
     def test_visible_title_and_package_names_have_no_candidate_wording(self) -> None:
         window_source = (ROOT / "main_window.py").read_text(encoding="utf-8")
         spec_source = (ROOT / "mercado_discount_manager_pyside.spec").read_text(encoding="utf-8")
-        self.assertIn('setWindowTitle("美客多活动助手")', window_source)
+        self.assertIn('setWindowTitle("美客多活动管家")', window_source)
         self.assertNotIn("候选版", window_source)
         self.assertNotIn("候选版", spec_source)
         self.assertNotIn("PySide6候选", spec_source)
-        self.assertIn('name="美客多活动助手"', spec_source)
+        self.assertIn('name="美客多活动管家"', spec_source)
 
     def test_diagnostic_switches_are_not_visible_in_normal_main_window(self) -> None:
         window_source = (ROOT / "main_window.py").read_text(encoding="utf-8")
@@ -69,7 +69,7 @@ class ReleaseModeTests(unittest.TestCase):
         self.assertIn("GetFolderPath('Programs')", installer)
         self.assertNotIn("GetFolderPath('Desktop')", installer)
         self.assertNotIn("DesktopDirectory", installer)
-        self.assertIn("0x6D3B,0x52A8,0x52A9,0x624B", installer)
+        self.assertIn("0x6D3B,0x52A8,0x7BA1,0x5BB6", installer)
         self.assertIn("Remove-LegacyStartMenuShortcut", installer)
 
     def test_installer_resolves_default_candidate_after_script_root_is_available(self) -> None:

@@ -124,7 +124,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.startup)
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("美客多活动助手")
+        self.setWindowTitle("美客多活动管家")
         self.setMinimumSize(1180, 720)
         self.resize(1440, 900)
         icon_path = resource_path("assets/app.ico")
@@ -180,7 +180,7 @@ class MainWindow(QMainWindow):
         brand_text = QVBoxLayout()
         brand_text.setSpacing(0)
         brand_text.setContentsMargins(0, 0, 0, 0)
-        title = QLabel("美客多活动助手")
+        title = QLabel("美客多活动管家")
         title.setObjectName("brandTitle")
         subtitle = QLabel("批量管理美客多促销与折扣活动")
         subtitle.setObjectName("brandSubtitle")
@@ -408,7 +408,7 @@ class MainWindow(QMainWindow):
         self._set_busy(False, "工作台未准备好")
         self.component_label.setText("程序组件未连接")
         self.log("工作台准备失败：" + product_error(message))
-        QMessageBox.warning(self, "美客多活动助手", product_error(message))
+        QMessageBox.warning(self, "美客多活动管家", product_error(message))
 
     def _fill_store_combo(self) -> None:
         blocker = QSignalBlocker(self.store_combo)

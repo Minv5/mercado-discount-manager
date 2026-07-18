@@ -11,7 +11,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Product = 'mercado-discount-manager'
-$DisplayName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x52A9,0x624B))
+$DisplayName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x7BA1,0x5BB6))
 $LegacyDisplayName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6298,0x6263,0x7BA1,0x5BB6))
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($CandidateRoot)) {

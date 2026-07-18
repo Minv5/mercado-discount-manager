@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const PRODUCT_ID = 'mercado-discount-manager';
-export const PRODUCT_DISPLAY_NAME = '美客多活动助手';
+export const PRODUCT_DISPLAY_NAME = '美客多活动管家';
 export const PROTOCOL_VERSION = '3';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
