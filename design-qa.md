@@ -1,9 +1,9 @@
 # 美客多折扣管家原生 UI 设计验收
 
-- Source visual truth: `C:\Users\dztf6\.codex\generated_images\019f258d-f059-7c60-bf0c-0394a2cb592c\exec-a0e6db2a-1aca-4a88-84a5-9f264fe76533.png`
-- Implementation screenshot: `C:\Users\dztf6\AppData\Local\Temp\mdm-product-design-final-approved.png`
-- Full-view comparison: `C:\Users\dztf6\AppData\Local\Temp\mdm-product-design-final-comparison.png`
-- Focused comparison: `C:\Users\dztf6\AppData\Local\Temp\mdm-product-design-final-focused-comparison.png`
+- Source visual truth: `%USERPROFILE%\.codex\generated_images\019f258d-f059-7c60-bf0c-0394a2cb592c\exec-a0e6db2a-1aca-4a88-84a5-9f264fe76533.png`
+- Implementation screenshot: `%TEMP%\mdm-product-design-final-approved.png`
+- Full-view comparison: `%TEMP%\mdm-product-design-final-comparison.png`
+- Focused comparison: `%TEMP%\mdm-product-design-final-focused-comparison.png`
 - Viewport: 1440 x 1024
 - State: 工作台已加载账号、站点、活动、批次历史和日志；首行批次被选中。
 

@@ -27,7 +27,7 @@
 
 - 不保留桥程序 exe、圆佑 DLL 目录、圆佑账号文件作为主流程设置。
 - 不调用旧 `YuanyouDiscountBridge.exe`、`YuanyouDiscountDesktop.exe`、`采集工具.dll`。
-- 不读取旧圆佑账号密码；新授权来源是 `C:\Users\dztf6\Documents\美客多授权` 的 standalone Mercado OAuth token。
+- 不读取旧圆佑账号密码；新授权默认来源是 `%USERPROFILE%\Documents\美客多授权` 的 standalone Mercado OAuth token，也可通过 `ML_STANDALONE_AUTH_DIR` 覆盖。
 
 ## 当前安全边界
 

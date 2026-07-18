@@ -32,6 +32,8 @@ class NodeServiceManager:
         local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         configured_data = os.environ.get("MDM_DATA_DIR")
         self.data_dir = Path(configured_data) if configured_data else local / "MercadoDiscountManagerStandalone" / "data"
+        configured_auth = os.environ.get("ML_STANDALONE_AUTH_DIR")
+        self.auth_dir = Path(configured_auth) if configured_auth else Path.home() / "Documents" / "美客多授权"
         self.log_dir = self.data_dir / "logs"
         self.process: subprocess.Popen[str] | None = None
         self._log_handles: list[object] = []
@@ -94,7 +96,7 @@ class NodeServiceManager:
         self._log_handles = [out_handle, err_handle]
         env = os.environ.copy()
         env["MDM_DATA_DIR"] = str(self.data_dir)
-        env["ML_STANDALONE_AUTH_DIR"] = r"C:\Users\dztf6\Documents\美客多授权"
+        env["ML_STANDALONE_AUTH_DIR"] = str(self.auth_dir)
         self.process = subprocess.Popen(
             [str(node_exe), "src/server.js"],
             cwd=str(app_dir),

@@ -198,6 +198,7 @@ test('hidden duplicate starts the fake group with remaining DEAL scope and never
   const result = await commitSubmission({
     store,
     prepareId: prepare.id,
+    now: () => '2026-07-17T00:00:00.000Z',
     confirmText: 'REAL_SUBMIT',
     createConfirmText: 'CREATE_SELLER_CAMPAIGN',
     revalidate: async () => ({ scope_hash: 'before', reconfirm_required: false, execution_relation_count: 1 }),

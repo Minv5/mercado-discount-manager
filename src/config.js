@@ -1,4 +1,5 @@
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -11,4 +12,5 @@ export const PORT = Number(process.env.MDM_PORT || 28758);
 export const API_BASE_URL = process.env.ML_API_BASE_URL || 'https://api.mercadolibre.com';
 export const DEFAULT_AUTH_DOMAIN = process.env.ML_AUTH_DOMAIN || 'https://global-selling.mercadolibre.com';
 export const APP_VERSION = process.env.ML_PROMO_APP_VERSION || 'v2';
-export const STANDALONE_AUTH_DIR = process.env.ML_STANDALONE_AUTH_DIR || 'C:\\Users\\dztf6\\Documents\\美客多授权';
+export const STANDALONE_AUTH_DIR = process.env.ML_STANDALONE_AUTH_DIR
+  || path.join(os.homedir(), 'Documents', '美客多授权');

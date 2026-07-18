@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $DesktopDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $DesktopDir
-$Python = 'C:\Users\dztf6\AppData\Local\Microsoft\WindowsApps\python.exe'
+$Python = (Get-Command python -ErrorAction Stop).Source
 $Spec = Join-Path $DesktopDir 'mercado_discount_manager_pyside.spec'
 $Dist = Join-Path $ProjectRoot 'dist-pyside'
 $Work = Join-Path $DesktopDir 'build'

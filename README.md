@@ -80,7 +80,7 @@ Mercado 写接口；`REAL_SUBMIT`、主管确认、业务预检和真实写入�
 
 ## 当前工作台能力
 
-- 默认使用 `C:\Users\dztf6\Documents\美客多授权` 的 standalone 授权。
+- 默认使用当前 Windows 用户的 `%USERPROFILE%\Documents\美客多授权` standalone 授权；可通过 `ML_STANDALONE_AUTH_DIR` 指定其它目录。
 - 显示当前账号、token 到期时间、站点概览和活动统计。
 - 支持刷新全部 CBT 子账号活动，活动保存 `site_id`、`child_user_id`、`logistic_type`。
 - 支持按站点、活动类型、状态、名称筛选活动。
@@ -100,7 +100,7 @@ Mercado 写接口；`REAL_SUBMIT`、主管确认、业务预检和真实写入�
 - 默认先生成测试模式计划，不提交真实报名、改价或取消。
 - 真实提交接口必须显式传入 `mode=real` 和确认字段 `REAL_SUBMIT`；满足条件后会调用 Mercado 写接口。
 - `access_token`、`refresh_token` 和 `Client Secret` 加密保存到本机数据库，不写入日志或导出。
-- 本机已有 standalone 授权会从 `C:\Users\dztf6\Documents\美客多授权` 运行时读取，不要求重新 OAuth，也不复制 token 到项目文件。
+- 本机已有 standalone 授权默认从 `%USERPROFILE%\Documents\美客多授权` 运行时读取，也可由 `ML_STANDALONE_AUTH_DIR` 覆盖；程序不复制 token 到项目文件。
 - 当前加密方案使用本地随机密钥文件 `data/local.key` 加 AES-256-GCM，适合单机本地第一版；后续建议升级到 Windows DPAPI 或系统凭据库。
 
 ## CBT 账号活动读取
@@ -124,7 +124,7 @@ GET /marketplace/seller-promotions/users/{child_user_id}
 默认直接读取现有授权目录：
 
 ```text
-C:\Users\dztf6\Documents\美客多授权
+%USERPROFILE%\Documents\美客多授权
 ```
 
-不需要重新输入 `Client ID`、`Client Secret` 或重新 OAuth。只有授权目录失效或刷新脚本失败时，才需要单独处理授权问题。
+需要使用其它位置时，在启动程序前设置 `ML_STANDALONE_AUTH_DIR`。已有授权有效时不需要重新输入 `Client ID`、`Client Secret` 或重新 OAuth；只有授权目录失效或刷新脚本失败时，才需要单独处理授权问题。

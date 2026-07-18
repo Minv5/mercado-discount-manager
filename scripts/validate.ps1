@@ -83,7 +83,7 @@ function Get-StringHash([string]$Value) {
   finally { $algorithm.Dispose() }
 }
 
-$Python = 'C:\Users\dztf6\AppData\Local\Python\bin\python.exe'
+$Python = (Get-Command python -ErrorAction Stop).Source
 $ExpectedServiceName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x52A9,0x624B))
 $ExpectedProduct = 'mercado-discount-manager'
 $ExpectedProtocolVersion = '3'

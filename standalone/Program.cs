@@ -21,6 +21,16 @@ namespace MercadoDiscountManagerStandalone;
 
 internal static class Program
 {
+	private static string ResolveDefaultAuthDir()
+	{
+		string? configured = Environment.GetEnvironmentVariable("ML_STANDALONE_AUTH_DIR");
+		if (!string.IsNullOrWhiteSpace(configured))
+		{
+			return configured;
+		}
+		return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "美客多授权");
+	}
+
 	private static class UiTheme
 	{
 		public static readonly Color MainBackground = ColorTranslator.FromHtml("#171B19");
@@ -391,7 +401,7 @@ internal static class Program
 
 		private string _selectedStoreKey = "all";
 
-		private string _authDir = "C:\\Users\\dztf6\\Documents\\美客多授权";
+		private string _authDir = ResolveDefaultAuthDir();
 
 		private string _outputDir = "";
 
@@ -1164,7 +1174,7 @@ internal static class Program
 			{
 				return;
 			}
-			_authDir = StringValue(settings, "authDir", "C:\\Users\\dztf6\\Documents\\美客多授权");
+			_authDir = StringValue(settings, "authDir", ResolveDefaultAuthDir());
 			_outputDir = StringValue(settings, "outputDir", "");
 			_sellerDiscount.Value = DecimalValue(settings, "sellerDefaultDiscount", 5m);
 			_officialDiscount.Value = DecimalValue(settings, "officialDefaultDiscount", 6m);
@@ -6369,7 +6379,7 @@ internal static class Program
 
 	private const string HealthUrl = "http://127.0.0.1:28758/api/health";
 
-	private const string AuthDir = "C:\\Users\\dztf6\\Documents\\美客多授权";
+	private static readonly string AuthDir = ResolveDefaultAuthDir();
 
 	private static readonly object ServiceLogLock = new object();
 
@@ -6493,7 +6503,7 @@ internal static class Program
 			StandardErrorEncoding = Encoding.UTF8
 		};
 		psi.Environment["MDM_DATA_DIR"] = dataDir;
-		psi.Environment["ML_STANDALONE_AUTH_DIR"] = "C:\\Users\\dztf6\\Documents\\美客多授权";
+		psi.Environment["ML_STANDALONE_AUTH_DIR"] = AuthDir;
 		Process process = Process.Start(psi) ?? throw new InvalidOperationException("程序组件启动失败。请关闭软件后重新打开；如果仍出现，请把诊断信息发给我处理。");
 		AttachServiceLogs(process, stdoutLog, stderrLog);
 		for (int i = 0; i < 60; i++)

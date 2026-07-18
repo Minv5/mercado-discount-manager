@@ -34,7 +34,7 @@ $stubBase64 = 'aW1wb3J0IGpzb24KZnJvbSBodHRwLnNlcnZlciBpbXBvcnQgQmFzZUhUVFBSZXF1Z
 $stub = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($stubBase64))
 $stubFile = Join-Path $Root 'active_stub.py'
 $stub | Set-Content -LiteralPath $stubFile -Encoding UTF8
-$python = 'C:\Users\dztf6\AppData\Local\Python\bin\python.exe'
+$python = (Get-Command python -ErrorAction Stop).Source
 $stubProcess = Start-Process -FilePath $python -ArgumentList $stubFile -WindowStyle Hidden -PassThru
 try {
   $deadline = (Get-Date).AddSeconds(5)

@@ -1,14 +1,18 @@
-美客多折扣管家 使用说明
+美客多活动助手 使用说明
 
 一、怎么启动
 
-双击桌面上的“美客多折扣管家.exe”。
+从当前用户开始菜单打开“美客多活动助手”，或运行完整发布目录中的：
 
-项目内完整 exe 文件在：
-C:\Users\dztf6\Documents\美客多折扣管家\dist-full\美客多折扣管家-完整版.exe
+美客多活动助手.exe
 
-这个 exe 是完整单文件，已经内置 Node.js、桌面窗口壳和程序文件。运行时会解压到：
-C:\Users\dztf6\AppData\Local\MercadoDiscountManagerStandalone
+项目内正式候选目录为：
+
+dist-pyside\美客多活动助手\
+
+这是完整 one-dir 目录，包含主程序、Qt、Node 和业务服务文件。发布、安装或移动时必须保留整个目录，不能只复制主 EXE。默认安装目录为：
+
+%LOCALAPPDATA%\Programs\MercadoDiscountManagerPySide
 
 启动后会打开独立桌面窗口，不再弹默认浏览器。下面这个地址只是后台服务地址，平时不用手动打开：
 
@@ -21,9 +25,9 @@ http://127.0.0.1:28758
 
 程序默认读取：
 
-C:\Users\dztf6\Documents\美客多授权
+%USERPROFILE%\Documents\美客多授权
 
-这里保存的是现有 Mercado Libre standalone 授权。程序不会把 token、refresh_token、Client Secret 写进说明、日志或导出结果。
+这里保存的是现有 Mercado Libre standalone 授权；需要使用其它位置时，可在启动前设置 `ML_STANDALONE_AUTH_DIR`。程序不会把 token、refresh_token、Client Secret 写进说明、日志或导出结果。
 
 三、日常使用流程
 

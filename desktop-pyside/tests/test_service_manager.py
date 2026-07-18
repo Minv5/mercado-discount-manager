@@ -85,6 +85,17 @@ class ServiceManagerTests(unittest.TestCase):
             manager = NodeServiceManager(ROOT.parent)
             self.assertEqual(manager.data_dir, Path(directory))
 
+    def test_auth_directory_defaults_to_current_user_documents(self) -> None:
+        with patch.dict("os.environ", {"ML_STANDALONE_AUTH_DIR": ""}):
+            manager = NodeServiceManager(ROOT.parent)
+            self.assertEqual(manager.auth_dir, Path.home() / "Documents" / "美客多授权")
+
+    def test_auth_directory_respects_explicit_override(self) -> None:
+        configured = Path("D:/Mercado/Auth")
+        with patch.dict("os.environ", {"ML_STANDALONE_AUTH_DIR": str(configured)}):
+            manager = NodeServiceManager(ROOT.parent)
+            self.assertEqual(manager.auth_dir, configured)
+
 
 if __name__ == "__main__":
     unittest.main()
