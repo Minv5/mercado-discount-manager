@@ -263,7 +263,7 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(today_section, 1)
         scroll.setWidget(content)
         layout.addWidget(scroll, 1)
-        self.execute_button = QPushButton("提交执行")
+        self.execute_button = QPushButton("开始核对范围")
         self.execute_button.setObjectName("primary")
         self.execute_button.setMinimumHeight(42)
         self.execute_button.clicked.connect(self._on_execute_clicked)
@@ -1079,8 +1079,8 @@ class MainWindow(QMainWindow):
         if state == "reconfirm_required":
             self.pending_prepare_payload = None
             self._set_prepare_busy(False)
-            self.log("检测到最终范围变化，请按更新后的摘要再次确认。")
-            self._confirm_submission(prepare)
+            self.log("执行动作或活动结构已变化，本次未执行，请重新开始核对范围。")
+            self._operation_error("核对执行范围", "执行动作或活动结构已变化，本次未执行，请重新开始核对范围。")
             return
         if state in {"failed", "expired"}:
             self.pending_prepare_payload = None
@@ -1177,7 +1177,10 @@ class MainWindow(QMainWindow):
             self.log("提交执行已取消，未创建活动、未启动执行任务。")
             self._discard_prepared_submission(str(prepare.get("prepare_id") or ""))
             return
-        commit_body = {"confirmText": "REAL_SUBMIT"}
+        commit_body = {
+            "confirmText": "REAL_SUBMIT",
+            "confirmationToken": str(prepare.get("confirmation_token") or ""),
+        }
         if selected:
             commit_body["createConfirmText"] = "CREATE_SELLER_CAMPAIGN"
         self.pending_group_payload = {"prepare_id": prepare["prepare_id"], "commit_body": commit_body}
@@ -1360,12 +1363,8 @@ class MainWindow(QMainWindow):
             self.commit_recovery_poll_count = 0
             self.poll_timer.setInterval(900)
             self._set_execution_busy(False)
-            changes = [str(value) for value in list(prepare.get("reconfirm_changes") or []) if str(value)]
-            if changes:
-                self.log("最终核对发现范围变化：" + "；".join(changes) + "。请按更新后的摘要再次确认。")
-            else:
-                self.log("最终核对发现范围变化，请按更新后的摘要再次确认。")
-            self._confirm_submission(prepare)
+            self.log("执行动作或活动结构已变化，本次未执行，请重新开始核对范围。")
+            self._operation_error("提交执行", "执行动作或活动结构已变化，本次未执行，请重新开始核对范围。", execution=True)
             return
         if state in {"failed", "expired", "cancelled", "paused", "terminal"}:
             self.poll_timer.stop()
@@ -1564,14 +1563,14 @@ class MainWindow(QMainWindow):
 
     def _set_execution_busy(self, busy: bool) -> None:
         self.execute_button.setEnabled(busy or self._can_start_submission())
-        self.execute_button.setText("停止任务" if busy else "提交执行")
+        self.execute_button.setText("停止任务" if busy else "开始核对范围")
         for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
             control.setEnabled(not busy)
         self._update_discount_state()
 
     def _set_prepare_busy(self, busy: bool) -> None:
         if not busy:
-            self.execute_button.setText("提交执行")
+            self.execute_button.setText("开始核对范围")
             self.execute_button.setEnabled(self._can_start_submission())
             for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
                 control.setEnabled(True)

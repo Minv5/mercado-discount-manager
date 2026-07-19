@@ -455,6 +455,7 @@ export async function commitSubmission({
   prepareId,
   confirmText,
   createConfirmText,
+  confirmationToken,
   revalidate,
   revalidateAfterCreation,
   createSellerCampaigns,
@@ -469,6 +470,10 @@ export async function commitSubmission({
   if (!current) throw submissionError('未找到本次准备结果，请重新准备。', 'PREPARE_NOT_FOUND', 404);
   if (current.group_id) return { prepare: current, group: current.group || { id: current.group_id }, reused: true };
   if (String(confirmText || '') !== 'REAL_SUBMIT') throw submissionError('最终提交需要 REAL_SUBMIT 确认。', 'REAL_SUBMIT_REQUIRED');
+  const expectedConfirmationToken = String(current.execution_confirmation_token || '');
+  if (!recover && expectedConfirmationToken && String(confirmationToken || '') !== expectedConfirmationToken) {
+    throw submissionError('本次最终确认已失效，请重新核对执行范围。', 'EXECUTION_CONFIRMATION_INVALID');
+  }
   const selectedBeforeCommit = current.seller_input?.selected_targets || [];
   if (selectedBeforeCommit.length
       && !['created', 'starting', 'executing', 'terminal'].includes(String(current.state || ''))
@@ -505,6 +510,7 @@ export async function commitSubmission({
   }, {
     state: ['prepared', 'reconfirm_required'].includes(fromState) ? 'committing' : fromState,
     commit_confirmed: true,
+    execution_confirmation_token_consumed_at: current.execution_confirmation_token_consumed_at || at,
     create_confirmed: Boolean(current.create_confirmed || String(createConfirmText || '') === 'CREATE_SELLER_CAMPAIGN'),
     commit_started_at: current.commit_started_at || at,
     commit_lease_id: leaseId,
@@ -620,41 +626,19 @@ export async function commitSubmission({
       const requiresReconfirm = checked?.reconfirm_required === true
         || (checked?.reconfirm_required !== false && scopeHashChanged);
       if (requiresReconfirm) {
-        if (Number(owned.reconfirm_count || 0) >= 1) {
-          transition('failed', {
-            revalidation_history: revalidationHistory,
-            error: '执行范围再次发生实质变化，本次已安全停止，请重新准备。',
-            failure_code: 'RECONFIRM_LIMIT_REACHED',
-            commit_lease_id: null,
-            commit_lease_owner: null,
-            commit_lease_expires_at: null,
-            progress: {
-              ...(owned.progress || {}), stage: 'failed', percent: 100,
-              message: '执行范围再次变化，本次已安全停止',
-            },
-          }, 'reconfirm_limit_reached');
-          throw submissionError('执行范围再次发生实质变化，本次已安全停止，请重新准备。', 'RECONFIRM_LIMIT_REACHED');
-        }
-        transition('reconfirm_required', {
-          ...(checked.prepared_patch || {}),
-          scope_hash: String(checked.scope_hash),
-          reconfirm_changes: clone(checked.changes || []),
-          reconfirm_target_keys: clone(checked.changed_target_keys || []),
-          reconfirm_count: Number(owned.reconfirm_count || 0) + 1,
+        transition('failed', {
           revalidation_history: revalidationHistory,
-          commit_confirmed: false,
-          create_confirmed: false,
-          error: null,
-          failure_code: null,
+          error: '执行动作或活动结构发生实质变化，本次未执行，请重新核对范围。',
+          failure_code: 'PREPARE_STALE',
           commit_lease_id: null,
           commit_lease_owner: null,
           commit_lease_expires_at: null,
           progress: {
-            ...(owned.progress || {}), stage: 'reconfirm_required', percent: 100,
-            message: '执行范围有变化，请核对更新后的摘要并再次确认',
+            ...(owned.progress || {}), stage: 'failed', percent: 100,
+            message: '执行范围发生实质变化，请重新核对范围',
           },
-        }, 'scope_changed_reconfirm');
-        return { prepare: owned, group: null, reused: false, reconfirm_required: true, changes: checked.changes || [] };
+        }, 'scope_changed_reprepare');
+        throw submissionError('执行动作或活动结构发生实质变化，本次未执行，请重新核对范围。', 'PREPARE_STALE');
       }
       if (checked?.execution_relation_count === 0) {
         transition('failed', {
@@ -752,38 +736,21 @@ export async function commitSubmission({
       const scopeHashChanged = Boolean(checked?.scope_hash && checked.scope_hash !== owned.scope_hash);
       const requiresReconfirm = checked?.reconfirm_required === true
         || (checked?.reconfirm_required !== false && scopeHashChanged);
-      if (requiresReconfirm) {
-        if (Number(owned.reconfirm_count || 0) >= 1) {
-          transition('failed', {
-            revalidation_history: revalidationHistory,
-            error: '执行范围再次发生实质变化，本次已安全停止，请重新准备。',
-            failure_code: 'RECONFIRM_LIMIT_REACHED',
-            commit_lease_id: null,
-            commit_lease_owner: null,
-            commit_lease_expires_at: null,
-          }, 'reconfirm_limit_reached_after_creation');
-          throw submissionError('执行范围再次发生实质变化，本次已安全停止，请重新准备。', 'RECONFIRM_LIMIT_REACHED');
-        }
-        transition('reconfirm_required', {
-          ...(checked.prepared_patch || {}),
-          scope_hash: String(checked.scope_hash),
-          reconfirm_changes: clone(checked.changes || []),
-          reconfirm_target_keys: clone(checked.changed_target_keys || ['__SELLER__']),
-          reconfirm_count: Number(owned.reconfirm_count || 0) + 1,
+      const changedTargetKeys = clone(checked?.changed_target_keys || []);
+      const expectedSellerCreationChange = requiresReconfirm
+        && changedTargetKeys.length > 0
+        && changedTargetKeys.every((key) => String(key) === '__SELLER__')
+        && checked?.prepared_patch?.confirmed_execution_scope;
+      if (requiresReconfirm && !expectedSellerCreationChange) {
+        transition('failed', {
           revalidation_history: revalidationHistory,
-          commit_confirmed: false,
-          create_confirmed: true,
-          error: null,
-          failure_code: null,
+          error: '新建活动回查结果与已确认目标不一致，本次未执行，请重新核对范围。',
+          failure_code: 'PREPARE_STALE',
           commit_lease_id: null,
           commit_lease_owner: null,
           commit_lease_expires_at: null,
-          progress: {
-            ...(owned.progress || {}), stage: 'reconfirm_required', percent: 100,
-            message: '新建活动已回查，请核对最终商品范围并再次确认',
-          },
-        }, 'seller_creation_scope_reconfirm');
-        return { prepare: owned, group: null, reused: false, reconfirm_required: true, changes: checked.changes || [] };
+        }, 'seller_creation_scope_changed');
+        throw submissionError('新建活动回查结果与已确认目标不一致，本次未执行，请重新核对范围。', 'PREPARE_STALE');
       }
       if (checked?.execution_relation_count === 0) {
         transition('failed', {

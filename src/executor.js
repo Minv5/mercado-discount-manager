@@ -64,6 +64,7 @@ export async function executePlannedRowsWithConcurrency({
   shouldCancel,
   onItemEvent,
   onStopRequested,
+  onPending,
   classifyError = () => ({ interfaceFailure: false }),
   retryOptions = {}
 }) {
@@ -76,7 +77,8 @@ export async function executePlannedRowsWithConcurrency({
     deferred: 0,
     deferred_success: 0,
     deferred_failed: 0,
-    deferred_skipped: 0
+    deferred_skipped: 0,
+    deferred_pending: 0
   };
   const successfulItemKeys = new Set();
 
@@ -252,6 +254,38 @@ export async function executePlannedRowsWithConcurrency({
           });
           return { itemId: row.item?.item_id || '', status: 'deferred', row, error, errorCn, classifiedError };
         }
+        if (retryable && finalRetry) {
+          const pending = {
+            taskId,
+            accountId,
+            promotionId,
+            promotionType,
+            itemId: row.item?.item_id || '',
+            action,
+            mode,
+            status: 'pending',
+            dealPrice: row.deal_price,
+            errorCn,
+            errorRaw: JSON.stringify({ message: error?.message, status: error?.status, body: error?.body || null, retryable: true })
+          };
+          await saveResult?.(pending);
+          await onPending?.({ row, error, errorCn, classifiedError, attempt, retryCount, finalRetry });
+          await onItemEvent?.({
+            type: 'item_pending',
+            row,
+            status: 'pending',
+            startedAt,
+            finishedAt,
+            durationMs: Date.now() - startedMs,
+            error,
+            errorCn,
+            isInterfaceFailure: true,
+            attempt,
+            retryCount,
+            finalRetry,
+          });
+          return { itemId: row.item?.item_id || '', status: 'pending', row, errorCn, classifiedError, finalRetry: true };
+        }
         await saveResult?.({
           taskId,
           accountId,
@@ -279,7 +313,7 @@ export async function executePlannedRowsWithConcurrency({
           retryCount,
           finalRetry
         });
-        if (classifiedError.interfaceFailure) onStopRequested?.({ error, errorCn, row, classifiedError });
+        if (classifiedError.authFailure) onStopRequested?.({ error, errorCn, row, classifiedError });
         return { itemId: row.item?.item_id || '', status: 'failed', errorCn, finalRetry };
       }
     }
@@ -303,6 +337,7 @@ export async function executePlannedRowsWithConcurrency({
     retrySummary.deferred_success = deferredExecuted.filter((result) => result?.status === 'success').length;
     retrySummary.deferred_failed = deferredExecuted.filter((result) => result?.status === 'failed').length;
     retrySummary.deferred_skipped = deferredExecuted.filter((result) => result?.status === 'skipped').length;
+    retrySummary.deferred_pending = deferredExecuted.filter((result) => result?.status === 'pending').length;
     await onItemEvent?.({
       type: 'deferred_retry_done',
       status: 'completed',
@@ -310,8 +345,28 @@ export async function executePlannedRowsWithConcurrency({
       success: retrySummary.deferred_success,
       failed: retrySummary.deferred_failed,
       skipped: retrySummary.deferred_skipped,
+      pending: retrySummary.deferred_pending,
       deferred: true
     });
+  } else if (deferredRows.length > 0 && shouldCancel?.()) {
+    deferredExecuted = await Promise.all(deferredRows.map(async (row) => {
+      const reason = '用户已停止执行，留置商品未再提交。';
+      await saveResult?.({
+        taskId,
+        accountId,
+        promotionId,
+        promotionType,
+        itemId: row.item?.item_id || '',
+        action,
+        mode,
+        status: 'skipped',
+        dealPrice: row.deal_price,
+        errorCn: reason,
+      });
+      await onItemEvent?.({ type: 'item_cancelled_before_start', row, status: 'skipped', reason, deferred: true });
+      return { itemId: row.item?.item_id || '', status: 'skipped', reason, cancelled: true };
+    }));
+    retrySummary.deferred_skipped = deferredExecuted.length;
   }
 
   const finalResults = [
@@ -321,6 +376,7 @@ export async function executePlannedRowsWithConcurrency({
   for (const result of finalResults) {
     if (result?.status === 'success') counts.success += 1;
     else if (result?.status === 'skipped') counts.skipped += 1;
+    else if (result?.status === 'pending') counts.pending = Number(counts.pending || 0) + 1;
     else counts.failed += 1;
   }
 

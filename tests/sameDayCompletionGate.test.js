@@ -252,7 +252,7 @@ test('manual same-action is also gated while a truly different or cross-day scop
   }), { allowed: true, confirmed: false, completed: null, binding: null });
 });
 
-test('HTTP prepare gate creates zero submissions and prior idempotency cannot change action', async () => {
+test('HTTP prepare gate blocks automatic duplicates and folds manual warning into the single final summary', async () => {
   const dataDir = temporaryDirectory();
   const groupStore = createExecutionGroupPersistence({
     stateDir: path.join(dataDir, 'execution-group-states'),
@@ -316,57 +316,16 @@ test('HTTP prepare gate creates zero submissions and prior idempotency cannot ch
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify(manualRequest),
     });
-    assert.equal(manual.status, 409);
-    const warning = await manual.json();
-    assert.equal(warning.code, 'CONFIRM_SAME_DAY_ACTION');
-    assert.ok(warning.details.confirmation_token);
-
-    const rebound = await fetch(`${baseUrl}/api/execution/submissions/prepare`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        ...manualRequest,
-        client_submission_id: 'manual-rebound',
-        same_day_confirmation_token: warning.details.confirmation_token,
-      }),
-    });
-    assert.equal(rebound.status, 409);
-    assert.equal((await rebound.json()).code, 'SAME_DAY_CONFIRMATION_MISMATCH');
-
-    const cancelRequest = requestFixture({ client_submission_id: 'manual-cancel', requested_action: 'enroll', action: 'enroll' });
-    const cancelWarningResponse = await fetch(`${baseUrl}/api/execution/submissions/prepare`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(cancelRequest),
-    });
-    assert.equal(cancelWarningResponse.status, 409);
-    const cancelWarning = await cancelWarningResponse.json();
-    const cancelled = await fetch(`${baseUrl}/api/execution/submissions/same-day-confirmations/cancel`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ confirmation_token: cancelWarning.details.confirmation_token }),
-    });
-    assert.equal(cancelled.status, 200);
-    const retried = await fetch(`${baseUrl}/api/execution/submissions/prepare`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        ...cancelRequest,
-        same_day_confirmation_token: cancelWarning.details.confirmation_token,
-      }),
-    });
-    assert.equal(retried.status, 409);
-    assert.equal((await retried.json()).code, 'SAME_DAY_CONFIRMATION_CANCELLED');
-
-    const accepted = await fetch(`${baseUrl}/api/execution/submissions/prepare`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ...manualRequest, same_day_confirmation_token: warning.details.confirmation_token }),
-    });
-    assert.equal(accepted.status, 200);
-    const acceptedBody = await accepted.json();
-    assert.equal(acceptedBody.prepare_id, 'prepare-paused');
-    assert.equal(acceptedBody.prepare.state, 'prepared');
+    assert.equal(manual.status, 200);
+    const manualBody = await manual.json();
+    assert.equal(manualBody.prepare_id, 'prepare-paused');
+    assert.equal(manualBody.prepare.state, 'prepared');
     const acceptedState = fs.readFileSync(path.join(dataDir, 'execution-submissions', 'prepare-paused.json'), 'utf8');
-    assert.equal(acceptedState.includes(warning.details.confirmation_token), false);
+    assert.equal(acceptedState.includes('same_day_confirmation_token'), false);
 
     const responseRetry = await fetch(`${baseUrl}/api/execution/submissions/prepare`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ...manualRequest, same_day_confirmation_token: warning.details.confirmation_token }),
+      body: JSON.stringify(manualRequest),
     });
     assert.equal(responseRetry.status, 200);
     assert.equal((await responseRetry.json()).prepare_id, 'prepare-paused');

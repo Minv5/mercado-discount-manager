@@ -290,7 +290,9 @@ export function createSameDayConfirmationStore({ stateDir, now = () => new Date(
   return { cancel, consume, issue, load, loadAll, statePath };
 }
 
-export function sameDayCompletionGate({ groups = [], request = {}, confirmationStore, now = () => new Date().toISOString() }) {
+export function sameDayCompletionGate({
+  groups = [], request = {}, confirmationStore, now = () => new Date().toISOString(), deferManualConfirmation = false,
+}) {
   const timestamp = typeof now === 'function' ? now() : now;
   const completedGroup = findSameDayTerminalGroup(groups, request, timestamp);
   if (!completedGroup) return { allowed: true, confirmed: false, completed: null, binding: null };
@@ -310,6 +312,18 @@ export function sameDayCompletionGate({ groups = [], request = {}, confirmationS
     completed_group_id: completed.group_id,
     business_date: businessDateInShanghai(timestamp),
   };
+  if (deferManualConfirmation) {
+    return {
+      allowed: true,
+      confirmed: false,
+      completed,
+      binding,
+      warning: {
+        same_action: completed.action === requestedAction,
+        completed,
+      },
+    };
+  }
   const token = request.same_day_confirmation_token || request.sameDayConfirmationToken || '';
   if (token) {
     confirmationStore.consume(token, binding);

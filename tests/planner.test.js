@@ -3395,7 +3395,7 @@ test('single promotion write concurrency is not capped by read concurrency', asy
   assert.equal(result.counts.success, 30);
 });
 
-test('execution rows request stop only after deferred interface failure is final', async () => {
+test('deferred interface failure remains pending without stopping unrelated rows', async () => {
   const saved = [];
   const events = [];
   let stop = false;
@@ -3431,14 +3431,16 @@ test('execution rows request stop only after deferred interface failure is final
     retryOptions: { retryBackoffMs: [0, 0, 0], deferredConcurrency: 1 }
   });
 
-  assert.equal(result.counts.failed, 1);
+  assert.equal(result.counts.failed, 0);
+  assert.equal(result.counts.pending, 1);
   assert.equal(result.counts.skipped, 0);
   assert.equal(result.retrySummary.deferred, 1);
-  assert.equal(result.retrySummary.deferred_failed, 1);
-  assert.equal(stop, true);
+  assert.equal(result.retrySummary.deferred_failed, 0);
+  assert.equal(result.retrySummary.deferred_pending, 1);
+  assert.equal(stop, false);
   assert.equal(saved.some((row) => row.errorCn === '执行任务已停止，未开始的商品已跳过'), false);
   assert.equal(events.some((event) => event.type === 'item_deferred'), true);
-  assert.equal(events.some((event) => event.type === 'deferred_retry_done' && event.failed === 1), true);
+  assert.equal(events.some((event) => event.type === 'deferred_retry_done' && event.pending === 1), true);
 });
 
 test('execution rows do not stop remaining items after business write errors', async () => {
@@ -3530,7 +3532,7 @@ test('transient interface failures retry three times then defer to final retry',
   assert.equal(events.some((event) => event.type === 'deferred_retry_done' && event.success === 1), true);
 });
 
-test('deferred transient failure is final failed only after the tail retry', async () => {
+test('deferred transient failure becomes auditable pending after the tail retry', async () => {
   const saved = [];
   const events = [];
   let stopRequests = 0;
@@ -3558,15 +3560,16 @@ test('deferred transient failure is final failed only after the tail retry', asy
     retryOptions: { retryBackoffMs: [0, 0, 0], deferredConcurrency: 1 }
   });
 
-  assert.deepEqual(result.counts, { success: 0, failed: 1, skipped: 0 });
+  assert.deepEqual(result.counts, { success: 0, failed: 0, skipped: 0, pending: 1 });
   assert.equal(saved.length, 1);
-  assert.equal(saved[0].status, 'failed');
+  assert.equal(saved[0].status, 'pending');
   assert.equal(result.retrySummary.immediate_retries, 3);
   assert.equal(result.retrySummary.deferred, 1);
-  assert.equal(result.retrySummary.deferred_failed, 1);
-  assert.equal(stopRequests, 1);
+  assert.equal(result.retrySummary.deferred_failed, 0);
+  assert.equal(result.retrySummary.deferred_pending, 1);
+  assert.equal(stopRequests, 0);
   assert.equal(events.some((event) => event.type === 'item_retry' && /平台限流，正在第 1 次重试/.test(event.reason)), true);
-  assert.equal(events.some((event) => event.type === 'item_finish' && event.finalRetry === true && event.status === 'failed'), true);
+  assert.equal(events.some((event) => event.type === 'item_pending' && event.finalRetry === true && event.status === 'pending'), true);
 });
 
 test('execution job item audit resolves run-id event files and counts true write attempts only', () => {
@@ -3645,7 +3648,8 @@ test('execution job path carries normalized write concurrency into real executio
   assert.match(serverSource, /activityConcurrency: jobActivityConcurrency/);
   assert.match(serverSource, /getSharedWriteLimiter\(request\.executionGroupId, normalizedGlobalWriteConcurrency/);
   assert.match(serverSource, /sharedWriteLimiters/);
-  assert.match(serverSource, /const normalizedWriteConcurrency = normalizeWriteConcurrency\(writeConcurrency, readSettings\(\)\.writeConcurrency\)/);
+  assert.match(serverSource, /const requestedNormalizedWriteConcurrency = normalizeWriteConcurrency\(writeConcurrency, readSettings\(\)\.writeConcurrency\)/);
+  assert.match(serverSource, /Math\.min\(requestedNormalizedWriteConcurrency, ADAPTIVE_WRITE_PROFILE\.perRoute\)/);
   assert.match(serverSource, /mapLimited\(indexedPlans, normalizedActivityConcurrency/);
   assert.match(serverSource, /requestedWriteConcurrency/);
   assert.match(serverSource, /requestedGlobalWriteConcurrency/);

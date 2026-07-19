@@ -15,7 +15,13 @@ export function createExecutionJobPersistence({ stateDir, publicJob, currentPid 
     fs.mkdirSync(stateDir, { recursive: true });
     const target = statePath(job.id);
     const temporary = `${target}.${currentPid}.tmp`;
-    const snapshot = { ...publicJob(job), process_pid: currentPid, persisted_at: now() };
+    const snapshot = {
+      ...publicJob(job),
+      request: job.request || null,
+      batch_task_id: job.batch_task_id || null,
+      process_pid: currentPid,
+      persisted_at: now(),
+    };
     fs.writeFileSync(temporary, JSON.stringify(snapshot), 'utf8');
     fs.renameSync(temporary, target);
   }

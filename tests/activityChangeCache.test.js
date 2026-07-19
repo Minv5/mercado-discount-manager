@@ -5,11 +5,13 @@ import test from 'node:test';
 import {
   ACTIVITY_CATALOG_TTL_MS,
   ACTIVITY_ITEMS_TTL_MS,
+  ACTIVITY_PARTIAL_ITEMS_TTL_MS,
   activityCatalogDecision,
   activityItemsDecision,
   applyActivityChangeEvent,
   isActivityExpired,
   nextNonPeakCalibrationAt,
+  planActivityCatalogRoutes,
 } from '../src/activityChangeCache.js';
 
 const NOW = new Date('2026-07-15T06:00:00.000Z');
@@ -29,6 +31,22 @@ test('activity catalog uses a daily calibration and dirty or gap forces only the
   assert.equal(states.get('A|MLM|P-1|DEAL').dirty, 0);
   assert.equal(states.get('A|MLM|P-2|DEAL').dirty, 1);
   assert.equal(states.get('A|MLM|P-2|DEAL').event_cursor, '18');
+});
+
+test('catalog route plan performs zero external reads for clean routes and targets only dirty routes', () => {
+  const routes = [
+    { account_id: 'A', child_user_id: 'C1', site_id: 'MLM' },
+    { account_id: 'A', child_user_id: 'C2', site_id: 'MLB' },
+  ];
+  const checkedAt = new Date(NOW.getTime() - 1_000).toISOString();
+  const states = new Map([
+    ['MLM', { catalog_checked_at: checkedAt, dirty: 0, continuity: 'continuous' }],
+    ['MLB', { catalog_checked_at: checkedAt, dirty: 1, continuity: 'continuous' }],
+  ]);
+  const plan = planActivityCatalogRoutes(routes, (route) => states.get(route.site_id), NOW);
+  assert.deepEqual(plan.cached.map((route) => route.site_id), ['MLM']);
+  assert.deepEqual(plan.refresh.map((route) => route.site_id), ['MLB']);
+  assert.equal(plan.reasons['A|C2|MLB'], 'dirty');
 });
 
 test('activity items reuse verified full cache for three days and never reuse dirty gap error or partial cache', () => {
@@ -64,6 +82,39 @@ test('partial candidate plus fresh inventory fallback is a reusable complete ver
     now: NOW,
   });
   assert.equal(staleFallback.refresh, true);
+});
+
+test('audited sparse candidate responses use a bounded low-frequency window instead of refreshing every prepare', () => {
+  const checkedAt = new Date(NOW.getTime() - ACTIVITY_PARTIAL_ITEMS_TTL_MS + 1).toISOString();
+  const reusable = activityItemsDecision({
+    promotion: { finish_date: '2026-07-31' },
+    cacheState: { dirty: 0, continuity: 'continuous' },
+    fetchState: {
+      detail_status: 'partial_api_sparse_marketplace_candidate',
+      saved_count: 20,
+      platform_total: 80,
+      updated_at: checkedAt,
+    },
+    now: NOW,
+  });
+  assert.deepEqual(reusable, {
+    refresh: false,
+    reason: 'verified_sparse_window',
+    effective_state: 'partial_api_sparse_marketplace_candidate',
+  });
+  const stale = activityItemsDecision({
+    promotion: { finish_date: '2026-07-31' },
+    cacheState: { dirty: 0, continuity: 'continuous' },
+    fetchState: {
+      detail_status: 'partial_api_sparse_marketplace_candidate',
+      saved_count: 20,
+      platform_total: 80,
+      updated_at: new Date(NOW.getTime() - ACTIVITY_PARTIAL_ITEMS_TTL_MS - 1).toISOString(),
+    },
+    now: NOW,
+  });
+  assert.equal(stale.refresh, true);
+  assert.equal(stale.reason, 'not_full');
 });
 
 test('finish date expires locally after the Shanghai business day without a network read', () => {

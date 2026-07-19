@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const ACTIVE_EXECUTION_GROUP_STATUSES = new Set(['queued', 'running', 'stopping']);
+export const ACTIVE_EXECUTION_GROUP_STATUSES = new Set(['queued', 'running', 'stopping', 'paused']);
 export const TERMINAL_EXECUTION_GROUP_STATUSES = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
 
 function safeId(value) {
@@ -17,9 +17,10 @@ function childCounts(child = {}) {
   const success = Math.max(0, Number(execution.success || 0));
   const failed = Math.max(0, Number(execution.failed || 0));
   const skipped = Math.max(0, Number(execution.skipped || 0));
-  const total = Math.max(Number(execution.total || 0), success + failed + skipped);
+  const pending = Math.max(0, Number(execution.pending || 0));
+  const total = Math.max(Number(execution.total || 0), success + failed + skipped + pending);
   return {
-    total, success, failed, skipped,
+    total, success, failed, skipped, pending,
     relation_count: execution.relation_count ?? null,
     unique_item_count: execution.unique_item_count ?? null,
     activity_failure_count: execution.activity_failure_count ?? null,
@@ -72,6 +73,7 @@ export function summarizeExecutionGroup(group = {}) {
     summary.success += store.success;
     summary.failed += store.failed;
     summary.skipped += store.skipped;
+    summary.pending += store.pending;
     for (const field of ['relation_count', 'unique_item_count', 'activity_failure_count', 'request_success_count', 'live_verified_removed_count', 'pending_verification_count']) {
       if (store[field] !== null && store[field] !== undefined) summary[field] += Number(store[field] || 0);
     }
@@ -83,6 +85,7 @@ export function summarizeExecutionGroup(group = {}) {
     success: 0,
     failed: 0,
     skipped: 0,
+    pending: 0,
     relation_count: 0,
     unique_item_count: 0,
     activity_failure_count: 0,
@@ -116,6 +119,14 @@ export function createExecutionGroupPersistence({ stateDir, currentPid = process
   function recover(snapshot) {
     const status = String(snapshot?.status || '');
     if (!ACTIVE_EXECUTION_GROUP_STATUSES.has(status) || Number(snapshot.process_pid || 0) === currentPid) return snapshot;
+    if (status === 'paused') {
+      snapshot.status = 'queued';
+      snapshot.children = (snapshot.children || []).map((child) => String(child.status || '') === 'paused'
+        ? { ...child, status: 'queued', progress: { ...(child.progress || {}), recovered_pending_after_restart: true } }
+        : child);
+      snapshot.recovered_pending_after_restart = true;
+      return persist(snapshot);
+    }
     const recoveredAt = now();
     snapshot.status = 'interrupted';
     snapshot.finished_at = snapshot.finished_at || recoveredAt;

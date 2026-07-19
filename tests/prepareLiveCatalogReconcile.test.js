@@ -262,13 +262,15 @@ test('verified raw identities correct only stale regional aliases without hard-c
   }).store_name, '湖南旗舰店');
 });
 
-test('prepare always refreshes selected catalog routes while item cache reuse remains metadata-diff driven', () => {
+test('prepare refreshes only dirty or stale catalog routes while item cache reuse remains metadata-diff driven', () => {
   const server = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
   const start = server.indexOf('async function refreshActivityCatalogForPrepare');
   const end = server.indexOf('\nfunction activityCatalogSellerStatus', start);
   const section = server.slice(start, end);
   assert.ok(start >= 0 && end > start);
-  assert.doesNotMatch(section, /activityCatalogDecision\(/);
+  assert.match(section, /planActivityCatalogRoutes\(/);
+  assert.match(section, /cached_route_keys/);
+  assert.match(section, /refreshRoutes/);
   assert.match(section, /liveCatalogSiteIds/);
   assert.match(server, /reconcileActivityCatalog/);
   assert.match(server, /sellerCampaignWriteThroughPromotion/);

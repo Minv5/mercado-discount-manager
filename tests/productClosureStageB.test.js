@@ -134,8 +134,27 @@ test('one shared limiter caps all child workloads and is removable after group t
   assert.equal(limiters.has('group-1'), false);
 });
 
-test('group status vocabulary includes queued/running/stopping only as active', () => {
-  assert.deepEqual([...ACTIVE_EXECUTION_GROUP_STATUSES].sort(), ['queued', 'running', 'stopping']);
+test('group status vocabulary keeps persistent pending work active while paused', () => {
+  assert.deepEqual([...ACTIVE_EXECUTION_GROUP_STATUSES].sort(), ['paused', 'queued', 'running', 'stopping']);
+});
+
+test('paused pending group is recovered as queued instead of being marked interrupted after restart', () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mdm-group-paused-recovery-'));
+  try {
+    const first = createExecutionGroupPersistence({ stateDir, currentPid: 100, now: () => '2026-07-14T00:00:01.000Z' });
+    first.create(groupFixture({ status: 'paused', children: [
+      { job_id: 'job-a', account_id: 'A', status: 'completed' },
+      { job_id: 'job-b', account_id: 'B', status: 'paused' },
+    ] }));
+    const restarted = createExecutionGroupPersistence({ stateDir, currentPid: 200, now: () => '2026-07-14T00:10:00.000Z' });
+    const [group] = restarted.loadAll();
+    assert.equal(group.status, 'queued');
+    assert.equal(group.children[0].status, 'completed');
+    assert.equal(group.children[1].status, 'queued');
+    assert.equal(group.recovered_pending_after_restart, true);
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
 });
 
 test('server exposes group APIs and retires direct product job start', () => {

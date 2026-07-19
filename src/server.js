@@ -9,13 +9,15 @@ import { exportWorkspace } from './exporter.js';
 import { queryFiltersFromSearchParams } from './filterQuery.js';
 import { CANDIDATE_INCOMPLETE_STATUSES, buildBatchPlans, buildPlan, filterPromotions, normalizeItem, promotionKey, roundMoney, validateDealPrice } from './planner.js';
 import { ordinaryPromotions, promotionBucketCounts } from './promotionDomain.js';
-import { activityCatalogDecision, activityItemsDecision, isActivityExpired, nextNonPeakCalibrationAt } from './activityChangeCache.js';
+import { activityItemsDecision, isActivityExpired, nextNonPeakCalibrationAt, planActivityCatalogRoutes } from './activityChangeCache.js';
 import { activityCallbackConfig, createActivityCallbackAdapter } from './activityCallbackAdapter.js';
 import { createActivityWebhookConsumer } from './activityWebhookConsumer.js';
 import { buildCandidateIncompleteResolution, buildManualCandidateDraftRows, parseManualCandidateItemIds } from './candidateResolution.js';
 import { MAX_READ_CONCURRENCY, MAX_WRITE_CONCURRENCY, mapLimited, mapLimitedWithCap, normalizeConcurrency, normalizeConcurrencyWithCap, normalizeWriteConcurrency } from './concurrency.js';
 import { BALANCED_READ_PROFILES, buildReadConcurrencyReport, createBalancedReadScheduler } from './balancedReadScheduler.js';
 import { createAsyncLimiter, executePlannedRowsWithConcurrency } from './executor.js';
+import { ADAPTIVE_WRITE_PROFILE, createAdaptiveWriteScheduler } from './adaptiveWriteScheduler.js';
+import { createPendingWriteQueue, pendingRelationKey } from './pendingWriteQueue.js';
 import {
   filterItemsByConfirmedScope,
   filterItemsByRequestedIds,
@@ -201,11 +203,13 @@ const EXECUTION_JOB_STATE_DIR = path.join(DATA_DIR, 'execution-job-states');
 const EXECUTION_GROUP_STATE_DIR = path.join(DATA_DIR, 'execution-group-states');
 const SUBMISSION_STATE_DIR = path.join(DATA_DIR, 'execution-submissions');
 const SAME_DAY_CONFIRMATION_STATE_DIR = path.join(DATA_DIR, 'execution-submission-confirmations');
+const PENDING_WRITE_STATE_DIR = path.join(DATA_DIR, 'pending-write-queues');
 const executionEventFileDescriptors = new Map();
 const executionJobPersistence = createExecutionJobPersistence({ stateDir: EXECUTION_JOB_STATE_DIR, publicJob: publicExecutionJob });
 const executionGroupPersistence = createExecutionGroupPersistence({ stateDir: EXECUTION_GROUP_STATE_DIR });
 const submissionPersistence = createSubmissionPersistence({ stateDir: SUBMISSION_STATE_DIR });
 const sameDayConfirmationStore = createSameDayConfirmationStore({ stateDir: SAME_DAY_CONFIRMATION_STATE_DIR });
+const pendingWriteQueue = createPendingWriteQueue({ stateDir: PENDING_WRITE_STATE_DIR });
 const SERVER_INSTANCE_ID = `node-${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
 const activityWebhookConsumer = createActivityWebhookConsumer({
   listMarketplaceSites: listAllMarketplaceSites,
@@ -231,7 +235,12 @@ const activityCallbackAdapter = createActivityCallbackAdapter({
   markDirty: markActivityCacheDirty,
   consumeEvent: activityWebhookConsumer,
 });
-for (const group of executionGroupPersistence.loadAll()) executionGroups.set(String(group.id), group);
+for (const group of executionGroupPersistence.loadAll()) {
+  executionGroups.set(String(group.id), group);
+  if (group.recovered_pending_after_restart && String(group.status || '') === 'queued') {
+    setImmediate(() => runExecutionGroup(group.id).catch((error) => failExecutionGroup(group.id, error)));
+  }
+}
 const READ_BENCHMARK_LEVELS = [1, 2, 3, 4, 5, 8, 10, 15, 20];
 const WRITE_BENCHMARK_LEVELS = [1, 2, 3, 5, 8, 10, 15, 20];
 const READ_BENCHMARK_MAX_CONCURRENCY = 20;
@@ -3172,6 +3181,7 @@ function publicExecutionSubmission(prepare = {}) {
       validation_errors: prepare.seller_input.validation_errors || [],
     } : null,
     confirmation_summary: prepare.confirmation_summary || '',
+    confirmation_token: prepare.execution_confirmation_token || null,
     creation_result: prepare.creation_result ? {
       created_count: Number(prepare.creation_result.created_count || 0),
       recovered_existing_count: Number(prepare.creation_result.recovered_existing_count || 0),
@@ -3228,31 +3238,39 @@ function selectedActivityRoutes(account, filters = {}, settings = {}) {
 
 async function refreshActivityCatalogForPrepare({ account, filters = {}, settings = {}, readConcurrency = null, signal = null, checkpoint = null, readScheduler = null } = {}) {
   const selectedRoutes = selectedActivityRoutes(account, filters, settings);
-  const liveCatalogSiteIds = [...new Set(selectedRoutes.map((route) => route.site_id).filter(Boolean))];
+  const routePlan = planActivityCatalogRoutes(
+    selectedRoutes,
+    (route) => getActivityCacheState(route.account_id, route.site_id, '', ''),
+  );
+  const refreshRoutes = routePlan.refresh;
+  const cachedRoutes = routePlan.cached;
+  const liveCatalogSiteIds = [...new Set(refreshRoutes.map((route) => route.site_id).filter(Boolean))];
   let fetched = null;
   let fetchError = null;
-  try {
-    checkpoint?.();
-    fetched = await fetchAndSavePromotions(account, {
-      readConcurrency: readConcurrency ?? settings.readConcurrency,
-      siteIds: liveCatalogSiteIds.length ? liveCatalogSiteIds : null,
-      routes: selectedRoutes,
-      signal,
-      checkpoint,
-      readScheduler,
-    });
-    checkpoint?.();
-  } catch (error) {
-    if (signal?.aborted
-        || String(error?.code || '').startsWith('COMMIT_')
-        || String(error?.code || '').startsWith('SUBMISSION_')
-        || String(error?.code || '').startsWith('ACTIVITY_ACCOUNT_ROUTE_')) throw error;
-    fetchError = toChineseError(error);
-    for (const siteId of liveCatalogSiteIds) {
-      recordActivityCatalogCalibration({ accountId: account.account_id, siteId, error: fetchError });
+  if (refreshRoutes.length) {
+    try {
+      checkpoint?.();
+      fetched = await fetchAndSavePromotions(account, {
+        readConcurrency: readConcurrency ?? settings.readConcurrency,
+        siteIds: liveCatalogSiteIds,
+        routes: refreshRoutes,
+        signal,
+        checkpoint,
+        readScheduler,
+      });
+      checkpoint?.();
+    } catch (error) {
+      if (signal?.aborted
+          || String(error?.code || '').startsWith('COMMIT_')
+          || String(error?.code || '').startsWith('SUBMISSION_')
+          || String(error?.code || '').startsWith('ACTIVITY_ACCOUNT_ROUTE_')) throw error;
+      fetchError = toChineseError(error);
+      for (const siteId of liveCatalogSiteIds) {
+        recordActivityCatalogCalibration({ accountId: account.account_id, siteId, error: fetchError });
+      }
     }
   }
-  const resultRows = String(account.site_id || '').toUpperCase() === 'CBT'
+  const fetchedRows = String(account.site_id || '').toUpperCase() === 'CBT'
     ? (fetched?.children || [])
     : fetched ? [{
         account_id: account.account_id,
@@ -3263,15 +3281,26 @@ async function refreshActivityCatalogForPrepare({ account, filters = {}, setting
         catalog_revision: fetched.catalog_revision,
         catalog_changes: fetched.catalog_changes,
       }] : [];
+  const cachedRows = cachedRoutes.map((route) => ({
+    account_id: route.account_id,
+    child_user_id: route.child_user_id,
+    site_id: route.site_id,
+    status: 'ok',
+    cached: true,
+    total: cachedActivityCatalogForRoute(route).length,
+    catalog_changes: { added: 0, changed: 0, removed: 0, identities: [] },
+  }));
+  const resultRows = [...fetchedRows, ...cachedRows];
   const routeReads = summarizeActivityCatalogRouteReads({
     expectedRoutes: selectedRoutes,
     results: resultRows.map((row) => ({ account_id: account.account_id, ...row })),
     error: fetchError,
   });
   const refreshedRouteKeys = routeReads.refreshed_route_keys;
+  const cachedRouteKeys = new Set(cachedRoutes.map(accountRouteKey));
   const blockedRouteKeys = routeReads.blocked_route_keys;
   const errorsByRoute = routeReads.errors_by_route;
-  const catalogIdentityChanges = resultRows.flatMap((row) => (
+  const catalogIdentityChanges = fetchedRows.flatMap((row) => (
     Array.isArray(row?.catalog_changes?.identities) ? row.catalog_changes.identities : []
   ));
   const blockedSiteIds = new Set([...blockedRouteKeys].map((key) => key.split('|')[2]).filter(Boolean));
@@ -3279,12 +3308,16 @@ async function refreshActivityCatalogForPrepare({ account, filters = {}, setting
     account_id: String(account.account_id),
     routes: selectedRoutes,
     site_ids: liveCatalogSiteIds,
+    refreshed_site_ids: new Set(fetchedRows.map((row) => String(row.site_id || '').toUpperCase()).filter(Boolean)),
+    cached_site_ids: new Set(cachedRoutes.map((route) => route.site_id)),
     refreshed_route_keys: refreshedRouteKeys,
+    cached_route_keys: cachedRouteKeys,
+    external_read_count: refreshRoutes.length,
+    cache_reused_count: cachedRoutes.length,
+    refresh_reasons: routePlan.reasons,
     blocked_route_keys: blockedRouteKeys,
     errors_by_route: errorsByRoute,
     catalog_identity_changes: catalogIdentityChanges,
-    refreshed_site_ids: new Set([...refreshedRouteKeys].map((key) => key.split('|')[2]).filter(Boolean)),
-    cached_site_ids: new Set(),
     blocked_site_ids: blockedSiteIds,
     fetch_result: fetched,
   };
@@ -3341,7 +3374,7 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
       stage: 'accounts', percent: 5 + Math.floor((accountRefreshCompleted / Math.max(1, accountIds.length)) * 25),
       completed: accountRefreshCompleted,
       total: accountIds.length,
-      message: finalRevalidation ? '提交前正在核对活动目录' : '正在刷新店铺活动',
+      message: finalRevalidation ? '提交前正在检查活动目录版本与变更标记' : '正在核对本地活动目录状态',
       current_store: storeNames[accountId],
     });
     const catalogRefresh = await refreshActivityCatalogForPrepare({
@@ -3355,6 +3388,16 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
     });
     context.checkpoint?.();
     catalogRefreshByAccount.set(String(accountId), catalogRefresh);
+    reportProgress({
+      stage: 'catalog',
+      percent: 8 + Math.floor((accountRefreshCompleted / Math.max(1, accountIds.length)) * 20),
+      completed: accountRefreshCompleted,
+      total: accountIds.length,
+      message: catalogRefresh.external_read_count
+        ? `活动目录校准：外部读取 ${catalogRefresh.external_read_count} 个站点，缓存复用 ${catalogRefresh.cache_reused_count} 个站点`
+        : `活动目录缓存有效：外部读取 0 个站点，缓存复用 ${catalogRefresh.cache_reused_count} 个站点`,
+      current_store: storeNames[accountId],
+    });
     await recoverHiddenSellerCampaignsForPreparedAccount({
       account,
       filters,
@@ -3444,8 +3487,19 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
     });
   }
   let startedActivitiesCompleted = 0;
+  const preparationReadProgress = {
+    external_reads_started: 0,
+    cache_reused: 0,
+    inventory_fallback_active: 0,
+  };
   const reportActivityProgress = (stage, event, completedBase, percentBase, percentSpan) => {
-    if (event.type !== 'item_fetch_done' && event.type !== 'item_fetch_start') return completedBase;
+    if (event.type === 'inventory_fallback_start') preparationReadProgress.inventory_fallback_active += 1;
+    if (event.type === 'inventory_fallback_done') preparationReadProgress.inventory_fallback_active = Math.max(0, preparationReadProgress.inventory_fallback_active - 1);
+    if (event.type === 'item_fetch_start') {
+      if (event.external_read) preparationReadProgress.external_reads_started += 1;
+      else if (event.cache_reused) preparationReadProgress.cache_reused += 1;
+    }
+    if (!['item_fetch_done', 'item_fetch_start', 'inventory_fallback_start', 'inventory_fallback_done'].includes(event.type)) return completedBase;
     const completed = event.type === 'item_fetch_done' ? completedBase + 1 : completedBase;
     reportProgress({
       stage,
@@ -3458,6 +3512,11 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
       current_store: storeNames[event.promotion?.account_id || ''] || '',
       current_site: String(event.promotion?.site_id || ''),
       current_activity: String(event.promotion_id || ''),
+      external_reads_started: preparationReadProgress.external_reads_started,
+      cache_reused: preparationReadProgress.cache_reused,
+      inventory_fallback_active: preparationReadProgress.inventory_fallback_active,
+      remaining_activities: Math.max(0, selectedForLiveRead.length - completed),
+      current_reason: String(event.refresh_reason || ''),
     });
     return completed;
   };
@@ -3790,6 +3849,10 @@ function executionSubmissionPreparedPatch(snapshot, prepare, options = {}) {
   });
   const scopeHash = options.scopeHash || executionSubmissionScopeHash(confirmedScope, snapshot.discounts);
   const scopeMessages = Array.isArray(options.scopeMessages) ? options.scopeMessages.filter(Boolean) : [];
+  const sameDayWarning = prepare.same_day_warning || null;
+  const sameDayMessage = sameDayWarning?.completed
+    ? `提醒：今天当前范围已完成${actionDisplayName(sameDayWarning.completed.action)}，本次${sameDayWarning.same_action ? '仍准备相同动作，可能重复处理' : `将执行${actionDisplayName(snapshot.resolved_action)}，属于另一项真实操作`}。`
+    : '';
   return {
     scope_hash: scopeHash,
     scope_version: preparedAt.toISOString(),
@@ -3807,7 +3870,8 @@ function executionSubmissionPreparedPatch(snapshot, prepare, options = {}) {
       ...prepare.seller_input,
       selected_targets: selectedSellerTargets,
     } : { name: '', start_date: null, finish_date: null, selected_targets: [], validation_errors: [] },
-    confirmation_summary: [snapshot.confirmation_summary, ...scopeMessages].filter(Boolean).join(' '),
+    confirmation_summary: [sameDayMessage, snapshot.confirmation_summary, ...scopeMessages].filter(Boolean).join(' '),
+    execution_confirmation_token: prepare.execution_confirmation_token || crypto.randomBytes(24).toString('base64url'),
     group_request: {
       ...snapshot.group_request,
       confirmedExecutionScope: confirmedScope,
@@ -3871,10 +3935,11 @@ function prepareExecutionSubmission(body = {}) {
     error.code = 'ACTIVE_SUBMISSION_EXISTS';
     throw error;
   }
-  sameDayCompletionGate({
+  const sameDayDecision = sameDayCompletionGate({
     groups: executionGroupPersistence.loadAll(),
     request: body,
     confirmationStore: sameDayConfirmationStore,
+    deferManualConfirmation: true,
   });
   const request = { ...body };
   delete request.same_day_confirmation_token;
@@ -3903,6 +3968,7 @@ function prepareExecutionSubmission(body = {}) {
     live_read: { rows: [], readable_count: 0, blocked_count: 0, all_blocked: false },
     seller_input: { name: '', start_date: null, finish_date: null, selected_targets: [], validation_errors: [] },
     confirmation_summary: '',
+    same_day_warning: sameDayDecision.warning || null,
     request,
     request_fingerprint: submissionRequestFingerprint(request),
     group_request: null,
@@ -3967,6 +4033,13 @@ async function commitExecutionSubmission(prepareId, body = {}) {
   if (String(body.confirmText || body.confirm_text || '') !== 'REAL_SUBMIT') {
     const error = new ApiError('最终提交需要 REAL_SUBMIT 确认。', 409);
     error.code = 'REAL_SUBMIT_REQUIRED';
+    throw error;
+  }
+  const expectedConfirmationToken = String(current.execution_confirmation_token || '');
+  const suppliedConfirmationToken = String(body.confirmationToken || body.confirmation_token || '');
+  if (expectedConfirmationToken && suppliedConfirmationToken !== expectedConfirmationToken) {
+    const error = new ApiError('本次最终确认已失效，请重新核对执行范围。', 409);
+    error.code = 'EXECUTION_CONFIRMATION_INVALID';
     throw error;
   }
   const selected = current.seller_input?.selected_targets || [];
@@ -4035,13 +4108,19 @@ async function revalidateExecutionSubmissionScope(prepare, context = {}, { readS
     error.details = { blocked_activity_count: reconciled.blocked_activity_count };
     throw error;
   }
+  const sellerCreationOnly = reconciled.requires_reconfirm
+    && Array.isArray(context.targetKeys)
+    && context.targetKeys.includes('__SELLER__')
+    && reconciled.structural_target_keys.length > 0
+    && reconciled.structural_target_keys.every((key) => key === '__SELLER__');
+  const requiresReprepare = reconciled.requires_reconfirm && !sellerCreationOnly;
   const confirmedScope = reconciled.requires_reconfirm
     ? reconciled.reconfirmation_scope
     : reconciled.execution_scope;
   const scopeHash = executionSubmissionScopeHash(confirmedScope, current.discounts);
   const businessChanges = reconciled.messages.length
     ? reconciled.messages
-    : reconciled.requires_reconfirm ? ['执行动作或活动结构发生变化，需要再次确认'] : [];
+    : requiresReprepare ? ['执行动作或活动结构发生实质变化，需要重新核对范围'] : [];
   const scopeAdjustments = {
     messages: businessChanges,
     auto_removed_item_count: reconciled.auto_removed_item_count,
@@ -4051,7 +4130,7 @@ async function revalidateExecutionSubmissionScope(prepare, context = {}, { readS
   };
   return {
     scope_hash: scopeHash,
-    reconfirm_required: reconciled.requires_reconfirm,
+    reconfirm_required: requiresReprepare,
     execution_relation_count: reconciled.execution_relation_count,
     changes: businessChanges,
     changed_target_keys: reconciled.structural_target_keys,
@@ -4094,6 +4173,7 @@ function scheduleExecutionSubmissionCommit(prepareId, body = {}, { recover = fal
     prepareId: key,
     confirmText: body.confirmText || body.confirm_text,
     createConfirmText: body.createConfirmText || body.create_confirm_text,
+    confirmationToken: body.confirmationToken || body.confirmation_token,
     leaseOwner: SERVER_INSTANCE_ID,
     recover,
     signal: controller.signal,
@@ -4255,7 +4335,10 @@ async function runExecutionGroup(groupId) {
   if (!group || TERMINAL_EXECUTION_GROUP_STATUSES.has(String(group.status || ''))) return;
   group.status = 'running';
   executionGroupPersistence.persist(group);
-  const jobs = (group.children || []).map((child) => executionJobs.get(String(child.job_id)) || loadPersistedExecutionJob(child.job_id)).filter(Boolean);
+  const terminalJobStatuses = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+  const jobs = (group.children || [])
+    .map((child) => executionJobs.get(String(child.job_id)) || loadPersistedExecutionJob(child.job_id))
+    .filter((job) => job && !terminalJobStatuses.has(String(job.status || '')));
   await Promise.all(jobs.map(async (job) => {
     executionJobs.set(job.id, job);
     try {
@@ -4268,6 +4351,24 @@ async function runExecutionGroup(groupId) {
   }));
   const current = executionGroups.get(String(group.id)) || executionGroupPersistence.load(group.id) || group;
   const childStatuses = (current.children || []).map((child) => String(child.status || ''));
+  if (childStatuses.includes('paused')) {
+    current.status = 'paused';
+    current.finished_at = null;
+    current.result = summarizeExecutionGroup(current);
+    executionGroupPersistence.persist(current);
+    executionGroups.set(String(current.id), current);
+    sharedWriteLimiters.delete(String(current.id));
+    const pendingSince = Date.parse(String(current.pending_since || '')) || Date.now();
+    current.pending_since = current.pending_since || new Date(pendingSince).toISOString();
+    current.pending_retry_round = Number(current.pending_retry_round || 0) + 1;
+    current.next_retry_at = new Date(Date.now() + 60_000).toISOString();
+    executionGroupPersistence.persist(current);
+    if (Date.now() - pendingSince < 30 * 60_000) {
+      const timer = setTimeout(() => runExecutionGroup(current.id).catch((error) => failExecutionGroup(current.id, error)), 60_000);
+      timer.unref?.();
+    }
+    return;
+  }
   if (current.cancel_requested || childStatuses.includes('cancelled')) current.status = 'cancelled';
   else if (childStatuses.includes('interrupted')) current.status = 'interrupted';
   else if (childStatuses.includes('failed')) current.status = 'failed';
@@ -4907,14 +5008,49 @@ function summarizeExecutionFailureReasons(execution, limit = 5) {
 function displayExecutionTotal(execution = {}) {
   return Math.max(
     Number(execution.total || 0),
-    Number(execution.success || 0) + Number(execution.failed || 0) + Number(execution.skipped || 0)
+    Number(execution.success || 0) + Number(execution.failed || 0) + Number(execution.skipped || 0) + Number(execution.pending || 0)
   );
+}
+
+function mergeExecutionRecoveryRound(previous = {}, current = {}) {
+  const promotionKeyForResult = (row = {}) => [
+    String(row.site_id || '').toUpperCase(),
+    String(row.promotion_id || ''),
+    String(row.promotion_type || '').toUpperCase(),
+  ].join('|');
+  const promotions = new Map((previous.promotions || []).map((row) => [promotionKeyForResult(row), { ...row }]));
+  for (const row of current.promotions || []) {
+    const key = promotionKeyForResult(row);
+    const prior = promotions.get(key) || {};
+    promotions.set(key, {
+      ...prior,
+      ...row,
+      total: Math.max(Number(prior.total || 0), Number(row.total || 0)),
+      success: Number(prior.success || 0) + Number(row.success || 0),
+      failed: Number(prior.failed || 0) + Number(row.failed || 0),
+      skipped: Number(prior.skipped || 0) + Number(row.skipped || 0),
+      pending: Number(row.pending || 0),
+    });
+  }
+  return {
+    ...previous,
+    ...current,
+    promotions: [...promotions.values()],
+    total: Math.max(Number(previous.total || 0), Number(current.total || 0)),
+    relation_count: Math.max(Number(previous.relation_count || 0), Number(current.relation_count || 0)),
+    unique_item_count: Math.max(Number(previous.unique_item_count || 0), Number(current.unique_item_count || 0)),
+    success: Number(previous.success || 0) + Number(current.success || 0),
+    failed: Number(previous.failed || 0) + Number(current.failed || 0),
+    skipped: Number(previous.skipped || 0) + Number(current.skipped || 0),
+    pending: Number(current.pending || 0),
+    recovery_round: Number(previous.recovery_round || 0) + 1,
+  };
 }
 
 function displayProgressTotal(event = {}) {
   return Math.max(
     Number(event.total_items || 0),
-    Number(event.success || 0) + Number(event.failed || 0) + Number(event.skipped || 0)
+    Number(event.success || 0) + Number(event.failed || 0) + Number(event.skipped || 0) + Number(event.pending || 0)
   );
 }
 
@@ -4925,7 +5061,7 @@ function executionTaskIdentity(request = {}) {
   };
 }
 
-function saveBatchExecutionSummaryTask({ account, action, execution, completed, request = {} }) {
+function saveBatchExecutionSummaryTask({ account, action, execution, completed, request = {}, existingTaskId = null }) {
   const plan = {
     total: execution.total || 0,
     planned: execution.success || 0,
@@ -4933,21 +5069,22 @@ function saveBatchExecutionSummaryTask({ account, action, execution, completed, 
     priceMode: 'batch',
     rows: []
   };
-  const taskId = createTask({
-    accountId: account.account_id,
-    promotionId: '__BATCH__',
-    promotionType: 'BATCH',
-    action,
-    mode: 'real',
-    discountPercent: null,
-    directPrice: null,
-    plan,
-    ...executionTaskIdentity(request)
-  });
+  const taskId = Number(existingTaskId || 0) || createTask({
+      accountId: account.account_id,
+      promotionId: '__BATCH__',
+      promotionType: 'BATCH',
+      action,
+      mode: 'real',
+      discountPercent: null,
+      directPrice: null,
+      plan,
+      ...executionTaskIdentity(request)
+    });
   finishTask(taskId, {
     success: execution.success || 0,
     failed: execution.failed || 0,
     skipped: execution.skipped || 0,
+    pending: execution.pending || 0,
     blocked: execution.blocked || 0,
     planned: execution.success || 0,
     total: execution.total || 0,
@@ -5191,6 +5328,32 @@ async function runExecutionJob(jobId) {
       sampleOnly,
       allowInventoryFallback
     });
+    if (request.resumePendingOnly) {
+      const pendingKeys = new Set(pendingWriteQueue.pending(job.id).map((record) => String(record.relation_key || '')));
+      for (const entry of batch.plans) {
+        const promotion = entry.promotion;
+        entry.plan.rows = (entry.plan.rows || []).filter((row) => pendingKeys.has(pendingRelationKey({
+          accountId: account.account_id,
+          siteId: promotion.site_id,
+          promotionId: promotion.promotion_id,
+          promotionType: promotion.promotion_type,
+          itemId: row.item?.item_id,
+          action,
+        })));
+        entry.plan.total = entry.plan.rows.length;
+        entry.plan.planned = entry.plan.rows.filter((row) => row.status === 'planned').length;
+        entry.plan.skipped = entry.plan.rows.filter((row) => row.status !== 'planned').length;
+      }
+      batch.plans = batch.plans.filter((entry) => entry.plan.total > 0);
+      batch.totals = {
+        ...batch.totals,
+        promotions: batch.plans.length,
+        total: batch.plans.reduce((sum, entry) => sum + Number(entry.plan.total || 0), 0),
+        planned: batch.plans.reduce((sum, entry) => sum + Number(entry.plan.planned || 0), 0),
+        skipped: batch.plans.reduce((sum, entry) => sum + Number(entry.plan.skipped || 0), 0),
+      };
+      appendExecutionUserLog(job, `恢复末尾留置队列：仅处理 ${batch.totals.planned} 条仍待确认的活动商品关系。`);
+    }
     appendExecutionJobLog(job, `计划阶段：活动 ${batch.totals.promotions} 个，商品 ${batch.totals.total}，可执行 ${batch.totals.planned}，跳过 ${batch.totals.skipped}，阻断活动 ${batch.totals.blocked}。`);
     for (const [index, entry] of batch.plans.entries()) {
       appendExecutionJobLog(job, formatPlanProgress(entry, index, batch.plans.length));
@@ -5231,7 +5394,7 @@ async function runExecutionJob(jobId) {
     appendExecutionUserLog(job, `并发处理活动任务：活动并发=${jobActivityConcurrency}，商品写入并发=${jobWriteConcurrency}，全局写入上限=${jobGlobalWriteConcurrency}。`);
     appendExecutionUserLog(job, `开始提交${actionVerb(action)}：活动 ${batch.plans.length} 个。`);
     appendExecutionJobLog(job, `开始真实执行：${action}，活动 ${batch.plans.length} 个。`);
-    const execution = await executeBatchPlans({
+    let execution = await executeBatchPlans({
       account,
       action,
       itemStatus,
@@ -5245,6 +5408,10 @@ async function runExecutionJob(jobId) {
         if (event.type === 'write_peak') {
           job.progress.global_active_writes = event.active || 0;
           job.progress.global_peak_in_flight = Math.max(job.progress.global_peak_in_flight || 0, event.maxActive || 0);
+          job.progress.write_queue_depth = Number(event.queued || 0);
+          job.progress.write_adaptive_limit = Number(event.limit || 0);
+          job.progress.write_cooldown_until = event.cooldown_until || null;
+          job.progress.write_route_active = event.route_active || {};
         }
         if (event.type === 'execution_stop_requested') {
           job.cancel_requested = true;
@@ -5268,6 +5435,9 @@ async function runExecutionJob(jobId) {
         }
       }
     });
+    if (request.resumePendingOnly && job.result?.execution) {
+      execution = mergeExecutionRecoveryRound(job.result.execution, execution);
+    }
     if (itemFilter.hasFilter) {
       execution.target_item_ids = itemFilter.requestedItemIds;
       execution.itemIds_filtered_count = itemFilter.matchedItemIds.length;
@@ -5287,12 +5457,17 @@ async function runExecutionJob(jobId) {
       execution,
       completed: !execution.cancelled
         && Number(execution.failed || 0) === 0
+        && Number(execution.pending || 0) === 0
         && Number(execution.activity_failure_count || 0) === 0,
       request,
+      existingTaskId: job.batch_task_id,
     });
     job.batch_task_id = Number(batchTaskId);
-    job.status = execution.cancelled ? 'cancelled' : 'completed';
+    job.status = execution.cancelled ? 'cancelled' : Number(execution.pending || 0) > 0 ? 'paused' : 'completed';
+    job.request.resumePendingOnly = job.status === 'paused';
     job.progress.stage = job.status;
+    job.progress.pending_relations = Number(execution.pending || 0);
+    job.progress.write_queue = globalWriteLimiter.snapshot?.() || null;
     job.finished_at = new Date().toISOString();
     job.result = {
       ok: !execution.cancelled,
@@ -5305,10 +5480,14 @@ async function runExecutionJob(jobId) {
       execution
     };
     const executionDisplayTotal = displayExecutionTotal(execution);
-    appendExecutionJobLog(job, execution.cancelled
+    appendExecutionJobLog(job, job.status === 'paused'
+      ? `临时失败已进入持久留置队列：待恢复 ${execution.pending || 0} 条关系；已成功和业务失败项不会重复提交。`
+      : execution.cancelled
       ? '执行任务已停止。'
       : `结束：总商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，阻断活动 ${execution.blocked}，用时 ${Math.round((Date.now() - jobStartedMs) / 1000)} 秒。`);
-    appendExecutionUserLog(job, execution.cancelled
+    appendExecutionUserLog(job, job.status === 'paused'
+      ? `平台限流或临时网络失败，${execution.pending || 0} 条关系已安全留置并等待恢复；其它商品结果已保存。`
+      : execution.cancelled
       ? `执行任务已按规则停止：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，已保存结果。`
       : `${actionDisplayName(action)}完成：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，用时 ${formatDuration(Date.now() - jobStartedMs)}。`);
     persistExecutionJob(job);
@@ -5337,20 +5516,20 @@ function buildTodayDecisionForScope(accountIds, promotions) {
 }
 
 async function executeBatchPlans({ account, action, itemStatus, batch, request, writeConcurrency, globalWriteConcurrency, activityConcurrency, onProgress, shouldCancel }) {
-  const normalizedWriteConcurrency = normalizeWriteConcurrency(writeConcurrency, readSettings().writeConcurrency);
+  const requestedNormalizedWriteConcurrency = normalizeWriteConcurrency(writeConcurrency, readSettings().writeConcurrency);
+  const normalizedWriteConcurrency = Math.min(requestedNormalizedWriteConcurrency, ADAPTIVE_WRITE_PROFILE.perRoute);
   const normalizedActivityConcurrency = normalizeConcurrency(activityConcurrency ?? request?.activityConcurrency ?? readSettings().previewConcurrency, readSettings().previewConcurrency);
-  const normalizedGlobalWriteConcurrency = normalizeConcurrencyWithCap(globalWriteConcurrency ?? request?.globalWriteConcurrency ?? normalizedWriteConcurrency, normalizedWriteConcurrency, MAX_WRITE_CONCURRENCY);
+  const normalizedGlobalWriteConcurrency = ADAPTIVE_WRITE_PROFILE.maxGlobal;
   let stopReason = null;
-  let transientInterfaceFailures = 0;
   const globalWriteLimiter = request?.executionGroupId
-    ? getSharedWriteLimiter(request.executionGroupId, normalizedGlobalWriteConcurrency, ({ active, maxActive, limit }) => {
+    ? getSharedWriteLimiter(request.executionGroupId, normalizedGlobalWriteConcurrency, ({ active, maxActive, limit, queued, cooldown_until, route_active }) => {
       summary.globalMaxActive = Math.max(summary.globalMaxActive || 0, maxActive || 0);
-      onProgress?.({ type: 'write_peak', active, maxActive, limit });
+      onProgress?.({ type: 'write_peak', active, maxActive, limit, queued, cooldown_until, route_active });
     })
-    : createAsyncLimiter(normalizedGlobalWriteConcurrency, {
-      onActiveChange: ({ active, maxActive, limit }) => {
+    : createAdaptiveWriteScheduler({
+      onStateChange: ({ active, maxActive, limit, queued, cooldown_until, route_active }) => {
         summary.globalMaxActive = Math.max(summary.globalMaxActive || 0, maxActive || 0);
-        onProgress?.({ type: 'write_peak', active, maxActive, limit });
+        onProgress?.({ type: 'write_peak', active, maxActive, limit, queued, cooldown_until, route_active });
       }
     });
   const summary = {
@@ -5359,6 +5538,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
     success: 0,
     failed: 0,
     skipped: 0,
+    pending: 0,
     blocked: 0,
     result_contract_version: RESULT_CONTRACT_VERSION,
     relation_count: 0,
@@ -5459,17 +5639,27 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       });
       return;
     }
-    const taskId = createTask({
-      accountId: account.account_id,
-      promotionId: promotion.promotion_id,
-      promotionType: promotion.promotion_type,
-      action,
-      mode: 'real',
-      discountPercent: plan.discountPercent,
-      directPrice: plan.directPrice,
-      plan,
-      ...executionTaskIdentity(request)
-    });
+    const resumedPendingRecords = request?.resumePendingOnly
+      ? pendingWriteQueue.pending(request?.executionJobId, (record) => (
+          String(record.account_id || '') === String(account.account_id)
+          && String(record.site_id || '').toUpperCase() === String(promotion.site_id || '').toUpperCase()
+          && String(record.promotion_id || '') === String(promotion.promotion_id || '')
+          && String(record.promotion_type || '').toUpperCase() === String(promotion.promotion_type || '').toUpperCase()
+          && String(record.action || '') === String(action || '')
+        ))
+      : [];
+    const resumedTaskId = Number(resumedPendingRecords[0]?.task_id || 0);
+    const taskId = resumedTaskId || createTask({
+        accountId: account.account_id,
+        promotionId: promotion.promotion_id,
+        promotionType: promotion.promotion_type,
+        action,
+        mode: 'real',
+        discountPercent: plan.discountPercent,
+        directPrice: plan.directPrice,
+        plan,
+        ...executionTaskIdentity(request)
+      });
     if (plan.total === 0) {
       const reason = `${itemStatus} 商品未读取到或当前筛选下无可处理商品。`;
       saveExecutionResult({
@@ -5614,7 +5804,10 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       accountId: account.account_id,
       taskId,
       writeConcurrency: normalizedWriteConcurrency,
-      schedule: globalWriteLimiter.run,
+      schedule: (runWrite) => globalWriteLimiter.run(runWrite, {
+        accountId: account.account_id,
+        siteId: promotion.site_id,
+      }),
       shouldCancel: shouldStop,
       executeOne: ({ row, itemId, dealPrice }) => executeOnePlannedWithTokenRefresh({
         client,
@@ -5633,13 +5826,33 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       saveResult: persistExecutionOutcome,
       toErrorText: toChineseError,
       classifyError: classifyExecutionWriteError,
-      onStopRequested: ({ error, errorCn, classifiedError }) => {
-        if (classifiedError?.rateLimited) requestStop('接口限流触发停止。', { errorCn });
-        else if (classifiedError?.authFailure) requestStop('账号授权失败触发停止。', { errorCn });
-        else if (classifiedError?.transientFailure) {
-          transientInterfaceFailures += 1;
-          if (transientInterfaceFailures >= 2) requestStop('连续接口超时或网络失败触发停止。', { errorCn });
-        }
+      onStopRequested: ({ errorCn, classifiedError }) => {
+        if (classifiedError?.authFailure) requestStop('账号授权失败，已停止该账号写入。', { errorCn });
+      },
+      onPending: ({ row, errorCn, classifiedError, attempt }) => {
+        const relationKey = pendingRelationKey({
+          accountId: account.account_id,
+          siteId: promotion.site_id,
+          promotionId: promotion.promotion_id,
+          promotionType: promotion.promotion_type,
+          itemId: row.item?.item_id,
+          action,
+        });
+        pendingWriteQueue.enqueue(request?.executionJobId, {
+          relation_key: relationKey,
+          account_id: String(account.account_id),
+          child_user_id: String(promotion.child_user_id || ''),
+          site_id: String(promotion.site_id || '').toUpperCase(),
+          promotion_id: String(promotion.promotion_id || ''),
+          promotion_type: String(promotion.promotion_type || '').toUpperCase(),
+          item_id: String(row.item?.item_id || ''),
+          action,
+          task_id: Number(taskId),
+          row,
+          attempt_count: attempt,
+          retry_category: classifiedError?.rateLimited ? 'rate_limited' : 'transient_interface_failure',
+          error_cn: errorCn,
+        });
       },
       onItemEvent: (event) => {
         const progressJob = executionJobs.get(String(request?.executionJobId || ''));
@@ -5668,8 +5881,20 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
             promotion_id: promotion.promotion_id,
             promotion_type: promotion.promotion_type,
             promotion,
-            message: `${businessScope({ storeName: request?.storeName, promotion })}：末尾补跑完成，成功 ${event.success || 0}，仍失败 ${event.failed || 0}，跳过 ${event.skipped || 0}。`
+            message: `${businessScope({ storeName: request?.storeName, promotion })}：末尾补跑完成，成功 ${event.success || 0}，最终失败 ${event.failed || 0}，跳过 ${event.skipped || 0}，待后续恢复 ${event.pending || 0}。`
           });
+        }
+        if (['item_finish', 'item_skipped', 'item_cancelled_before_start'].includes(event.type)
+            && ['success', 'failed', 'skipped'].includes(String(event.status || ''))) {
+          const relationKey = pendingRelationKey({
+            accountId: account.account_id,
+            siteId: promotion.site_id,
+            promotionId: promotion.promotion_id,
+            promotionType: promotion.promotion_type,
+            itemId: event.row?.item?.item_id,
+            action,
+          });
+          pendingWriteQueue.resolve(request?.executionJobId, relationKey, event.status);
         }
         appendExecutionItemAuditEvent(request?.executionJobId, {
           ...event,
@@ -5683,7 +5908,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         maxImmediateRetries: 3,
         retryBackoffMs: [1000, 2000, 4000],
         deferredFinalRetry: true,
-        deferredConcurrency: Math.min(normalizedWriteConcurrency, 20)
+        deferredConcurrency: Math.min(normalizedWriteConcurrency, ADAPTIVE_WRITE_PROFILE.perRoute)
       }
     });
     const counts = execution.counts;
@@ -5787,10 +6012,14 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         request_success_count: 0,
         live_verified_removed_count: 0,
         pending_verification_count: 0,
+        pending_count: Number(counts.pending || 0),
         result_contract_version: RESULT_CONTRACT_VERSION,
       });
     }
-    const completed = counts.failed === 0 && Number(counts.activity_failure_count || 0) === 0 && plan.rows.length === counts.success + counts.skipped;
+    const completed = counts.failed === 0
+      && Number(counts.pending || 0) === 0
+      && Number(counts.activity_failure_count || 0) === 0
+      && plan.rows.length === counts.success + counts.skipped;
     finishTask(taskId, counts, completed ? 'completed' : 'partial_or_failed', completed, { publishHistory: false });
     markCycleAfterTask({
       accountId: account.account_id,
@@ -5814,6 +6043,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
     summary.success += counts.success;
     summary.failed += counts.failed;
     summary.skipped += counts.skipped;
+    summary.pending += Number(counts.pending || 0);
     summary.promotions.push({
       site_id: promotion.site_id,
       child_user_id: promotion.child_user_id,
@@ -5824,6 +6054,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       success: counts.success,
       failed: counts.failed,
       skipped: counts.skipped,
+      pending: Number(counts.pending || 0),
       unreadable_candidates: unreadable,
       recheck,
       result_contract_version: RESULT_CONTRACT_VERSION,
@@ -5850,6 +6081,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       success: counts.success,
       failed: counts.failed,
       skipped: counts.skipped,
+      pending: Number(counts.pending || 0),
       activityConcurrency: normalizedActivityConcurrency,
       globalWriteConcurrency: normalizedGlobalWriteConcurrency,
       globalMaxActive: globalWriteLimiter.maxActive,
@@ -5863,16 +6095,15 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
 
 function getSharedWriteLimiter(groupId, limit, onActiveChange) {
   const key = String(groupId || '');
-  if (!key) return createAsyncLimiter(limit);
+  if (!key) return createAdaptiveWriteScheduler({ onStateChange: onActiveChange });
   const existing = sharedWriteLimiters.get(key);
   if (existing) {
-    if (existing.limit !== limit) throw new Error('同一执行组的全局写入并发必须一致。');
     if (onActiveChange) existing.listeners.add(onActiveChange);
     return existing;
   }
   const listeners = new Set(onActiveChange ? [onActiveChange] : []);
-  const limiter = createAsyncLimiter(limit, {
-    onActiveChange: (state) => {
+  const limiter = createAdaptiveWriteScheduler({
+    onStateChange: (state) => {
       for (const listener of listeners) listener(state);
       const group = executionGroups.get(key) || executionGroupPersistence.load(key);
       if (group) {
@@ -5883,7 +6114,7 @@ function getSharedWriteLimiter(groupId, limit, onActiveChange) {
         }
         executionGroups.set(key, group);
       }
-    }
+    },
   });
   limiter.listeners = listeners;
   sharedWriteLimiters.set(key, limiter);
@@ -6086,14 +6317,6 @@ async function prepareItemsForExecution({
   const worker = async (campaign, index) => {
     checkpoint?.();
     if (shouldCancel?.()) throw new Error('执行任务已停止。');
-    onProgress?.({
-      type: 'item_fetch_start',
-      index,
-      total: promotions.length,
-      promotion_id: campaign.promotion_id,
-      promotion_type: campaign.promotion_type,
-      promotion: campaign
-    });
     const cacheState = readStateSnapshot
       ? preparationActivityCacheState(readStateSnapshot, { ...campaign, account_id: account.account_id })
       : getActivityCacheState(account.account_id, campaign.site_id, campaign.promotion_id, campaign.promotion_type);
@@ -6113,6 +6336,17 @@ async function prepareItemsForExecution({
       : fetchMode === 'full'
       ? activityItemsDecision({ promotion: campaign, cacheState, fetchState, fallbackState })
       : { refresh: true, reason: 'sample_requested' };
+    onProgress?.({
+      type: 'item_fetch_start',
+      index,
+      total: promotions.length,
+      promotion_id: campaign.promotion_id,
+      promotion_type: campaign.promotion_type,
+      promotion: campaign,
+      external_read: cacheDecision.refresh,
+      cache_reused: !cacheDecision.refresh,
+      refresh_reason: cacheDecision.reason,
+    });
     const effectiveState = cacheDecision.effective_state ? fallbackState : fetchState;
     const row = (!forceRefresh && operationCached) || (cacheDecision.refresh
       ? await fetchAndSavePromotionItemsForCampaign({ account, campaign, status: itemStatus, maxItems, fetchMode, signal, checkpoint, readScheduler })

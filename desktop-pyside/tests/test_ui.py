@@ -533,7 +533,7 @@ class QtUiTests(unittest.TestCase):
         self.window.poll_timer.stop()
         self.window.pending_group_payload = None
 
-    def test_commit_202_is_polled_and_reconfirm_required_returns_to_confirmation(self) -> None:
+    def test_commit_202_is_polled_and_reconfirm_required_never_opens_a_second_confirmation(self) -> None:
         self.window.pending_group_payload = {"prepare_id": "P-ASYNC", "commit_body": {"confirmText": "REAL_SUBMIT"}}
         self.window._commit_accepted({
             "prepare": {"prepare_id": "P-ASYNC", "state": "committing", "progress": {"message": "正在重新核对最终范围"}},
@@ -543,14 +543,16 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.pending_group_payload["prepare_id"], "P-ASYNC")
 
         confirmations: list[dict[str, object]] = []
+        errors: list[str] = []
         self.window._confirm_submission = lambda prepare: confirmations.append(prepare)  # type: ignore[method-assign]
+        self.window._operation_error = lambda _title, message, **_kwargs: errors.append(message)  # type: ignore[method-assign]
         self.window._commit_submission_polled({
             "prepare_id": "P-ASYNC", "state": "reconfirm_required",
             "confirmation_summary": "候选商品数量已变化，请再次确认。",
             "reconfirm_changes": ["候选商品数量已变化"],
         })
-        self.assertEqual(len(confirmations), 1)
-        self.assertEqual(confirmations[0]["state"], "reconfirm_required")
+        self.assertEqual(confirmations, [])
+        self.assertTrue(any("重新开始核对范围" in message for message in errors))
         self.assertIsNone(self.window.pending_group_payload)
         self.window.poll_timer.stop()
 
@@ -622,7 +624,7 @@ class QtUiTests(unittest.TestCase):
         with patch.object(QMessageBox, "warning"):
             self.window._prepare_polled({"prepare": {"prepare_id": "P-FAIL", "state": "failed", "error": "活动读取失败"}})
         self.assertFalse(self.window.preparing_submission)
-        self.assertEqual(self.window.execute_button.text(), "提交执行")
+        self.assertEqual(self.window.execute_button.text(), "开始核对范围")
 
     def test_startup_restores_preparing_submission_poll(self) -> None:
         self.window.refresh_scope = lambda: None  # type: ignore[method-assign]
@@ -670,7 +672,7 @@ class QtUiTests(unittest.TestCase):
         success(operation())
         self.assertEqual(calls, ["/api/execution/submissions/P-LOCK/cancel"])
         self.assertFalse(self.window.preparing_submission)
-        self.assertEqual(self.window.execute_button.text(), "提交执行")
+        self.assertEqual(self.window.execute_button.text(), "开始核对范围")
         self.assertFalse(any(path.endswith("/commit") for path in calls))
 
     def test_close_during_preparing_detaches_service_without_stopping_node(self) -> None:
@@ -782,7 +784,7 @@ class QtUiTests(unittest.TestCase):
             "result": {"action": "update", "store_count": 0, "stores": [], "total": 0, "success": 0, "failed": 0, "skipped": 0},
         }})
         self.assertFalse(self.window.running_group)
-        self.assertEqual(self.window.execute_button.text(), "提交执行")
+        self.assertEqual(self.window.execute_button.text(), "开始核对范围")
 
     def test_final_completion_refreshes_recent_and_current_all_view(self) -> None:
         refreshed: list[list[str]] = []
@@ -794,7 +796,7 @@ class QtUiTests(unittest.TestCase):
         self.assertFalse(self.window.running_group)
         self.assertEqual(refreshed, [["recent"]])
         self.assertNotIn("all", self.window.records_cache)
-        self.assertEqual(self.window.execute_button.text(), "提交执行")
+        self.assertEqual(self.window.execute_button.text(), "开始核对范围")
 
         self.window.records_view = "all"
         self.window.running_group = {"id": "G2", "status": "running", "children": []}

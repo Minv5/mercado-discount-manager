@@ -226,7 +226,7 @@ test('paused prepared snapshot is reused only for the same unexpired request fin
   assert.equal(resumePausedSubmission({ store, request, clientSubmissionId: 'expired', now: () => '2026-07-15T06:11:00.000Z' }), null);
 });
 
-test('commit returns a changed scope to prepared reconfirmation without writes', async () => {
+test('structural scope change fails safely without a second confirmation or writes', async () => {
   const store = createSubmissionPersistence({ stateDir: temporaryDirectory(), now: () => '2026-07-14T00:00:00.000Z' });
   store.create({
     id: 'prepare-stale', client_submission_id: 'submit-stale', state: 'prepared',
@@ -235,7 +235,7 @@ test('commit returns a changed scope to prepared reconfirmation without writes',
   });
   let createCalls = 0;
   let groupCalls = 0;
-  const result = await commitSubmission({
+  await assert.rejects(() => commitSubmission({
     store, prepareId: 'prepare-stale', confirmText: 'REAL_SUBMIT', createConfirmText: 'CREATE_SELLER_CAMPAIGN',
     revalidate: async () => ({
       scope_hash: 'after', changes: ['候选商品数量已变化'], changed_target_keys: ['A|MLM|P-1|DEAL'],
@@ -244,36 +244,31 @@ test('commit returns a changed scope to prepared reconfirmation without writes',
     createSellerCampaigns: async () => { createCalls += 1; },
     startGroup: async () => { groupCalls += 1; },
     now: () => '2026-07-14T00:00:01.000Z',
-  });
-  assert.equal(result.reconfirm_required, true);
-  assert.equal(result.prepare.state, 'reconfirm_required');
-  assert.equal(result.prepare.scope_hash, 'after');
-  assert.deepEqual(result.prepare.reconfirm_target_keys, ['A|MLM|P-1|DEAL']);
-  assert.equal(result.prepare.confirmation_summary, '范围已更新，请再次确认。');
+  }), (error) => error.code === 'PREPARE_STALE');
+  assert.equal(store.load('prepare-stale').state, 'failed');
   assert.equal(createCalls, 0);
   assert.equal(groupCalls, 0);
 });
 
-test('one submission can enter reconfirmation at most once', async () => {
+test('one submission never enters a repeated reconfirmation loop', async () => {
   const store = createSubmissionPersistence({ stateDir: temporaryDirectory(), now: () => '2026-07-16T00:00:00.000Z' });
   store.create({
     id: 'prepare-reconfirm-once', client_submission_id: 'submit-reconfirm-once', state: 'prepared',
     scope_hash: 'before', expires_at: '2026-07-17T00:00:00.000Z', seller_input: { selected_targets: [] },
   });
-  const first = await commitSubmission({
+  await assert.rejects(() => commitSubmission({
     store, prepareId: 'prepare-reconfirm-once', confirmText: 'REAL_SUBMIT',
     revalidate: async () => ({ scope_hash: 'after-1', reconfirm_required: true, changes: ['material change'] }),
     now: () => '2026-07-16T00:00:01.000Z',
-  });
-  assert.equal(first.prepare.state, 'reconfirm_required');
-  assert.equal(first.prepare.reconfirm_count, 1);
+  }), (error) => error.code === 'PREPARE_STALE');
+  assert.equal(store.load('prepare-reconfirm-once').state, 'failed');
   let groupCalls = 0;
   await assert.rejects(() => commitSubmission({
     store, prepareId: 'prepare-reconfirm-once', confirmText: 'REAL_SUBMIT',
     revalidate: async () => ({ scope_hash: 'after-2', reconfirm_required: true, changes: ['another material change'] }),
     startGroup: async () => { groupCalls += 1; },
     now: () => '2026-07-16T00:00:02.000Z',
-  }), (error) => error.code === 'RECONFIRM_LIMIT_REACHED');
+  }), (error) => error.code === 'PREPARE_STALE');
   assert.equal(groupCalls, 0);
   assert.equal(store.load('prepare-reconfirm-once').state, 'failed');
 });
@@ -352,7 +347,7 @@ test('non-structural item drift persists one frozen intersection and starts exac
   assert.deepEqual(saved.revalidation_history[0].activity_diffs[0].removed_item_ids, ['I-1']);
 });
 
-test('seller creation is followed by one explicit frozen-scope reconfirm before any fake group starts', async () => {
+test('seller creation confirmed in the final summary starts one group without a second confirmation', async () => {
   const store = createSubmissionPersistence({ stateDir: temporaryDirectory(), now: () => '2026-07-16T00:50:00.000Z' });
   store.create({
     id: 'prepare-seller-post-create', client_submission_id: 'submit-seller-post-create', state: 'prepared',
@@ -362,7 +357,7 @@ test('seller creation is followed by one explicit frozen-scope reconfirm before 
   });
   let createCalls = 0;
   let groupCalls = 0;
-  const first = await commitSubmission({
+  const result = await commitSubmission({
     store, prepareId: 'prepare-seller-post-create', confirmText: 'REAL_SUBMIT', createConfirmText: 'CREATE_SELLER_CAMPAIGN',
     revalidate: async () => ({ scope_hash: 'before-create', reconfirm_required: false, execution_relation_count: 1 }),
     createSellerCampaigns: async () => { createCalls += 1; return { ok: true, created_count: 1 }; },
@@ -378,22 +373,10 @@ test('seller creation is followed by one explicit frozen-scope reconfirm before 
         },
       },
     }),
-    startGroup: async () => { groupCalls += 1; return { id: 'should-not-start' }; },
+    startGroup: async () => { groupCalls += 1; return { id: 'group-after-create', status: 'queued' }; },
     now: () => '2026-07-16T00:50:01.000Z',
   });
-  assert.equal(first.prepare.state, 'reconfirm_required');
-  assert.equal(first.prepare.reconfirm_count, 1);
-  assert.equal(createCalls, 1);
-  assert.equal(groupCalls, 0);
-
-  const second = await commitSubmission({
-    store, prepareId: 'prepare-seller-post-create', confirmText: 'REAL_SUBMIT',
-    revalidate: async () => ({ scope_hash: 'after-create', reconfirm_required: false, execution_relation_count: 2 }),
-    createSellerCampaigns: async () => { createCalls += 1; },
-    startGroup: async () => { groupCalls += 1; return { id: 'group-after-reconfirm', status: 'queued' }; },
-    now: () => '2026-07-16T00:50:02.000Z',
-  });
-  assert.equal(second.group.id, 'group-after-reconfirm');
+  assert.equal(result.group.id, 'group-after-create');
   assert.equal(createCalls, 1);
   assert.equal(groupCalls, 1);
 });

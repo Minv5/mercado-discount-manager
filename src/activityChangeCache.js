@@ -1,5 +1,6 @@
 export const ACTIVITY_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 export const ACTIVITY_ITEMS_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+export const ACTIVITY_PARTIAL_ITEMS_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function activityCacheKey(value = {}) {
   return [
@@ -24,6 +25,25 @@ export function activityCatalogDecision(state = null, now = new Date()) {
   return { refresh: false, reason: 'verified_cache' };
 }
 
+export function planActivityCatalogRoutes(routes = [], getState = () => null, now = new Date()) {
+  const refresh = [];
+  const cached = [];
+  const reasons = {};
+  for (const route of routes || []) {
+    const decision = activityCatalogDecision(getState(route), now);
+    const key = [
+      String(route.account_id || route.accountId || ''),
+      String(route.child_user_id || route.childUserId || ''),
+      String(route.site_id || route.siteId || '').toUpperCase(),
+    ].join('|');
+    if (decision.refresh) {
+      refresh.push(route);
+      reasons[key] = decision.reason;
+    } else cached.push(route);
+  }
+  return { refresh, cached, reasons };
+}
+
 export function activityItemsDecision({ promotion = {}, cacheState = null, fetchState = null, fallbackState = null, now = new Date() } = {}) {
   if (isActivityExpired(promotion, now)) return { refresh: false, blocked: true, reason: 'expired' };
   if (!cacheState) return { refresh: true, reason: 'unverified' };
@@ -36,6 +56,14 @@ export function activityItemsDecision({ promotion = {}, cacheState = null, fetch
         && isFresh(fallbackState.updated_at, ACTIVITY_ITEMS_TTL_MS, now)
         && isFresh(cacheState.items_full_checked_at, ACTIVITY_ITEMS_TTL_MS, now)) {
       return { refresh: false, reason: 'verified_composite_cache', effective_state: 'candidate_plus_inventory_fallback' };
+    }
+    if (String(fetchState.detail_status || '').toLowerCase() === 'partial_api_sparse_marketplace_candidate'
+        && isFresh(fetchState.updated_at, ACTIVITY_PARTIAL_ITEMS_TTL_MS, now)) {
+      return {
+        refresh: false,
+        reason: 'verified_sparse_window',
+        effective_state: 'partial_api_sparse_marketplace_candidate',
+      };
     }
     return { refresh: true, reason: 'not_full' };
   }
