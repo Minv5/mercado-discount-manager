@@ -66,6 +66,7 @@ test('visible product name changes while internal compatibility identity remains
   const server = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
   assert.match(server, /PRODUCT_DISPLAY_NAME/);
   const validation = fs.readFileSync(new URL('../scripts/validate.ps1', import.meta.url), 'utf8');
-  assert.match(validation, /0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x52A9,0x624B/);
+  assert.match(validation, /0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x7BA1,0x5BB6/);
+  assert.doesNotMatch(validation, /0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x52A9,0x624B/);
   assert.doesNotMatch(validation, /0x7F8E,0x5BA2,0x591A,0x6298,0x6263,0x7BA1,0x5BB6/);
 });

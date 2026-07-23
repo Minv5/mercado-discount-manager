@@ -4,7 +4,7 @@ import calendar
 from datetime import date, timedelta
 from typing import Any
 
-from PySide6.QtCore import QDate, Qt, Signal
+from PySide6.QtCore import QDate, QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStyledItemDelegate,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -32,6 +33,24 @@ from PySide6.QtWidgets import (
 )
 
 from core import Account, site_name
+
+
+class AliasEditorDelegate(QStyledItemDelegate):
+    """Keeps the compact table editor readable without changing global inputs."""
+
+    def __init__(self, table: QTableWidget):
+        super().__init__(table)
+        self._table = table
+
+    def createEditor(self, parent: QWidget, _option: Any, _index: Any) -> QLineEdit:
+        editor = QLineEdit(parent)
+        editor.setFont(self._table.font())
+        editor.setFrame(False)
+        editor.setStyleSheet("QLineEdit { padding: 0 4px; border: 0; background: transparent; }")
+        return editor
+
+    def updateEditorGeometry(self, editor: QWidget, option: Any, _index: Any) -> None:
+        editor.setGeometry(option.rect.adjusted(1, 1, -1, -1))
 
 
 class ConfirmDialog(QDialog):
@@ -210,6 +229,7 @@ class SettingsDialog(QDialog):
             if str(alias).strip()
         }
         self._initial_store_names = {account.account_id: account.store_name for account in accounts}
+        self._initial_field_values: dict[str, object] = {}
         self.setWindowTitle("设置")
         self.resize(760, 620)
         root = QVBoxLayout(self)
@@ -237,8 +257,22 @@ class SettingsDialog(QDialog):
             field.setSuffix(" %")
         self.seller_discount.setValue(int(self.settings.get("sellerDefaultDiscount", 5)))
         self.official_discount.setValue(int(self.settings.get("officialDefaultDiscount", 6)))
+        self.seller_max_discount = QSpinBox()
+        self.official_max_discount = QSpinBox()
+        for field in (self.seller_max_discount, self.official_max_discount):
+            field.setRange(0, 90)
+            field.setSpecialValueText("未设置")
+            field.setSuffix(" %")
+        self.seller_max_discount.setValue(_bounded_int(self.settings.get("sellerMaxDiscount"), 0, 0, 90))
+        self.official_max_discount.setValue(_bounded_int(self.settings.get("officialMaxDiscount"), 0, 0, 90))
         form.addRow("自建默认折扣", self.seller_discount)
         form.addRow("官方默认折扣", self.official_discount)
+        form.addRow("自建最高折扣", self.seller_max_discount)
+        form.addRow("官方最高折扣", self.official_max_discount)
+        note = QLabel("自动判断达到两项最高折扣后，本次完成；下一执行周期有已报名商品时批量取消。未设置时自动判断不会执行。")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        form.addRow("自动周期", note)
         return page
 
     def _stores_tab(self) -> QWidget:
@@ -250,18 +284,29 @@ class SettingsDialog(QDialog):
         self.store_table = QTableWidget(0, 2)
         self.store_table.setHorizontalHeaderLabels(["原始店铺名称", "店铺名称"])
         self.store_table.setSortingEnabled(False)
+        # Keep the account identity readable and avoid a permanent editor from a single click.
+        self.store_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self.store_table.setItemDelegateForColumn(1, AliasEditorDelegate(self.store_table))
+        header = self.store_table.horizontalHeader()
+        header.setMinimumSectionSize(260)
+        self.store_table.setColumnWidth(0, 340)
         for account in self.accounts:
             row = self.store_table.rowCount()
             self.store_table.insertRow(row)
             original_item = QTableWidgetItem(original_store_identifier(account))
             original_item.setFlags(original_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             original_item.setData(Qt.ItemDataRole.UserRole, account.account_id)
+            original_item.setToolTip(original_store_identifier(account))
             name_item = QTableWidgetItem(account.store_name)
             name_item.setData(Qt.ItemDataRole.UserRole, account.account_id)
+            name_item.setToolTip(account.store_name)
             self.store_table.setItem(row, 0, original_item)
             self.store_table.setItem(row, 1, name_item)
         self.store_table.setSortingEnabled(True)
-        self.store_table.horizontalHeader().setStretchLastSection(True)
+        header.setStretchLastSection(True)
         layout.addWidget(self.store_table, 1)
         self.site_list = QListWidget()
         operating = self._initial_operating_sites
@@ -330,13 +375,16 @@ class SettingsDialog(QDialog):
                 original_item = QTableWidgetItem(original_store_identifier(account))
                 original_item.setFlags(original_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 original_item.setData(Qt.ItemDataRole.UserRole, account.account_id)
+                original_item.setToolTip(original_store_identifier(account))
                 name_item = QTableWidgetItem(account.store_name)
                 name_item.setData(Qt.ItemDataRole.UserRole, account.account_id)
+                name_item.setToolTip(account.store_name)
                 self.store_table.setItem(row, 0, original_item)
                 self.store_table.setItem(row, 1, name_item)
                 self._initial_store_names[account.account_id] = account.store_name
             else:
                 self.store_table.item(row, 0).setText(original_store_identifier(account))
+                self.store_table.item(row, 0).setToolTip(original_store_identifier(account))
         self.store_table.setSortingEnabled(sorting_enabled)
         self._merging_sites = True
         try:
@@ -350,6 +398,24 @@ class SettingsDialog(QDialog):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.addWidget(QLabel(f"已授权账号：{len(self.accounts)} 个"))
+        form = QFormLayout()
+        self.oauth_client_id = QLineEdit(str(self.settings.get("oauthClientId") or ""))
+        self.oauth_client_secret = QLineEdit()
+        self.oauth_client_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        if bool(self.settings.get("oauthClientSecretConfigured")):
+            self.oauth_client_secret.setPlaceholderText("已保存，留空不修改")
+        self.oauth_redirect_uri = QLineEdit(str(self.settings.get("oauthRedirectUri") or ""))
+        self.webhook_callback_url = QLineEdit(str(self.settings.get("webhookCallbackUrl") or ""))
+        self.webhook_callback_url.setPlaceholderText("请输入独立回调服务的公网通知地址")
+        form.addRow("美客多应用 Client ID", self.oauth_client_id)
+        form.addRow("美客多应用 Client Secret", self.oauth_client_secret)
+        form.addRow("OAuth 回调地址", self.oauth_redirect_uri)
+        form.addRow("Webhook 通知地址", self.webhook_callback_url)
+        layout.addLayout(form)
+        callback_note = QLabel("Webhook 通知地址仅保存独立回调服务的公网地址。本桌面程序不会修改 Caddy 或外部回调服务配置。")
+        callback_note.setObjectName("muted")
+        callback_note.setWordWrap(True)
+        layout.addWidget(callback_note)
         actions = QHBoxLayout()
         authorize = QPushButton("新增账号授权")
         refresh = QPushButton("刷新账号")
@@ -375,21 +441,65 @@ class SettingsDialog(QDialog):
         self.read_concurrency = QSpinBox()
         self.activity_concurrency = QSpinBox()
         self.write_concurrency = QSpinBox()
-        self.read_concurrency.setRange(1, 1000)
-        self.activity_concurrency.setRange(1, 1000)
-        self.write_concurrency.setRange(1, 10000)
-        self.read_concurrency.setValue(int(self.settings.get("readConcurrency", 2)))
-        self.activity_concurrency.setValue(int(self.settings.get("previewConcurrency", 2)))
-        self.write_concurrency.setValue(int(self.settings.get("writeConcurrency", 2)))
+        self.read_concurrency.setRange(1, 125)
+        self.activity_concurrency.setRange(1, 192)
+        self.write_concurrency.setRange(1, 160)
+        self.read_concurrency.setValue(_bounded_int(self.settings.get("readConcurrency"), 125, 1, 125))
+        self.activity_concurrency.setValue(_bounded_int(self.settings.get("previewConcurrency"), 192, 1, 192))
+        self.write_concurrency.setValue(_bounded_int(self.settings.get("writeConcurrency"), 160, 1, 160))
         form.addRow("授权目录", self.auth_dir)
-        form.addRow("读取并发（当前使用值）", self.read_concurrency)
-        form.addRow("活动并发（当前使用值）", self.activity_concurrency)
-        form.addRow("商品写入并发（当前使用值）", self.write_concurrency)
+        form.addRow("读取全局上限", self.read_concurrency)
+        form.addRow("活动目录并发上限", self.activity_concurrency)
+        form.addRow("商品写入全局上限", self.write_concurrency)
         self.benchmark_note = QLabel(benchmark_text)
         self.benchmark_note.setWordWrap(True)
         self.benchmark_note.setObjectName("muted")
         form.addRow("并发说明", self.benchmark_note)
+        self._initial_field_values.update({
+            "sellerDefaultDiscount": self.seller_discount.value(),
+            "officialDefaultDiscount": self.official_discount.value(),
+            "sellerMaxDiscount": self.seller_max_discount.value(),
+            "officialMaxDiscount": self.official_max_discount.value(),
+            "authDir": self.auth_dir.text(),
+            "readConcurrency": self.read_concurrency.value(),
+            "previewConcurrency": self.activity_concurrency.value(),
+            "writeConcurrency": self.write_concurrency.value(),
+            "oauthClientId": self.oauth_client_id.text(),
+            "oauthRedirectUri": self.oauth_redirect_uri.text(),
+            "webhookCallbackUrl": self.webhook_callback_url.text(),
+        })
         return page
+
+    def apply_settings_context(self, settings: dict[str, Any]) -> None:
+        """Apply the latest normalized settings without overwriting a live edit."""
+        if not isinstance(settings, dict):
+            return
+        self.settings = {**self.settings, **settings}
+        fields = (
+            ("sellerDefaultDiscount", self.seller_discount, _bounded_int(settings.get("sellerDefaultDiscount"), 5, 1, 90)),
+            ("officialDefaultDiscount", self.official_discount, _bounded_int(settings.get("officialDefaultDiscount"), 6, 1, 90)),
+            ("sellerMaxDiscount", self.seller_max_discount, _bounded_int(settings.get("sellerMaxDiscount"), 0, 0, 90)),
+            ("officialMaxDiscount", self.official_max_discount, _bounded_int(settings.get("officialMaxDiscount"), 0, 0, 90)),
+            ("authDir", self.auth_dir, str(settings.get("authDir") or "")),
+            ("readConcurrency", self.read_concurrency, _bounded_int(settings.get("readConcurrency"), 125, 1, 125)),
+            ("previewConcurrency", self.activity_concurrency, _bounded_int(settings.get("previewConcurrency"), 192, 1, 192)),
+            ("writeConcurrency", self.write_concurrency, _bounded_int(settings.get("writeConcurrency"), 160, 1, 160)),
+            ("oauthClientId", self.oauth_client_id, str(settings.get("oauthClientId") or "")),
+            ("oauthRedirectUri", self.oauth_redirect_uri, str(settings.get("oauthRedirectUri") or "")),
+            ("webhookCallbackUrl", self.webhook_callback_url, str(settings.get("webhookCallbackUrl") or "")),
+        )
+        for key, field, value in fields:
+            current = field.value() if isinstance(field, QSpinBox) else field.text()
+            if current != self._initial_field_values.get(key):
+                continue
+            with QSignalBlocker(field):
+                if isinstance(field, QSpinBox):
+                    field.setValue(int(value))
+                else:
+                    field.setText(str(value))
+            self._initial_field_values[key] = value
+        if bool(settings.get("oauthClientSecretConfigured")) and not self.oauth_client_secret.text():
+            self.oauth_client_secret.setPlaceholderText("已保存，留空不修改")
 
     def values(self) -> dict[str, Any]:
         aliases = dict(self._initial_aliases)
@@ -418,9 +528,15 @@ class SettingsDialog(QDialog):
             "outputDir": str(self.settings.get("outputDir") or ""),
             "sellerDefaultDiscount": self.seller_discount.value(),
             "officialDefaultDiscount": self.official_discount.value(),
+            "sellerMaxDiscount": self.seller_max_discount.value() or None,
+            "officialMaxDiscount": self.official_max_discount.value() or None,
             "readConcurrency": self.read_concurrency.value(),
             "previewConcurrency": self.activity_concurrency.value(),
             "writeConcurrency": self.write_concurrency.value(),
+            "oauthClientId": self.oauth_client_id.text().strip(),
+            "oauthClientSecret": self.oauth_client_secret.text(),
+            "oauthRedirectUri": self.oauth_redirect_uri.text().strip(),
+            "webhookCallbackUrl": self.webhook_callback_url.text().strip(),
             "storeAliases": aliases,
             "operatingSites": operating,
         }
@@ -447,6 +563,14 @@ def original_store_identifier(account: Account) -> str:
         return display_name
     suffix = account.account_id[-4:] if account.account_id else "未知"
     return f"本地授权账号（尾号 {suffix}）"
+
+
+def _bounded_int(value: object, fallback: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = fallback
+    return max(minimum, min(maximum, parsed))
 
 
 def target_account_id(target: dict[str, Any]) -> str:

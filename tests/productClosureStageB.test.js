@@ -11,6 +11,7 @@ import {
   ACTIVE_EXECUTION_GROUP_STATUSES,
   createExecutionGroupPersistence,
   executionGroupBusinessScope,
+  projectLiveExecutionGroupChildren,
   summarizeExecutionGroup,
 } from '../src/executionGroupPersistence.js';
 
@@ -89,6 +90,38 @@ test('group summary keeps a failed-to-start child visible and uses existing disp
   assert.equal(summary.skipped, 1);
 });
 
+test('running group responses project each live child instead of waiting for child completion', () => {
+  const jobs = new Map([
+    ['job-a', {
+      id: 'job-a',
+      status: 'running',
+      progress: { stage: 'execute', completed_promotions: 2 },
+      userLogs: [{ at: '2026-07-23T05:47:28.000Z', message: '湖北实时日志' }],
+    }],
+    ['job-b', {
+      id: 'job-b',
+      status: 'running',
+      progress: { stage: 'execute', completed_promotions: 1 },
+      userLogs: [{ at: '2026-07-23T05:47:29.000Z', message: '广州实时日志' }],
+    }],
+  ]);
+  const children = projectLiveExecutionGroupChildren(
+    groupFixture(),
+    (jobId) => jobs.get(jobId),
+    (job) => ({
+      job_id: job.id,
+      status: job.status,
+      progress: job.progress,
+      userLogs: job.userLogs,
+    }),
+  );
+  assert.equal(children[0].status, 'running');
+  assert.equal(children[0].progress.completed_promotions, 2);
+  assert.equal(children[0].userLogs[0].message, '湖北实时日志');
+  assert.equal(children[1].userLogs[0].message, '广州实时日志');
+  assert.equal(children[2].status, 'queued');
+});
+
 test('execution group exposes the exact safe business scope used by the completed submission', () => {
   const scope = executionGroupBusinessScope(groupFixture({
     request: {
@@ -119,7 +152,8 @@ test('execution group exposes the exact safe business scope used by the complete
   const source = fs.readFileSync(path.join(process.cwd(), 'src', 'server.js'), 'utf8');
   assert.match(source, /scope:\s*executionGroupBusinessScope\(group\)/);
   assert.match(source, /compact:\s*url\.searchParams\.get\('compact'\) === '1'/);
-  assert.match(source, /children:\s*compact \? \[\]/);
+  assert.match(source, /const children = compact \? \[\] : projectedChildren/);
+  assert.match(source, /summarizeExecutionGroup\(\{ \.\.\.group, children: projectedChildren \}\)/);
 });
 
 test('one shared limiter caps all child workloads and is removable after group terminal', async () => {

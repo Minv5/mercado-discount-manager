@@ -2,8 +2,14 @@ const DEFAULT_INITIAL_LIMIT = 6;
 const DEFAULT_MAX_LIMIT = 10;
 const DEFAULT_PER_ACCOUNT_LIMIT = 4;
 const DEFAULT_DETAIL_LIMIT = 4;
+const DEFAULT_ACTIVITY_LIMIT = 4;
+const DEFAULT_DETAIL_PER_ACCOUNT_LIMIT = 4;
+const DEFAULT_ACTIVITY_PER_ACCOUNT_LIMIT = 4;
 const DEFAULT_FALLBACK_LIMIT = 1;
 const DEFAULT_SUCCESSES_PER_INCREASE = 20;
+const DEFAULT_MIN_LIMIT = 1;
+const DEFAULT_RATE_LIMIT_DECREASE_STEP = 1;
+const DEFAULT_SNAPSHOT_THROTTLE_MS = 500;
 const TRANSIENT_RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
 
 export const BALANCED_READ_PROFILES = Object.freeze({
@@ -22,11 +28,16 @@ export const BALANCED_READ_PROFILES = Object.freeze({
     fallbackPerAccount: 1,
   }),
   prepare: Object.freeze({
-    initialLimit: 10,
-    maxLimit: 18,
-    perAccountLimit: 6,
-    detailLimit: 8,
-    fallbackPerAccount: 1,
+    initialLimit: 192,
+    maxLimit: 192,
+    perAccountLimit: 64,
+    detailLimit: 125,
+    detailPerAccountLimit: 42,
+    activityLimit: 192,
+    activityPerAccountLimit: 64,
+    fallbackPerAccount: 2,
+    minLimit: 10,
+    rateLimitDecreaseStep: 5,
   }),
 });
 
@@ -41,18 +52,25 @@ function errorStatus(error) {
   return Number(error?.status || error?.statusCode || error?.response?.status || 0);
 }
 
-function isTimeoutOrNetwork(error) {
+function isTimeout(error) {
   const code = String(error?.code || error?.cause?.code || '').toUpperCase();
   const message = String(error?.message || '').toLowerCase();
-  return /(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|UND_ERR|SOCKET)/.test(code)
-    || /(timeout|timed out|fetch failed|network|socket)/.test(message);
+  return /ETIMEDOUT/.test(code) || /(timeout|timed out)/.test(message);
+}
+
+function isNetwork(error) {
+  const code = String(error?.code || error?.cause?.code || '').toUpperCase();
+  const message = String(error?.message || '').toLowerCase();
+  return /(ECONNRESET|ECONNREFUSED|EAI_AGAIN|UND_ERR|SOCKET)/.test(code)
+    || /(fetch failed|network|socket)/.test(message);
 }
 
 function transientKind(error) {
   const status = errorStatus(error);
   if (status === 429) return 'rate_limit';
   if (status >= 500 && status <= 599) return 'service';
-  if (isTimeoutOrNetwork(error)) return 'network';
+  if (isTimeout(error)) return 'timeout';
+  if (isNetwork(error)) return 'network';
   return null;
 }
 
@@ -98,8 +116,15 @@ export class BalancedReadScheduler {
     maxLimit = DEFAULT_MAX_LIMIT,
     perAccountLimit = DEFAULT_PER_ACCOUNT_LIMIT,
     detailLimit = DEFAULT_DETAIL_LIMIT,
+    activityLimit = DEFAULT_ACTIVITY_LIMIT,
+    detailPerAccountLimit = null,
+    activityPerAccountLimit = null,
     fallbackPerAccount = DEFAULT_FALLBACK_LIMIT,
     successesPerIncrease = DEFAULT_SUCCESSES_PER_INCREASE,
+    minLimit = DEFAULT_MIN_LIMIT,
+    rateLimitDecreaseStep = DEFAULT_RATE_LIMIT_DECREASE_STEP,
+    snapshotThrottleMs = DEFAULT_SNAPSHOT_THROTTLE_MS,
+    onSnapshot = null,
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     now = () => Date.now(),
     random = Math.random,
@@ -109,8 +134,14 @@ export class BalancedReadScheduler {
     this.dynamicLimit = this.initialLimit;
     this.perAccountLimit = Math.max(1, Number(perAccountLimit || DEFAULT_PER_ACCOUNT_LIMIT));
     this.detailLimit = Math.max(1, Number(detailLimit || DEFAULT_DETAIL_LIMIT));
+    this.activityLimit = Math.max(1, Number(activityLimit || DEFAULT_ACTIVITY_LIMIT));
+    this.detailPerAccountLimit = Math.max(1, Number(detailPerAccountLimit || perAccountLimit || DEFAULT_DETAIL_PER_ACCOUNT_LIMIT));
+    this.activityPerAccountLimit = Math.max(1, Number(activityPerAccountLimit || perAccountLimit || DEFAULT_ACTIVITY_PER_ACCOUNT_LIMIT));
     this.fallbackPerAccount = Math.max(1, Number(fallbackPerAccount || DEFAULT_FALLBACK_LIMIT));
     this.successesPerIncrease = Math.max(1, Number(successesPerIncrease || DEFAULT_SUCCESSES_PER_INCREASE));
+    this.minLimit = Math.min(this.initialLimit, Math.max(1, Number(minLimit || DEFAULT_MIN_LIMIT)));
+    this.rateLimitDecreaseStep = Math.max(1, Number(rateLimitDecreaseStep || DEFAULT_RATE_LIMIT_DECREASE_STEP));
+    this.snapshotThrottleMs = Math.max(0, Number(snapshotThrottleMs ?? DEFAULT_SNAPSHOT_THROTTLE_MS));
     this.sleep = sleep;
     this.now = now;
     this.random = random;
@@ -118,15 +149,19 @@ export class BalancedReadScheduler {
     this.accountOrder = [];
     this.accountCursor = 0;
     this.accountInflight = new Map();
+    this.accountDetailInflight = new Map();
+    this.accountActivityInflight = new Map();
     this.accountCooldownUntil = new Map();
     this.globalCooldownUntil = 0;
     this.inflight = 0;
     this.detailInflight = 0;
+    this.activityInflight = 0;
     this.peakInflight = 0;
     this.peakDetail = 0;
+    this.peakActivity = 0;
     this.stableSuccesses = 0;
     this.deduped = new Map();
-    this.fallbackTails = new Map();
+    this.fallbackQueues = new Map();
     this.fallbackActive = new Map();
     this.peakFallbackByAccount = new Map();
     this.pumpQueued = false;
@@ -141,6 +176,17 @@ export class BalancedReadScheduler {
     this.metricRateLimits = 0;
     this.metricNetworkErrors = 0;
     this.metricServiceErrors = 0;
+    this.metricTimeoutErrors = 0;
+    this.snapshotListeners = new Set();
+    this.lastSnapshotEmittedAt = Number.NEGATIVE_INFINITY;
+    if (typeof onSnapshot === 'function') this.subscribe(onSnapshot);
+  }
+
+  subscribe(listener) {
+    if (typeof listener !== 'function') return () => {};
+    this.snapshotListeners.add(listener);
+    listener(this.snapshot());
+    return () => this.snapshotListeners.delete(listener);
   }
 
   schedule({ accountId = '', key = '', kind = 'read', signal = null } = {}, task) {
@@ -184,6 +230,7 @@ export class BalancedReadScheduler {
       signal.addEventListener('abort', job.abortListener, { once: true });
     }
     this.#queuePump();
+    this.#emitSnapshot();
     return promise;
   }
 
@@ -192,42 +239,60 @@ export class BalancedReadScheduler {
     const account = String(accountId || '__global__');
     const requestKey = key ? `fallback|${account}|${String(key)}` : '';
     if (requestKey && this.deduped.has(requestKey)) return this.deduped.get(requestKey);
-    const prior = this.fallbackTails.get(account) || Promise.resolve();
-    const run = prior.catch(() => undefined).then(async () => {
-      if (signal?.aborted) throw abortError();
-      const active = Number(this.fallbackActive.get(account) || 0) + 1;
-      this.fallbackActive.set(account, active);
-      this.peakFallbackByAccount.set(account, Math.max(Number(this.peakFallbackByAccount.get(account) || 0), active));
-      try {
-        return await task();
-      } finally {
-        this.fallbackActive.set(account, Math.max(0, active - 1));
-      }
+    let resolvePromise;
+    let rejectPromise;
+    const run = new Promise((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
     });
-    const tail = run.finally(() => {
-      if (this.fallbackTails.get(account) === tail) this.fallbackTails.delete(account);
-      if (requestKey && this.deduped.get(requestKey) === run) this.deduped.delete(requestKey);
-    });
-    this.fallbackTails.set(account, tail);
+    if (!this.fallbackQueues.has(account)) this.fallbackQueues.set(account, []);
+    this.fallbackQueues.get(account).push({ account, requestKey, signal, task, resolve: resolvePromise, reject: rejectPromise });
     if (requestKey) this.deduped.set(requestKey, run);
+    this.#pumpFallback(account);
+    this.#emitSnapshot();
     return run;
   }
 
   snapshot() {
+    const snapshotNow = this.now();
     const durations = [...this.metricDurations].sort((left, right) => left - right);
     const p95Index = durations.length ? Math.min(durations.length - 1, Math.ceil(durations.length * 0.95) - 1) : -1;
     const elapsedMs = this.metricStartedAt == null
       ? 0
-      : Math.max(0, Number((this.metricFinishedAt ?? this.now()) - this.metricStartedAt));
+      : Math.max(0, Number((this.metricFinishedAt ?? snapshotNow) - this.metricStartedAt));
+    const accountCooldownRemainingMs = Object.fromEntries(
+      [...this.accountCooldownUntil.entries()]
+        .map(([account, until]) => [account, Math.max(0, Number(until || 0) - snapshotNow)])
+        .filter(([, remaining]) => remaining > 0),
+    );
+    const globalCooldownRemainingMs = Math.max(0, this.globalCooldownUntil - snapshotNow);
+    const cooldownRemainingMs = Math.max(globalCooldownRemainingMs, 0, ...Object.values(accountCooldownRemainingMs));
     return {
       dynamicLimit: this.dynamicLimit,
       inflight: this.inflight,
       peakInflight: this.peakInflight,
       detailInflight: this.detailInflight,
       peakDetail: this.peakDetail,
+      activityInflight: this.activityInflight,
+      peakActivity: this.peakActivity,
       accountInflight: Object.fromEntries(this.accountInflight),
+      accountDetailInflight: Object.fromEntries(this.accountDetailInflight),
+      accountActivityInflight: Object.fromEntries(this.accountActivityInflight),
+      fallbackActiveByAccount: Object.fromEntries(this.fallbackActive),
       peakFallbackByAccount: Object.fromEntries(this.peakFallbackByAccount),
-      queued: [...this.queues.values()].reduce((sum, queue) => sum + queue.length, 0),
+      queued: [...this.queues.values()].reduce((sum, queue) => sum + queue.length, 0)
+        + [...this.fallbackQueues.values()].reduce((sum, queue) => sum + queue.length, 0),
+      initialLimit: this.initialLimit,
+      maxLimit: this.maxLimit,
+      perAccountLimit: this.perAccountLimit,
+      detailLimit: this.detailLimit,
+      detailPerAccountLimit: this.detailPerAccountLimit,
+      activityLimit: this.activityLimit,
+      activityPerAccountLimit: this.activityPerAccountLimit,
+      fallbackPerAccount: this.fallbackPerAccount,
+      globalCooldownRemainingMs,
+      accountCooldownRemainingMs,
+      cooldownRemainingMs,
       mercado_outbound_inflight: this.inflight,
       mercado_outbound_peak: this.peakInflight,
       mercado_outbound_logical_request_count: this.metricLogicalRequests,
@@ -237,6 +302,7 @@ export class BalancedReadScheduler {
       mercado_outbound_rate_limit_count: this.metricRateLimits,
       mercado_outbound_network_error_count: this.metricNetworkErrors,
       mercado_outbound_service_error_count: this.metricServiceErrors,
+      mercado_outbound_timeout_error_count: this.metricTimeoutErrors,
       mercado_outbound_failure_count: this.metricFailures,
       mercado_outbound_elapsed_ms: elapsedMs,
       mercado_outbound_p95_ms: p95Index >= 0 ? durations[p95Index] : 0,
@@ -244,6 +310,47 @@ export class BalancedReadScheduler {
         ? Number((this.metricCompleted * 1_000 / elapsedMs).toFixed(2))
         : 0,
     };
+  }
+
+  #emitSnapshot(force = false) {
+    if (!this.snapshotListeners.size) return;
+    const now = this.now();
+    if (!force && now - this.lastSnapshotEmittedAt < this.snapshotThrottleMs) return;
+    this.lastSnapshotEmittedAt = now;
+    const snapshot = this.snapshot();
+    for (const listener of this.snapshotListeners) {
+      try { listener(snapshot); } catch { /* Observability must not affect reads. */ }
+    }
+  }
+
+  #pumpFallback(account) {
+    const queue = this.fallbackQueues.get(account) || [];
+    while (queue.length && Number(this.fallbackActive.get(account) || 0) < this.fallbackPerAccount) {
+      const job = queue.shift();
+      if (job.signal?.aborted) {
+        if (job.requestKey && this.deduped.get(job.requestKey)) this.deduped.delete(job.requestKey);
+        job.reject(abortError());
+        continue;
+      }
+      const active = Number(this.fallbackActive.get(account) || 0) + 1;
+      this.fallbackActive.set(account, active);
+      this.peakFallbackByAccount.set(account, Math.max(Number(this.peakFallbackByAccount.get(account) || 0), active));
+      this.#emitSnapshot();
+      const finish = () => {
+        this.fallbackActive.set(account, Math.max(0, Number(this.fallbackActive.get(account) || 0) - 1));
+        if (job.requestKey && this.deduped.get(job.requestKey)) this.deduped.delete(job.requestKey);
+        if (!queue.length && Number(this.fallbackActive.get(account) || 0) === 0) this.fallbackQueues.delete(account);
+        this.#emitSnapshot();
+        this.#pumpFallback(account);
+      };
+      Promise.resolve().then(job.task).then((value) => {
+        finish();
+        job.resolve(value);
+      }, (error) => {
+        finish();
+        job.reject(error);
+      });
+    }
   }
 
   #queuePump() {
@@ -279,7 +386,12 @@ export class BalancedReadScheduler {
       if (!queue.length) continue;
       if (Number(this.accountInflight.get(account) || 0) >= this.perAccountLimit) continue;
       if (Number(this.accountCooldownUntil.get(account) || 0) > now) continue;
-      const runnableIndex = queue.findIndex((job) => job.kind !== 'detail' || this.detailInflight < this.detailLimit);
+      const runnableIndex = queue.findIndex((job) => (
+        (job.kind !== 'detail' || this.detailInflight < this.detailLimit)
+        && (job.kind !== 'detail' || Number(this.accountDetailInflight.get(account) || 0) < this.detailPerAccountLimit)
+        && (job.kind !== 'activity' || this.activityInflight < this.activityLimit)
+        && (job.kind !== 'activity' || Number(this.accountActivityInflight.get(account) || 0) < this.activityPerAccountLimit)
+      ));
       if (runnableIndex < 0) continue;
       this.accountCursor = (index + 1) % count;
       return queue.splice(runnableIndex, 1)[0];
@@ -304,8 +416,15 @@ export class BalancedReadScheduler {
     this.accountInflight.set(job.account, Number(this.accountInflight.get(job.account) || 0) + 1);
     if (job.kind === 'detail') {
       this.detailInflight += 1;
+      this.accountDetailInflight.set(job.account, Number(this.accountDetailInflight.get(job.account) || 0) + 1);
       this.peakDetail = Math.max(this.peakDetail, this.detailInflight);
     }
+    if (job.kind === 'activity') {
+      this.activityInflight += 1;
+      this.accountActivityInflight.set(job.account, Number(this.accountActivityInflight.get(job.account) || 0) + 1);
+      this.peakActivity = Math.max(this.peakActivity, this.activityInflight);
+    }
+    this.#emitSnapshot();
     this.#runWithRetry(job).then((value) => {
       this.#release(job);
       this.#settle(job, value, null);
@@ -318,7 +437,15 @@ export class BalancedReadScheduler {
   #release(job) {
       this.inflight = Math.max(0, this.inflight - 1);
       this.accountInflight.set(job.account, Math.max(0, Number(this.accountInflight.get(job.account) || 0) - 1));
-      if (job.kind === 'detail') this.detailInflight = Math.max(0, this.detailInflight - 1);
+      if (job.kind === 'detail') {
+        this.detailInflight = Math.max(0, this.detailInflight - 1);
+        this.accountDetailInflight.set(job.account, Math.max(0, Number(this.accountDetailInflight.get(job.account) || 0) - 1));
+      }
+      if (job.kind === 'activity') {
+        this.activityInflight = Math.max(0, this.activityInflight - 1);
+        this.accountActivityInflight.set(job.account, Math.max(0, Number(this.accountActivityInflight.get(job.account) || 0) - 1));
+      }
+      this.#emitSnapshot();
       this.#queuePump();
   }
 
@@ -333,6 +460,7 @@ export class BalancedReadScheduler {
         if (this.stableSuccesses >= this.successesPerIncrease && this.dynamicLimit < this.maxLimit) {
           this.dynamicLimit += 1;
           this.stableSuccesses = 0;
+          this.#emitSnapshot(true);
         }
         return result;
       } catch (error) {
@@ -341,17 +469,19 @@ export class BalancedReadScheduler {
         if (kind === 'rate_limit') this.metricRateLimits += 1;
         if (kind === 'network') this.metricNetworkErrors += 1;
         if (kind === 'service') this.metricServiceErrors += 1;
+        if (kind === 'timeout') this.metricTimeoutErrors += 1;
         if (!kind || attempt >= TRANSIENT_RETRY_DELAYS_MS.length) throw error;
         this.metricRetries += 1;
+        this.dynamicLimit = Math.max(this.minLimit, this.dynamicLimit - this.rateLimitDecreaseStep);
         let delay = TRANSIENT_RETRY_DELAYS_MS[attempt];
         if (kind === 'rate_limit') {
           delay = Math.max(delay, retryAfterMs(error));
-          this.dynamicLimit = Math.max(1, Math.floor(this.dynamicLimit / 2));
           this.globalCooldownUntil = Math.max(this.globalCooldownUntil, this.now() + delay);
         } else {
           this.accountCooldownUntil.set(job.account, Math.max(Number(this.accountCooldownUntil.get(job.account) || 0), this.now() + delay));
         }
         this.stableSuccesses = 0;
+        this.#emitSnapshot(true);
         const jitter = Math.floor(delay * 0.2 * Math.max(0, Number(this.random() || 0)));
         await waitWithSignal(delay + jitter, job.signal, this.sleep);
         attempt += 1;
@@ -382,11 +512,24 @@ export function buildReadConcurrencyReport({
   return {
     local_work_concurrency: Math.max(1, Math.floor(Number(localWorkConcurrency || 1))),
     local_db_batch_queries: Math.max(0, Math.floor(Number(localDbBatchQueries || 0))),
+    mercado_outbound_dynamic_limit: Math.max(0, Number(schedulerSnapshot.dynamicLimit || 0)),
+    mercado_outbound_max_limit: Math.max(0, Number(schedulerSnapshot.maxLimit || 0)),
+    mercado_outbound_per_account_limit: Math.max(0, Number(schedulerSnapshot.perAccountLimit || 0)),
+    mercado_outbound_detail_limit: Math.max(0, Number(schedulerSnapshot.detailLimit || 0)),
+    mercado_outbound_detail_per_account_limit: Math.max(0, Number(schedulerSnapshot.detailPerAccountLimit || 0)),
+    mercado_outbound_activity_limit: Math.max(0, Number(schedulerSnapshot.activityLimit || 0)),
+    mercado_outbound_activity_per_account_limit: Math.max(0, Number(schedulerSnapshot.activityPerAccountLimit || 0)),
+    mercado_outbound_fallback_per_account: Math.max(0, Number(schedulerSnapshot.fallbackPerAccount || 0)),
     mercado_outbound_inflight: Math.max(0, Number(schedulerSnapshot.mercado_outbound_inflight ?? schedulerSnapshot.inflight ?? 0)),
     mercado_outbound_peak: Math.max(0, Number(schedulerSnapshot.mercado_outbound_peak ?? schedulerSnapshot.peakInflight ?? 0)),
+    mercado_outbound_activity_inflight: Math.max(0, Number(schedulerSnapshot.activityInflight || 0)),
+    mercado_outbound_activity_peak: Math.max(0, Number(schedulerSnapshot.peakActivity || 0)),
     mercado_outbound_request_count: Math.max(0, Number(schedulerSnapshot.mercado_outbound_request_count || 0)),
     mercado_outbound_retry_count: Math.max(0, Number(schedulerSnapshot.mercado_outbound_retry_count || 0)),
     mercado_outbound_rate_limit_count: Math.max(0, Number(schedulerSnapshot.mercado_outbound_rate_limit_count || 0)),
+    mercado_outbound_network_error_count: Math.max(0, Number(schedulerSnapshot.mercado_outbound_network_error_count || 0)),
+    mercado_outbound_service_error_count: Math.max(0, Number(schedulerSnapshot.mercado_outbound_service_error_count || 0)),
+    mercado_outbound_timeout_error_count: Math.max(0, Number(schedulerSnapshot.mercado_outbound_timeout_error_count || 0)),
     mercado_outbound_failure_count: Math.max(0, Number(schedulerSnapshot.mercado_outbound_failure_count || 0)),
     mercado_outbound_elapsed_ms: Math.max(0, Number(schedulerSnapshot.mercado_outbound_elapsed_ms || 0)),
     mercado_outbound_p95_ms: Math.max(0, Number(schedulerSnapshot.mercado_outbound_p95_ms || 0)),
@@ -415,4 +558,26 @@ function normalizeBenchmark(value = {}) {
 
 export function createBalancedReadScheduler(options = {}) {
   return new BalancedReadScheduler(options);
+}
+
+export function prepareReadSchedulerProfile(settings = {}) {
+  const bounded = (value, fallback, maximum) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.min(maximum, Math.max(1, Math.floor(number))) : fallback;
+  };
+  const detailLimit = bounded(settings.readConcurrency, 125, 125);
+  const activityLimit = bounded(settings.previewConcurrency, BALANCED_READ_PROFILES.prepare.activityLimit, BALANCED_READ_PROFILES.prepare.activityLimit);
+  const globalLimit = Math.max(detailLimit, activityLimit);
+  const detailPerAccountLimit = Math.min(42, detailLimit);
+  const activityPerAccountLimit = Math.min(64, activityLimit);
+  return {
+    ...BALANCED_READ_PROFILES.prepare,
+    initialLimit: globalLimit,
+    maxLimit: globalLimit,
+    perAccountLimit: Math.max(detailPerAccountLimit, activityPerAccountLimit),
+    detailLimit,
+    detailPerAccountLimit,
+    activityLimit,
+    activityPerAccountLimit,
+  };
 }

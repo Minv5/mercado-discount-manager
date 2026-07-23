@@ -17,11 +17,19 @@ import {
 const NOW = new Date('2026-07-15T06:00:00.000Z');
 
 test('activity catalog uses a daily calibration and dirty or gap forces only the target scope', () => {
-  const fresh = { catalog_checked_at: new Date(NOW.getTime() - ACTIVITY_CATALOG_TTL_MS + 1_000).toISOString(), dirty: 0, continuity: 'continuous' };
+  const fresh = { catalog_checked_at: new Date(NOW.getTime() - 60_000).toISOString(), dirty: 0, continuity: 'continuous' };
   assert.equal(activityCatalogDecision(fresh, NOW).refresh, false);
+  assert.equal(activityCatalogDecision(fresh, NOW).reason, 'same_day_cache');
   assert.equal(activityCatalogDecision({ ...fresh, dirty: 1 }, NOW).reason, 'dirty');
   assert.equal(activityCatalogDecision({ ...fresh, continuity: 'gap' }, NOW).reason, 'event_gap');
-  assert.equal(activityCatalogDecision({ ...fresh, catalog_checked_at: new Date(NOW.getTime() - ACTIVITY_CATALOG_TTL_MS - 1).toISOString() }, NOW).reason, 'daily_due');
+  assert.equal(activityCatalogDecision({ ...fresh, catalog_checked_at: '2026-07-14T06:00:00.000Z' }, NOW).reason, 'daily_due');
+  assert.deepEqual(activityCatalogDecision({
+    ...fresh,
+    dirty: 1,
+    continuity: 'gap',
+    last_error: 'network',
+    updated_at: new Date(NOW.getTime() - 60_000).toISOString(),
+  }, NOW), { refresh: false, blocked: true, reason: 'same_day_failed' });
 
   const states = new Map([
     ['A|MLM|P-1|DEAL', { dirty: 0, continuity: 'continuous' }],
@@ -49,16 +57,60 @@ test('catalog route plan performs zero external reads for clean routes and targe
   assert.equal(plan.reasons['A|C2|MLB'], 'dirty');
 });
 
+test('catalog route plan blocks a failed route for the rest of the Shanghai day', () => {
+  const routes = [{ account_id: 'A', child_user_id: 'C1', site_id: 'MLM' }];
+  const plan = planActivityCatalogRoutes(routes, () => ({
+    dirty: 1,
+    continuity: 'gap',
+    last_error: 'network',
+    updated_at: new Date(NOW.getTime() - 1_000).toISOString(),
+  }), NOW);
+  assert.equal(plan.refresh.length, 0);
+  assert.equal(plan.cached.length, 0);
+  assert.deepEqual(plan.blocked, routes);
+  assert.equal(plan.reasons['A|C1|MLM'], 'same_day_failed');
+});
+
 test('activity items reuse verified full cache for three days and never reuse dirty gap error or partial cache', () => {
   const promotion = { finish_date: '2026-07-31' };
   const cacheState = { items_full_checked_at: new Date(NOW.getTime() - ACTIVITY_ITEMS_TTL_MS + 1_000).toISOString(), dirty: 0, continuity: 'continuous' };
   const fetchState = { detail_status: 'ok', saved_count: 12, platform_total: 12, updated_at: cacheState.items_full_checked_at };
   assert.equal(activityItemsDecision({ promotion, cacheState, fetchState, now: NOW }).refresh, false);
+  const sameDayCache = {
+    ...cacheState,
+    items_full_checked_at: new Date(NOW.getTime() - 2 * 60 * 60 * 1000).toISOString(),
+  };
+  assert.equal(activityItemsDecision({ promotion, cacheState: sameDayCache, fetchState, now: NOW }).reason, 'same_day_cache');
   assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, dirty: 1 }, fetchState, now: NOW }).reason, 'dirty');
   assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, continuity: 'gap' }, fetchState, now: NOW }).reason, 'event_gap');
   assert.equal(activityItemsDecision({ promotion, cacheState, fetchState: { ...fetchState, detail_status: 'error' }, now: NOW }).reason, 'unreadable');
   assert.equal(activityItemsDecision({ promotion, cacheState, fetchState: { ...fetchState, detail_status: 'partial' }, now: NOW }).reason, 'not_full');
   assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, items_full_checked_at: new Date(NOW.getTime() - ACTIVITY_ITEMS_TTL_MS - 1).toISOString() }, fetchState, now: NOW }).reason, 'three_day_due');
+});
+
+test('same-day failed or incomplete item reads do not repeat unless a newer event marks the activity dirty', () => {
+  const attemptedAt = new Date(NOW.getTime() - 60_000).toISOString();
+  const base = {
+    promotion: { finish_date: '2026-07-31' },
+    cacheState: { dirty: 1, continuity: 'gap', updated_at: new Date(NOW.getTime() - 120_000).toISOString() },
+    now: NOW,
+  };
+  assert.deepEqual(activityItemsDecision({
+    ...base,
+    fetchState: { detail_status: 'error', updated_at: attemptedAt },
+  }), { refresh: false, blocked: true, reason: 'same_day_failed' });
+  assert.deepEqual(activityItemsDecision({
+    ...base,
+    fetchState: { detail_status: 'api_incomplete_marketplace_candidate', updated_at: attemptedAt },
+  }), { refresh: false, blocked: true, reason: 'same_day_incomplete' });
+
+  const newerEvent = activityItemsDecision({
+    ...base,
+    cacheState: { ...base.cacheState, updated_at: new Date(NOW.getTime() - 1_000).toISOString() },
+    fetchState: { detail_status: 'error', updated_at: attemptedAt },
+  });
+  assert.equal(newerEvent.refresh, true);
+  assert.equal(newerEvent.reason, 'dirty');
 });
 
 test('partial candidate plus fresh inventory fallback is a reusable complete verification state', () => {
@@ -81,7 +133,9 @@ test('partial candidate plus fresh inventory fallback is a reusable complete ver
     fallbackState: { detail_status: 'candidate_inventory_fallback', saved_count: 60, platform_total: 60, updated_at: new Date(NOW.getTime() - ACTIVITY_ITEMS_TTL_MS - 1).toISOString() },
     now: NOW,
   });
-  assert.equal(staleFallback.refresh, true);
+  assert.equal(staleFallback.refresh, false);
+  assert.equal(staleFallback.blocked, true);
+  assert.equal(staleFallback.reason, 'same_day_incomplete');
 });
 
 test('audited sparse candidate responses use a bounded low-frequency window instead of refreshing every prepare', () => {
@@ -115,6 +169,24 @@ test('audited sparse candidate responses use a bounded low-frequency window inst
   });
   assert.equal(stale.refresh, true);
   assert.equal(stale.reason, 'not_full');
+});
+
+test('started activities never reuse sparse candidate window', () => {
+  const checkedAt = new Date(NOW.getTime() - ACTIVITY_PARTIAL_ITEMS_TTL_MS + 1).toISOString();
+  const startedDecision = activityItemsDecision({
+    promotion: { finish_date: '2026-07-31' },
+    cacheState: { dirty: 0, continuity: 'continuous' },
+    fetchState: {
+      detail_status: 'partial_api_sparse_marketplace_candidate',
+      saved_count: 20,
+      platform_total: 80,
+      updated_at: checkedAt,
+    },
+    itemStatus: 'started',
+    now: NOW,
+  });
+  assert.equal(startedDecision.refresh, true);
+  assert.equal(startedDecision.reason, 'not_full');
 });
 
 test('finish date expires locally after the Shanghai business day without a network read', () => {

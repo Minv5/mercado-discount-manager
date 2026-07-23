@@ -125,119 +125,21 @@ test('auto same-scope gate returns TODAY_COMPLETED without issuing a token', () 
   assert.equal(store.loadAll().length, 0);
 });
 
-test('manual same-day gate issues a bound short-lived token and accepts it once', () => {
-  const stateDir = temporaryDirectory();
-  let now = '2026-07-15T15:30:00.000Z';
-  const store = createSameDayConfirmationStore({ stateDir, now: () => now, ttlMs: 120_000 });
-  const request = requestFixture({ action: 'enroll', requested_action: 'enroll' });
-  let token = '';
-  assert.throws(
-    () => sameDayCompletionGate({ groups: [completedGroup()], request, confirmationStore: store, now: () => now }),
-    (error) => {
-      token = error.details.confirmation_token;
-      return error.code === 'CONFIRM_SAME_DAY_ACTION'
-        && error.details.same_action === false
-        && Boolean(token);
-    },
-  );
-  assert.equal(store.loadAll()[0].state, 'issued');
-  assert.deepEqual(store.loadAll()[0].events.map((row) => row.type), ['warning_issued']);
-  const allowed = sameDayCompletionGate({
-    groups: [completedGroup()],
-    request: { ...request, same_day_confirmation_token: token },
-    confirmationStore: store,
-    now: () => now,
-  });
-  assert.equal(allowed.allowed, true);
-  assert.equal(allowed.confirmed, true);
-  assert.equal(store.loadAll()[0].state, 'consumed');
-  assert.deepEqual(store.loadAll()[0].events.map((row) => row.type), ['warning_issued', 'accepted']);
-  assert.throws(
-    () => store.consume(token, allowed.binding),
-    (error) => error.code === 'SAME_DAY_CONFIRMATION_USED',
-  );
-  const persisted = fs.readFileSync(store.statePath(store.loadAll()[0].id), 'utf8');
-  assert.equal(persisted.includes(token), false);
-});
-
-test('confirmation token rejects wrong binding, expiry, cancellation, and double consumption', () => {
-  let now = '2026-07-15T15:30:00.000Z';
-  const store = createSameDayConfirmationStore({ stateDir: temporaryDirectory(), now: () => now, ttlMs: 1_000 });
-  const request = requestFixture({ action: 'cancel', requested_action: 'cancel' });
-  let issued;
-  try {
-    sameDayCompletionGate({ groups: [completedGroup()], request, confirmationStore: store, now: () => now });
-  } catch (error) {
-    issued = error.details;
-  }
-  assert.ok(issued.confirmation_token);
-  const record = store.loadAll()[0];
-  const binding = record.binding;
-  for (const changed of [
-    { requested_action: 'enroll' },
-    { client_submission_id: 'submission-other' },
-    { scope_key: `${binding.scope_key}-other` },
-    { completed_group_id: 'group-other' },
-    { business_date: '2026-07-16' },
-  ]) {
-    assert.throws(
-      () => store.consume(issued.confirmation_token, { ...binding, ...changed }),
-      (error) => error.code === 'SAME_DAY_CONFIRMATION_MISMATCH',
-    );
-  }
-  store.cancel(issued.confirmation_token);
-  assert.equal(store.loadAll()[0].state, 'cancelled');
-  assert.deepEqual(store.loadAll()[0].events.map((row) => row.type), ['warning_issued', 'cancelled']);
-  assert.throws(
-    () => store.consume(issued.confirmation_token, binding),
-    (error) => error.code === 'SAME_DAY_CONFIRMATION_CANCELLED',
-  );
-
-  const expiring = createSameDayConfirmationStore({ stateDir: temporaryDirectory(), now: () => now, ttlMs: 1_000 });
-  let expiringToken;
-  try {
-    sameDayCompletionGate({ groups: [completedGroup()], request, confirmationStore: expiring, now: () => now });
-  } catch (error) {
-    expiringToken = error.details.confirmation_token;
-  }
-  now = '2026-07-15T15:30:02.000Z';
-  assert.throws(
-    () => expiring.consume(expiringToken, expiring.loadAll()[0].binding),
-    (error) => error.code === 'SAME_DAY_CONFIRMATION_EXPIRED',
-  );
-});
-
-test('concurrent confirmation consumption accepts exactly one request', async () => {
+test('manual same-day actions bypass the retired secondary confirmation without issuing a token', () => {
   const store = createSameDayConfirmationStore({ stateDir: temporaryDirectory() });
-  const request = requestFixture({ action: 'update', requested_action: 'update' });
-  let token;
-  try {
-    sameDayCompletionGate({
-      groups: [completedGroup()], request, confirmationStore: store,
+  for (const action of ['enroll', 'update', 'cancel']) {
+    const result = sameDayCompletionGate({
+      groups: [completedGroup()],
+      request: requestFixture({ action, requested_action: action }),
       now: () => '2026-07-15T15:30:00.000Z',
     });
-  } catch (error) {
-    token = error.details.confirmation_token;
+    assert.equal(result.allowed, true);
+    assert.equal(result.confirmed, false);
+    assert.equal(result.binding, null);
+    assert.equal(result.completed?.group_id, 'group-today');
+    assert.equal(result.completed?.action, 'update');
   }
-  const binding = store.loadAll()[0].binding;
-  const results = await Promise.allSettled([
-    Promise.resolve().then(() => store.consume(token, binding)),
-    Promise.resolve().then(() => store.consume(token, binding)),
-  ]);
-  assert.equal(results.filter((row) => row.status === 'fulfilled').length, 1);
-  assert.equal(results.filter((row) => row.status === 'rejected' && row.reason.code === 'SAME_DAY_CONFIRMATION_USED').length, 1);
-  assert.deepEqual(store.loadAll()[0].events.map((row) => row.type), ['warning_issued', 'accepted']);
-});
-
-test('manual same-action is also gated while a truly different or cross-day scope is allowed', () => {
-  const store = createSameDayConfirmationStore({ stateDir: temporaryDirectory() });
-  assert.throws(
-    () => sameDayCompletionGate({
-      groups: [completedGroup()], request: requestFixture(), confirmationStore: store,
-      now: () => '2026-07-15T15:30:00.000Z',
-    }),
-    (error) => error.code === 'CONFIRM_SAME_DAY_ACTION' && error.details.same_action === true,
-  );
+  assert.equal(store.loadAll().length, 0);
   assert.deepEqual(sameDayCompletionGate({
     groups: [completedGroup()],
     request: requestFixture({
@@ -247,12 +149,12 @@ test('manual same-action is also gated while a truly different or cross-day scop
     now: () => '2026-07-15T15:30:00.000Z',
   }), { allowed: true, confirmed: false, completed: null, binding: null });
   assert.deepEqual(sameDayCompletionGate({
-    groups: [completedGroup()], request: requestFixture(), confirmationStore: store,
+    groups: [completedGroup()], request: requestFixture(),
     now: () => '2026-07-16T15:30:00.000Z',
   }), { allowed: true, confirmed: false, completed: null, binding: null });
 });
 
-test('HTTP prepare gate blocks automatic duplicates and folds manual warning into the single final summary', async () => {
+test('HTTP prepare gate blocks automatic duplicates and resumes manual preparation without a same-day warning', async () => {
   const dataDir = temporaryDirectory();
   const groupStore = createExecutionGroupPersistence({
     stateDir: path.join(dataDir, 'execution-group-states'),
@@ -322,6 +224,7 @@ test('HTTP prepare gate blocks automatic duplicates and folds manual warning int
     assert.equal(manualBody.prepare.state, 'prepared');
     const acceptedState = fs.readFileSync(path.join(dataDir, 'execution-submissions', 'prepare-paused.json'), 'utf8');
     assert.equal(acceptedState.includes('same_day_confirmation_token'), false);
+    assert.equal(acceptedState.includes('same_day_warning'), false);
 
     const responseRetry = await fetch(`${baseUrl}/api/execution/submissions/prepare`, {
       method: 'POST', headers: { 'content-type': 'application/json' },

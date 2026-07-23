@@ -459,6 +459,66 @@ export function saveItems(accountId, promotionId, promotionType, items, context 
   return rows;
 }
 
+export function applySuccessfulPromotionItemWrites({ accountId, promotionId, promotionType, action, items = [] }) {
+  const normalizedAction = String(action || '').toLowerCase();
+  const identity = [String(accountId), String(promotionId), String(promotionType)];
+  const rows = (items || [])
+    .map((item) => ({
+      itemId: String(item?.itemId || item?.item_id || '').trim(),
+      dealPrice: item?.dealPrice ?? item?.deal_price ?? null,
+    }))
+    .filter((item) => item.itemId);
+  if (!rows.length) return;
+  transaction((database) => {
+    if (normalizedAction === 'cancel') {
+      const statement = database.prepare(
+        `DELETE FROM promo_items
+         WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND item_id = ?`,
+      );
+      for (const row of rows) statement.run(...identity, row.itemId);
+      return;
+    }
+    if (!['enroll', 'update'].includes(normalizedAction)) return;
+    const statement = database.prepare(
+      `UPDATE promo_items
+       SET status = 'started', price = COALESCE(?, price), updated_at = ?
+       WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND item_id = ?`,
+    );
+    const updatedAt = nowIso();
+    for (const row of rows) {
+      statement.run(
+        row.dealPrice == null ? null : Number(row.dealPrice),
+        updatedAt,
+        ...identity,
+        row.itemId,
+      );
+    }
+  });
+}
+
+export function reconcilePromotionItemFetchCounts({ accountId, promotionId, promotionType }) {
+  const identity = [String(accountId), String(promotionId), String(promotionType)];
+  transaction((database) => {
+    const countStatement = database.prepare(
+      `SELECT COUNT(*) AS count FROM promo_items
+       WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND status = ?`,
+    );
+    const updateStatement = database.prepare(
+      `UPDATE promo_item_fetch_states
+       SET saved_count = ?,
+           platform_total = CASE
+             WHEN detail_status IN ('ok', 'full', 'empty') THEN ?
+             ELSE platform_total
+           END
+       WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND item_status = ?`,
+    );
+    for (const status of ['candidate', 'started']) {
+      const count = Number(countStatement.get(...identity, status)?.count || 0);
+      updateStatement.run(count, count, ...identity, status);
+    }
+  });
+}
+
 export function deleteItemsBySource(accountId, promotionId, promotionType, status, source) {
   run(
     `DELETE FROM promo_items
@@ -502,6 +562,14 @@ export function getItemFetchState(accountId, promotionId, promotionType, itemSta
   );
 }
 
+export function invalidatePromotionItemFetchStates({ accountId, promotionId, promotionType }) {
+  run(
+    `DELETE FROM promo_item_fetch_states
+     WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?`,
+    [String(accountId), String(promotionId), String(promotionType)]
+  );
+}
+
 export function getActivityCacheState(accountId, siteId = '', promotionId = '', promotionType = '') {
   return get(
     `SELECT * FROM activity_cache_states
@@ -536,7 +604,7 @@ export function saveActivityCacheState({ accountId, siteId = '', promotionId = '
     expired: changes.expired == null ? Number(current.expired || 0) : Number(Boolean(changes.expired)),
     continuity: String(changes.continuity ?? current.continuity ?? 'continuous'),
     event_cursor: changes.eventCursor ?? current.event_cursor ?? null,
-    last_error: changes.lastError ?? current.last_error ?? null,
+    last_error: Object.hasOwn(changes, 'lastError') ? changes.lastError : current.last_error ?? null,
   };
   run(
     `INSERT INTO activity_cache_states
@@ -562,7 +630,7 @@ export function saveActivityCacheState({ accountId, siteId = '', promotionId = '
 export function markActivityCacheDirty({ accountId, siteId = '', promotionId = '', promotionType = '', eventCursor = null, gap = false }) {
   return saveActivityCacheState({
     accountId, siteId, promotionId, promotionType, dirty: true,
-    continuity: gap ? 'gap' : undefined, eventCursor,
+    continuity: gap ? 'gap' : undefined, eventCursor, lastError: null,
   });
 }
 
@@ -827,6 +895,31 @@ export function listResults(limit = 300) {
   );
 }
 
+export function listLatestWriteRepeatGuards({ accountId, action, sameDayStartIso }) {
+  return all(
+    `WITH ranked AS (
+       SELECT promotion_id, promotion_type, item_id, action, status, deal_price, error_cn, created_at,
+              ROW_NUMBER() OVER (
+                PARTITION BY promotion_id, promotion_type, action, item_id
+                ORDER BY id DESC
+              ) AS rn
+       FROM promo_action_results
+       WHERE account_id = ?
+         AND action = ?
+         AND TRIM(COALESCE(item_id, '')) <> ''
+         AND status IN ('success', 'failed', 'request_success', 'live_verified_removed', 'live_still_started', 'pending_verification')
+     )
+     SELECT promotion_id, promotion_type, item_id, action, status, deal_price, error_cn, created_at
+     FROM ranked
+     WHERE rn = 1
+       AND (
+         status = 'pending_verification'
+         OR (status IN ('failed', 'live_still_started') AND created_at >= ?)
+       )`,
+    [String(accountId || ''), String(action || ''), String(sameDayStartIso || '')],
+  );
+}
+
 export function listTaskSummaries(limit = 300, options = {}) {
   const requested = Math.max(Number(limit) || 20, 1);
   const includeDetails = options.includeDetails !== false;
@@ -1027,17 +1120,16 @@ function parseTaskIds(value) {
   }
 }
 
-export function listGlobalDiscountUpdateSummaries(limit = 300) {
+export function listGlobalDiscountExecutionSummaries(limit = 300) {
   const settings = readSettings();
   const requested = Math.max(Number(limit) || TASK_SUMMARY_CANONICAL_LIMIT, 1);
-  const rows = fetchTaskSummaryRows(Math.max(requested * 24, 480), settings, {
-    action: 'update',
-    mode: 'real'
+  const summaries = ['enroll', 'update'].flatMap((action) => {
+    const rows = fetchTaskSummaryRows(Math.max(requested * 24, 480), settings, { action, mode: 'real' });
+    return buildLegacyTaskSummaries(rows, requested, { includeDetails: false, skipActionResults: true });
   });
-  return buildLegacyTaskSummaries(rows, requested, {
-    includeDetails: false,
-    skipActionResults: true
-  });
+  return summaries
+    .sort((a, b) => Date.parse(b.updated_at || b.created_at || 0) - Date.parse(a.updated_at || a.created_at || 0))
+    .slice(0, requested);
 }
 
 function fetchTaskSummaryRows(fetchLimit, settings, filters = {}) {
@@ -1318,7 +1410,10 @@ function buildBatchSummaryRow(group, options = {}) {
     countedSummary.planned = contractSummary.relation_count;
     countedSummary.total = contractSummary.relation_count;
   }
-  const processedTotal = countedSummary.success + countedSummary.failed + countedSummary.skipped;
+  const platformPendingTotal = Number(contractSummary?.platform_pending_count
+    ?? sumSummary(batchRows, 'platform_pending_count')
+    ?? 0);
+  const processedTotal = countedSummary.success + countedSummary.failed + countedSummary.skipped + platformPendingTotal;
   const candidatePoolTotal = Math.max(rawTotal, countedSummary.total, processedTotal);
   const isCancelAction = String(first.action || '') === 'cancel';
   const summary = {
@@ -1346,6 +1441,8 @@ function buildBatchSummaryRow(group, options = {}) {
     request_success_count: null,
     live_verified_removed_count: null,
     pending_verification_count: null,
+    platform_pending_count: null,
+    retryable_pending_count: null,
   });
   const stores = [...new Set([...batchRows, ...details].map((row) => row.store_name).filter(Boolean))];
   const sites = [...new Set(details.map((row) => row.site_name).filter(Boolean))];
@@ -1381,6 +1478,8 @@ function buildBatchSummaryRow(group, options = {}) {
     request_success_count: summary.request_success_count,
     live_verified_removed_count: summary.live_verified_removed_count,
     pending_verification_count: summary.pending_verification_count,
+    platform_pending_count: summary.platform_pending_count,
+    retryable_pending_count: summary.retryable_pending_count,
     seller_activity_text: summary.seller_activity_text,
     official_activity_text: summary.official_activity_text,
     detail_count: details.length,
@@ -1410,6 +1509,8 @@ function decorateTaskSummaryRow(row, options = {}) {
     request_success_count: row.request_success_count ?? summary.request_success_count ?? null,
     live_verified_removed_count: row.live_verified_removed_count ?? summary.live_verified_removed_count ?? null,
     pending_verification_count: row.pending_verification_count ?? summary.pending_verification_count ?? null,
+    platform_pending_count: row.platform_pending_count ?? summary.platform_pending_count ?? null,
+    retryable_pending_count: row.retryable_pending_count ?? summary.retryable_pending_count ?? null,
     short_failure_reason: row.short_failure_reason || shortFailureReason(
       reasons,
       Number(row.skipped_count || summary.skipped || 0),
@@ -1477,6 +1578,8 @@ function taskDetail(row) {
     request_success_count: summary.request_success_count ?? null,
     live_verified_removed_count: summary.live_verified_removed_count ?? null,
     pending_verification_count: summary.pending_verification_count ?? null,
+    platform_pending_count: summary.platform_pending_count ?? null,
+    retryable_pending_count: summary.retryable_pending_count ?? null,
     action: row.action,
     mode: row.mode,
     total_count: detailTotal,

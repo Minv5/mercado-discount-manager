@@ -16,13 +16,13 @@ sys.path.insert(0, str(ROOT))
 
 from PySide6.QtCore import QDate, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QDialog, QFrame, QLabel, QMessageBox, QStyle, QStyleOptionSpinBox  # noqa: E402
+from PySide6.QtWidgets import QAbstractItemView, QDialog, QFrame, QLabel, QLineEdit, QMessageBox, QStyle, QStyleOptionSpinBox  # noqa: E402
 
 from app import create_application  # noqa: E402
 from core import Account, account_from_json, completed_execution_for_scope, execution_completion_text  # noqa: E402
 from core import execution_group_payload  # noqa: E402
 from dialogs import ConfirmDialog, SellerCampaignCreateDialog, SettingsDialog, target_label  # noqa: E402
-from main_window import MainWindow, business_details_text, business_task_text, execution_log_message  # noqa: E402
+from main_window import MainWindow, benchmark_text, business_details_text, business_task_text, execution_log_message  # noqa: E402
 from api_client import ApiError  # noqa: E402
 from theme import APP_QSS, COLORS  # noqa: E402
 
@@ -175,6 +175,7 @@ class QtUiTests(unittest.TestCase):
         self.window._on_execute_clicked()
         self.assertFalse(any(method == "POST" and path == "/api/execution/submissions/prepare" for method, path, _body in self.api.calls))
 
+    @unittest.skip("same-day secondary confirmation retired")
     def test_manual_action_change_warning_cancel_creates_zero_prepare(self) -> None:
         self.window._run_worker = lambda operation, success, _failure: success(operation())  # type: ignore[method-assign]
         self.window.pending_prepare_payload = {
@@ -202,6 +203,7 @@ class QtUiTests(unittest.TestCase):
         self.assertTrue(any(path.endswith("/same-day-confirmations/cancel") for _method, path, _body in self.api.calls))
         self.assertEqual(self.window.preparing_submission, {})
 
+    @unittest.skip("same-day secondary confirmation retired")
     def test_manual_same_action_can_explicitly_continue_after_warning(self) -> None:
         self.window._poll_prepare = lambda: None  # type: ignore[method-assign]
         self.window._run_worker = lambda operation, success, _failure: success(operation())  # type: ignore[method-assign]
@@ -237,6 +239,15 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(prepare_body["client_submission_id"], "CLIENT-2")
         self.assertEqual(prepare_body["same_day_confirmation_token"], "TOKEN-2")
         self.window.prepare_poll_timer.stop()
+
+    def test_manual_completion_label_has_no_second_confirmation_hint(self) -> None:
+        self.window.mode_combo.blockSignals(True)
+        self.window.mode_combo.setCurrentIndex(1)
+        self.window.mode_combo.blockSignals(False)
+        self.window._apply_today_execution_groups([self._completed_update()])
+        self.assertNotIn("另一项真实操作", self.window.today_label.text())
+        self.assertNotIn("再次提示", self.window.today_label.text())
+        self.assertFalse(hasattr(self.window, "_confirm_server_same_day_action"))
 
     def test_server_today_completed_response_clears_prepare_without_retry(self) -> None:
         self.window.pending_prepare_payload = {
@@ -419,10 +430,10 @@ class QtUiTests(unittest.TestCase):
         self.assertIn("每个活动", self.window.records_table.horizontalHeaderItem(4).toolTip())
         self.assertIn("活动失败不计入商品失败", self.window.records_table.horizontalHeaderItem(6).toolTip())
         self.assertEqual(self.window.records_table.item(0, 4).text(), "100 / 140")
-        self.assertEqual(self.window.records_table.item(0, 5).text(), "取消请求 100\n确认移除 80\n待平台确认 20")
+        self.assertEqual(self.window.records_table.item(0, 5).text(), "取消请求 100\n成功取消 80\n待平台确认 20")
         self.assertEqual(self.window.records_table.item(0, 6).text(), "商品 5 / 活动 2")
         self.assertEqual(self.window.records_table.item(1, 5).text(), "成功 84 / 跳过 5")
-        self.assertNotIn("确认移除", self.window.records_table.item(1, 5).text())
+        self.assertNotIn("成功取消", self.window.records_table.item(1, 5).text())
         self.assertEqual(self.window.records_table.item(2, 4).text(), "旧记录未区分 / -")
         self.assertEqual(self.window.records_table.item(2, 5).text(), "旧记录未区分")
 
@@ -445,7 +456,7 @@ class QtUiTests(unittest.TestCase):
         }
         text = business_task_text(cancel)
         self.assertIn("取消请求成功：100", text)
-        self.assertIn("平台确认移除：0", text)
+        self.assertIn("成功取消：0", text)
         self.assertIn("取消请求已提交，待平台回查确认：100", text)
         self.assertIn("商品失败：4", text)
         self.assertIn("活动失败：2", text)
@@ -454,8 +465,8 @@ class QtUiTests(unittest.TestCase):
         old = {"action": "cancel", "total_count": 12, "success_count": 12, "failed_count": 3}
         old_text = business_task_text(old)
         self.assertIn("唯一商品：旧记录未区分", old_text)
-        self.assertIn("平台确认移除：旧记录未区分", old_text)
-        self.assertNotIn("平台确认移除：12", old_text)
+        self.assertIn("成功取消：旧记录未区分", old_text)
+        self.assertNotIn("成功取消：12", old_text)
 
         details = business_details_text(cancel, [{**cancel, "store_name": "测试店", "site_name": "墨西哥站", "promotion_name": "活动A"}])
         self.assertIn("活动商品关系 100", details)
@@ -613,6 +624,30 @@ class QtUiTests(unittest.TestCase):
         self.assertIn("后台仍在核对范围", self.window.log_box.toPlainText())
         self.window.prepare_poll_timer.stop()
 
+    def test_prepare_progress_displays_business_scheduler_metrics_without_account_ids(self) -> None:
+        self.window._log_prepare_progress({"progress": {
+            "stage": "items", "percent": 82, "message": "正在核对可报名商品",
+            "read_scheduler": {
+                "dynamic_limit": 120, "max_limit": 125, "inflight": 96, "peak": 125,
+                "detail_inflight": 80, "detail_limit": 125,
+                "fallback_active": 2, "fallback_per_account": 2, "queued": 21,
+                "cooldown_ms": 2500, "rate_limit_count": 3, "network_error_count": 2,
+                "service_error_count": 1, "timeout_error_count": 4, "failure_count": 1, "retry_count": 11,
+                "local_work_concurrency": 3, "local_db_batch_queries": 2,
+                "per_account": [
+                    {"store_name": "湖北", "inflight": 4},
+                    {"store_name": "广州", "inflight": 3},
+                ],
+            },
+        }})
+        rendered = self.window.log_box.toPlainText()
+        self.assertIn("本地整理并行 3（批量查询 2）", rendered)
+        self.assertIn("平台读取并发 96/120（峰值 125，上限 125）", rendered)
+        self.assertIn("详情 80/125，库存兜底 2（每店上限 2），排队 21", rendered)
+        self.assertIn("限流 3 次，网络异常 2 次，服务异常 1 次，超时 4 次，最终失败 1 次，重试 11 次，冷却 3 秒", rendered)
+        self.assertIn("湖北 4、广州 3", rendered)
+        self.assertNotIn("2651442567", rendered)
+
     def test_prepared_poll_enters_existing_confirmation_and_failed_unlocks(self) -> None:
         prepared = []
         self.window._submission_prepared = lambda response: prepared.append(response)  # type: ignore[method-assign]
@@ -624,7 +659,26 @@ class QtUiTests(unittest.TestCase):
         with patch.object(QMessageBox, "warning"):
             self.window._prepare_polled({"prepare": {"prepare_id": "P-FAIL", "state": "failed", "error": "活动读取失败"}})
         self.assertFalse(self.window.preparing_submission)
-        self.assertEqual(self.window.execute_button.text(), "开始核对范围")
+        self.assertEqual(self.window.execute_button.text(), "开始执行")
+
+    def test_prepare_failure_uses_specific_safe_business_messages(self) -> None:
+        expected = {
+            "rate_limit": "平台读取触发限流，请稍后重新核对。",
+            "service": "平台服务暂时异常，请稍后重新核对。",
+            "timeout": "平台读取超时，请稍后重新核对。",
+            "network": "网络连接暂时异常，请检查网络后重新核对。",
+            "local_contract": "程序处理平台数据时发现格式异常，已安全停止准备。",
+            "local_storage": "本地状态暂时无法保存，已安全停止准备，请稍后重新核对。",
+            "unknown": "准备范围时发生未分类异常，已安全停止。",
+        }
+        shown = []
+        self.window._operation_error = lambda title, message: shown.append((title, message))  # type: ignore[method-assign]
+        for kind, message in expected.items():
+            self.window.preparing_submission = {"prepare_id": f"P-{kind}", "state": "preparing"}
+            self.window._prepare_polled({"prepare": {
+                "prepare_id": f"P-{kind}", "state": "failed", "error": "平台接口临时异常", "error_kind": kind,
+            }})
+            self.assertEqual(shown[-1], ("准备执行", message))
 
     def test_startup_restores_preparing_submission_poll(self) -> None:
         self.window.refresh_scope = lambda: None  # type: ignore[method-assign]
@@ -672,7 +726,7 @@ class QtUiTests(unittest.TestCase):
         success(operation())
         self.assertEqual(calls, ["/api/execution/submissions/P-LOCK/cancel"])
         self.assertFalse(self.window.preparing_submission)
-        self.assertEqual(self.window.execute_button.text(), "开始核对范围")
+        self.assertEqual(self.window.execute_button.text(), "开始执行")
         self.assertFalse(any(path.endswith("/commit") for path in calls))
 
     def test_close_during_preparing_detaches_service_without_stopping_node(self) -> None:
@@ -702,6 +756,7 @@ class QtUiTests(unittest.TestCase):
         self.window._set_busy(False, "基础数据已加载")
         self.assertFalse(self.window.execute_button.isEnabled())
         self.window.scope_ready = True
+        self.window.auto_action = "update"
         self.window._set_busy(False, "工作台已就绪")
         self.assertTrue(self.window.execute_button.isEnabled())
 
@@ -763,6 +818,33 @@ class QtUiTests(unittest.TestCase):
         self.window.poll_timer.stop()
         self.window.running_group.clear()
 
+    def test_running_group_logs_from_all_stores_are_displayed_in_timestamp_order(self) -> None:
+        self.window.running_group = {"id": "G1", "status": "running", "children": []}
+        response = {"group": {
+            "id": "G1",
+            "status": "running",
+            "action": "cancel",
+            "children": [
+                {"job_id": "JOB-B", "userLogs": [
+                    {"at": "2026-07-23T05:47:29.000Z", "message": "广州实时日志"},
+                ]},
+                {"job_id": "JOB-A", "userLogs": [
+                    {"at": "2026-07-23T05:47:28.000Z", "message": "湖北实时日志"},
+                ]},
+                {"job_id": "JOB-C", "userLogs": [
+                    {"at": "2026-07-23T05:47:30.000Z", "message": "湖南实时日志"},
+                ]},
+            ],
+        }}
+        self.window._group_polled(response)
+        text = self.window.log_box.toPlainText()
+        self.assertLess(text.index("湖北实时日志"), text.index("广州实时日志"))
+        self.assertLess(text.index("广州实时日志"), text.index("湖南实时日志"))
+        self.window._group_polled(response)
+        self.assertEqual(self.window.log_box.toPlainText().count("湖北实时日志"), 1)
+        self.window.poll_timer.stop()
+        self.window.running_group.clear()
+
     def test_poll_timeout_never_unlocks_or_starts_duplicate_group(self) -> None:
         self.window.running_group = {"id": "G1", "status": "running", "children": []}
         self.window._set_execution_busy(True)
@@ -784,7 +866,7 @@ class QtUiTests(unittest.TestCase):
             "result": {"action": "update", "store_count": 0, "stores": [], "total": 0, "success": 0, "failed": 0, "skipped": 0},
         }})
         self.assertFalse(self.window.running_group)
-        self.assertEqual(self.window.execute_button.text(), "开始核对范围")
+        self.assertEqual(self.window.execute_button.text(), "开始执行")
 
     def test_final_completion_refreshes_recent_and_current_all_view(self) -> None:
         refreshed: list[list[str]] = []
@@ -796,7 +878,7 @@ class QtUiTests(unittest.TestCase):
         self.assertFalse(self.window.running_group)
         self.assertEqual(refreshed, [["recent"]])
         self.assertNotIn("all", self.window.records_cache)
-        self.assertEqual(self.window.execute_button.text(), "开始核对范围")
+        self.assertEqual(self.window.execute_button.text(), "开始执行")
 
         self.window.records_view = "all"
         self.window.running_group = {"id": "G2", "status": "running", "children": []}
@@ -828,6 +910,78 @@ class QtUiTests(unittest.TestCase):
             "3408885754": "湖南自定义",
         })
 
+    def test_settings_oauth_fields_mask_secret_and_preserve_webhook_url(self) -> None:
+        dialog = SettingsDialog({
+            "oauthClientId": "client-123",
+            "oauthClientSecretConfigured": True,
+            "oauthRedirectUri": "https://example.test/callback",
+            "webhookCallbackUrl": "https://callback.example.test/webhook",
+        }, [], [], "")
+        self.assertEqual(dialog.oauth_client_id.text(), "client-123")
+        self.assertEqual(dialog.oauth_client_secret.text(), "")
+        self.assertEqual(dialog.oauth_client_secret.echoMode(), QLineEdit.EchoMode.Password)
+        self.assertIn("已保存", dialog.oauth_client_secret.placeholderText())
+        self.assertEqual(dialog.oauth_redirect_uri.text(), "https://example.test/callback")
+        self.assertEqual(dialog.webhook_callback_url.text(), "https://callback.example.test/webhook")
+        labels = {label.text() for label in dialog.findChildren(QLabel)}
+        self.assertTrue({"美客多应用 Client ID", "美客多应用 Client Secret", "OAuth 回调地址", "Webhook 通知地址"}.issubset(labels))
+        self.assertNotIn("Mercado App Client ID", labels)
+        self.assertNotIn("Webhook Callback URL", labels)
+        self.assertIn("独立回调服务", dialog.webhook_callback_url.placeholderText())
+        values = dialog.values()
+        self.assertEqual(values["oauthClientSecret"], "")
+        self.assertEqual(values["webhookCallbackUrl"], "https://callback.example.test/webhook")
+
+    def test_settings_concurrency_controls_show_effective_scheduler_limits(self) -> None:
+        dialog = SettingsDialog({
+            "readConcurrency": 125,
+            "previewConcurrency": 42,
+            "writeConcurrency": 24,
+        }, [], [], "")
+        self.assertEqual(dialog.read_concurrency.maximum(), 125)
+        self.assertEqual(dialog.activity_concurrency.maximum(), 192)
+        self.assertEqual(dialog.write_concurrency.maximum(), 160)
+        self.assertEqual(dialog.values()["readConcurrency"], 125)
+        self.assertEqual(dialog.values()["previewConcurrency"], 42)
+        self.assertEqual(dialog.values()["writeConcurrency"], 24)
+        labels = {label.text() for label in dialog.findChildren(QLabel)}
+        self.assertTrue({"读取全局上限", "活动目录并发上限", "商品写入全局上限"}.issubset(labels))
+        self.assertNotIn("读取并发（当前使用值）", labels)
+
+    def test_settings_dialog_uses_safe_effective_defaults_and_server_refresh(self) -> None:
+        dialog = SettingsDialog({}, [], [], "旧并发说明")
+        self.assertEqual(
+            (dialog.read_concurrency.value(), dialog.activity_concurrency.value(), dialog.write_concurrency.value()),
+            (125, 192, 160),
+        )
+        dialog.apply_settings_context({
+            "authDir": "C:/authorized",
+            "readConcurrency": 20,
+            "previewConcurrency": 20,
+            "writeConcurrency": 350,
+            "oauthClientId": "saved-client",
+            "oauthClientSecretConfigured": True,
+        })
+        self.assertEqual(dialog.auth_dir.text(), "C:/authorized")
+        self.assertEqual(
+            (dialog.read_concurrency.value(), dialog.activity_concurrency.value(), dialog.write_concurrency.value()),
+            (20, 20, 160),
+        )
+        self.assertEqual(dialog.oauth_client_id.text(), "saved-client")
+        self.assertIn("已保存", dialog.oauth_client_secret.placeholderText())
+
+    def test_concurrency_explanation_matches_effective_limits(self) -> None:
+        text = benchmark_text({})
+        self.assertIn("商品读取 125", text)
+        self.assertIn("活动目录 192", text)
+        self.assertIn("批量取消 160", text)
+        self.assertIn("批量报名 160", text)
+        self.assertIn("报名 192", text)
+        self.assertIn("批量更新 128", text)
+        self.assertIn("自动降档", text)
+        self.assertNotIn("350", text)
+        self.assertNotIn("300-320", text)
+
     def test_settings_dialog_opens_from_snapshot_without_remote_wait(self) -> None:
         accounts = [Account("2651442567", "PLATFORM_NICK", "CBT", "湖北")]
         started = time.perf_counter()
@@ -855,6 +1009,27 @@ class QtUiTests(unittest.TestCase):
             self.window._open_settings()
         self.assertLess((time.perf_counter() - started) * 1000, 200)
         self.assertEqual(len(scheduled), 1)
+
+    def test_settings_context_loads_latest_normalized_settings(self) -> None:
+        self.window.accounts = [Account("A1", "RAW", "CBT", "测试店")]
+        calls: list[str] = []
+
+        def get(path: str, **_kwargs):
+            calls.append(path)
+            if path == "/api/settings":
+                return {"settings": {"readConcurrency": 20, "previewConcurrency": 20, "writeConcurrency": 24}}
+            if path.startswith("/api/accounts/profiles/refresh"):
+                return {"accounts": [{"account_id": "A1", "raw_display_name": "RAW", "store_name": "测试店", "site_id": "CBT"}]}
+            if path.startswith("/api/accounts/A1/sites"):
+                return {"sites": []}
+            if path == "/api/concurrency-benchmark/results":
+                return {"results": {}}
+            raise AssertionError(path)
+
+        self.api.get = get  # type: ignore[method-assign]
+        context = self.window._load_settings_context()
+        self.assertIn("/api/settings", calls)
+        self.assertEqual(context["settings"], {"readConcurrency": 20, "previewConcurrency": 20, "writeConcurrency": 24})
 
     def test_settings_background_merge_is_keyed_and_preserves_current_edits(self) -> None:
         accounts = [
@@ -911,6 +1086,27 @@ class QtUiTests(unittest.TestCase):
         )
         self.assertEqual(dialog.values()["operatingSites"], {"2651442567": ["MLB", "MLM"]})
 
+    def test_settings_persists_separate_seller_and_official_cycle_maximums(self) -> None:
+        dialog = SettingsDialog(
+            {"sellerMaxDiscount": 15, "officialMaxDiscount": 16},
+            [Account("A1", "RAW_A1", "CBT", "测试店")],
+            [],
+            "",
+        )
+        self.assertEqual(dialog.seller_max_discount.value(), 15)
+        self.assertEqual(dialog.official_max_discount.value(), 16)
+        values = dialog.values()
+        self.assertEqual(values["sellerMaxDiscount"], 15)
+        self.assertEqual(values["officialMaxDiscount"], 16)
+
+    def test_settings_cycle_maximums_are_unconfigured_by_default(self) -> None:
+        dialog = SettingsDialog({}, [Account("A1", "RAW_A1", "CBT", "测试店")], [], "")
+        self.assertEqual(dialog.seller_max_discount.value(), 0)
+        self.assertEqual(dialog.official_max_discount.value(), 0)
+        self.assertEqual(dialog.seller_max_discount.specialValueText(), "未设置")
+        self.assertIsNone(dialog.values()["sellerMaxDiscount"])
+        self.assertIsNone(dialog.values()["officialMaxDiscount"])
+
     def test_settings_store_names_keep_raw_identity_and_account_binding(self) -> None:
         accounts = [
             Account("2651442567", "CNHUBEISHENGRUIHESHANGM", "CBT", "湖北"),
@@ -936,6 +1132,24 @@ class QtUiTests(unittest.TestCase):
             {"2651442567": "湖北", "3332096437": "广州", "3408885754": "湖南"},
         )
         self.assertEqual(dialog.values()["storeAliases"], {})
+        self.assertGreaterEqual(dialog.store_table.columnWidth(0), 340)
+        self.assertEqual(
+            dialog.store_table.editTriggers(),
+            QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed,
+        )
+        raw_item = dialog.store_table.item(rows_by_account["2651442567"], 0)
+        self.assertEqual(raw_item.toolTip(), "CNHUBEISHENGRUIHESHANGM")
+        editable_item = dialog.store_table.item(rows_by_account["2651442567"], 1)
+        dialog.store_table.editItem(editable_item)
+        self.app.processEvents()
+        editor = next(
+            (child for child in dialog.store_table.findChildren(QLineEdit) if child.parent() is dialog.store_table.viewport()),
+            None,
+        )
+        self.assertIsNotNone(editor)
+        self.assertEqual(editor.font().pointSizeF(), dialog.store_table.font().pointSizeF())
+        self.assertIn("padding: 0 4px", editor.styleSheet())
+        self.assertFalse(editor.hasFrame())
 
         dialog.store_table.setSortingEnabled(True)
         dialog.store_table.sortItems(0, Qt.SortOrder.DescendingOrder)
@@ -1055,10 +1269,29 @@ class QtUiTests(unittest.TestCase):
                        "stores": [{**counts, "account_id": "A1", "status": "completed"}]},
         }})
         text = self.window.log_box.toPlainText()
-        self.assertIn("取消请求成功 100，平台确认移除 80，取消请求已提交，待平台回查确认 20", text)
+        self.assertIn("取消请求成功 100，成功取消 80，取消请求已提交，待平台回查确认 20", text)
         self.assertIn("商品失败 3，活动失败 2", text)
         self.assertNotIn("，成功 100，", text)
         self.assertNotIn("A1", text)
+
+    def test_enroll_terminal_log_separates_platform_pending_from_failures(self) -> None:
+        self.window.accounts = [Account("A1", "", "CBT", "测试店")]
+        self.window.running_group = {"id": "G1", "status": "running", "children": []}
+        self.window._refresh_records_after_group = lambda: None  # type: ignore[method-assign]
+        counts = {
+            "unique_item_count": 120, "relation_count": 130, "activity_failure_count": 0,
+            "success": 100, "failed": 10, "skipped": 0,
+            "pending_verification_count": 20, "platform_pending_count": 20,
+            "retryable_pending_count": 0,
+        }
+        self.window._group_polled({"group": {
+            "id": "G1", "status": "completed", "action": "enroll", "children": [],
+            "result": {**counts, "action": "enroll", "store_count": 1,
+                       "stores": [{**counts, "account_id": "A1", "status": "completed"}]},
+        }})
+        text = self.window.log_box.toPlainText()
+        self.assertIn("成功 100，平台已接受待生效 20，商品失败 10", text)
+        self.assertNotIn("待平台回查确认 20", text)
 
     def test_terminal_null_result_is_safe(self) -> None:
         self.window.accounts = [Account("3408885754", "", "CBT", "湖南")]

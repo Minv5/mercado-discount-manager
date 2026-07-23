@@ -13,16 +13,18 @@ import { activityItemsDecision, isActivityExpired, nextNonPeakCalibrationAt, pla
 import { activityCallbackConfig, createActivityCallbackAdapter } from './activityCallbackAdapter.js';
 import { createActivityWebhookConsumer } from './activityWebhookConsumer.js';
 import { buildCandidateIncompleteResolution, buildManualCandidateDraftRows, parseManualCandidateItemIds } from './candidateResolution.js';
-import { MAX_READ_CONCURRENCY, MAX_WRITE_CONCURRENCY, mapLimited, mapLimitedWithCap, normalizeConcurrency, normalizeConcurrencyWithCap, normalizeWriteConcurrency } from './concurrency.js';
-import { BALANCED_READ_PROFILES, buildReadConcurrencyReport, createBalancedReadScheduler } from './balancedReadScheduler.js';
+import { MAX_READ_CONCURRENCY, MAX_WRITE_CONCURRENCY, mapLimited, mapLimitedWithCap, normalizeActivityConcurrency, normalizeConcurrency, normalizeConcurrencyWithCap, normalizeWriteConcurrency } from './concurrency.js';
+import { buildReadConcurrencyReport, createBalancedReadScheduler, prepareReadSchedulerProfile } from './balancedReadScheduler.js';
 import { createAsyncLimiter, executePlannedRowsWithConcurrency } from './executor.js';
-import { ADAPTIVE_WRITE_PROFILE, createAdaptiveWriteScheduler } from './adaptiveWriteScheduler.js';
+import { adaptiveWriteProfileForAction, createAdaptiveWriteScheduler } from './adaptiveWriteScheduler.js';
 import { createPendingWriteQueue, pendingRelationKey } from './pendingWriteQueue.js';
 import {
+  filterPendingRecordsByConfirmedScope,
   filterItemsByConfirmedScope,
   filterItemsByRequestedIds,
   filterPromotionsByConfirmedScope,
   hasConfirmedExecutionScope,
+  partitionItemsByAllowedIds,
   requestedItemFilterErrorMessage,
 } from './executionItemFilter.js';
 import {
@@ -33,7 +35,7 @@ import {
   isSellerCampaign
 } from './inventoryFallback.js';
 import { decideCycleAction, getCycleState, markCycleAfterTask, nextDiscountFor } from './cycle.js';
-import { ApiError, toChineseError } from './errors.js';
+import { ApiError, classifyPrepareError, prepareErrorMessage, toChineseError } from './errors.js';
 import { MercadoLibreClient, buildAuthorizationUrl, extractMarketplaceUsers, extractPromotions, mergePromotionsByIdentity } from './mlClient.js';
 import { accountProfileRecord } from './accountProfiles.js';
 import {
@@ -88,6 +90,7 @@ import {
   getCampaign,
   getItemFetchState,
   getActivityCacheState,
+  applySuccessfulPromotionItemWrites,
   hasActivityCallbackEvent,
   listAllMarketplaceSites,
   listStoredAccounts,
@@ -98,11 +101,12 @@ import {
   listItemFetchStatesForPromotions,
   listItems,
   listItemsForPromotions,
-  listGlobalDiscountUpdateSummaries,
+  listGlobalDiscountExecutionSummaries,
   listHiddenSellerCampaignsForAccount,
   listHiddenSellerCampaignsForRoute,
   listPendingOAuthStates,
   listPreparationReadStates,
+  listLatestWriteRepeatGuards,
   listResults,
   listTaskDetails,
   listTaskSummaries,
@@ -110,6 +114,7 @@ import {
   listSellerCampaignRecoveryCandidates,
   listVerifiedActivityCallbackPromotionMappings,
   invalidateMarketplaceSiteCatalog,
+  invalidatePromotionItemFetchStates,
   markCampaignsCatalogRemoved,
   saveMarketplaceSites,
   deleteItemsBySource,
@@ -118,6 +123,7 @@ import {
   saveItemFetchState,
   recordActivityCatalogCalibration,
   recordActivityItemsCalibration,
+  reconcilePromotionItemFetchCounts,
   markActivityCacheDirty,
   saveActivityCacheState,
   saveActivityCallbackEvent,
@@ -130,9 +136,11 @@ import {
   updateAccountToken,
   publishHistorySummaryForExecutionGroup
 } from './repository.js';
+import { isTransientOfferLockError, shouldInvalidateWriteCache } from './writeFailurePolicy.js';
+import { applyWriteRepeatGuards, shanghaiDayStartIso } from './writeRepeatGuard.js';
 import { getDb } from './db.js';
 import { buildSubmitPayloadPreview, requireExecutableSubmitPayload, requireItemStatus } from './promotionPayload.js';
-import { readSettings, saveSettings } from './settings.js';
+import { hasConfiguredCycleMaximums, readSettings, resolveOAuthConfig, saveSettings } from './settings.js';
 import { filterByOperatingSites, hasOperatingSiteScope, mergeOperatingSiteEvidence, operatingSiteIds } from './operatingSites.js';
 import { decideToday } from './today.js';
 import { buildGlobalTodayDiscount } from './globalTodayDiscount.js';
@@ -143,6 +151,7 @@ import {
   TERMINAL_EXECUTION_GROUP_STATUSES,
   createExecutionGroupPersistence,
   executionGroupBusinessScope,
+  projectLiveExecutionGroupChildren,
   summarizeExecutionGroup
 } from './executionGroupPersistence.js';
 import { PRODUCT_BUILD_INFO, PRODUCT_DISPLAY_NAME } from './productContract.js';
@@ -198,6 +207,7 @@ let nextWriteBenchmarkJobSeq = 1;
 const CONCURRENCY_BENCHMARK_PATH = path.join(DATA_DIR, 'concurrency-benchmark-results.json');
 const WRITE_BENCHMARK_JOB_DIR = path.join(DATA_DIR, 'write-benchmark-jobs');
 const WRITE_BENCHMARK_JOB_INDEX_PATH = path.join(WRITE_BENCHMARK_JOB_DIR, 'index.json');
+const WRITE_BENCHMARK_AUTHORIZATION_DIR = path.join(DATA_DIR, 'write-benchmark-authorizations');
 const EXECUTION_JOB_EVENT_DIR = path.join(DATA_DIR, 'execution-job-events');
 const EXECUTION_JOB_STATE_DIR = path.join(DATA_DIR, 'execution-job-states');
 const EXECUTION_GROUP_STATE_DIR = path.join(DATA_DIR, 'execution-group-states');
@@ -256,18 +266,22 @@ const LEGACY_SYNC_WRITE_ROUTES = new Set([
 ]);
 const LEGACY_SYNC_WRITE_MESSAGE = '旧版同步执行入口已停用，请使用当前桌面版后台执行任务。';
 const LATEST_WRITE_BENCHMARK_STATUS = {
-  tool_status: '后台压测工具已启用逐商品落盘',
-  source: '真实测试线程最新回传',
-  action: 'update',
-  target_discount_percent: 10,
-  verified_stable_concurrency: 350,
-  verified_note: '350 两次稳定，峰值 350，接口类失败 0',
-  daily_recommendation_text: '保守 300-320；追求速度可手动设 350，并保留停止/回查',
-  daily_recommended_min: 300,
-  daily_recommended_max: 320,
-  manual_fast_value: 350,
-  formal_compact_result_pending: true,
-  updated_at: '2026-07-05T00:00:00+08:00'
+  tool_status: '全店铺三轮真实批量测试已完成',
+  source: '2026-07-22 全店铺真实三轮证据',
+  action: 'action_specific',
+  verified_stable_concurrency: 160,
+  verified_note: '全店铺持续报名在192出现503次429和18次网络失败，正式报名降为160并放慢恢复；更新128、取消160保持实测档',
+  action_profiles: {
+    cancel: { initial: 160, max: 160, per_route: 54, first_unstable: 176 },
+    enroll: { initial: 160, max: 160, per_route: 28, sustained_192_rate_limits: 503, sustained_192_network_errors: 18 },
+    update: { initial: 128, max: 128, per_route: 28, first_unstable: 144 },
+  },
+  daily_recommendation_text: '按全量持续实测使用：批量取消160、批量报名160、批量更新128；临时接口异常自动降档，报名恢复升档采用慢窗口',
+  daily_recommended_min: 128,
+  daily_recommended_max: 192,
+  manual_fast_value: 192,
+  formal_compact_result_pending: false,
+  updated_at: '2026-07-22T14:46:11+08:00'
 };
 
 getDb();
@@ -333,7 +347,7 @@ async function runLowFrequencyActivityCalibration() {
       for (const status of ['candidate', 'started']) {
         const cacheState = getActivityCacheState(account.account_id, campaign.site_id, campaign.promotion_id, campaign.promotion_type);
         const fetchState = getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, status);
-        if (!activityItemsDecision({ promotion: campaign, cacheState, fetchState }).refresh) continue;
+        if (!activityItemsDecision({ promotion: campaign, cacheState, fetchState, itemStatus: status }).refresh) continue;
         await fetchAndSavePromotionItemsForCampaign({ account, campaign, status, maxItems: 'all', fetchMode: 'full' });
       }
     });
@@ -530,6 +544,16 @@ async function handleApi(req, res) {
     const job = loadWriteBenchmarkJob(writeBenchmarkItemsMatch[1]);
     if (!job) return sendJson(res, 404, { ok: false, error: '未找到写入并发压测任务。' });
     const limit = Math.max(1, Math.min(5000, Math.floor(Number(url.searchParams.get('limit') || 500))));
+    if (url.searchParams.has('offset')) {
+      const offset = Math.max(0, Math.floor(Number(url.searchParams.get('offset') || 0)));
+      const page = readWriteBenchmarkJobEventPage(job.id, { offset, limit });
+      return sendJson(res, 200, {
+        ok: true,
+        job: publicWriteBenchmarkJob(job),
+        ...page,
+        items: writeBenchmarkItemsFromEvents(page.events),
+      });
+    }
     const events = readWriteBenchmarkJobEvents(job.id, limit);
     return sendJson(res, 200, { ok: true, job: publicWriteBenchmarkJob(job), events, items: writeBenchmarkItemsFromEvents(events) });
   }
@@ -703,9 +727,11 @@ async function handleApi(req, res) {
     const state = createState();
     const standaloneConfig = readStandaloneConfig();
     const standaloneToken = readStandaloneToken();
-    const prepared = prepareOAuthStartFromConfig(standaloneConfig, {
+    const oauthConfig = resolveOAuthConfig(standaloneConfig);
+    const prepared = prepareOAuthStartFromConfig(oauthConfig, {
       pkce: { verifier, challenge },
       state,
+      redirectUri: oauthConfig.redirect_uri,
       tokenRedirectUri: standaloneToken?.redirect_uri
     });
     clearOAuthStates();
@@ -1354,7 +1380,7 @@ async function handleApi(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/today/global-discount') {
     const settings = readSettings();
-    const tasks = listGlobalDiscountUpdateSummaries(300);
+    const tasks = listGlobalDiscountExecutionSummaries(300);
     return sendJson(res, 200, {
       ok: true,
       discount: buildGlobalTodayDiscount({ tasks, settings, today: new Date() })
@@ -1888,7 +1914,11 @@ async function executeAction(res, body) {
       taskId,
       writeConcurrency: request.writeConcurrency,
       maxRounds: readSettings().cancelMaxRounds,
-      counts: execution.counts
+      counts: execution.counts,
+      allowedItemIds: (plan.rows || []).map((row) => row.item?.item_id).filter(Boolean),
+      retryableItemIds: (execution.results || [])
+        .filter((result) => result?.status === 'success')
+        .map((result) => result.itemId),
     });
   }
   const completed = execution.counts.failed === 0 && plan.rows.length + unreadable === execution.counts.success + execution.counts.skipped;
@@ -1916,21 +1946,17 @@ async function executeAction(res, body) {
   });
 }
 
-async function recheckAndCancelRemainingStarted({ client, accountId, campaign, promotionId, promotionType, action, taskId, writeConcurrency, maxRounds, counts, saveResult = saveExecutionResult, executionJobId, shouldCancel }) {
+async function recheckAndCancelRemainingStarted({ client, accountId, campaign, promotionId, promotionType, action, taskId, writeConcurrency, maxRounds, counts, saveResult = saveExecutionResult, executionJobId, shouldCancel, schedule = null, allowedItemIds = null, retryableItemIds = null, settleDelaysMs = [5_000, 15_000, 30_000] }) {
   const rounds = [];
-  for (let round = 1; round <= maxRounds; round += 1) {
-    if (shouldCancel?.()) return { remainingStarted: null, remainingItemIds: null, rounds, completed: false, cancelled: true };
+  const excludedOutOfScopeItemIds = new Set();
+  const retryable = new Set((retryableItemIds || allowedItemIds || []).map(String).filter(Boolean));
+  const readRemaining = async ({ round, poll, delayMs = 0 }) => {
+    if (delayMs > 0) await sleep(delayMs);
     let after;
     try {
       after = await client.fetchAllPromotionItems({ promotionId, promotionType, status: 'started', maxItems: 5000 });
     } catch (error) {
-      return {
-        remainingStarted: null,
-        remainingItemIds: null,
-        rounds,
-        completed: false,
-        read_error: toChineseError(error),
-      };
+      return { readError: toChineseError(error) };
     }
     saveItems(accountId, promotionId, promotionType, after.results, {
       childUserId: campaign?.child_user_id,
@@ -1939,10 +1965,61 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
       replaceStatus: 'started',
       itemStatus: 'started'
     });
-    rounds.push({ round, remainingStarted: after.results.length });
-    if (after.results.length === 0) return { remainingStarted: 0, remainingItemIds: [], rounds, completed: true };
+    const partition = partitionItemsByAllowedIds(after.results, allowedItemIds);
+    for (const item of partition.outOfScope) {
+      const itemId = String(item?.item_id || item?.id || '');
+      if (!itemId || excludedOutOfScopeItemIds.has(itemId)) continue;
+      excludedOutOfScopeItemIds.add(itemId);
+      appendExecutionItemAuditEvent(executionJobId, {
+        type: 'item_out_of_confirmed_scope',
+        account: { account_id: accountId },
+        promotion: campaign,
+        taskId,
+        action,
+        row: { item, deal_price: item.price },
+        status: 'excluded_new_item',
+        reason: '提交后实时回查发现新增商品，本次冻结范围不纳入且未发送取消请求',
+        sentToApi: false,
+      });
+    }
+    rounds.push({
+      round,
+      poll,
+      delay_ms: delayMs,
+      observedStarted: after.results.length,
+      remainingStarted: partition.inScope.length,
+      retryableRemaining: partition.inScope.filter((item) => retryable.has(String(item.item_id || item.id || ''))).length,
+      excludedOutOfScope: partition.outOfScope.length,
+    });
+    return { remaining: partition.inScope };
+  };
+  for (let round = 1; round <= maxRounds; round += 1) {
+    if (shouldCancel?.()) return { remainingStarted: null, remainingItemIds: null, rounds, completed: false, cancelled: true };
+    let read = await readRemaining({ round, poll: 0 });
+    if (read.readError) return { remainingStarted: null, remainingItemIds: null, rounds, completed: false, read_error: read.readError };
+    let remaining = read.remaining;
+    if (remaining.length === 0) return {
+      remainingStarted: 0,
+      remainingItemIds: [],
+      excludedOutOfScopeItemIds: [...excludedOutOfScopeItemIds],
+      rounds,
+      completed: true,
+    };
+    for (let poll = 0; poll < settleDelaysMs.length && remaining.some((item) => retryable.has(String(item.item_id || item.id || ''))); poll += 1) {
+      if (shouldCancel?.()) return { remainingStarted: null, remainingItemIds: null, rounds, completed: false, cancelled: true };
+      read = await readRemaining({ round, poll: poll + 1, delayMs: Math.max(0, Number(settleDelaysMs[poll]) || 0) });
+      if (read.readError) return { remainingStarted: null, remainingItemIds: null, rounds, completed: false, read_error: read.readError };
+      remaining = read.remaining;
+      if (remaining.length === 0) return {
+        remainingStarted: 0,
+        remainingItemIds: [],
+        excludedOutOfScopeItemIds: [...excludedOutOfScopeItemIds],
+        rounds,
+        completed: true,
+      };
+    }
     if (String(promotionType || '').toUpperCase() === 'SMART') {
-      for (const item of after.results) {
+      for (const item of remaining) {
         appendExecutionItemAuditEvent(executionJobId, {
           type: 'item_remaining_started',
           account: { account_id: accountId },
@@ -1954,10 +2031,10 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
           reason: 'SMART取消验证只做只读回查，不自动重试剩余商品'
         });
       }
-      return { remainingStarted: after.results.length, remainingItemIds: after.results.map((item) => String(item.item_id || item.id || '')).filter(Boolean), rounds, completed: false, smart_cancel_no_auto_retry: true };
+      return { remainingStarted: remaining.length, remainingItemIds: remaining.map((item) => String(item.item_id || item.id || '')).filter(Boolean), excludedOutOfScopeItemIds: [...excludedOutOfScopeItemIds], rounds, completed: false, smart_cancel_no_auto_retry: true };
     }
     if (round === maxRounds) {
-      for (const item of after.results) {
+      for (const item of remaining) {
         appendExecutionItemAuditEvent(executionJobId, {
           type: 'item_remaining_started',
           account: { account_id: accountId },
@@ -1969,13 +2046,17 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
           reason: '取消后仍处于 started'
         });
       }
-      return { remainingStarted: after.results.length, remainingItemIds: after.results.map((item) => String(item.item_id || item.id || '')).filter(Boolean), rounds, completed: false };
+      return { remainingStarted: remaining.length, remainingItemIds: remaining.map((item) => String(item.item_id || item.id || '')).filter(Boolean), excludedOutOfScopeItemIds: [...excludedOutOfScopeItemIds], rounds, completed: false };
     }
 
+    const retryItems = remaining.filter((item) => retryable.has(String(item.item_id || item.id || '')));
+    if (!retryItems.length) {
+      return { remainingStarted: remaining.length, remainingItemIds: remaining.map((item) => String(item.item_id || item.id || '')).filter(Boolean), excludedOutOfScopeItemIds: [...excludedOutOfScopeItemIds], rounds, completed: false, business_failures_only: true };
+    }
     const retryPlan = buildPlan({
       action: 'cancel',
       promotion: campaign,
-      items: after.results,
+      items: retryItems,
       priceMode: 'discount'
     });
     const retry = await executePlannedRowsWithConcurrency({
@@ -1986,6 +2067,7 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
       accountId,
       taskId,
       writeConcurrency,
+      schedule,
       shouldCancel,
       executeOne: ({ row, itemId }) => executeOnePlanned(client, action, campaign, row, { itemId, promotionId, promotionType }),
       saveResult,
@@ -2002,6 +2084,118 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
     });
   }
   return { remainingStarted: null, remainingItemIds: null, rounds, completed: false };
+}
+
+async function readAppliedWriteRows({ client, accountId, campaign, rows, action = 'enroll' }) {
+  const startedResult = await client.fetchAllPromotionItems({
+    promotionId: campaign.promotion_id,
+    promotionType: campaign.promotion_type,
+    status: 'started',
+    maxItems: 5000,
+  });
+  saveItems(accountId, campaign.promotion_id, campaign.promotion_type, startedResult.results, {
+    childUserId: campaign?.child_user_id,
+    siteId: campaign?.site_id,
+    logisticType: campaign?.logistic_type,
+    replaceStatus: 'started',
+    itemStatus: 'started',
+  });
+  const candidateResult = action === 'cancel'
+    ? { results: [] }
+    : await client.fetchAllPromotionItems({
+        promotionId: campaign.promotion_id,
+        promotionType: campaign.promotion_type,
+        status: 'candidate',
+        maxItems: 5000,
+      });
+  const pendingResult = action === 'cancel'
+    ? { results: [] }
+    : await client.fetchAllPromotionItems({
+        promotionId: campaign.promotion_id,
+        promotionType: campaign.promotion_type,
+        status: 'pending',
+        maxItems: 5000,
+      });
+  const startedByItem = new Map((startedResult.results || []).map((item) => [String(item.item_id || item.id || ''), item]));
+  const candidateByItem = new Map((candidateResult.results || []).map((item) => [String(item.item_id || item.id || ''), item]));
+  const pendingByItem = new Map((pendingResult.results || []).map((item) => [String(item.item_id || item.id || ''), item]));
+  const verified = [];
+  const startedPriceMismatch = [];
+  const confirmedPending = [];
+  const confirmedCandidate = [];
+  const unresolved = [];
+  for (const row of rows || []) {
+    const itemId = String(row.item?.item_id || '');
+    const live = startedByItem.get(itemId);
+    const livePrice = live?.price == null ? null : roundMoney(Number(live.price));
+    const targetPrice = row.deal_price == null ? null : roundMoney(Number(row.deal_price));
+    const applied = action === 'cancel'
+      ? !live
+      : Boolean(live && (targetPrice == null || livePrice === targetPrice));
+    if (applied) verified.push(row);
+    else if (action !== 'cancel' && live) startedPriceMismatch.push({ ...row, live_price: livePrice });
+    else if (action !== 'cancel' && pendingByItem.has(itemId)) confirmedPending.push(row);
+    else if (action !== 'cancel' && candidateByItem.has(itemId)) confirmedCandidate.push(row);
+    else unresolved.push(row);
+  }
+  return {
+    verified,
+    started_price_mismatch: startedPriceMismatch,
+    confirmed_pending: confirmedPending,
+    confirmed_candidate: confirmedCandidate,
+    unresolved,
+    observed_started: startedResult.results?.length || 0,
+    observed_pending: pendingResult.results?.length || 0,
+    observed_candidate: candidateResult.results?.length || 0,
+  };
+}
+
+async function waitForAppliedWriteRows({ client, accountId, campaign, rows, action = 'enroll', settleDelaysMs = [5_000, 15_000, 30_000], shouldCancel }) {
+  const polls = [];
+  let unresolved = rows || [];
+  let verified = [];
+  let startedPriceMismatch = [];
+  let confirmedPending = [];
+  let confirmedCandidate = [];
+  for (let poll = 0; poll <= settleDelaysMs.length; poll += 1) {
+    if (shouldCancel?.()) return { verified, unresolved, started_price_mismatch: startedPriceMismatch, confirmed_pending: confirmedPending, confirmed_candidate: confirmedCandidate, polls, cancelled: true };
+    const delayMs = poll === 0 ? 0 : Math.max(0, Number(settleDelaysMs[poll - 1]) || 0);
+    if (delayMs > 0) await sleep(delayMs);
+    const read = await readAppliedWriteRows({ client, accountId, campaign, rows: unresolved, action });
+    verified = [...verified, ...read.verified];
+    startedPriceMismatch = read.started_price_mismatch || [];
+    confirmedPending = read.confirmed_pending || [];
+    confirmedCandidate = read.confirmed_candidate || [];
+    unresolved = [...startedPriceMismatch, ...confirmedPending, ...confirmedCandidate, ...(read.unresolved || [])];
+    polls.push({
+      poll,
+      delay_ms: delayMs,
+      verified: read.verified.length,
+      started_price_mismatch: startedPriceMismatch.length,
+      confirmed_pending: confirmedPending.length,
+      confirmed_candidate: confirmedCandidate.length,
+      unknown: (read.unresolved || []).length,
+      remaining: unresolved.length,
+      observed_started: read.observed_started,
+      observed_pending: read.observed_pending,
+      observed_candidate: read.observed_candidate,
+    });
+    if (!unresolved.length) break;
+  }
+  const classified = new Set([
+    ...startedPriceMismatch.map((row) => String(row.item?.item_id || '')),
+    ...confirmedPending.map((row) => String(row.item?.item_id || '')),
+    ...confirmedCandidate.map((row) => String(row.item?.item_id || '')),
+  ]);
+  return {
+    verified,
+    started_price_mismatch: startedPriceMismatch,
+    confirmed_pending: confirmedPending,
+    confirmed_candidate: confirmedCandidate,
+    unresolved: unresolved.filter((row) => !classified.has(String(row.item?.item_id || ''))),
+    polls,
+    cancelled: false,
+  };
 }
 
 function executeOne(client, action, input) {
@@ -2023,8 +2217,8 @@ function executeOnePlanned(client, action, campaign, row, input) {
     }
     return client.request(url.toString(), {
       method: 'DELETE',
-      headers: client.marketplace ? { version: 'v2' } : {},
-      includeResponseMeta: String(input.promotionType || campaign?.promotion_type || '').toUpperCase() === 'SMART'
+      headers: client.promotionItemWriteHeaders(),
+      includeResponseMeta: true
     });
   }
   const payloadPreview = buildSubmitPayloadPreview({ promotion: campaign, row, action });
@@ -2034,7 +2228,8 @@ function executeOnePlanned(client, action, campaign, row, input) {
   return client.request(writeItemPath(client, itemId), {
     method,
     body: payload,
-    headers: client.marketplace ? { version: 'v2' } : {}
+    headers: client.promotionItemWriteHeaders(),
+    includeResponseMeta: true
   });
 }
 
@@ -2043,7 +2238,7 @@ function makeWriteClient(account, campaign) {
   return new MercadoLibreClient({
     accessToken: account.accessToken,
     userId: targetUserId,
-    callerId: targetUserId,
+    callerId: account.account_id,
     marketplace: isMarketplaceCampaign(account, campaign)
   });
 }
@@ -3093,12 +3288,19 @@ function executionGroupChildSnapshot(job) {
 }
 
 function publicExecutionGroup(group, { compact = false } = {}) {
-  const result = group.result || summarizeExecutionGroup(group);
+  const projectedChildren = projectLiveExecutionGroupChildren(
+    group,
+    (jobId) => executionJobs.get(String(jobId)),
+    executionGroupChildSnapshot,
+  );
+  const children = compact ? [] : projectedChildren;
+  const result = group.result || summarizeExecutionGroup({ ...group, children: projectedChildren });
   const compactResult = {};
   for (const field of [
     'action', 'store_count', 'total', 'success', 'failed', 'skipped',
     'relation_count', 'unique_item_count', 'activity_failure_count',
-    'request_success_count', 'live_verified_removed_count', 'pending_verification_count'
+    'request_success_count', 'live_verified_removed_count', 'pending_verification_count',
+    'platform_pending_count', 'retryable_pending_count'
   ]) compactResult[field] = result?.[field] ?? null;
   return {
     id: group.id,
@@ -3111,7 +3313,7 @@ function publicExecutionGroup(group, { compact = false } = {}) {
     finished_at: group.finished_at,
     global_peak_in_flight: Number(group.global_peak_in_flight || 0),
     scope: executionGroupBusinessScope(group),
-    children: compact ? [] : (group.children || []).map((child) => ({ ...child })),
+    children,
     result: compact ? compactResult : result,
     error: group.error || null
   };
@@ -3139,6 +3341,50 @@ function createExecutionPrepareId() {
   return `prepare-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function submissionReadSchedulerProgress(snapshot = {}, local = {}) {
+  const accountInflight = snapshot.accountInflight && typeof snapshot.accountInflight === 'object'
+    ? Object.fromEntries(Object.entries(snapshot.accountInflight).map(([key, value]) => [String(key), Math.max(0, Number(value || 0))]))
+    : {};
+  const fallbackActive = Object.values(snapshot.fallbackActiveByAccount || {})
+    .reduce((sum, value) => sum + Math.max(0, Number(value || 0)), 0);
+  const fallbackPeak = Object.values(snapshot.peakFallbackByAccount || {})
+    .reduce((sum, value) => sum + Math.max(0, Number(value || 0)), 0);
+  return {
+    dynamic_limit: Math.max(0, Number(snapshot.dynamicLimit || 0)),
+    max_limit: Math.max(0, Number(snapshot.maxLimit || 0)),
+    per_account_limit: Math.max(0, Number(snapshot.perAccountLimit || 0)),
+    detail_limit: Math.max(0, Number(snapshot.detailLimit || 0)),
+    fallback_per_account: Math.max(0, Number(snapshot.fallbackPerAccount || 0)),
+    inflight: Math.max(0, Number(snapshot.inflight || 0)),
+    peak: Math.max(0, Number(snapshot.peakInflight || 0)),
+    detail_inflight: Math.max(0, Number(snapshot.detailInflight || 0)),
+    detail_peak: Math.max(0, Number(snapshot.peakDetail || 0)),
+    fallback_active: fallbackActive,
+    fallback_peak: fallbackPeak,
+    queued: Math.max(0, Number(snapshot.queued || 0)),
+    cooldown_ms: Math.max(0, Number(snapshot.cooldownRemainingMs ?? snapshot.globalCooldownRemainingMs ?? 0)),
+    rate_limit_count: Math.max(0, Number(snapshot.mercado_outbound_rate_limit_count || 0)),
+    network_error_count: Math.max(0, Number(snapshot.mercado_outbound_network_error_count || 0)),
+    service_error_count: Math.max(0, Number(snapshot.mercado_outbound_service_error_count || 0)),
+    timeout_error_count: Math.max(0, Number(snapshot.mercado_outbound_timeout_error_count || 0)),
+    failure_count: Math.max(0, Number(snapshot.mercado_outbound_failure_count || 0)),
+    retry_count: Math.max(0, Number(snapshot.mercado_outbound_retry_count || 0)),
+    per_account: accountInflight,
+    local_work_concurrency: Math.max(1, Number(local.localWorkConcurrency || 1)),
+    local_db_batch_queries: Math.max(0, Number(local.localDbBatchQueries || 0)),
+  };
+}
+
+function attachPrepareErrorContext(error, context = {}) {
+  if (!error || (typeof error !== 'object' && typeof error !== 'function')) return error;
+  error.prepare_context = {
+    ...(error.prepare_context && typeof error.prepare_context === 'object' ? error.prepare_context : {}),
+    ...Object.fromEntries(Object.entries(context).filter(([, value]) => value != null && String(value))),
+  };
+  if (!error.operation && error.prepare_context.operation) error.operation = error.prepare_context.operation;
+  return error;
+}
+
 function publicExecutionSubmission(prepare = {}) {
   const publicTarget = (target = {}) => ({
     account_id: String(target.account_id || ''),
@@ -3151,6 +3397,39 @@ function publicExecutionSubmission(prepare = {}) {
     existing_seller_campaign_count: Number(target.existing_seller_campaign_count || 0),
     hidden_activity_names: Array.isArray(target.hidden_activity_names) ? target.hidden_activity_names.map(String) : [],
   });
+  const schedulerProgress = prepare.progress?.read_scheduler && typeof prepare.progress.read_scheduler === 'object'
+    ? prepare.progress.read_scheduler
+    : null;
+  const publicSchedulerProgress = schedulerProgress ? {
+    dynamic_limit: Number(schedulerProgress.dynamic_limit || 0),
+    max_limit: Number(schedulerProgress.max_limit || 0),
+    per_account_limit: Number(schedulerProgress.per_account_limit || 0),
+    detail_limit: Number(schedulerProgress.detail_limit || 0),
+    activity_limit: Number(schedulerProgress.activity_limit || 0),
+    fallback_per_account: Number(schedulerProgress.fallback_per_account || 0),
+    inflight: Number(schedulerProgress.inflight || 0),
+    peak: Number(schedulerProgress.peak || 0),
+    detail_inflight: Number(schedulerProgress.detail_inflight || 0),
+    detail_peak: Number(schedulerProgress.detail_peak || 0),
+    activity_inflight: Number(schedulerProgress.activity_inflight || 0),
+    activity_peak: Number(schedulerProgress.activity_peak || 0),
+    fallback_active: Number(schedulerProgress.fallback_active || 0),
+    fallback_peak: Number(schedulerProgress.fallback_peak || 0),
+    queued: Number(schedulerProgress.queued || 0),
+    cooldown_ms: Number(schedulerProgress.cooldown_ms || 0),
+    rate_limit_count: Number(schedulerProgress.rate_limit_count || 0),
+    network_error_count: Number(schedulerProgress.network_error_count || 0),
+    service_error_count: Number(schedulerProgress.service_error_count || 0),
+    timeout_error_count: Number(schedulerProgress.timeout_error_count || 0),
+    failure_count: Number(schedulerProgress.failure_count || 0),
+    retry_count: Number(schedulerProgress.retry_count || 0),
+    local_work_concurrency: Number(schedulerProgress.local_work_concurrency || 1),
+    local_db_batch_queries: Number(schedulerProgress.local_db_batch_queries || 0),
+    per_account: Object.entries(schedulerProgress.per_account || {}).map(([accountId, inflight]) => ({
+      store_name: String(prepare.storeNames?.[accountId] || '店铺'),
+      inflight: Math.max(0, Number(inflight || 0)),
+    })).filter((row) => row.inflight > 0),
+  } : null;
   return {
     id: prepare.id,
     prepare_id: prepare.id,
@@ -3201,6 +3480,17 @@ function publicExecutionSubmission(prepare = {}) {
     group_id: prepare.group_id || null,
     group: prepare.group ? publicExecutionGroup(prepare.group) : null,
     error: prepare.error || null,
+    error_kind: prepare.error_kind || null,
+    http_status: prepare.http_status == null ? null : Number(prepare.http_status),
+    code: prepare.code || null,
+    cause_code: prepare.cause_code || null,
+    operation: prepare.operation || null,
+    failure_context: {
+      stage: prepare.stage || null,
+      account: prepare.account || null,
+      site: prepare.site || null,
+      activity: prepare.activity || null,
+    },
     progress: {
       stage: String(prepare.progress?.stage || prepare.state || ''),
       percent: Math.max(0, Math.min(100, Number(prepare.progress?.percent || 0))),
@@ -3210,6 +3500,7 @@ function publicExecutionSubmission(prepare = {}) {
       current_store: String(prepare.progress?.current_store || ''),
       current_site: String(prepare.progress?.current_site || ''),
       current_activity: String(prepare.progress?.current_activity || ''),
+      read_scheduler: publicSchedulerProgress,
     },
   };
 }
@@ -3344,10 +3635,36 @@ function activityCatalogSellerStatus(accountId, refresh = {}, filters = {}, sett
   return rows;
 }
 
-async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () => {}, context = {}) {
+async function buildExecutionSubmissionSnapshot(input = {}, progressReporter = () => {}, context = {}) {
   const accountIds = normalizeAccountIdList(input.accountIds || input.account_ids || input.accountId || input.account_id);
   if (!accountIds.length) throw new ApiError('请选择至少一个店铺账号。', 400);
   const finalRevalidation = context.finalRevalidation === true;
+  let latestProgress = {};
+  const localReadMetrics = {
+    localWorkConcurrency: Math.min(6, Math.max(1, accountIds.length)),
+    localDbBatchQueries: 0,
+  };
+  const settings = readSettings();
+  let readScheduler = context.readScheduler || null;
+  const reportProgress = (progress = {}) => {
+    latestProgress = { ...latestProgress, ...progress };
+    return progressReporter({
+      ...latestProgress,
+      read_scheduler: submissionReadSchedulerProgress(
+        typeof readScheduler?.snapshot === 'function' ? readScheduler.snapshot() : {},
+        localReadMetrics,
+      ),
+    });
+  };
+  if (!readScheduler) {
+    readScheduler = createBalancedReadScheduler({
+      ...prepareReadSchedulerProfile(settings),
+      onSnapshot: (snapshot) => progressReporter({
+        ...latestProgress,
+        read_scheduler: submissionReadSchedulerProgress(snapshot, localReadMetrics),
+      }),
+    });
+  }
   reportProgress({
     stage: finalRevalidation ? 'final_catalog' : 'accounts',
     percent: 2,
@@ -3355,8 +3672,6 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
     total: accountIds.length,
     message: finalRevalidation ? '正在执行提交前轻量活动目录复核' : '正在核对店铺和活动范围',
   });
-  const settings = readSettings();
-  const readScheduler = context.readScheduler || createBalancedReadScheduler(BALANCED_READ_PROFILES.prepare);
   const operationReadCache = context.operationReadCache || new Map();
   const filters = input.filters || {};
   const storeNames = {};
@@ -3366,7 +3681,12 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
   let accountRefreshCompleted = 0;
   await Promise.all(accountIds.map(async (accountId) => {
     context.checkpoint?.();
-    const account = await ensureUsableAccount(accountId);
+    let account;
+    try {
+      account = await ensureUsableAccount(accountId);
+    } catch (error) {
+      throw attachPrepareErrorContext(error, { operation: 'account_access', stage: 'accounts', account: storeNames[accountId] || '' });
+    }
     context.checkpoint?.();
     accountsById.set(String(accountId), account);
     storeNames[accountId] = storeIdentityForAccount(accountId, account, settings).store_name;
@@ -3377,15 +3697,20 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
       message: finalRevalidation ? '提交前正在检查活动目录版本与变更标记' : '正在核对本地活动目录状态',
       current_store: storeNames[accountId],
     });
-    const catalogRefresh = await refreshActivityCatalogForPrepare({
-      account,
-      filters,
-      settings,
-      readConcurrency: normalizeConcurrency(input.readConcurrency ?? settings.readConcurrency),
-      signal: context.signal,
-      checkpoint: context.checkpoint,
-      readScheduler,
-    });
+    let catalogRefresh;
+    try {
+      catalogRefresh = await refreshActivityCatalogForPrepare({
+        account,
+        filters,
+        settings,
+        readConcurrency: normalizeConcurrency(input.readConcurrency ?? settings.readConcurrency),
+        signal: context.signal,
+        checkpoint: context.checkpoint,
+        readScheduler,
+      });
+    } catch (error) {
+      throw attachPrepareErrorContext(error, { operation: 'activity_catalog', stage: 'catalog', account: storeNames[accountId] });
+    }
     context.checkpoint?.();
     catalogRefreshByAccount.set(String(accountId), catalogRefresh);
     reportProgress({
@@ -3398,15 +3723,19 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
         : `活动目录缓存有效：外部读取 0 个站点，缓存复用 ${catalogRefresh.cache_reused_count} 个站点`,
       current_store: storeNames[accountId],
     });
-    await recoverHiddenSellerCampaignsForPreparedAccount({
-      account,
-      filters,
-      settings,
-      catalogRefresh,
-      signal: context.signal,
-      checkpoint: context.checkpoint,
-      readScheduler,
-    });
+    try {
+      await recoverHiddenSellerCampaignsForPreparedAccount({
+        account,
+        filters,
+        settings,
+        catalogRefresh,
+        signal: context.signal,
+        checkpoint: context.checkpoint,
+        readScheduler,
+      });
+    } catch (error) {
+      throw attachPrepareErrorContext(error, { operation: 'seller_visibility_recovery', stage: 'catalog', account: storeNames[accountId] });
+    }
     context.checkpoint?.();
     const allowedRoutes = listSiteSummaries(accountId).map((site) => ({
       account_id: String(accountId),
@@ -3439,8 +3768,13 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
   const requested = String(input.requested_action || input.requestedAction || input.action || 'auto').toLowerCase();
   const selected = ordinaryPromotions(filterPromotions(promotions, filters));
   const readStateSnapshot = buildPreparationReadStateSnapshot(accountIds);
+  localReadMetrics.localDbBatchQueries = readStateSnapshot.db_batch_queries;
+  const autoDecision = requested === 'auto' ? buildTodayDecisionForScope(accountIds, selected) : null;
+  if (autoDecision?.action === 'configuration_required') {
+    throw new ApiError(autoDecision.reason, 422);
+  }
   const resolvedAction = requested === 'auto'
-    ? String(buildTodayDecisionForScope(accountIds, selected).action || '')
+    ? String(autoDecision?.action || '')
     : ['enroll', 'update', 'cancel'].includes(requested) ? requested : (() => { throw new ApiError('不支持的执行动作。', 400); })();
   const rawRevalidateKeys = (context.revalidateTargetKeys || []).map(String).filter(Boolean);
   const revalidationPlan = finalRevalidation
@@ -3450,6 +3784,8 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
         catalogRefreshes: [...catalogRefreshByAccount.values()],
         action: resolvedAction,
         explicitTargetKeys: rawRevalidateKeys,
+        previousRevalidationRecord: context.previousSnapshot?.revalidation_record || null,
+        previousConfirmedScope: context.previousSnapshot?.confirmed_execution_scope || null,
         getCacheState: (promotion) => preparationActivityCacheState(readStateSnapshot, promotion),
         getFetchState: (promotion, status) => preparationItemFetchState(readStateSnapshot, promotion, status),
         getFallbackState: (promotion) => preparationItemFetchState(readStateSnapshot, promotion, INVENTORY_FALLBACK_ITEM_STATUS),
@@ -3474,6 +3810,21 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
   const unchangedPriorLiveRows = priorLiveRows.filter((row) => !promotionIsTargeted(row)).map((row) => ({ ...row }));
   const startedLiveReadRows = [];
   const selectedForLiveRead = targetedRevalidate ? selected.filter(promotionNeedsItemRead) : selected;
+  const plannedExternalReads = (status) => selectedForLiveRead.reduce((count, promotion) => {
+    const cacheState = preparationActivityCacheState(readStateSnapshot, promotion);
+    const fetchState = preparationItemFetchState(readStateSnapshot, promotion, status);
+    const fallbackState = status === 'candidate'
+      ? preparationItemFetchState(readStateSnapshot, promotion, INVENTORY_FALLBACK_ITEM_STATUS)
+      : null;
+    const operationKey = operationActivityReadKey(promotion.account_id, promotion, status);
+    const forceRefresh = forceReadKeysForStatus(revalidateIdentityKeys, status).has(operationKey);
+    const decision = forceRefresh
+      ? { refresh: true }
+      : activityItemsDecision({ promotion, cacheState, fetchState, fallbackState, itemStatus: status });
+    return count + Number(Boolean(decision.refresh));
+  }, 0);
+  const startedExternalReadCount = plannedExternalReads('started');
+  const candidateExternalReadCount = resolvedAction === 'enroll' ? plannedExternalReads('candidate') : 0;
   if (finalRevalidation) {
     const reasonCount = Object.values(revalidationPlan.reasons_by_identity || {}).flat().length;
     reportProgress({
@@ -3508,7 +3859,9 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
       total: selectedForLiveRead.length,
       message: finalRevalidation
         ? `提交前定向复核：${stage === 'started' ? '已报名商品' : '可报名商品'} ${completed}/${selectedForLiveRead.length}`
-        : stage === 'started' ? '正在核对已报名商品' : '正在核对可报名商品',
+        : (stage === 'started' ? startedExternalReadCount : candidateExternalReadCount) > 0
+          ? `正在读取需更新的${stage === 'started' ? '已报名商品' : '可报名商品'}缓存`
+          : `已使用今日${stage === 'started' ? '已报名商品' : '可报名商品'}缓存，无外部读取`,
       current_store: storeNames[event.promotion?.account_id || ''] || '',
       current_site: String(event.promotion?.site_id || ''),
       current_activity: String(event.promotion_id || ''),
@@ -3526,7 +3879,10 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
     if (!accountPromotions.length) return;
     reportProgress({
       stage: 'started', percent: 35 + Math.floor((startedCompleted / Math.max(1, accountIds.length)) * 25),
-      completed: startedCompleted, total: accountIds.length, message: '正在核对已报名商品', current_store: storeNames[accountId],
+      completed: startedCompleted,
+      total: accountIds.length,
+      message: startedExternalReadCount > 0 ? '正在读取需更新的已报名商品缓存' : '已使用今日已报名商品缓存，无外部读取',
+      current_store: storeNames[accountId],
     });
     const prep = await prepareItemsForExecution({
       account: accountsById.get(String(accountId)),
@@ -3576,7 +3932,10 @@ async function buildExecutionSubmissionSnapshot(input = {}, reportProgress = () 
       if (!accountPromotions.length) return;
       reportProgress({
         stage: 'items', percent: 70 + Math.floor((itemAccountsCompleted / Math.max(1, accountIds.length)) * 22),
-        completed: itemAccountsCompleted, total: accountIds.length, message: '正在核对可报名商品', current_store: storeNames[accountId],
+        completed: itemAccountsCompleted,
+        total: accountIds.length,
+        message: candidateExternalReadCount > 0 ? '正在读取需更新的可报名商品缓存' : '已使用今日可报名商品缓存，无外部读取',
+        current_store: storeNames[accountId],
       });
       const prep = await prepareItemsForExecution({
         account: accountsById.get(String(accountId)),
@@ -3849,10 +4208,6 @@ function executionSubmissionPreparedPatch(snapshot, prepare, options = {}) {
   });
   const scopeHash = options.scopeHash || executionSubmissionScopeHash(confirmedScope, snapshot.discounts);
   const scopeMessages = Array.isArray(options.scopeMessages) ? options.scopeMessages.filter(Boolean) : [];
-  const sameDayWarning = prepare.same_day_warning || null;
-  const sameDayMessage = sameDayWarning?.completed
-    ? `提醒：今天当前范围已完成${actionDisplayName(sameDayWarning.completed.action)}，本次${sameDayWarning.same_action ? '仍准备相同动作，可能重复处理' : `将执行${actionDisplayName(snapshot.resolved_action)}，属于另一项真实操作`}。`
-    : '';
   return {
     scope_hash: scopeHash,
     scope_version: preparedAt.toISOString(),
@@ -3870,7 +4225,7 @@ function executionSubmissionPreparedPatch(snapshot, prepare, options = {}) {
       ...prepare.seller_input,
       selected_targets: selectedSellerTargets,
     } : { name: '', start_date: null, finish_date: null, selected_targets: [], validation_errors: [] },
-    confirmation_summary: [sameDayMessage, snapshot.confirmation_summary, ...scopeMessages].filter(Boolean).join(' '),
+    confirmation_summary: [snapshot.confirmation_summary, ...scopeMessages].filter(Boolean).join(' '),
     execution_confirmation_token: prepare.execution_confirmation_token || crypto.randomBytes(24).toString('base64url'),
     group_request: {
       ...snapshot.group_request,
@@ -3889,7 +4244,12 @@ function scheduleExecutionSubmissionPreparation(prepareId) {
       prepareId: key,
       buildSnapshot: buildExecutionSubmissionSnapshot,
       preparedPatch: executionSubmissionPreparedPatch,
-      formatError: toChineseError,
+      classifyError: classifyPrepareError,
+      formatError: (error) => prepareErrorMessage(classifyPrepareError(error)),
+      logFailure: (event) => {
+        const { per_account: _privateAccountMetrics, ...readScheduler } = event.read_scheduler || {};
+        console.error(JSON.stringify({ at: new Date().toISOString(), ...event, read_scheduler: readScheduler }));
+      },
     }))
     .finally(() => submissionPreparationTasks.delete(key));
   submissionPreparationTasks.set(key, task);
@@ -3935,11 +4295,9 @@ function prepareExecutionSubmission(body = {}) {
     error.code = 'ACTIVE_SUBMISSION_EXISTS';
     throw error;
   }
-  const sameDayDecision = sameDayCompletionGate({
+  sameDayCompletionGate({
     groups: executionGroupPersistence.loadAll(),
     request: body,
-    confirmationStore: sameDayConfirmationStore,
-    deferManualConfirmation: true,
   });
   const request = { ...body };
   delete request.same_day_confirmation_token;
@@ -3968,7 +4326,6 @@ function prepareExecutionSubmission(body = {}) {
     live_read: { rows: [], readable_count: 0, blocked_count: 0, all_blocked: false },
     seller_input: { name: '', start_date: null, finish_date: null, selected_targets: [], validation_errors: [] },
     confirmation_summary: '',
-    same_day_warning: sameDayDecision.warning || null,
     request,
     request_fingerprint: submissionRequestFingerprint(request),
     group_request: null,
@@ -4164,7 +4521,7 @@ function scheduleExecutionSubmissionCommit(prepareId, body = {}, { recover = fal
   const existing = submissionCommitTasks.get(key);
   if (existing) return existing;
   const controller = new AbortController();
-  const readScheduler = createBalancedReadScheduler(BALANCED_READ_PROFILES.prepare);
+  const readScheduler = createBalancedReadScheduler(prepareReadSchedulerProfile(readSettings()));
   const operationReadCache = new Map();
   submissionCommitControllers.set(key, controller);
   let leaseTimer = null;
@@ -4289,7 +4646,9 @@ async function startExecutionGroupInternal(body = {}) {
     }
   }
   const settings = readSettings();
-  const normalizedWriteConcurrency = normalizeWriteConcurrency(body.writeConcurrency, settings.writeConcurrency);
+  const configuredWriteConcurrency = normalizeWriteConcurrency(settings.writeConcurrency);
+  const requestedWriteConcurrency = normalizeWriteConcurrency(body.writeConcurrency, configuredWriteConcurrency);
+  const normalizedWriteConcurrency = Math.min(requestedWriteConcurrency, configuredWriteConcurrency);
   const commonRequest = {
     ...body,
     accountIds,
@@ -4703,23 +5062,25 @@ function classifyExecutionWriteError(error = {}) {
   const raw = executionRawErrorSummary(error) || '';
   const lower = raw.toLowerCase();
   const errorCn = toChineseError(error);
-  const rateLimited = status === 429 || /too many|rate.?limit|429|限流/.test(lower);
-  const authFailure = status === 401 || /invalid_token|unauthorized|401/.test(lower);
-  const businessFailure = !rateLimited && !authFailure && (
+  const rateLimited = status === 429 || /too many|rate.?limit|\b429\b|限流/.test(lower);
+  const authFailure = status === 401 || /invalid_token|unauthorized|\b401\b/.test(lower);
+  const transientOfferLock = isTransientOfferLockError(error);
+  const businessFailure = !rateLimited && !authFailure && !transientOfferLock && (
     (status >= 400 && status < 500)
-    || /offer_id|offer id|invalid_parameter|bad_request|under_review|lockedentity|price/.test(lower)
+    || /offer_id|offer id|invalid_parameter|bad_request|under_review|price/.test(lower)
     || /活动报价|报价|参数|审核|价格|缺少或无效/.test(errorCn)
   );
   const serverFailure = !businessFailure && (status >= 500 || /5\d\d|server|temporarily|service unavailable/.test(lower));
   const timeoutFailure = /timeout|timed out|504|fetch failed|socket|network|econnreset|etimedout|und_err|aborted/.test(lower);
-  const transientFailure = !businessFailure && (serverFailure || timeoutFailure);
+  const transientFailure = !businessFailure && (transientOfferLock || serverFailure || timeoutFailure);
   return {
     status: status || null,
-    category: rateLimited ? 'rate_limited' : authFailure ? 'auth_failure' : transientFailure ? 'transient_interface_failure' : businessFailure ? 'business_failure' : null,
+    category: rateLimited ? 'rate_limited' : authFailure ? 'auth_failure' : transientOfferLock ? 'transient_offer_lock' : transientFailure ? 'transient_interface_failure' : businessFailure ? 'business_failure' : null,
     interfaceFailure: !businessFailure && (rateLimited || authFailure || transientFailure),
     rateLimited,
     authFailure,
     transientFailure,
+    transientOfferLock,
     businessFailure,
     errorCn
   };
@@ -5037,14 +5398,354 @@ function mergeExecutionRecoveryRound(previous = {}, current = {}) {
     ...current,
     promotions: [...promotions.values()],
     total: Math.max(Number(previous.total || 0), Number(current.total || 0)),
+    promotions_total: Math.max(Number(previous.promotions_total || 0), Number(current.promotions_total || 0)),
     relation_count: Math.max(Number(previous.relation_count || 0), Number(current.relation_count || 0)),
     unique_item_count: Math.max(Number(previous.unique_item_count || 0), Number(current.unique_item_count || 0)),
     success: Number(previous.success || 0) + Number(current.success || 0),
     failed: Number(previous.failed || 0) + Number(current.failed || 0),
     skipped: Number(previous.skipped || 0) + Number(current.skipped || 0),
     pending: Number(current.pending || 0),
+    platform_pending_count: Number(previous.platform_pending_count || 0) + Number(current.platform_pending_count || 0),
+    retryable_pending_count: Number(current.retryable_pending_count ?? current.pending ?? 0),
     recovery_round: Number(previous.recovery_round || 0) + 1,
   };
+}
+
+function combineCurrentRecoveryExecutions(left = null, right = null) {
+  if (!left) return right;
+  if (!right) return left;
+  return {
+    ...left,
+    ...right,
+    total: Number(left.total || 0) + Number(right.total || 0),
+    promotions_total: Number(left.promotions_total || 0) + Number(right.promotions_total || 0),
+    success: Number(left.success || 0) + Number(right.success || 0),
+    failed: Number(left.failed || 0) + Number(right.failed || 0),
+    skipped: Number(left.skipped || 0) + Number(right.skipped || 0),
+    pending: Number(left.pending || 0) + Number(right.pending || 0),
+    blocked: Number(left.blocked || 0) + Number(right.blocked || 0),
+    relation_count: Number(left.relation_count || 0) + Number(right.relation_count || 0),
+    unique_item_count: Number(left.unique_item_count || 0) + Number(right.unique_item_count || 0),
+    activity_failure_count: Number(left.activity_failure_count || 0) + Number(right.activity_failure_count || 0),
+    request_success_count: Number(left.request_success_count || 0) + Number(right.request_success_count || 0),
+    live_verified_removed_count: Number(left.live_verified_removed_count || 0) + Number(right.live_verified_removed_count || 0),
+    pending_verification_count: Number(left.pending_verification_count || 0) + Number(right.pending_verification_count || 0),
+    platform_pending_count: Number(left.platform_pending_count || 0) + Number(right.platform_pending_count || 0),
+    retryable_pending_count: Number(left.retryable_pending_count || 0) + Number(right.retryable_pending_count || 0),
+    promotions: [...(left.promotions || []), ...(right.promotions || [])],
+  };
+}
+
+function pendingRecoveryCampaign(record = {}) {
+  return {
+    account_id: String(record.account_id || ''),
+    child_user_id: String(record.child_user_id || ''),
+    site_id: String(record.site_id || '').toUpperCase(),
+    promotion_id: String(record.promotion_id || ''),
+    promotion_type: String(record.promotion_type || '').toUpperCase(),
+  };
+}
+
+function pendingRecoveryRow(record = {}) {
+  const row = record.row && typeof record.row === 'object' ? record.row : {};
+  return {
+    ...row,
+    item: {
+      ...(row.item || {}),
+      item_id: String(row.item?.item_id || record.item_id || ''),
+    },
+    deal_price: row.deal_price ?? record.deal_price ?? null,
+  };
+}
+
+const MAX_CONFIRMED_CANDIDATE_WRITE_ATTEMPTS = 3;
+const MAX_PENDING_VERIFICATION_READ_ATTEMPTS = 3;
+
+async function recoverPendingVerificationRecords({ job, account, action, records = [] }) {
+  const groups = new Map();
+  for (const record of records) {
+    const campaign = pendingRecoveryCampaign(record);
+    const key = promotionKey(campaign);
+    if (!groups.has(key)) groups.set(key, { campaign, records: [] });
+    groups.get(key).records.push(record);
+  }
+  const execution = {
+    cancelled: false,
+    total: 0,
+    promotions_total: groups.size,
+    success: 0,
+    failed: 0,
+    skipped: 0,
+    pending: 0,
+    blocked: 0,
+    relation_count: 0,
+    unique_item_count: 0,
+    activity_failure_count: 0,
+    request_success_count: 0,
+    live_verified_removed_count: 0,
+    pending_verification_count: 0,
+    platform_pending_count: 0,
+    retryable_pending_count: 0,
+    result_contract_version: RESULT_CONTRACT_VERSION,
+    recovery_mode: 'read_only_verification',
+    repeated_write_requests: 0,
+    promotions: [],
+  };
+  const retryRecords = [];
+  const countedItems = new Set();
+  for (const { campaign, records: campaignRecords } of groups.values()) {
+    const rows = campaignRecords.map(pendingRecoveryRow);
+    const client = makeWriteClient(account, campaign);
+    let verification = { verified: [], started_price_mismatch: [], confirmed_pending: [], confirmed_candidate: [], unresolved: rows, polls: [] };
+    try {
+      verification = await waitForAppliedWriteRows({
+        client,
+        accountId: account.account_id,
+        campaign,
+        rows,
+        action,
+        settleDelaysMs: [],
+        shouldCancel: () => job.cancel_requested,
+      });
+    } catch (error) {
+      verification = { ...verification, read_error: toChineseError(error) };
+    }
+    const recordByItemId = new Map(campaignRecords.map((record) => [String(record.item_id || record.row?.item?.item_id || ''), record]));
+    const taskId = Number(campaignRecords[0]?.task_id || 0);
+    applySuccessfulPromotionItemWrites({
+      accountId: account.account_id,
+      promotionId: campaign.promotion_id,
+      promotionType: campaign.promotion_type,
+      action,
+      items: (verification.verified || []).map((row) => ({ itemId: row.item?.item_id, dealPrice: row.deal_price })),
+    });
+    for (const row of verification.verified || []) {
+      const itemId = String(row.item?.item_id || '');
+      const record = recordByItemId.get(itemId);
+      saveExecutionResult({
+        taskId: Number(record?.task_id || taskId),
+        accountId: account.account_id,
+        promotionId: campaign.promotion_id,
+        promotionType: campaign.promotion_type,
+        itemId,
+        action,
+        mode: 'real',
+        status: action === 'cancel' ? CANCEL_RESULT_STATUS.liveVerifiedRemoved : 'success',
+        dealPrice: row.deal_price,
+      });
+      pendingWriteQueue.resolve(job.id, record?.relation_key, 'success', { recovery_mode: 'read_only_verification' });
+      countedItems.add(itemId);
+    }
+    for (const row of verification.started_price_mismatch || []) {
+      const itemId = String(row.item?.item_id || '');
+      const record = recordByItemId.get(itemId);
+      saveExecutionResult({
+        taskId: Number(record?.task_id || taskId),
+        accountId: account.account_id,
+        promotionId: campaign.promotion_id,
+        promotionType: campaign.promotion_type,
+        itemId,
+        action,
+        mode: 'real',
+        status: 'failed',
+        dealPrice: row.deal_price,
+        errorCn: `商品已进入活动，但平台活动价 ${row.live_price ?? '-'} 未达到本次目标价 ${row.deal_price ?? '-'}；本次不重复报名`,
+      });
+      pendingWriteQueue.resolve(job.id, record?.relation_key, 'failed', {
+        recovery_mode: 'started_price_mismatch',
+        live_price: row.live_price ?? null,
+      });
+      countedItems.add(itemId);
+    }
+    for (const row of verification.confirmed_pending || []) {
+      const itemId = String(row.item?.item_id || '');
+      const record = recordByItemId.get(itemId);
+      saveExecutionResult({
+        taskId: Number(record?.task_id || taskId),
+        accountId: account.account_id,
+        promotionId: campaign.promotion_id,
+        promotionType: campaign.promotion_type,
+        itemId,
+        action,
+        mode: 'real',
+        status: CANCEL_RESULT_STATUS.pendingVerification,
+        dealPrice: row.deal_price,
+        errorCn: '平台已明确返回 pending（待生效），本地执行已完成且不会重复提交',
+      });
+      pendingWriteQueue.resolve(job.id, record?.relation_key, 'platform_pending', {
+        recovery_mode: 'platform_pending',
+      });
+      countedItems.add(itemId);
+    }
+    for (const row of verification.confirmed_candidate || []) {
+      const itemId = String(row.item?.item_id || '');
+      const record = recordByItemId.get(itemId);
+      const previousAttempts = Math.max(1, Number(record?.attempt_count || 0));
+      if (previousAttempts < MAX_CONFIRMED_CANDIDATE_WRITE_ATTEMPTS) {
+        const retryRecord = pendingWriteQueue.enqueue(job.id, {
+          ...record,
+          retry_category: 'confirmed_candidate_after_write',
+          attempt_count: previousAttempts + 1,
+          error_cn: `平台仍明确返回可报名；将在原确认范围内执行第 ${previousAttempts + 1} 次有限重试`,
+        });
+        retryRecords.push(retryRecord);
+        continue;
+      }
+      saveExecutionResult({
+        taskId: Number(record?.task_id || taskId),
+        accountId: account.account_id,
+        promotionId: campaign.promotion_id,
+        promotionType: campaign.promotion_type,
+        itemId,
+        action,
+        mode: 'real',
+        status: 'failed',
+        dealPrice: row.deal_price,
+        errorCn: `写入接口已成功返回 ${previousAttempts} 次，但平台仍返回可报名；已停止重试`,
+      });
+      pendingWriteQueue.resolve(job.id, record?.relation_key, 'failed', {
+        recovery_mode: 'confirmed_candidate_retry_exhausted',
+        attempt_count: previousAttempts,
+      });
+      countedItems.add(itemId);
+    }
+    let unresolvedPendingCount = 0;
+    let verificationExhaustedCount = 0;
+    for (const row of verification.unresolved || []) {
+      const itemId = String(row.item?.item_id || '');
+      const record = recordByItemId.get(itemId);
+      const verificationAttempts = Number(record?.verification_attempt_count || 0) + 1;
+      const exhausted = verificationAttempts >= MAX_PENDING_VERIFICATION_READ_ATTEMPTS;
+      saveExecutionResult({
+        taskId: Number(record?.task_id || taskId),
+        accountId: account.account_id,
+        promotionId: campaign.promotion_id,
+        promotionType: campaign.promotion_type,
+        itemId,
+        action,
+        mode: 'real',
+        status: exhausted ? 'failed' : CANCEL_RESULT_STATUS.pendingVerification,
+        dealPrice: row.deal_price,
+        errorCn: exhausted
+          ? `写入接口已成功，但连续 ${verificationAttempts} 轮只读回查均无法确认平台状态；已停止回查且不会重复提交`
+          : verification.read_error || '写入请求已成功，但平台未返回已报名、待生效或可报名状态；继续只读确认且不会盲目重写',
+      });
+      if (exhausted) {
+        pendingWriteQueue.resolve(job.id, record?.relation_key, 'failed', {
+          recovery_mode: 'verification_unknown_after_retries',
+          verification_attempt_count: verificationAttempts,
+        });
+        verificationExhaustedCount += 1;
+      } else {
+        pendingWriteQueue.enqueue(job.id, {
+          ...record,
+          verification_attempt_count: verificationAttempts,
+          error_cn: verification.read_error || '平台状态仍不可确认；继续只读回查且不会重复提交',
+        });
+        unresolvedPendingCount += 1;
+      }
+      countedItems.add(itemId);
+    }
+    const verifiedCount = (verification.verified || []).length;
+    const mismatchCount = (verification.started_price_mismatch || []).length;
+    const platformPendingCount = (verification.confirmed_pending || []).length;
+    const candidateCount = (verification.confirmed_candidate || []).length;
+    const retryCount = retryRecords.filter((record) => (
+      String(record.promotion_id || '') === String(campaign.promotion_id || '')
+      && String(record.promotion_type || '').toUpperCase() === String(campaign.promotion_type || '').toUpperCase()
+    )).length;
+    const exhaustedCount = candidateCount - retryCount;
+    const unresolvedCount = (verification.unresolved || []).length;
+    execution.success += verifiedCount;
+    execution.failed += mismatchCount + exhaustedCount + verificationExhaustedCount;
+    execution.pending += platformPendingCount + unresolvedPendingCount + retryCount;
+    execution.pending_verification_count += unresolvedPendingCount;
+    execution.platform_pending_count += platformPendingCount;
+    execution.retryable_pending_count += unresolvedPendingCount + retryCount;
+    execution.total += verifiedCount + mismatchCount + platformPendingCount + candidateCount + unresolvedCount;
+    execution.relation_count += verifiedCount + mismatchCount + platformPendingCount + candidateCount + unresolvedCount;
+    if (action === 'cancel') execution.live_verified_removed_count += verifiedCount;
+    appendExecutionItemAuditEvent(job.id, {
+      type: 'pending_verification_recovery',
+      account,
+      promotion: campaign,
+      taskId,
+      action,
+      requested_count: campaignRecords.length,
+      verified_count: verifiedCount,
+      started_price_mismatch_count: mismatchCount,
+      platform_pending_count: platformPendingCount,
+      confirmed_candidate_count: candidateCount,
+      scheduled_retry_count: retryCount,
+      exhausted_retry_count: exhaustedCount,
+      unresolved_count: unresolvedPendingCount,
+      verification_exhausted_count: verificationExhaustedCount,
+      repeated_write_requests: 0,
+      polls: verification.polls || [],
+    });
+    execution.promotions.push({
+      ...campaign,
+      taskId,
+      total: verifiedCount + mismatchCount + platformPendingCount + candidateCount + unresolvedCount,
+      success: verifiedCount,
+      failed: mismatchCount + exhaustedCount + verificationExhaustedCount,
+      skipped: 0,
+      pending: platformPendingCount + unresolvedPendingCount + retryCount,
+      pending_verification_count: unresolvedPendingCount,
+      platform_pending_count: platformPendingCount,
+      retryable_pending_count: unresolvedPendingCount + retryCount,
+      recovery_mode: 'read_only_verification',
+      repeated_write_requests: 0,
+    });
+  }
+  execution.unique_item_count = countedItems.size;
+  return { execution, retryRecords };
+}
+
+function finalizeExecutionJob({ job, account, action, itemStatus, decision, promotionPrep, itemPrep, execution, jobStartedMs }) {
+  const request = job.request;
+  const batchTaskId = saveBatchExecutionSummaryTask({
+    account,
+    action,
+    execution,
+    completed: !execution.cancelled
+      && Number(execution.failed || 0) === 0
+      && Number(execution.pending || 0) === 0
+      && Number(execution.activity_failure_count || 0) === 0,
+    request,
+    existingTaskId: job.batch_task_id,
+  });
+  job.batch_task_id = Number(batchTaskId);
+  const retryablePendingCount = Number(execution.retryable_pending_count ?? execution.pending ?? 0);
+  job.status = execution.cancelled ? 'cancelled' : retryablePendingCount > 0 ? 'paused' : 'completed';
+  job.request.resumePendingOnly = job.status === 'paused';
+  job.progress.stage = job.status;
+  job.progress.pending_relations = Number(execution.pending || 0);
+  job.progress.write_queue = execution.write_queue || null;
+  job.finished_at = new Date().toISOString();
+  job.error = null;
+  job.result = {
+    ok: !execution.cancelled,
+    message: execution.cancelled ? '执行任务已停止。' : '真实执行已完成。',
+    today_decision: decision,
+    action,
+    itemStatus,
+    batchTaskId,
+    prepare: { promotions: promotionPrep.summary, items: itemPrep.summary },
+    execution,
+  };
+  const executionDisplayTotal = displayExecutionTotal(execution);
+  appendExecutionJobLog(job, job.status === 'paused'
+    ? `待恢复 ${execution.pending || 0} 条关系；已成功、业务失败和普通跳过项不会重复提交。`
+    : execution.cancelled
+      ? '执行任务已停止。'
+      : `结束：总商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，待平台生效 ${execution.platform_pending_count || 0}，阻断活动 ${execution.blocked}，用时 ${Math.round((Date.now() - jobStartedMs) / 1000)} 秒。`);
+  appendExecutionUserLog(job, job.status === 'paused'
+    ? `${execution.pending || 0} 条关系等待恢复；写请求成功但待生效的关系只读回查，不会重复写入。`
+    : execution.cancelled
+      ? `执行任务已按规则停止：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，已保存结果。`
+      : `${actionDisplayName(action)}完成：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，待平台生效 ${execution.platform_pending_count || 0}，用时 ${formatDuration(Date.now() - jobStartedMs)}。`);
+  persistExecutionJob(job);
 }
 
 function displayProgressTotal(event = {}) {
@@ -5096,6 +5797,8 @@ function saveBatchExecutionSummaryTask({ account, action, execution, completed, 
     request_success_count: execution.request_success_count ?? 0,
     live_verified_removed_count: execution.live_verified_removed_count ?? 0,
     pending_verification_count: execution.pending_verification_count ?? 0,
+    platform_pending_count: execution.platform_pending_count ?? 0,
+    retryable_pending_count: execution.retryable_pending_count ?? 0,
     failure_reasons: summarizeExecutionFailureReasons(execution)
   }, completed && !execution.cancelled && (execution.failed || 0) === 0 && (execution.activity_failure_count || 0) === 0
     ? 'completed'
@@ -5155,15 +5858,100 @@ async function runExecutionJob(jobId) {
     const selectedSiteName = request.selectedSiteName || (filters.siteId ? siteDisplayName(filters.siteId) : '全部站点');
     const jobReadConcurrency = normalizeConcurrency(request.readConcurrency, settings.readConcurrency);
     const jobSiteConcurrency = normalizeConcurrency(request.siteConcurrency ?? request.readConcurrency, settings.readConcurrency);
-    const jobActivityConcurrency = normalizeConcurrency(request.activityConcurrency ?? request.previewConcurrency ?? settings.previewConcurrency, settings.previewConcurrency);
-    const jobWriteConcurrency = normalizeWriteConcurrency(request.writeConcurrency, settings.writeConcurrency);
-    const jobGlobalWriteConcurrency = normalizeConcurrencyWithCap(request.globalWriteConcurrency ?? jobWriteConcurrency, jobWriteConcurrency, MAX_WRITE_CONCURRENCY);
+    const jobActivityConcurrency = normalizeActivityConcurrency(request.activityConcurrency ?? request.previewConcurrency ?? settings.previewConcurrency, settings.previewConcurrency);
+    const requestedJobWriteConcurrency = normalizeWriteConcurrency(request.writeConcurrency, settings.writeConcurrency);
+    const requestedJobGlobalWriteConcurrency = normalizeConcurrencyWithCap(
+      request.globalWriteConcurrency ?? requestedJobWriteConcurrency,
+      requestedJobWriteConcurrency,
+      MAX_WRITE_CONCURRENCY,
+    );
+    const jobWriteProfile = adaptiveWriteProfileForAction(request.action, requestedJobGlobalWriteConcurrency);
+    const jobWriteConcurrency = Math.min(requestedJobWriteConcurrency, jobWriteProfile.perRoute);
+    const jobGlobalWriteConcurrency = jobWriteProfile.maxGlobal;
+    let action = request.action || '';
+    let decision = null;
     Object.assign(job.progress, {
       requested_write_concurrency: request.requestedWriteConcurrency ?? request.writeConcurrency,
       write_concurrency: jobWriteConcurrency,
       requested_global_write_concurrency: request.requestedGlobalWriteConcurrency ?? request.globalWriteConcurrency,
       global_write_concurrency: jobGlobalWriteConcurrency
     });
+
+    const startupPendingRecords = request.resumePendingOnly ? pendingWriteQueue.pending(job.id) : [];
+    const existingRetryablePendingCount = Number(
+      job.result?.execution?.retryable_pending_count
+      ?? job.result?.execution?.pending
+      ?? 0
+    );
+    if (request.resumePendingOnly && startupPendingRecords.length === 0 && existingRetryablePendingCount === 0) {
+      job.status = 'completed';
+      job.error = null;
+      job.finished_at = job.finished_at || new Date().toISOString();
+      job.request.resumePendingOnly = false;
+      job.progress.stage = 'completed';
+      job.progress.pending_relations = 0;
+      appendExecutionJobLog(job, '持久待恢复队列已清空，执行结果已幂等收口，未重复提交商品。');
+      appendExecutionUserLog(job, '待平台确认关系已全部收口，本次未重复提交。');
+      persistExecutionJob(job);
+      return;
+    }
+    const startsWithReadOnlyVerification = startupPendingRecords.length > 0
+      && startupPendingRecords.every((record) => record.retry_category === 'pending_verification');
+    if (request.resumePendingOnly && startsWithReadOnlyVerification) {
+      if (!action) throw new ApiError('待恢复任务缺少已确认动作，已停止恢复且未重复提交商品。', 409);
+      const recoveryScope = filterPendingRecordsByConfirmedScope({
+        accountId: account.account_id,
+        records: startupPendingRecords,
+        request,
+      });
+      if (recoveryScope.missingRelations.length) {
+        throw new ApiError('待恢复关系超出原最终确认范围，已停止恢复且未重复提交商品。', 409);
+      }
+      job.progress.stage = 'pending_verification';
+      appendExecutionUserLog(job, `只读回查 ${recoveryScope.records.length} 条待平台确认关系，不会再次提交写入。`);
+      appendExecutionJobLog(job, '恢复模式先处理持久待确认队列，跳过普通活动目录和商品准备。');
+      persistExecutionJob(job);
+      const recovery = await recoverPendingVerificationRecords({
+        job,
+        account,
+        action,
+        records: recoveryScope.records,
+      });
+      const recoveryExecution = job.result?.execution
+        ? mergeExecutionRecoveryRound(job.result.execution, recovery.execution)
+        : recovery.execution;
+      const recoveryItemStatus = requireItemStatus(request.itemStatus || actionDefaultStatus(action));
+      finalizeExecutionJob({
+        job,
+        account,
+        action,
+        itemStatus: recoveryItemStatus,
+        decision,
+        promotionPrep: {
+          promotions: [],
+          summary: {
+            stages: ['仅恢复持久待确认关系，未重新读取普通活动范围。'],
+            fetched: false,
+            matched_before_fetch: 0,
+            matched_after_fetch: 0,
+            total_after_fetch: 0,
+          },
+        },
+        itemPrep: {
+          summary: {
+            action,
+            itemStatus: recoveryItemStatus,
+            fetchMode: 'pending_verification_read_only',
+            promotions: recovery.execution?.promotions_total || 0,
+            saved_count: recovery.execution?.total || 0,
+            stages: ['仅只读回查待平台确认关系，未重复写入。'],
+          },
+        },
+        execution: recoveryExecution,
+        jobStartedMs,
+      });
+      return;
+    }
 
     job.progress.stage = 'promotions';
     appendExecutionUserLog(job, `开始${actionDisplayName(request.action || '')}：店铺=${request.selectedStoreName || storeName}，站点=${selectedSiteName}，自建${request.sellerDiscountPercent ?? settings.sellerDefaultDiscount}%，官方${request.officialDiscountPercent ?? settings.officialDefaultDiscount}%，读取并发=${jobReadConcurrency}，站点并发=${jobSiteConcurrency}，活动并发=${jobActivityConcurrency}，商品写入并发=${jobWriteConcurrency}，全局写入上限=${jobGlobalWriteConcurrency}。`);
@@ -5209,10 +5997,11 @@ async function runExecutionJob(jobId) {
       throw new ApiError('最终确认活动已不在本地验证范围中，本次未执行商品。请重新准备。', 409);
     }
 
-    let action = request.action || '';
-    let decision = null;
     if (!action) {
       decision = buildTodayDecision(account.account_id, promotions);
+      if (decision.action === 'configuration_required') {
+        throw new ApiError(decision.reason, 422);
+      }
       action = decision.action;
       job.result = { today_decision: decision };
       appendExecutionUserLog(job, `今日判断：${actionDisplayName(action)}。${decision.reason || ''}`);
@@ -5223,6 +6012,64 @@ async function runExecutionJob(jobId) {
     }
 
     const itemStatus = requireItemStatus(request.itemStatus || actionDefaultStatus(action));
+    const pendingRecoveryRecords = request.resumePendingOnly ? pendingWriteQueue.pending(job.id) : [];
+    let pendingVerificationExecution = null;
+    let pendingWriteRecords = null;
+    if (request.resumePendingOnly) {
+      if (!pendingRecoveryRecords.length) {
+        throw new ApiError('持久待恢复队列为空，已停止恢复且未重复提交商品。', 409);
+      }
+      const recoveryScope = filterPendingRecordsByConfirmedScope({
+        accountId: account.account_id,
+        records: pendingRecoveryRecords,
+        request,
+      });
+      if (recoveryScope.missingRelations.length) {
+        throw new ApiError('待恢复关系超出原最终确认范围，已停止恢复且未重复提交商品。', 409);
+      }
+      const pendingVerificationRecords = recoveryScope.records.filter((record) => record.retry_category === 'pending_verification');
+      pendingWriteRecords = recoveryScope.records.filter((record) => record.retry_category !== 'pending_verification');
+      if (pendingVerificationRecords.length) {
+        appendExecutionUserLog(job, `只读回查 ${pendingVerificationRecords.length} 条待平台确认关系，不会再次提交写入。`);
+        const pendingVerificationRecovery = await recoverPendingVerificationRecords({
+          job,
+          account,
+          action,
+          records: pendingVerificationRecords,
+        });
+        pendingVerificationExecution = pendingVerificationRecovery.execution;
+        pendingWriteRecords = [...pendingWriteRecords, ...pendingVerificationRecovery.retryRecords];
+        if (pendingVerificationRecovery.retryRecords.length) {
+          appendExecutionUserLog(job, `${pendingVerificationRecovery.retryRecords.length} 条关系经实时确认仍可报名且未进入活动，将在原确认范围内有限重试。`);
+        }
+      }
+      if (!pendingWriteRecords.length) {
+        const recoveryExecution = job.result?.execution
+          ? mergeExecutionRecoveryRound(job.result.execution, pendingVerificationExecution)
+          : pendingVerificationExecution;
+        finalizeExecutionJob({
+          job,
+          account,
+          action,
+          itemStatus,
+          decision,
+          promotionPrep,
+          itemPrep: {
+            summary: {
+              action,
+              itemStatus,
+              fetchMode: 'pending_verification_read_only',
+              promotions: pendingVerificationExecution?.promotions_total || 0,
+              saved_count: pendingVerificationExecution?.total || 0,
+              stages: ['仅只读回查待平台确认关系，未重新读取候选范围，未重复写入。'],
+            },
+          },
+          execution: recoveryExecution,
+          jobStartedMs,
+        });
+        return;
+      }
+    }
     job.progress.stage = 'items';
     appendExecutionUserLog(job, `开始读取${itemStatusDisplayName(itemStatus)}：活动 ${promotions.length} 个，读取并发=${jobReadConcurrency}。`);
     appendExecutionJobLog(job, `读取 ${itemStatus} 商品，活动 ${promotions.length} 个。`);
@@ -5290,7 +6137,13 @@ async function runExecutionJob(jobId) {
 
     const allowInventoryFallback = request.allowInventoryFallback !== false;
     let itemsByPromotion = listItemsForPromotions(account.account_id, promotions, itemStatus);
-    const confirmedFilter = filterItemsByConfirmedScope({ accountId: account.account_id, promotions, itemsByPromotion, request });
+    const confirmedFilter = filterItemsByConfirmedScope({
+      accountId: account.account_id,
+      promotions,
+      itemsByPromotion,
+      request,
+      requiredRecords: request.resumePendingOnly ? pendingWriteRecords : null,
+    });
     if (confirmedFilter.hasFilter) {
       if (confirmedFilter.missingRelations.length) {
         throw new ApiError('最终确认商品已不在本地验证范围中，本次未执行商品。请重新准备。', 409);
@@ -5329,7 +6182,7 @@ async function runExecutionJob(jobId) {
       allowInventoryFallback
     });
     if (request.resumePendingOnly) {
-      const pendingKeys = new Set(pendingWriteQueue.pending(job.id).map((record) => String(record.relation_key || '')));
+      const pendingKeys = new Set((pendingWriteRecords || []).map((record) => String(record.relation_key || '')));
       for (const entry of batch.plans) {
         const promotion = entry.promotion;
         entry.plan.rows = (entry.plan.rows || []).filter((row) => pendingKeys.has(pendingRelationKey({
@@ -5412,6 +6265,12 @@ async function runExecutionJob(jobId) {
           job.progress.write_adaptive_limit = Number(event.limit || 0);
           job.progress.write_cooldown_until = event.cooldown_until || null;
           job.progress.write_route_active = event.route_active || {};
+          job.progress.write_overload_count = Number(event.overload_count || 0);
+          job.progress.write_rate_limit_count = Number(event.rate_limit_count || 0);
+          job.progress.write_network_error_count = Number(event.network_error_count || 0);
+          job.progress.write_service_error_count = Number(event.service_error_count || 0);
+          job.progress.write_timeout_error_count = Number(event.timeout_error_count || 0);
+          job.progress.write_last_overload_kind = event.last_overload_kind || null;
         }
         if (event.type === 'execution_stop_requested') {
           job.cancel_requested = true;
@@ -5435,62 +6294,17 @@ async function runExecutionJob(jobId) {
         }
       }
     });
-    if (request.resumePendingOnly && job.result?.execution) {
-      execution = mergeExecutionRecoveryRound(job.result.execution, execution);
+    if (request.resumePendingOnly) {
+      const recoveryRound = combineCurrentRecoveryExecutions(pendingVerificationExecution, execution);
+      execution = job.result?.execution
+        ? mergeExecutionRecoveryRound(job.result.execution, recoveryRound)
+        : recoveryRound;
     }
     if (itemFilter.hasFilter) {
       execution.target_item_ids = itemFilter.requestedItemIds;
       execution.itemIds_filtered_count = itemFilter.matchedItemIds.length;
     }
-    for (const promotionResult of execution.promotions || []) {
-      if (Number(promotionResult.success || 0) <= 0 && Number(promotionResult.request_success_count || 0) <= 0) continue;
-      markActivityCacheDirty({
-        accountId: account.account_id,
-        siteId: promotionResult.site_id || '',
-        promotionId: promotionResult.promotion_id,
-        promotionType: promotionResult.promotion_type,
-      });
-    }
-    const batchTaskId = saveBatchExecutionSummaryTask({
-      account,
-      action,
-      execution,
-      completed: !execution.cancelled
-        && Number(execution.failed || 0) === 0
-        && Number(execution.pending || 0) === 0
-        && Number(execution.activity_failure_count || 0) === 0,
-      request,
-      existingTaskId: job.batch_task_id,
-    });
-    job.batch_task_id = Number(batchTaskId);
-    job.status = execution.cancelled ? 'cancelled' : Number(execution.pending || 0) > 0 ? 'paused' : 'completed';
-    job.request.resumePendingOnly = job.status === 'paused';
-    job.progress.stage = job.status;
-    job.progress.pending_relations = Number(execution.pending || 0);
-    job.progress.write_queue = globalWriteLimiter.snapshot?.() || null;
-    job.finished_at = new Date().toISOString();
-    job.result = {
-      ok: !execution.cancelled,
-      message: execution.cancelled ? '执行任务已停止。' : '真实执行已完成。',
-      today_decision: decision,
-      action,
-      itemStatus,
-      batchTaskId,
-      prepare: { promotions: promotionPrep.summary, items: itemPrep.summary },
-      execution
-    };
-    const executionDisplayTotal = displayExecutionTotal(execution);
-    appendExecutionJobLog(job, job.status === 'paused'
-      ? `临时失败已进入持久留置队列：待恢复 ${execution.pending || 0} 条关系；已成功和业务失败项不会重复提交。`
-      : execution.cancelled
-      ? '执行任务已停止。'
-      : `结束：总商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，阻断活动 ${execution.blocked}，用时 ${Math.round((Date.now() - jobStartedMs) / 1000)} 秒。`);
-    appendExecutionUserLog(job, job.status === 'paused'
-      ? `平台限流或临时网络失败，${execution.pending || 0} 条关系已安全留置并等待恢复；其它商品结果已保存。`
-      : execution.cancelled
-      ? `执行任务已按规则停止：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，已保存结果。`
-      : `${actionDisplayName(action)}完成：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，用时 ${formatDuration(Date.now() - jobStartedMs)}。`);
-    persistExecutionJob(job);
+    finalizeExecutionJob({ job, account, action, itemStatus, decision, promotionPrep, itemPrep, execution, jobStartedMs });
   } catch (error) {
     failExecutionJob(job, error);
   }
@@ -5501,6 +6315,7 @@ function buildTodayDecision(accountId, promotions) {
 }
 
 function buildTodayDecisionForScope(accountIds, promotions) {
+  const settings = readSettings();
   const cycleStatesByPromotion = new Map();
   const startedCountsByPromotion = new Map();
   for (const accountId of accountIds) {
@@ -5509,27 +6324,52 @@ function buildTodayDecisionForScope(accountIds, promotions) {
     for (const [key, value] of listItemCountsForPromotions(accountId, scoped, 'started')) startedCountsByPromotion.set(key, value);
   }
   const globalCycle = buildGlobalTodayDiscount({
-    tasks: listGlobalDiscountUpdateSummaries(300),
-    settings: readSettings(),
+    tasks: listGlobalDiscountExecutionSummaries(300),
+    settings,
   });
-  return decideToday({ promotions, cycleStatesByPromotion, startedCountsByPromotion, globalCycle });
+  if (!hasConfiguredCycleMaximums(settings)) {
+    return {
+      action: 'configuration_required',
+      today_action: 'configuration_required',
+      already_completed: false,
+      needs_resume: false,
+      promotions_total: promotions.length,
+      selected_promotions: 0,
+      rows: [],
+      reason: '请先在设置的日常设置中填写自建最高折扣和官方最高折扣。',
+    };
+  }
+  return decideToday({
+    promotions,
+    cycleStatesByPromotion,
+    startedCountsByPromotion,
+    globalCycle,
+    sellerMaxDiscount: settings.sellerMaxDiscount,
+    officialMaxDiscount: settings.officialMaxDiscount,
+  });
 }
 
 async function executeBatchPlans({ account, action, itemStatus, batch, request, writeConcurrency, globalWriteConcurrency, activityConcurrency, onProgress, shouldCancel }) {
   const requestedNormalizedWriteConcurrency = normalizeWriteConcurrency(writeConcurrency, readSettings().writeConcurrency);
-  const normalizedWriteConcurrency = Math.min(requestedNormalizedWriteConcurrency, ADAPTIVE_WRITE_PROFILE.perRoute);
-  const normalizedActivityConcurrency = normalizeConcurrency(activityConcurrency ?? request?.activityConcurrency ?? readSettings().previewConcurrency, readSettings().previewConcurrency);
-  const normalizedGlobalWriteConcurrency = ADAPTIVE_WRITE_PROFILE.maxGlobal;
+  const normalizedActivityConcurrency = normalizeActivityConcurrency(activityConcurrency ?? request?.activityConcurrency ?? readSettings().previewConcurrency, readSettings().previewConcurrency);
+  const requestedGlobalWriteConcurrency = Math.max(
+    1,
+    Number(globalWriteConcurrency ?? request?.globalWriteConcurrency ?? requestedNormalizedWriteConcurrency),
+  );
+  const actionWriteProfile = adaptiveWriteProfileForAction(action, requestedGlobalWriteConcurrency);
+  const normalizedWriteConcurrency = Math.min(requestedNormalizedWriteConcurrency, actionWriteProfile.perRoute);
+  const normalizedGlobalWriteConcurrency = actionWriteProfile.maxGlobal;
   let stopReason = null;
   const globalWriteLimiter = request?.executionGroupId
-    ? getSharedWriteLimiter(request.executionGroupId, normalizedGlobalWriteConcurrency, ({ active, maxActive, limit, queued, cooldown_until, route_active }) => {
-      summary.globalMaxActive = Math.max(summary.globalMaxActive || 0, maxActive || 0);
-      onProgress?.({ type: 'write_peak', active, maxActive, limit, queued, cooldown_until, route_active });
+    ? getSharedWriteLimiter(request.executionGroupId, action, normalizedGlobalWriteConcurrency, (state) => {
+      summary.globalMaxActive = Math.max(summary.globalMaxActive || 0, state.maxActive || 0);
+      onProgress?.({ type: 'write_peak', ...state });
     })
     : createAdaptiveWriteScheduler({
-      onStateChange: ({ active, maxActive, limit, queued, cooldown_until, route_active }) => {
-        summary.globalMaxActive = Math.max(summary.globalMaxActive || 0, maxActive || 0);
-        onProgress?.({ type: 'write_peak', active, maxActive, limit, queued, cooldown_until, route_active });
+      profile: actionWriteProfile,
+      onStateChange: (state) => {
+        summary.globalMaxActive = Math.max(summary.globalMaxActive || 0, state.maxActive || 0);
+        onProgress?.({ type: 'write_peak', ...state });
       }
     });
   const summary = {
@@ -5547,6 +6387,8 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
     request_success_count: 0,
     live_verified_removed_count: 0,
     pending_verification_count: 0,
+    platform_pending_count: 0,
+    retryable_pending_count: 0,
     writeConcurrency: normalizedWriteConcurrency,
     activityConcurrency: normalizedActivityConcurrency,
     globalWriteConcurrency: normalizedGlobalWriteConcurrency,
@@ -5564,10 +6406,20 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
     summary.stop_reason = stopReason;
     onProgress?.({ type: 'execution_stop_requested', reason: stopReason, details });
   };
+  const writeRepeatGuards = request?.resumePendingOnly
+    ? []
+    : listLatestWriteRepeatGuards({
+        accountId: account.account_id,
+        action,
+        sameDayStartIso: shanghaiDayStartIso(),
+      });
   const indexedPlans = batch.plans.map((entry, index) => ({ entry, index }));
   await mapLimited(indexedPlans, normalizedActivityConcurrency, async ({ entry, index }) => {
     const { promotion, blocked, warning, detail_status: detailStatus } = entry;
     let plan = entry.plan;
+    if (!blocked && writeRepeatGuards.length) {
+      plan = applyWriteRepeatGuards(plan, writeRepeatGuards, action);
+    }
     if (shouldStop()) {
       summary.cancelled = true;
       return;
@@ -5850,7 +6702,9 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
           task_id: Number(taskId),
           row,
           attempt_count: attempt,
-          retry_category: classifiedError?.rateLimited ? 'rate_limited' : 'transient_interface_failure',
+          retry_category: classifiedError?.rateLimited
+            ? 'rate_limited'
+            : classifiedError?.transientOfferLock ? 'transient_offer_lock' : 'transient_interface_failure',
           error_cn: errorCn,
         });
       },
@@ -5908,9 +6762,167 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         maxImmediateRetries: 3,
         retryBackoffMs: [1000, 2000, 4000],
         deferredFinalRetry: true,
-        deferredConcurrency: Math.min(normalizedWriteConcurrency, ADAPTIVE_WRITE_PROFILE.perRoute)
+        deferredConcurrency: Math.min(normalizedWriteConcurrency, actionWriteProfile.perRoute)
       }
     });
+    if (action !== 'cancel') {
+      const plannedByItemId = new Map((plan.rows || []).map((row) => [String(row.item?.item_id || ''), row]));
+      const requestSuccessRows = (execution.results || [])
+        .filter((result) => result?.status === 'success')
+        .map((result) => plannedByItemId.get(String(result.itemId || '')))
+        .filter(Boolean);
+      let verification = { verified: [], unresolved: requestSuccessRows, polls: [] };
+      try {
+        verification = await waitForAppliedWriteRows({
+          client,
+          accountId: account.account_id,
+          campaign: promotion,
+          rows: requestSuccessRows,
+          action,
+          shouldCancel: shouldStop,
+        });
+      } catch (error) {
+        verification = { ...verification, read_error: toChineseError(error) };
+      }
+      appendExecutionItemAuditEvent(request?.executionJobId, {
+        type: 'write_live_verification_round',
+        account,
+        promotion,
+        taskId,
+        action,
+        verificationRound: 1,
+        polls: verification.polls,
+        verified_count: verification.verified.length,
+        started_price_mismatch_count: verification.started_price_mismatch?.length || 0,
+        platform_pending_count: verification.confirmed_pending?.length || 0,
+        confirmed_candidate_count: verification.confirmed_candidate?.length || 0,
+        unresolved_count: verification.unresolved.length,
+        repeated_write_requests: 0,
+      });
+      const verifiedRows = verification.verified || [];
+      const mismatchRows = verification.started_price_mismatch || [];
+      const platformPendingRows = verification.confirmed_pending || [];
+      const candidateRows = verification.confirmed_candidate || [];
+      const unresolvedRows = verification.unresolved || [];
+      applySuccessfulPromotionItemWrites({
+        accountId: account.account_id,
+        promotionId: promotion.promotion_id,
+        promotionType: promotion.promotion_type,
+        action,
+        items: verifiedRows.map((row) => ({ itemId: row.item?.item_id, dealPrice: row.deal_price })),
+      });
+      for (const row of mismatchRows) {
+        const relationKey = pendingRelationKey({
+          accountId: account.account_id,
+          siteId: promotion.site_id,
+          promotionId: promotion.promotion_id,
+          promotionType: promotion.promotion_type,
+          itemId: row.item?.item_id,
+          action,
+        });
+        saveExecutionResult({
+          taskId,
+          accountId: account.account_id,
+          promotionId: promotion.promotion_id,
+          promotionType: promotion.promotion_type,
+          itemId: row.item?.item_id || '',
+          action,
+          mode: 'real',
+          status: 'failed',
+          dealPrice: row.deal_price,
+          errorCn: `商品已进入活动，但平台活动价 ${row.live_price ?? '-'} 未达到本次目标价 ${row.deal_price ?? '-'}；本次不重复报名`,
+        });
+        pendingWriteQueue.resolve(request?.executionJobId, relationKey, 'failed', {
+          recovery_mode: 'started_price_mismatch',
+          live_price: row.live_price ?? null,
+        });
+      }
+      for (const row of platformPendingRows) {
+        saveExecutionResult({
+          taskId,
+          accountId: account.account_id,
+          promotionId: promotion.promotion_id,
+          promotionType: promotion.promotion_type,
+          itemId: row.item?.item_id || '',
+          action,
+          mode: 'real',
+          status: CANCEL_RESULT_STATUS.pendingVerification,
+          dealPrice: row.deal_price,
+          errorCn: '平台已明确返回 pending（待生效），本地执行已完成且不会重复提交',
+        });
+      }
+      for (const [category, rows] of [
+        ['confirmed_candidate_after_write', candidateRows],
+        ['pending_verification', unresolvedRows],
+      ]) {
+        for (const row of rows) {
+        const relationKey = pendingRelationKey({
+          accountId: account.account_id,
+          siteId: promotion.site_id,
+          promotionId: promotion.promotion_id,
+          promotionType: promotion.promotion_type,
+          itemId: row.item?.item_id,
+          action,
+        });
+        saveExecutionResult({
+          taskId,
+          accountId: account.account_id,
+          promotionId: promotion.promotion_id,
+          promotionType: promotion.promotion_type,
+          itemId: row.item?.item_id || '',
+          action,
+          mode: 'real',
+          status: CANCEL_RESULT_STATUS.pendingVerification,
+          dealPrice: row.deal_price,
+          errorCn: category === 'confirmed_candidate_after_write'
+            ? '写入请求已成功，但平台仍明确返回可报名；将在原确认范围内有限重试'
+            : verification.read_error || '写入请求已成功，但平台未返回已报名或可报名状态；继续只读确认且不会盲目重写',
+        });
+        pendingWriteQueue.enqueue(request?.executionJobId, {
+          relation_key: relationKey,
+          account_id: String(account.account_id),
+          child_user_id: String(promotion.child_user_id || ''),
+          site_id: String(promotion.site_id || '').toUpperCase(),
+          promotion_id: String(promotion.promotion_id || ''),
+          promotion_type: String(promotion.promotion_type || '').toUpperCase(),
+          item_id: String(row.item?.item_id || ''),
+          action,
+          task_id: Number(taskId),
+          row,
+          attempt_count: 1,
+          retry_category: category,
+          error_cn: category === 'confirmed_candidate_after_write'
+            ? '平台仍明确返回可报名，等待有限重试'
+            : verification.read_error || '写入请求已成功，等待平台实时状态只读确认',
+        });
+        }
+      }
+      const nonVerifiedCount = mismatchRows.length + platformPendingRows.length + candidateRows.length + unresolvedRows.length;
+      execution.counts.success = Math.max(0, Number(execution.counts.success || 0) - nonVerifiedCount);
+      execution.counts.failed = Number(execution.counts.failed || 0) + mismatchRows.length;
+      execution.counts.pending = Number(execution.counts.pending || 0) + platformPendingRows.length + candidateRows.length + unresolvedRows.length;
+      execution.counts.pending_verification_count = unresolvedRows.length;
+      execution.counts.platform_pending_count = platformPendingRows.length;
+      execution.counts.retryable_pending_count = candidateRows.length + unresolvedRows.length;
+      invalidatePromotionItemFetchStates({
+        accountId: account.account_id,
+        promotionId: promotion.promotion_id,
+        promotionType: promotion.promotion_type,
+      });
+      markActivityCacheDirty({
+        accountId: account.account_id,
+        siteId: promotion.site_id,
+        promotionId: promotion.promotion_id,
+        promotionType: promotion.promotion_type,
+      });
+    }
+    if (Number(execution?.counts?.success || 0) > 0 || Number(execution?.counts?.request_success_count || 0) > 0) {
+      reconcilePromotionItemFetchCounts({
+        accountId: account.account_id,
+        promotionId: promotion.promotion_id,
+        promotionType: promotion.promotion_type,
+      });
+    }
     const counts = execution.counts;
     const unreadable = unreadableCandidateCount({
       action,
@@ -5948,7 +6960,15 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         counts,
         saveResult: persistExecutionOutcome,
         executionJobId: request?.executionJobId,
-        shouldCancel: shouldStop
+        shouldCancel: shouldStop,
+        schedule: (runWrite) => globalWriteLimiter.run(runWrite, {
+          accountId: account.account_id,
+          siteId: promotion.site_id,
+        }),
+        allowedItemIds: (plan.rows || []).map((row) => row.item?.item_id).filter(Boolean),
+        retryableItemIds: cancelOutcomes
+          .filter((outcome) => outcome.status === CANCEL_RESULT_STATUS.requestSuccess)
+          .map((outcome) => outcome.item_id),
       });
     }
     let resultContract = null;
@@ -5965,6 +6985,14 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       const rowByItemId = new Map((plan.rows || []).map((row) => [String(row.item?.item_id || ''), row]));
       for (const [itemId, status] of Object.entries(resultContract.final_status_by_item)) {
         const row = rowByItemId.get(itemId);
+        const relationKey = pendingRelationKey({
+          accountId: account.account_id,
+          siteId: promotion.site_id,
+          promotionId: promotion.promotion_id,
+          promotionType: promotion.promotion_type,
+          itemId,
+          action,
+        });
         saveExecutionResult({
           taskId,
           accountId: account.account_id,
@@ -5981,6 +7009,24 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
               ? '取消请求已提交，但实时回查仍为已报名状态'
               : null,
         });
+        if (status === CANCEL_RESULT_STATUS.pendingVerification) {
+          pendingWriteQueue.enqueue(request?.executionJobId, {
+            relation_key: relationKey,
+            account_id: String(account.account_id),
+            child_user_id: String(promotion.child_user_id || ''),
+            site_id: String(promotion.site_id || '').toUpperCase(),
+            promotion_id: String(promotion.promotion_id || ''),
+            promotion_type: String(promotion.promotion_type || '').toUpperCase(),
+            item_id: itemId,
+            action,
+            task_id: Number(taskId),
+            row,
+            retry_category: 'pending_verification',
+            error_cn: '取消请求已成功，等待平台实时状态只读确认',
+          });
+        } else if (status === CANCEL_RESULT_STATUS.liveVerifiedRemoved) {
+          pendingWriteQueue.resolve(request?.executionJobId, relationKey, 'success', { recovery_mode: 'read_only_verification' });
+        }
         appendExecutionItemAuditEvent(request?.executionJobId, {
           type: 'item_cancel_final_state',
           account,
@@ -6011,7 +7057,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         activity_failure_count: activityFailureCount,
         request_success_count: 0,
         live_verified_removed_count: 0,
-        pending_verification_count: 0,
+        pending_verification_count: Number(counts.pending_verification_count || 0),
         pending_count: Number(counts.pending || 0),
         result_contract_version: RESULT_CONTRACT_VERSION,
       });
@@ -6039,6 +7085,8 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
     summary.request_success_count += Number(counts.request_success_count || 0);
     summary.live_verified_removed_count += Number(counts.live_verified_removed_count || 0);
     summary.pending_verification_count += Number(counts.pending_verification_count || 0);
+    summary.platform_pending_count += Number(counts.platform_pending_count || 0);
+    summary.retryable_pending_count += Number(counts.retryable_pending_count || 0);
     summary.activity_failure_count += Number(counts.activity_failure_count || 0);
     summary.success += counts.success;
     summary.failed += counts.failed;
@@ -6064,6 +7112,8 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       request_success_count: Number(counts.request_success_count || 0),
       live_verified_removed_count: Number(counts.live_verified_removed_count || 0),
       pending_verification_count: Number(counts.pending_verification_count || 0),
+      platform_pending_count: Number(counts.platform_pending_count || 0),
+      retryable_pending_count: Number(counts.retryable_pending_count || 0),
       completed,
       writeConcurrency: execution.writeConcurrency,
       maxActive: execution.maxActive,
@@ -6089,13 +7139,19 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
     });
   });
   summary.globalMaxActive = globalWriteLimiter.maxActive;
+  summary.write_queue = globalWriteLimiter.snapshot?.() || null;
   if (stopReason) summary.stop_reason = stopReason;
   return summary;
 }
 
-function getSharedWriteLimiter(groupId, limit, onActiveChange) {
+function getSharedWriteLimiter(groupId, action, limit, onActiveChange) {
   const key = String(groupId || '');
-  if (!key) return createAdaptiveWriteScheduler({ onStateChange: onActiveChange });
+  if (!key) {
+    return createAdaptiveWriteScheduler({
+      profile: adaptiveWriteProfileForAction(action, limit),
+      onStateChange: onActiveChange,
+    });
+  }
   const existing = sharedWriteLimiters.get(key);
   if (existing) {
     if (onActiveChange) existing.listeners.add(onActiveChange);
@@ -6103,6 +7159,7 @@ function getSharedWriteLimiter(groupId, limit, onActiveChange) {
   }
   const listeners = new Set(onActiveChange ? [onActiveChange] : []);
   const limiter = createAdaptiveWriteScheduler({
+    profile: adaptiveWriteProfileForAction(action, limit),
     onStateChange: (state) => {
       for (const listener of listeners) listener(state);
       const group = executionGroups.get(key) || executionGroupPersistence.load(key);
@@ -6331,10 +7388,16 @@ async function prepareItemsForExecution({
     const operationKey = operationActivityReadKey(account.account_id, campaign, itemStatus);
     const operationCached = operationReadCache?.get(operationKey) || null;
     const forceRefresh = forceReadKeys instanceof Set && forceReadKeys.has(operationKey);
-    const cacheDecision = forceRefresh
+      const cacheDecision = forceRefresh
       ? { refresh: true, reason: 'reconfirm_changed_target' }
       : fetchMode === 'full'
-      ? activityItemsDecision({ promotion: campaign, cacheState, fetchState, fallbackState })
+      ? activityItemsDecision({
+        promotion: campaign,
+        cacheState,
+        fetchState,
+        fallbackState,
+        itemStatus,
+      })
       : { refresh: true, reason: 'sample_requested' };
     onProgress?.({
       type: 'item_fetch_start',
@@ -6359,11 +7422,15 @@ async function prepareItemsForExecution({
           sample_only: false,
           fetch_mode: 'cache',
           detail_status: cacheDecision.effective_state || effectiveState?.detail_status || 'ok',
-          blocked: false,
+          blocked: Boolean(cacheDecision.blocked),
           cache_reused: true,
           note: cacheDecision.reason === 'verified_composite_cache'
             ? '使用三日内已验证的 candidate 与库存兜底合成缓存。'
-            : '使用三日内已验证完整活动商品缓存。',
+            : cacheDecision.reason === 'same_day_failed'
+              ? '今天已读取失败，本次不重复访问平台；等待次日、Webhook 新变化或手动刷新。'
+              : cacheDecision.reason === 'same_day_incomplete'
+                ? '今天已读取但明细不完整，本次不重复访问平台。'
+                : '使用已验证活动商品缓存。',
         }));
     operationReadCache?.set(operationKey, row);
     checkpoint?.();
@@ -6944,10 +8011,25 @@ function normalizeBenchmarkLevels(value) {
   return [...new Set(levels)].sort((a, b) => a - b);
 }
 
+function normalizeWriteBenchmarkAction(value) {
+  const action = String(value || '').trim().toLowerCase();
+  return ['enroll', 'update', 'cancel'].includes(action) ? action : 'enroll';
+}
+
+function writeBenchmarkItemStatus(action) {
+  return action === 'cancel' ? 'started' : action === 'update' ? 'started' : 'candidate';
+}
+
+function writeBenchmarkActionLabel(action) {
+  if (action === 'cancel') return '取消';
+  if (action === 'update') return '更新';
+  return '报名';
+}
+
 function buildWriteConcurrencyBenchmarkPlan({ account, input = {} }) {
-  const levels = normalizeWriteBenchmarkLevels(input.levels || WRITE_BENCHMARK_LEVELS);
-  const action = input.action === 'update' ? 'update' : 'enroll';
-  const itemStatus = action === 'update' ? 'started' : 'candidate';
+  const levels = writeBenchmarkLevelsFromInput(input);
+  const action = normalizeWriteBenchmarkAction(input.action);
+  const itemStatus = writeBenchmarkItemStatus(action);
   const filters = input.filters || readSettings().defaultFilters || {};
   const candidatePromotions = listCampaignsFiltered(account.account_id, {
     ...filters,
@@ -7070,6 +8152,32 @@ function readWriteBenchmarkJobEvents(jobId, limit = 500) {
   }
 }
 
+function readWriteBenchmarkJobEventPage(jobId, { offset = 0, limit = 500 } = {}) {
+  const file = writeBenchmarkJobEventPath(jobId);
+  try {
+    const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean);
+    const start = Math.max(0, Math.min(lines.length, Math.floor(Number(offset) || 0)));
+    const size = Math.max(1, Math.min(5000, Math.floor(Number(limit) || 500)));
+    const events = lines.slice(start, start + size).map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return { parse_error: true, raw: line.slice(0, 500) };
+      }
+    });
+    const nextOffset = start + events.length;
+    return {
+      events,
+      event_total: lines.length,
+      offset: start,
+      next_offset: nextOffset,
+      has_more: nextOffset < lines.length,
+    };
+  } catch {
+    return { events: [], event_total: 0, offset: 0, next_offset: 0, has_more: false };
+  }
+}
+
 function writeBenchmarkItemsFromEvents(events = []) {
   return events
     .filter((event) => event.item && ['item_start', 'item_finish', 'item_cancelled'].includes(event.type))
@@ -7120,9 +8228,14 @@ function createWriteBenchmarkJob({ account, input = {} }) {
     error.status = 409;
     throw error;
   }
-  const levels = normalizeWriteBenchmarkLevels(input.levels || WRITE_BENCHMARK_LEVELS);
-  const action = input.action === 'update' ? 'update' : 'enroll';
-  const itemStatus = action === 'update' ? 'started' : 'candidate';
+  if (!dryRun && !String(input.confirmedPrepareId || input.confirmed_prepare_id || '').trim()) {
+    const error = new Error('真实写入并发测试必须绑定已冻结的 prepare_id。');
+    error.status = 409;
+    throw error;
+  }
+  const levels = writeBenchmarkLevelsFromInput(input);
+  const action = normalizeWriteBenchmarkAction(input.action);
+  const itemStatus = writeBenchmarkItemStatus(action);
   const id = `wbj-${Date.now()}-${nextWriteBenchmarkJobSeq++}`;
   const job = {
     id,
@@ -7200,15 +8313,24 @@ function writeBenchmarkInputSummary(input, account) {
   return {
     account_id: String(account.account_id),
     all_accounts: Boolean(input.allAccounts),
-    action: input.action === 'update' ? 'update' : 'enroll',
+    action: normalizeWriteBenchmarkAction(input.action),
     dry_run: input.dryRun !== false,
-    levels: normalizeWriteBenchmarkLevels(input.levels || WRITE_BENCHMARK_LEVELS),
+    levels: writeBenchmarkLevelsFromInput(input),
     sample_offset: input.sampleOffset || input.sample_offset || 0,
     round: input.round || 1,
     attempt: input.attempt || 1,
     discount_percent: Number(input.discountPercent) || null,
+    seller_discount_percent: Number(input.sellerDiscountPercent) || null,
+    official_discount_percent: Number(input.officialDiscountPercent) || null,
+    confirmed_prepare_id: input.confirmedPrepareId || input.confirmed_prepare_id || null,
+    confirmed_scope_hash: input.confirmedScopeHash || input.confirmed_scope_hash || null,
+    authorized_scope_hash: input.authorizedScopeHash || input.authorized_scope_hash || null,
+    cooldown_seconds_between_levels: Math.max(0, Math.min(600, Math.floor(Number(input.cooldownSecondsBetweenLevels || 0)))),
     fake_item_count: input.fakeItemCount || null,
-    exclude_item_count: Array.isArray(input.excludeItemIds) ? input.excludeItemIds.length : 0
+    exclude_item_count: Array.isArray(input.excludeItemIds) ? input.excludeItemIds.length : 0,
+    include_relation_count: Array.isArray(input.includeRelationKeys || input.include_relation_keys)
+      ? (input.includeRelationKeys || input.include_relation_keys).length
+      : 0
   };
 }
 
@@ -7226,9 +8348,10 @@ async function runWriteBenchmarkJob(jobId) {
     appendWriteBenchmarkJobEvent(job, { type: 'sample_pool_ready', item_count: rows.length, dry_run: job.dry_run });
     let cursor = 0;
     let cumulativeTimeouts = 0;
-    for (const level of job.levels) {
+    for (let levelIndex = 0; levelIndex < job.levels.length; levelIndex += 1) {
+      const level = job.levels[levelIndex];
       if (job.cancel_requested) break;
-      const sampleSize = Math.max(level, 3);
+      const sampleSize = level;
       const rowsForLevel = rows.slice(cursor, cursor + sampleSize);
       if (rowsForLevel.length < sampleSize) {
         const levelResult = {
@@ -7253,13 +8376,26 @@ async function runWriteBenchmarkJob(jobId) {
       cumulativeTimeouts += Number(levelResult.summary?.timeout || 0);
       persistWriteBenchmarkJob(job);
       if (job.cancel_requested) break;
-      const stopReason = writeBenchmarkStopReason({ level, summary: levelResult.summary }, cumulativeTimeouts);
+      const strictInterfaceFailures = writeBenchmarkStrictInterfaceFailureCount(levelResult.summary);
+      const stopReason = job.input?.strictInterfaceStop === true && strictInterfaceFailures > 0
+        ? `严格模式检测到 ${strictInterfaceFailures} 个接口错误，停止后续升档。`
+        : writeBenchmarkStopReason({ level, summary: levelResult.summary }, cumulativeTimeouts);
       if (stopReason) {
         job.status = 'completed';
         job.progress.stage = 'stopped_by_rule';
         job.stop_reason = stopReason;
         appendWriteBenchmarkJobEvent(job, { type: 'job_stopped_by_rule', stop_reason: stopReason });
         break;
+      }
+      const cooldownSeconds = Math.max(0, Math.min(600, Math.floor(Number(job.input?.cooldownSecondsBetweenLevels || 0))));
+      if (cooldownSeconds > 0 && levelIndex < job.levels.length - 1) {
+        job.progress.stage = 'cooldown_between_levels';
+        appendWriteBenchmarkJobEvent(job, { type: 'level_cooldown_started', level, cooldown_seconds: cooldownSeconds });
+        persistWriteBenchmarkJob(job);
+        await sleep(cooldownSeconds * 1000);
+        appendWriteBenchmarkJobEvent(job, { type: 'level_cooldown_completed', level, cooldown_seconds: cooldownSeconds });
+        job.progress.stage = 'running_level';
+        persistWriteBenchmarkJob(job);
       }
     }
     if (job.cancel_requested) {
@@ -7288,7 +8424,12 @@ async function collectRowsForWriteBenchmarkJob({ job, account }) {
     return buildFakeWriteBenchmarkRows({ job, account, input });
   }
   const settings = readSettings();
-  const requiredItems = (job.levels || []).reduce((sum, level) => sum + Math.max(level, 3), 0);
+  const confirmedScope = resolveWriteBenchmarkConfirmedScope(job.input || {}, job.action);
+  const includedRelations = new Set((input.includeRelationKeys || input.include_relation_keys || []).map(String).filter(Boolean));
+  const allowedIdentityKeys = includedRelations.size
+    ? new Set([...confirmedScope.identityKeys].filter((key) => includedRelations.has(key)))
+    : confirmedScope.identityKeys;
+  const requiredItems = (job.levels || []).reduce((sum, level) => sum + level, 0);
   const accounts = await resolveWriteBenchmarkAccounts(account, input);
   const samplePool = await collectWriteBenchmarkRows({
     accounts,
@@ -7296,7 +8437,8 @@ async function collectRowsForWriteBenchmarkJob({ job, account }) {
     itemStatus: job.item_status,
     input,
     settings,
-    requiredItems
+    requiredItems,
+    allowedIdentityKeys
   });
   const excluded = new Set((input.excludeItemIds || input.exclude_item_ids || []).map(String));
   return samplePool.rows.filter((row) => !excluded.has(String(row.item?.item_id || '')));
@@ -7306,7 +8448,7 @@ function buildFakeWriteBenchmarkRows({ job, account, input = {} }) {
   const fakeRows = Array.isArray(input.fakeRows) ? input.fakeRows : [];
   const requiredItems = Math.max(
     Number(input.fakeItemCount || 0),
-    (job.levels || []).reduce((sum, level) => sum + Math.max(level, 3), 0)
+    (job.levels || []).reduce((sum, level) => sum + level, 0)
   );
   const rows = fakeRows.length ? fakeRows : Array.from({ length: requiredItems }, (_, index) => ({
     itemId: `FAKE-${job.id}-${index + 1}`,
@@ -7358,6 +8500,7 @@ async function runWriteBenchmarkJobLevel({ job, level, rows }) {
     success: 0,
     failed: 0,
     interface_failed: 0,
+    retryable_failed: 0,
     business_failed: 0,
     skipped: 0
   });
@@ -7445,7 +8588,10 @@ async function runWriteBenchmarkJobLevel({ job, level, rows }) {
       };
     } catch (error) {
       const itemError = writeBenchmarkError(error);
-      const isInterfaceFailure = Number(itemError.status) === 429 || Number(itemError.status) >= 500 || isWriteBenchmarkNetworkFailure(itemError);
+      const isRetryableFailure = isTransientOfferLockError(itemError);
+      const isInterfaceFailure = [401, 403, 404, 429].includes(Number(itemError.status))
+        || Number(itemError.status) >= 500
+        || isWriteBenchmarkNetworkFailure(itemError);
       const itemFinish = {
         ...itemStart,
         result_status: 'failed',
@@ -7455,11 +8601,14 @@ async function runWriteBenchmarkJobLevel({ job, level, rows }) {
         error_category: itemError.code || itemError.message_cn || 'unknown',
         raw_error_summary: itemError.message,
         is_interface_failure: isInterfaceFailure,
-        is_business_failure: !isInterfaceFailure,
+        is_retryable_failure: isRetryableFailure,
+        retry_category: isRetryableFailure ? 'transient_offer_lock' : null,
+        is_business_failure: !isInterfaceFailure && !isRetryableFailure,
         error_cn: itemError.message_cn
       };
       job.progress.failed += 1;
       if (isInterfaceFailure) job.progress.interface_failed += 1;
+      else if (isRetryableFailure) job.progress.retryable_failed += 1;
       else job.progress.business_failed += 1;
       job.progress.current_level_finished += 1;
       activeWrites = Math.max(0, activeWrites - 1);
@@ -7476,10 +8625,13 @@ async function runWriteBenchmarkJobLevel({ job, level, rows }) {
         ok: false,
         status: 'failed',
         duration_ms: itemFinish.duration_ms,
+        retryable_failure: isRetryableFailure,
+        interface_failure: isInterfaceFailure,
         error: itemError
       };
     }
   });
+  persistWriteBenchmarkLevelCacheEffects({ job, rows, items });
   job.progress.peak_in_flight = Math.max(job.progress.peak_in_flight, maxActiveWrites, items.maxActive || 0);
   const summary = summarizeWriteBenchmarkItems(items.filter((item) => !item.cancelled));
   const levelResult = {
@@ -7511,6 +8663,83 @@ async function runWriteBenchmarkJobLevel({ job, level, rows }) {
   return levelResult;
 }
 
+function persistWriteBenchmarkLevelCacheEffects({ job, rows = [], items = [] }) {
+  if (job.dry_run) return;
+  const activities = new Map();
+  let permanentFailuresIgnored = 0;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const result = items[index];
+    if (!row?.account?.account_id || !row?.campaign?.promotion_id || result?.cancelled) continue;
+    if (!shouldInvalidateWriteCache(result)) {
+      permanentFailuresIgnored += 1;
+      continue;
+    }
+    const key = [
+      String(row.account.account_id),
+      String(row.campaign.site_id || ''),
+      String(row.campaign.promotion_id),
+      String(row.campaign.promotion_type || '').toUpperCase(),
+    ].join('|');
+    if (!activities.has(key)) {
+      activities.set(key, {
+        account: row.account,
+        campaign: row.campaign,
+        attempted: 0,
+        successful: [],
+      });
+    }
+    const activity = activities.get(key);
+    activity.attempted += 1;
+    if (result?.ok) {
+      activity.successful.push({ itemId: row.item?.item_id, dealPrice: row.deal_price });
+    }
+  }
+  let attempted = 0;
+  let successful = 0;
+  for (const activity of activities.values()) {
+    attempted += activity.attempted;
+    successful += activity.successful.length;
+    if (activity.successful.length && job.action !== 'cancel') {
+      applySuccessfulPromotionItemWrites({
+        accountId: activity.account.account_id,
+        promotionId: activity.campaign.promotion_id,
+        promotionType: activity.campaign.promotion_type,
+        action: job.action,
+        items: activity.successful,
+      });
+      reconcilePromotionItemFetchCounts({
+        accountId: activity.account.account_id,
+        promotionId: activity.campaign.promotion_id,
+        promotionType: activity.campaign.promotion_type,
+      });
+    }
+    // A successful or uncertain platform write can move an item between
+    // candidate and started. Invalidate every status for only this activity so
+    // reading one side cannot make the opposite side look fresh.
+    invalidatePromotionItemFetchStates({
+      accountId: activity.account.account_id,
+      promotionId: activity.campaign.promotion_id,
+      promotionType: activity.campaign.promotion_type,
+    });
+    // Only activities touched by this write are re-read on the next prepare.
+    markActivityCacheDirty({
+      accountId: activity.account.account_id,
+      siteId: activity.campaign.site_id,
+      promotionId: activity.campaign.promotion_id,
+      promotionType: activity.campaign.promotion_type,
+    });
+  }
+  appendWriteBenchmarkJobEvent(job, {
+    type: 'cache_effects_recorded',
+    action: job.action,
+    activity_count: activities.size,
+    attempted,
+    successful,
+    permanent_failures_ignored: permanentFailuresIgnored,
+  });
+}
+
 function writeBenchmarkItemBase(job, level, row, index, status) {
   const campaign = row.campaign || {};
   const account = row.account || {};
@@ -7522,6 +8751,7 @@ function writeBenchmarkItemBase(job, level, row, index, status) {
     sampleOffset: job.sample_offset,
     sampleIndex: index,
     accountId: String(account.account_id || job.account_id || ''),
+    childUserId: String(campaign.child_user_id || account.account_id || job.account_id || ''),
     storeName: storeIdentityForAccount(account.account_id, account).store_name,
     siteId: campaign.site_id || '',
     siteName: siteDisplayName(campaign.site_id || ''),
@@ -7577,9 +8807,9 @@ async function recheckPersistedWriteBenchmarkJob(job, input = {}) {
 async function runWriteConcurrencyBenchmark({ account, input = {} }) {
   const settings = readSettings();
   const levels = normalizeWriteBenchmarkLevels(input.levels || WRITE_BENCHMARK_LEVELS);
-  const action = input.action === 'update' ? 'update' : 'enroll';
-  const itemStatus = action === 'update' ? 'started' : 'candidate';
-  const requiredItems = levels.reduce((sum, level) => sum + Math.max(level, 3), 0);
+  const action = normalizeWriteBenchmarkAction(input.action);
+  const itemStatus = writeBenchmarkItemStatus(action);
+  const requiredItems = levels.reduce((sum, level) => sum + level, 0);
   const benchmarkAccounts = await resolveWriteBenchmarkAccounts(account, input);
   const samplePool = await collectWriteBenchmarkRows({
     accounts: benchmarkAccounts,
@@ -7591,16 +8821,18 @@ async function runWriteConcurrencyBenchmark({ account, input = {} }) {
   });
   const benchmarkRows = samplePool.rows;
   if (!benchmarkRows.length) {
-    throw new Error(`未找到价格边界清楚且可用于真实${action === 'update' ? '更新' : '报名'}压测的 ${itemStatus} 商品。`);
+    throw new Error(`未找到可用于真实${writeBenchmarkActionLabel(action)}压测的 ${itemStatus} 商品。`);
   }
   const primaryCampaign = benchmarkRows[0]?.campaign || samplePool.promotions[0] || null;
 
   const benchmark = {
-    benchmark_type: action === 'update' ? 'write_concurrency_real_update' : 'write_concurrency_real_enroll',
+    benchmark_type: `write_concurrency_real_${action}`,
     real_write_executed: true,
     note: action === 'update'
       ? '本报告来自小样本真实 Mercado PUT 更新压测；不包含全量更新、报名、取消，也不会自动回滚成功更新。'
-      : '本报告来自小样本真实 Mercado POST 报名压测；不包含全量报名、更新、取消，也不会自动撤销成功报名。',
+      : action === 'cancel'
+        ? '本报告来自小样本真实 Mercado DELETE 取消压测；不包含全量取消、报名、更新，也不会自动恢复成功取消。'
+        : '本报告来自小样本真实 Mercado POST 报名压测；不包含全量报名、更新、取消，也不会自动撤销成功报名。',
     account_id: benchmarkAccounts.length === 1 ? String(benchmarkAccounts[0].account_id) : 'multiple',
     account_count: benchmarkAccounts.length,
     display_name: benchmarkAccounts.length === 1 ? storeIdentityForAccount(benchmarkAccounts[0].account_id, benchmarkAccounts[0]).store_name : '多个店铺',
@@ -7631,7 +8863,7 @@ async function runWriteConcurrencyBenchmark({ account, input = {} }) {
   let cumulativeTimeouts = 0;
   let refreshCountTotal = 0;
   for (const level of levels) {
-    const sampleSize = Math.max(level, 3);
+    const sampleSize = level;
     const rows = benchmarkRows.slice(cursor, cursor + sampleSize);
     if (rows.length < sampleSize) {
       benchmark.results.push({
@@ -7714,12 +8946,12 @@ async function resolveWriteBenchmarkAccounts(defaultAccount, input = {}) {
   return accounts.length ? accounts : [defaultAccount];
 }
 
-async function collectWriteBenchmarkRows({ accounts, action, itemStatus, input = {}, settings, requiredItems }) {
+async function collectWriteBenchmarkRows({ accounts, action, itemStatus, input = {}, settings, requiredItems, allowedIdentityKeys = null }) {
   const rows = [];
   const rowBuckets = [];
   const promotions = [];
   const scope = [];
-  const useRoundRobinSamplePool = action === 'update' && input.roundRobinSamplePool !== false;
+  const useRoundRobinSamplePool = input.roundRobinSamplePool !== false;
   let fetchedTotal = 0;
   let fetchedSaved = 0;
   const perPromotionMax = input.maxItems === 'all' || input.maxCandidateItems === 'all'
@@ -7733,7 +8965,7 @@ async function collectWriteBenchmarkRows({ accounts, action, itemStatus, input =
       if (['SMART', 'LIGHTNING'].includes(promotionType)) continue;
       if (!['DEAL', 'SELLER_CAMPAIGN'].includes(promotionType)) continue;
       const remaining = requiredItems - rows.length;
-      if (action === 'update' && input.useCachedSamplePool !== false) {
+      if (input.useCachedSamplePool !== false) {
         const cachedItems = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, itemStatus);
         const selectedFromCache = selectBenchmarkRows({
           items: cachedItems,
@@ -7742,30 +8974,31 @@ async function collectWriteBenchmarkRows({ accounts, action, itemStatus, input =
           promotion: campaign,
           settings,
           limit: useRoundRobinSamplePool ? cachedItems.length : remaining
-        }).map((row) => ({ ...row, account, campaign }));
+        }).map((row) => ({ ...row, account, campaign }))
+          .filter((row) => !allowedIdentityKeys || allowedIdentityKeys.has(writeBenchmarkRelationIdentity(row)));
         if (selectedFromCache.length > 0) {
           if (useRoundRobinSamplePool) {
-            rowBuckets.push(selectedFromCache);
+            rowBuckets.push({ account_id: String(account.account_id), rows: selectedFromCache });
           } else {
             rows.push(...selectedFromCache);
           }
-          promotions.push(campaign);
-          fetchedTotal += cachedItems.length;
-          fetchedSaved += cachedItems.length;
-          scope.push({
-            account_id: String(account.account_id),
-            site_id: campaign.site_id || null,
-            child_user_id: campaign.child_user_id || account.account_id,
-            promotion_id: campaign.promotion_id,
-            promotion_type: promotionType,
-            promotion_name: campaign.name || '',
-            sample_source: 'cached_started_items',
-            fetched_total: cachedItems.length,
-            fetched_saved: cachedItems.length,
-            selected_rows: selectedFromCache.length
-          });
-          continue;
         }
+        promotions.push(campaign);
+        fetchedTotal += cachedItems.length;
+        fetchedSaved += cachedItems.length;
+        scope.push({
+          account_id: String(account.account_id),
+          site_id: campaign.site_id || null,
+          child_user_id: campaign.child_user_id || account.account_id,
+          promotion_id: campaign.promotion_id,
+          promotion_type: promotionType,
+          promotion_name: campaign.name || '',
+          sample_source: 'confirmed_cached_items',
+          fetched_total: cachedItems.length,
+          fetched_saved: cachedItems.length,
+          selected_rows: selectedFromCache.length
+        });
+        continue;
       }
       let rowAccount = account;
       let client = makeWriteClient(rowAccount, campaign);
@@ -7819,9 +9052,10 @@ async function collectWriteBenchmarkRows({ accounts, action, itemStatus, input =
         promotion: campaign,
         settings,
         limit: useRoundRobinSamplePool ? (fetched.results?.length || remaining) : remaining
-      }).map((row) => ({ ...row, account: rowAccount, campaign }));
+      }).map((row) => ({ ...row, account: rowAccount, campaign }))
+        .filter((row) => !allowedIdentityKeys || allowedIdentityKeys.has(writeBenchmarkRelationIdentity(row)));
       if (useRoundRobinSamplePool) {
-        if (selected.length > 0) rowBuckets.push(selected);
+        if (selected.length > 0) rowBuckets.push({ account_id: String(account.account_id), rows: selected });
       } else {
         rows.push(...selected);
       }
@@ -7841,7 +9075,7 @@ async function collectWriteBenchmarkRows({ accounts, action, itemStatus, input =
   }
   if (useRoundRobinSamplePool) {
     const sampleOffset = Math.max(0, Math.floor(Number(input.sampleOffset || input.sample_offset || 0)));
-    rows.push(...interleaveBenchmarkRowBuckets(rowBuckets, requiredItems, sampleOffset));
+    rows.push(...interleaveBenchmarkRowsByAccountAndCampaign(rowBuckets, requiredItems, sampleOffset));
   }
   return {
     rows,
@@ -7850,6 +9084,124 @@ async function collectWriteBenchmarkRows({ accounts, action, itemStatus, input =
     fetched_saved: fetchedSaved,
     scope
   };
+}
+
+function writeBenchmarkRelationIdentity(row) {
+  const account = row?.account || {};
+  const campaign = row?.campaign || {};
+  return [
+    String(account.account_id || ''),
+    String(campaign.child_user_id || account.account_id || ''),
+    String(campaign.site_id || ''),
+    String(campaign.promotion_id || ''),
+    String(campaign.promotion_type || '').toUpperCase(),
+    String(row?.item?.item_id || '')
+  ].join('|');
+}
+
+function resolveWriteBenchmarkConfirmedScope(input = {}, action = 'enroll') {
+  const prepareId = String(input.confirmedPrepareId || input.confirmed_prepare_id || '').trim();
+  const expectedHash = String(input.confirmedScopeHash || input.confirmed_scope_hash || '').trim().toUpperCase();
+  const prepare = prepareId ? submissionPersistence.load(prepareId) : null;
+  if (!prepare || !['prepared', 'paused'].includes(String(prepare.state || ''))) {
+    const error = new Error('真实写入并发测试绑定的 prepare 不存在或不再处于可用冻结态。');
+    error.status = 409;
+    throw error;
+  }
+  if (prepare.group_id || prepare.commit_lease) {
+    const error = new Error('真实写入并发测试绑定的 prepare 已进入提交或执行状态。');
+    error.status = 409;
+    throw error;
+  }
+  const actualHash = String(prepare.scope_hash || '').trim().toUpperCase();
+  if (!expectedHash || !actualHash || expectedHash !== actualHash) {
+    const error = new Error('真实写入并发测试的冻结范围指纹不匹配。');
+    error.status = 409;
+    throw error;
+  }
+  const normalizedAction = normalizeWriteBenchmarkAction(action);
+  const scopeAction = normalizeWriteBenchmarkAction(prepare.confirmed_execution_scope?.action || prepare.resolved_action);
+  if (scopeAction !== normalizedAction) {
+    const error = new Error('真实写入并发测试动作与冻结 prepare 不一致。');
+    error.status = 409;
+    throw error;
+  }
+  if (normalizedAction !== 'cancel') {
+    const sellerDiscount = Number(input.sellerDiscountPercent);
+    const officialDiscount = Number(input.officialDiscountPercent);
+    if (sellerDiscount !== Number(prepare.discounts?.seller) || officialDiscount !== Number(prepare.discounts?.official)) {
+      const error = new Error('真实写入并发测试折扣与冻结 prepare 不一致。');
+      error.status = 409;
+      throw error;
+    }
+  }
+  const identityKeys = new Set();
+  for (const activity of prepare.confirmed_execution_scope?.activities || []) {
+    if (activity.blocked) continue;
+    for (const itemId of activity.item_ids || []) {
+      identityKeys.add([
+        String(activity.account_id || ''),
+        String(activity.child_user_id || activity.account_id || ''),
+        String(activity.site_id || ''),
+        String(activity.promotion_id || ''),
+        String(activity.promotion_type || '').toUpperCase(),
+        String(itemId || '')
+      ].join('|'));
+    }
+  }
+  if (!identityKeys.size) {
+    const error = new Error('真实写入并发测试绑定的冻结 prepare 没有可执行关系。');
+    error.status = 409;
+    throw error;
+  }
+  const authorizedScope = loadWriteBenchmarkAuthorizedScope(input);
+  if (input.requireAuthorizedEnvelope === true && !authorizedScope) {
+    const error = new Error('真实写入并发测试缺少服务端可验证的原始授权范围。');
+    error.status = 409;
+    throw error;
+  }
+  if (authorizedScope) {
+    for (const key of [...identityKeys]) {
+      if (!authorizedScope.identityKeys.has(key)) identityKeys.delete(key);
+    }
+  }
+  if (!identityKeys.size) {
+    const error = new Error('当前实时范围与原始授权范围没有可执行交集。');
+    error.status = 409;
+    throw error;
+  }
+  return {
+    prepareId,
+    scopeHash: actualHash,
+    identityKeys,
+    authorizedScopeHash: authorizedScope?.scopeHash || null,
+  };
+}
+
+function loadWriteBenchmarkAuthorizedScope(input = {}) {
+  const scopeHash = String(input.authorizedScopeHash || input.authorized_scope_hash || '').trim().toUpperCase();
+  if (!scopeHash) return null;
+  if (!/^[A-F0-9]{64}$/.test(scopeHash)) {
+    const error = new Error('真实写入并发测试的原始授权范围指纹格式无效。');
+    error.status = 409;
+    throw error;
+  }
+  const file = path.join(WRITE_BENCHMARK_AUTHORIZATION_DIR, `${scopeHash}.json`);
+  if (!fs.existsSync(file)) {
+    const error = new Error('真实写入并发测试的原始授权范围文件不存在。');
+    error.status = 409;
+    throw error;
+  }
+  const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const relationKeys = [...new Set((stored.relation_keys || [])
+    .map((value) => String(value || '').trim()).filter(Boolean))].sort();
+  const actualHash = crypto.createHash('sha256').update(relationKeys.join('\n')).digest('hex').toUpperCase();
+  if (String(stored.scope_hash || '').toUpperCase() !== scopeHash || actualHash !== scopeHash) {
+    const error = new Error('真实写入并发测试的原始授权范围文件校验失败。');
+    error.status = 409;
+    throw error;
+  }
+  return { scopeHash, identityKeys: new Set(relationKeys) };
 }
 
 function interleaveBenchmarkRowBuckets(buckets, limit, offset = 0) {
@@ -7869,6 +9221,22 @@ function interleaveBenchmarkRowBuckets(buckets, limit, offset = 0) {
     if (!added) break;
   }
   return output.slice(Math.max(0, offset), Math.max(0, offset) + limit);
+}
+
+function interleaveBenchmarkRowsByAccountAndCampaign(buckets, limit, offset = 0) {
+  const campaignBucketsByAccount = new Map();
+  for (const bucket of buckets || []) {
+    const rows = Array.isArray(bucket) ? bucket : (bucket?.rows || []);
+    if (!rows.length) continue;
+    const accountId = String(bucket?.account_id || rows[0]?.account?.account_id || 'unknown');
+    if (!campaignBucketsByAccount.has(accountId)) campaignBucketsByAccount.set(accountId, []);
+    campaignBucketsByAccount.get(accountId).push(rows);
+  }
+  const accountBuckets = [...campaignBucketsByAccount.values()].map((campaignBuckets) => {
+    const accountTotal = campaignBuckets.reduce((sum, rows) => sum + rows.length, 0);
+    return interleaveBenchmarkRowBuckets(campaignBuckets, accountTotal, 0);
+  });
+  return interleaveBenchmarkRowBuckets(accountBuckets, limit, offset);
 }
 
 async function resolveWriteBenchmarkPromotions({ account, input = {}, settings }) {
@@ -7912,17 +9280,19 @@ function selectBenchmarkRows({ items, action = 'enroll', input = {}, promotion, 
   const seen = new Set();
   for (const source of items || []) {
     const item = normalizeItem(source);
-    const expectedStatus = action === 'update' ? 'started' : 'candidate';
+    const expectedStatus = writeBenchmarkItemStatus(action);
     if (!item.item_id || seen.has(item.item_id) || item.status !== expectedStatus) continue;
-    const dealPrice = benchmarkDealPrice(item, promotion, settings, input);
-    if (!Number.isFinite(dealPrice)) continue;
+    const dealPrice = action === 'cancel' ? null : benchmarkDealPrice(item, promotion, settings, input);
+    if (action !== 'cancel' && !Number.isFinite(dealPrice)) continue;
     if (action === 'update' && item.price !== null && roundMoney(item.price) === roundMoney(dealPrice)) continue;
     rows.push({
       item,
       action,
       status: 'planned',
       deal_price: dealPrice,
-      reason: `真实写入并发${action === 'update' ? '更新' : '报名'}压测样本`
+      reason: action === 'cancel'
+        ? '真实写入并发取消压测样本'
+        : `真实写入并发${action === 'update' ? '更新' : '报名'}压测样本`
     });
     seen.add(item.item_id);
     if (rows.length >= limit) break;
@@ -7932,6 +9302,14 @@ function selectBenchmarkRows({ items, action = 'enroll', input = {}, promotion, 
 
 function targetBenchmarkDiscountPercent(promotion, settings, input = {}) {
   const promotionType = String(promotion?.promotion_type || '').toUpperCase();
+  const sellerExplicit = Number(input.sellerDiscountPercent);
+  if (promotionType === 'SELLER_CAMPAIGN' && Number.isFinite(sellerExplicit) && sellerExplicit > 0 && sellerExplicit < 100) {
+    return sellerExplicit;
+  }
+  const officialExplicit = Number(input.officialDiscountPercent);
+  if (promotionType !== 'SELLER_CAMPAIGN' && Number.isFinite(officialExplicit) && officialExplicit > 0 && officialExplicit < 100) {
+    return officialExplicit;
+  }
   const explicit = Number(input.discountPercent);
   if (Number.isFinite(explicit) && explicit > 0 && explicit < 100) return explicit;
   return promotionType === 'SELLER_CAMPAIGN'
@@ -8066,6 +9444,9 @@ function summarizeWriteBenchmarkItems(items) {
     skipped: 0,
     http_429: failed.filter((item) => Number(item.error?.status) === 429 || /429|限流/i.test(item.error?.message_cn || '')).length,
     http_5xx: failed.filter((item) => Number(item.error?.status) >= 500).length,
+    http_401: failed.filter((item) => Number(item.error?.status) === 401).length,
+    http_403: failed.filter((item) => Number(item.error?.status) === 403).length,
+    http_404: failed.filter((item) => Number(item.error?.status) === 404).length,
     timeout: failed.filter((item) => isWriteBenchmarkNetworkFailure(item.error)).length,
     http_401_refresh: 0,
     failure_rate: items.length ? Math.round((failed.length / items.length) * 10000) / 100 : 0,
@@ -8074,6 +9455,15 @@ function summarizeWriteBenchmarkItems(items) {
     p95_ms: percentile(durations, 0.95),
     slowest_ms: durations.at(-1) || 0
   };
+}
+
+function writeBenchmarkStrictInterfaceFailureCount(summary = {}) {
+  return Number(summary.http_429 || 0)
+    + Number(summary.http_5xx || 0)
+    + Number(summary.timeout || 0)
+    + Number(summary.http_401 || 0)
+    + Number(summary.http_403 || 0)
+    + Number(summary.http_404 || 0);
 }
 
 function isWriteBenchmarkNetworkFailure(error) {
@@ -8219,6 +9609,17 @@ function normalizeWriteBenchmarkLevels(value) {
     .map((item) => normalizeConcurrencyWithCap(item, 1, WRITE_BENCHMARK_MAX_CONCURRENCY))
     .filter(Boolean);
   return [...new Set(levels)].sort((a, b) => a - b);
+}
+
+function normalizeWriteBenchmarkLevelSequence(value) {
+  if (!Array.isArray(value) || !value.length) return [];
+  if (value.length > 10_000) throw new Error('真实写入并发批次数不能超过 10000。');
+  return value.map((item) => normalizeConcurrencyWithCap(item, 1, WRITE_BENCHMARK_MAX_CONCURRENCY));
+}
+
+function writeBenchmarkLevelsFromInput(input = {}) {
+  const sequence = normalizeWriteBenchmarkLevelSequence(input.levelSequence || input.level_sequence);
+  return sequence.length ? sequence : normalizeWriteBenchmarkLevels(input.levels || WRITE_BENCHMARK_LEVELS);
 }
 
 function readConcurrencyBenchmarkResults() {
@@ -8626,6 +10027,15 @@ async function fetchAndSavePromotionItemsForCampaign({ account, campaign, status
         });
       }
     }
+    saveActivityCacheState({
+      accountId: account.account_id,
+      siteId: campaign.site_id,
+      promotionId: campaign.promotion_id,
+      promotionType: campaign.promotion_type,
+      dirty: false,
+      continuity: 'continuous',
+      lastError: null,
+    });
     const savedCount = preserveExisting ? Number(existingState.saved_count || 0) : result.saved;
     const platformTotal = preserveExisting ? Number(existingState.platform_total ?? result.total ?? savedCount) : result.total;
     const detailStatus = preserveExisting ? existingState.detail_status : result.detailStatus;

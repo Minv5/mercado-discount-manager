@@ -263,7 +263,7 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(today_section, 1)
         scroll.setWidget(content)
         layout.addWidget(scroll, 1)
-        self.execute_button = QPushButton("开始核对范围")
+        self.execute_button = QPushButton("开始执行")
         self.execute_button.setObjectName("primary")
         self.execute_button.setMinimumHeight(42)
         self.execute_button.clicked.connect(self._on_execute_clicked)
@@ -311,7 +311,7 @@ class MainWindow(QMainWindow):
         table.horizontalHeaderItem(4).setToolTip(
             "前者是唯一商品，同一商品跨多个活动只计算一次；后者是活动商品关系，同一商品在每个活动中分别计算。"
         )
-        table.horizontalHeaderItem(5).setToolTip("批量取消显示取消请求成功、平台确认移除和待平台确认；其它动作显示成功与跳过。")
+        table.horizontalHeaderItem(5).setToolTip("批量取消显示取消请求成功、成功取消和待平台确认；其它动作显示成功与跳过。")
         table.horizontalHeaderItem(6).setToolTip("前者是商品失败，后者是活动失败；活动失败不计入商品失败。")
         header = table.horizontalHeader()
         for column, width in enumerate((75, 72, 100, 52, 145, 118, 110)):
@@ -575,10 +575,7 @@ class MainWindow(QMainWindow):
             self.auto_action = ""
             self._update_discount_state()
             if mode_action:
-                self.today_label.setText(
-                    completed_text
-                    + f" 当前选择{action_label(mode_action)}；提交前会再次提示这是今天的另一项真实操作。"
-                )
+                self.today_label.setText(completed_text + f" 当前选择{action_label(mode_action)}。")
             else:
                 self.today_label.setText(
                     completed_text
@@ -608,6 +605,8 @@ class MainWindow(QMainWindow):
     def _resolve_action(self, account_ids: list[str], filters: dict[str, Any]) -> str:
         result = self.api.post("/api/today/decision", {"accountIds": account_ids, "filters": filters})
         decision = result.get("decision") or {}
+        if str(decision.get("action") or "") == "configuration_required":
+            raise RuntimeError(str(decision.get("reason") or "请先在设置中填写自动周期最高折扣。"))
         return str(decision.get("action") or "")
 
     def _auto_action_ready(self, action: object, decision_token: int | None = None) -> None:
@@ -945,9 +944,6 @@ class MainWindow(QMainWindow):
             if code == "TODAY_COMPLETED":
                 self._prepare_blocked_by_today_completion(details)
                 return
-            if code == "CONFIRM_SAME_DAY_ACTION":
-                self._confirm_server_same_day_action(details)
-                return
         if isinstance(error, ApiError) and error.retryable:
             self.log("准备请求响应暂未确认，正在查找已保存的准备记录；不会重复提交。")
             self._set_prepare_busy(True)
@@ -969,62 +965,6 @@ class MainWindow(QMainWindow):
         self.today_label.setText(self._discount_summary() + " " + message)
         self.log(message + " 自动模式未创建新的执行准备。")
         QMessageBox.information(self, "今日已完成", message + "\n\n自动模式不会重复执行当前范围。")
-
-    def _confirm_server_same_day_action(self, details: dict[str, Any]) -> None:
-        token = str(details.get("confirmation_token") or "")
-        payload = dict(self.pending_prepare_payload or {})
-        if not token or not payload:
-            self.preparing_submission = {}
-            self.pending_prepare_payload = None
-            self._set_prepare_busy(False)
-            self._operation_error("准备执行", "未取得有效的二次确认，请重新操作。")
-            return
-        completed = dict(details.get("completed") or {})
-        requested_action = str(payload.get("requested_action") or payload.get("action") or "")
-        completed_text = execution_completion_text(completed) if completed else "今天当前范围已有真实操作。"
-        if bool(details.get("same_action")):
-            message = (
-                f"{completed_text}\n"
-                f"现在仍将准备{action_label(requested_action)}，可能重复处理同一范围。\n\n"
-                "仅在明确需要补跑时继续。"
-            )
-        else:
-            message = (
-                f"{completed_text}\n"
-                f"现在将准备{action_label(requested_action)}，这是今天的另一项真实操作。\n\n"
-                "请确认这确实是当前意图。"
-            )
-        dialog = ConfirmDialog("今日已有真实操作", message, "确认继续", "取消", self)
-        if dialog.exec() != QDialogAccepted:
-            self.preparing_submission = {}
-            self.pending_prepare_payload = None
-            self._set_prepare_busy(False)
-            self.log("已取消今天的额外真实操作，未创建执行准备。")
-            self._run_worker(
-                lambda: self.api.post(
-                    "/api/execution/submissions/same-day-confirmations/cancel",
-                    {"confirmation_token": token}, timeout=10,
-                ),
-                lambda _response: None,
-                lambda _error: self.log("本次取消已生效；本地确认记录暂未同步。"),
-            )
-            return
-        payload["same_day_confirmation_token"] = token
-        self.pending_prepare_payload = payload
-        self.preparing_submission = {
-            "client_submission_id": str(payload.get("client_submission_id") or ""),
-            "state": "starting",
-        }
-        self._set_prepare_busy(True)
-        self.log("已确认今天继续此项操作，正在建立执行准备；尚未提交商品。")
-        self._run_worker(
-            lambda: self.api.post(
-                "/api/execution/submissions/prepare", payload, timeout=20,
-                timeout_message="准备请求响应延迟，正在恢复已保存的准备记录。",
-            ),
-            self._prepare_started,
-            self._prepare_start_failed,
-        )
 
     def _poll_prepare(self) -> None:
         if self.prepare_poll_busy or not self.preparing_submission:
@@ -1085,7 +1025,7 @@ class MainWindow(QMainWindow):
         if state in {"failed", "expired"}:
             self.pending_prepare_payload = None
             self._set_prepare_busy(False)
-            self._operation_error("准备执行", str(prepare.get("error") or "执行范围准备未完成。"))
+            self._operation_error("准备执行", prepare_failure_message(prepare))
             return
         if state in {"cancelled", "paused"}:
             self.pending_prepare_payload = None
@@ -1122,12 +1062,55 @@ class MainWindow(QMainWindow):
         message = str(progress.get("message") or "正在核对执行范围")
         current = " / ".join(str(progress.get(key) or "") for key in ("current_store", "current_site", "current_activity") if progress.get(key))
         percent = max(0, min(100, int(progress.get("percent") or 0)))
-        key = f"{message}|{current}|{percent}"
+        scheduler_text = self._prepare_scheduler_text(progress)
+        key = f"{message}|{current}|{percent}|{scheduler_text}"
         if key == self.prepare_progress_key:
             return
         self.prepare_progress_key = key
         suffix = f"：{current}" if current else ""
-        self.log(f"{message}{suffix}（{percent}%）。")
+        metrics = f" {scheduler_text}" if scheduler_text else ""
+        self.log(f"{message}{suffix}（{percent}%）。{metrics}")
+
+    @staticmethod
+    def _prepare_scheduler_text(progress: dict[str, Any]) -> str:
+        scheduler = dict(progress.get("read_scheduler") or {})
+        dynamic_limit = max(0, int(scheduler.get("dynamic_limit") or 0))
+        max_limit = max(0, int(scheduler.get("max_limit") or 0))
+        if not dynamic_limit and not max_limit:
+            return ""
+        inflight = max(0, int(scheduler.get("inflight") or 0))
+        peak = max(0, int(scheduler.get("peak") or 0))
+        detail = max(0, int(scheduler.get("detail_inflight") or 0))
+        detail_limit = max(0, int(scheduler.get("detail_limit") or 0))
+        fallback = max(0, int(scheduler.get("fallback_active") or 0))
+        fallback_limit = max(0, int(scheduler.get("fallback_per_account") or 0))
+        queued = max(0, int(scheduler.get("queued") or 0))
+        limited = max(0, int(scheduler.get("rate_limit_count") or 0))
+        network_errors = max(0, int(scheduler.get("network_error_count") or 0))
+        service_errors = max(0, int(scheduler.get("service_error_count") or 0))
+        timeout_errors = max(0, int(scheduler.get("timeout_error_count") or 0))
+        failures = max(0, int(scheduler.get("failure_count") or 0))
+        retries = max(0, int(scheduler.get("retry_count") or 0))
+        local_concurrency = max(1, int(scheduler.get("local_work_concurrency") or 1))
+        local_queries = max(0, int(scheduler.get("local_db_batch_queries") or 0))
+        cooldown_seconds = (max(0, int(scheduler.get("cooldown_ms") or 0)) + 999) // 1000
+        account_parts = []
+        for row in list(scheduler.get("per_account") or []):
+            if not isinstance(row, dict):
+                continue
+            store_name = str(row.get("store_name") or "").strip()
+            account_inflight = max(0, int(row.get("inflight") or 0))
+            if store_name and account_inflight:
+                account_parts.append(f"{store_name} {account_inflight}")
+        account_text = f"；店铺并发 {'、'.join(account_parts)}" if account_parts else ""
+        return (
+            f"本地整理并行 {local_concurrency}（批量查询 {local_queries}）；"
+            f"平台读取并发 {inflight}/{dynamic_limit}（峰值 {peak}，上限 {max_limit}）；"
+            f"详情 {detail}/{detail_limit}，库存兜底 {fallback}（每店上限 {fallback_limit}），排队 {queued}；"
+            f"限流 {limited} 次，网络异常 {network_errors} 次，服务异常 {service_errors} 次，"
+            f"超时 {timeout_errors} 次，最终失败 {failures} 次，重试 {retries} 次，"
+            f"冷却 {cooldown_seconds} 秒{account_text}。"
+        )
 
     def _submission_prepared(self, response: object) -> None:
         self.prepare_poll_timer.stop()
@@ -1297,15 +1280,22 @@ class MainWindow(QMainWindow):
         self.running_group = group
         self.pending_group_payload = None
         self.poll_failure_count = 0
-        for child in list(group.get("children") or []):
+        pending_log_lines: list[tuple[str, int, int, object]] = []
+        for child_index, child in enumerate(list(group.get("children") or [])):
             job_id = str(child.get("job_id") or child.get("id") or "")
             logs = list(child.get("userLogs") or child.get("user_logs") or [])
             start = self.job_log_counts.get(job_id, 0)
-            for line in logs[start:]:
-                message = execution_log_message(line)
-                if message:
-                    self.log(message)
+            for line_index, line in enumerate(logs[start:], start=start):
+                at = str(line.get("at") or "") if isinstance(line, dict) else ""
+                pending_log_lines.append((at, child_index, line_index, line))
             self.job_log_counts[job_id] = len(logs)
+        for _at, _child_index, _line_index, line in sorted(
+            pending_log_lines,
+            key=lambda entry: (not entry[0], entry[0], entry[1], entry[2]),
+        ):
+            message = execution_log_message(line)
+            if message:
+                self.log(message)
         if str(group.get("status") or "").lower() in terminal:
             self.poll_timer.stop()
             result = dict(group.get("result") or {})
@@ -1469,6 +1459,7 @@ class MainWindow(QMainWindow):
         )
 
     def _load_settings_context(self) -> dict[str, Any]:
+        settings = dict(self.api.get("/api/settings").get("settings") or {})
         ids = [account.account_id for account in self.accounts]
         refresh_path = ApiClient.query("/api/accounts/profiles/refresh", accountIds=",".join(ids))
         refreshed = self.api.get(refresh_path, timeout=45)
@@ -1486,22 +1477,32 @@ class MainWindow(QMainWindow):
             for rows in executor.map(load_sites, accounts):
                 operating.extend(rows)
         benchmark = self.api.get("/api/concurrency-benchmark/results").get("results", {})
-        return {"accounts": accounts, "operating": operating, "benchmark": benchmark}
+        return {"settings": settings, "accounts": accounts, "operating": operating, "benchmark": benchmark}
 
     def _apply_settings_context(self, dialog: SettingsDialog, context: object) -> None:
         data = dict(context or {})
+        settings = dict(data.get("settings") or {})
         accounts = list(data.get("accounts") or self.accounts)
         operating = list(data.get("operating") or [])
         benchmark = benchmark_text(dict(data.get("benchmark") or {}))
+        if settings:
+            self.settings = settings
         self.accounts = accounts
         self.operating_rows_cache = operating
         self.benchmark_text_cache = benchmark
         if dialog.isVisible():
+            dialog.apply_settings_context(settings)
             dialog.apply_background_context(accounts, operating, benchmark)
 
     def _settings_saved(self, settings: object) -> None:
         self.settings = dict(settings or self.settings)
-        self.log("设置已保存。")
+        self.log(
+            "设置已保存：读取全局上限 {read}，活动目录并发上限 {activity}，商品写入全局上限 {write}。".format(
+                read=self.settings.get("readConcurrency", 125),
+                activity=self.settings.get("previewConcurrency", 192),
+                write=self.settings.get("writeConcurrency", 160),
+            )
+        )
         self._run_worker(self._load_initial_bundle, self._apply_initial_bundle, lambda error: self._operation_error("刷新设置", error))
 
     def _start_oauth(self, dialog: SettingsDialog) -> None:
@@ -1563,14 +1564,14 @@ class MainWindow(QMainWindow):
 
     def _set_execution_busy(self, busy: bool) -> None:
         self.execute_button.setEnabled(busy or self._can_start_submission())
-        self.execute_button.setText("停止任务" if busy else "开始核对范围")
+        self.execute_button.setText("停止任务" if busy else "开始执行")
         for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
             control.setEnabled(not busy)
         self._update_discount_state()
 
     def _set_prepare_busy(self, busy: bool) -> None:
         if not busy:
-            self.execute_button.setText("开始核对范围")
+            self.execute_button.setText("开始执行")
             self.execute_button.setEnabled(self._can_start_submission())
             for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
                 control.setEnabled(True)
@@ -1588,6 +1589,8 @@ class MainWindow(QMainWindow):
         if self.ui_busy or not self.scope_ready or not self.today_completion_ready:
             return False
         if self.mode_combo.currentText() == "自动判断" and self._completion_for_current_scope():
+            return False
+        if self.mode_combo.currentText() == "自动判断" and self.auto_action not in {"enroll", "update", "cancel"}:
             return False
         return True
 
@@ -1788,7 +1791,7 @@ def record_result_text(task: dict[str, Any]) -> str:
         return "旧记录未区分"
     return (
         f"取消请求 {count_or_marker(request_success)}\n"
-        f"确认移除 {count_or_marker(verified_removed)}\n"
+        f"成功取消 {count_or_marker(verified_removed)}\n"
         f"待平台确认 {count_or_marker(pending)}"
     )
 
@@ -1809,7 +1812,7 @@ def execution_result_text(result: dict[str, Any], action: str) -> str:
         pending = optional_contract_count(result, "pending_verification_count")
         cancellation = (
             f"取消请求成功 {count_or_marker(request_success, '旧记录未区分')}，"
-            f"平台确认移除 {count_or_marker(verified_removed, '旧记录未区分')}，"
+            f"成功取消 {count_or_marker(verified_removed, '旧记录未区分')}，"
             f"取消请求已提交，待平台回查确认 {count_or_marker(pending, '旧记录未区分')}"
         )
         return (
@@ -1817,8 +1820,12 @@ def execution_result_text(result: dict[str, Any], action: str) -> str:
             f"活动失败 {count_or_marker(activity_failures)}，跳过 {skipped}"
         )
     success = int(result.get("success") or result.get("success_count") or 0)
+    platform_pending = optional_contract_count(result, "platform_pending_count")
+    pending_text = ""
+    if platform_pending:
+        pending_text = f"，平台已接受待生效 {platform_pending}"
     return (
-        f"{common}，成功 {success}，商品失败 {failed}，"
+        f"{common}，成功 {success}{pending_text}，商品失败 {failed}，"
         f"活动失败 {count_or_marker(activity_failures)}，跳过 {skipped}"
     )
 
@@ -1896,12 +1903,15 @@ def business_task_text(task: dict[str, Any]) -> str:
     if str(task.get("action") or "").lower() == "cancel":
         lines.extend([
             f"取消请求成功：{count_or_marker(optional_contract_count(task, 'request_success_count'), '旧记录未区分')}",
-            f"平台确认移除：{count_or_marker(optional_contract_count(task, 'live_verified_removed_count'), '旧记录未区分')}",
+            f"成功取消：{count_or_marker(optional_contract_count(task, 'live_verified_removed_count'), '旧记录未区分')}",
             "取消请求已提交，待平台回查确认："
             + count_or_marker(optional_contract_count(task, "pending_verification_count"), "旧记录未区分"),
         ])
     else:
         lines.append(f"成功：{success}")
+        platform_pending = optional_contract_count(task, "platform_pending_count")
+        if platform_pending:
+            lines.append(f"平台已接受待生效：{platform_pending}")
     lines.extend([
         f"商品失败：{failed}",
         f"活动失败：{count_or_marker(activity_failures, '旧记录未区分')}",
@@ -1922,11 +1932,13 @@ def business_details_text(task: dict[str, Any], details: list[dict[str, Any]]) -
 
 
 def benchmark_text(results: dict[str, Any]) -> str:
-    latest = dict(results.get("write_latest_status") or {})
-    stable = int(latest.get("verified_stable_concurrency") or 350)
-    minimum = int(latest.get("daily_recommended_min") or 300)
-    maximum = int(latest.get("daily_recommended_max") or 320)
-    return f"自动并发按实测和接口反馈调整。当前重复验证最高稳定档 {stable}；日常建议 {minimum}-{maximum}。手动数值仅用于排障或主管要求。"
+    _ = results
+    return (
+        "真实上限：商品读取 125，活动目录 192；商品写入按动作分别为"
+        "批量取消 160、批量报名 160、批量更新 128；报名 192 在全店铺持续运行中出现密集限流，已停用。"
+        "设置中的写入上限是总开关，实际任务不会超过对应动作的实测上限；"
+        "遇到限流、网络异常、平台服务异常或超时会自动降档并持久续跑。"
+    )
 
 
 def product_error(message: str) -> str:
@@ -1941,6 +1953,22 @@ def product_error(message: str) -> str:
             return "网络连接失败，请稍后重试。"
         return "任务结果不完整，已完成结果仍会保留，请查看历史记录。"
     return clean
+
+
+def prepare_failure_message(prepare: dict[str, Any]) -> str:
+    kind = str(prepare.get("error_kind") or "").strip()
+    messages = {
+        "rate_limit": "平台读取触发限流，请稍后重新核对。",
+        "service": "平台服务暂时异常，请稍后重新核对。",
+        "timeout": "平台读取超时，请稍后重新核对。",
+        "network": "网络连接暂时异常，请检查网络后重新核对。",
+        "local_contract": "程序处理平台数据时发现格式异常，已安全停止准备。",
+        "local_storage": "本地状态暂时无法保存，已安全停止准备，请稍后重新核对。",
+        "unknown": "准备范围时发生未分类异常，已安全停止。",
+    }
+    if kind in messages:
+        return messages[kind]
+    return str(prepare.get("error") or "执行范围准备未完成。")
 
 
 QDialogAccepted = 1

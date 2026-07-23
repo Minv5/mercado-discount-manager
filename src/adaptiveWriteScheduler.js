@@ -1,11 +1,59 @@
-export const ADAPTIVE_WRITE_PROFILE = Object.freeze({
-  initialGlobal: 8,
-  maxGlobal: 24,
-  perRoute: 6,
-  minGlobal: 2,
+const WRITE_PROFILE_BASE = Object.freeze({
+  minGlobal: 10,
   successWindow: 40,
+  overloadDecreaseStep: 16,
   defaultRateLimitCooldownMs: 5_000,
+  defaultTransientCooldownMs: 2_000,
 });
+
+export const ADAPTIVE_WRITE_ACTION_PROFILES = Object.freeze({
+  cancel: Object.freeze({
+    ...WRITE_PROFILE_BASE,
+    initialGlobal: 160,
+    maxGlobal: 160,
+    perRoute: 54,
+  }),
+  enroll: Object.freeze({
+    ...WRITE_PROFILE_BASE,
+    initialGlobal: 160,
+    maxGlobal: 160,
+    perRoute: 28,
+    successWindow: 1000,
+    defaultRateLimitCooldownMs: 15_000,
+  }),
+  update: Object.freeze({
+    ...WRITE_PROFILE_BASE,
+    initialGlobal: 128,
+    maxGlobal: 128,
+    perRoute: 28,
+  }),
+});
+
+export const ADAPTIVE_WRITE_PROFILE = ADAPTIVE_WRITE_ACTION_PROFILES.enroll;
+
+export function adaptiveWriteProfileForAction(action, value) {
+  const normalizedAction = String(action || '').toLowerCase();
+  const source = ADAPTIVE_WRITE_ACTION_PROFILES[normalizedAction] || ADAPTIVE_WRITE_PROFILE;
+  return profileForLimit(source, value);
+}
+
+export function adaptiveWriteProfileForLimit(value) {
+  return profileForLimit(ADAPTIVE_WRITE_PROFILE, value);
+}
+
+function profileForLimit(source, value) {
+  const requested = Number(value);
+  const maxGlobal = Number.isFinite(requested)
+    ? Math.min(source.maxGlobal, Math.max(1, Math.floor(requested)))
+    : source.maxGlobal;
+  return {
+    ...source,
+    initialGlobal: maxGlobal,
+    perRoute: Math.min(source.perRoute, maxGlobal),
+    minGlobal: Math.min(source.minGlobal, maxGlobal),
+    maxGlobal,
+  };
+}
 
 export function createAdaptiveWriteScheduler(options = {}) {
   const profile = { ...ADAPTIVE_WRITE_PROFILE, ...(options.profile || {}) };
@@ -16,6 +64,13 @@ export function createAdaptiveWriteScheduler(options = {}) {
   let maxActive = 0;
   let stableSuccesses = 0;
   let cooldownUntil = 0;
+  let decreaseAllowedAt = 0;
+  let overloadCount = 0;
+  let rateLimitCount = 0;
+  let networkErrorCount = 0;
+  let serviceErrorCount = 0;
+  let timeoutErrorCount = 0;
+  let lastOverloadKind = null;
   const routeActive = new Map();
   const routePeaks = new Map();
   const queues = new Map();
@@ -31,6 +86,12 @@ export function createAdaptiveWriteScheduler(options = {}) {
       route_active: Object.fromEntries(routeActive),
       route_peaks: Object.fromEntries(routePeaks),
       queued: [...queues.values()].reduce((sum, rows) => sum + rows.length, 0),
+      overload_count: overloadCount,
+      rate_limit_count: rateLimitCount,
+      network_error_count: networkErrorCount,
+      service_error_count: serviceErrorCount,
+      timeout_error_count: timeoutErrorCount,
+      last_overload_kind: lastOverloadKind,
     };
   }
 
@@ -81,6 +142,28 @@ export function createAdaptiveWriteScheduler(options = {}) {
     emit();
   }
 
+  function recordOverload(kind, error) {
+    overloadCount += 1;
+    lastOverloadKind = kind;
+    if (kind === 'rate_limit') rateLimitCount += 1;
+    if (kind === 'network') networkErrorCount += 1;
+    if (kind === 'service') serviceErrorCount += 1;
+    if (kind === 'timeout') timeoutErrorCount += 1;
+    const cooldownMs = kind === 'rate_limit'
+      ? retryAfterMs(error, profile.defaultRateLimitCooldownMs)
+      : Math.max(0, Number(profile.defaultTransientCooldownMs || 0));
+    const currentTime = now();
+    if (currentTime >= decreaseAllowedAt) {
+      const step = Number(profile.overloadDecreaseStep);
+      limit = Number.isFinite(step) && step > 0
+        ? Math.max(profile.minGlobal, limit - Math.floor(step))
+        : Math.max(profile.minGlobal, Math.floor(limit * 0.5));
+      decreaseAllowedAt = currentTime + Math.max(1, cooldownMs);
+    }
+    stableSuccesses = 0;
+    cooldownUntil = Math.max(cooldownUntil, currentTime + cooldownMs);
+  }
+
   async function run(key, item) {
     active += 1;
     maxActive = Math.max(maxActive, active);
@@ -97,11 +180,8 @@ export function createAdaptiveWriteScheduler(options = {}) {
       }
       item.resolve(value);
     } catch (error) {
-      if (isRateLimited(error)) {
-        limit = Math.max(profile.minGlobal, Math.floor(limit * 0.5));
-        stableSuccesses = 0;
-        cooldownUntil = Math.max(cooldownUntil, now() + retryAfterMs(error, profile.defaultRateLimitCooldownMs));
-      }
+      const kind = transientOverloadKind(error);
+      if (kind) recordOverload(kind, error);
       item.reject(error);
     } finally {
       active -= 1;
@@ -132,8 +212,16 @@ export function retryAfterMs(error, fallbackMs = 5_000) {
   return Number.isFinite(date) ? Math.max(0, date - Date.now()) : fallbackMs;
 }
 
-function isRateLimited(error) {
-  return Number(error?.status || error?.statusCode) === 429 || /429|rate.?limit|too many|限流/i.test(String(error?.message || ''));
+function transientOverloadKind(error) {
+  const status = Number(error?.status || error?.statusCode || error?.response?.status || 0);
+  const code = String(error?.code || error?.cause?.code || '').toUpperCase();
+  const message = String(error?.message || '').toLowerCase();
+  if (status === 429 || /429|rate.?limit|too many|限流/i.test(message)) return 'rate_limit';
+  if (status >= 500 && status <= 599) return 'service';
+  if (/ETIMEDOUT/.test(code) || /(timeout|timed out)/.test(message)) return 'timeout';
+  if (/(ECONNRESET|ECONNREFUSED|EAI_AGAIN|UND_ERR|SOCKET)/.test(code)
+      || /(fetch failed|network|socket)/.test(message)) return 'network';
+  return null;
 }
 
 function clamp(value, min, max) {

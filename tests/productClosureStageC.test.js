@@ -14,6 +14,7 @@ import {
 } from '../src/promotionDomain.js';
 import { filterPromotions } from '../src/planner.js';
 import { classifyPromotionType } from '../src/cycle.js';
+import { classifyPrepareError, prepareErrorMessage } from '../src/errors.js';
 import {
   claimSubmissionPreparation,
   cancelSubmissionCommit,
@@ -123,6 +124,38 @@ test('submission persistence versions every mutation and rejects stale compare-a
   assert.equal(stale.prepare.version, 2);
 });
 
+test('submission progress persistence retries a transient EPERM, uses unique temporary names, and coalesces high-frequency updates', async () => {
+  const stateDir = temporaryDirectory();
+  const calls = [];
+  let renameAttempts = 0;
+  const fsOps = {
+    ...fs,
+    renameSync(from, to) {
+      calls.push({ from, to });
+      renameAttempts += 1;
+      if (renameAttempts === 1) {
+        const error = Object.assign(new Error('sharing violation'), { code: 'EPERM', syscall: 'rename', path: to });
+        throw error;
+      }
+      return fs.renameSync(from, to);
+    },
+  };
+  const store = createSubmissionPersistence({ stateDir, fsOps, retryDelaysMs: [0, 0] });
+  store.create({ id: 'prepare-eprem', client_submission_id: 'submit-eprem', state: 'preparing', request: {} });
+  calls.length = 0;
+  renameAttempts = 0;
+  for (let index = 1; index <= 40; index += 1) {
+    store.queueProgress('prepare-eprem', { stage: 'started', percent: index, message: `进度 ${index}` });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  store.flushProgress('prepare-eprem');
+  const persisted = createSubmissionPersistence({ stateDir }).load('prepare-eprem');
+  assert.equal(persisted.progress.percent, 40);
+  assert.equal(renameAttempts, 2);
+  assert.notEqual(calls[0].from, calls[1].from);
+  assert.ok(persisted.version < 10, `expected coalesced writes, got version ${persisted.version}`);
+});
+
 test('submission preparation is persisted before a delayed snapshot and survives restart', async () => {
   const stateDir = temporaryDirectory();
   const store = createSubmissionPersistence({ stateDir, now: () => '2026-07-15T04:00:00.000Z' });
@@ -138,14 +171,40 @@ test('submission preparation is persisted before a delayed snapshot and survives
     prepareId: 'prepare-delayed',
     buildSnapshot: async (_request, reportProgress) => {
       reportProgress({ stage: 'activities', percent: 40, message: '正在核对活动' });
+      reportProgress({
+        read_scheduler: {
+          dynamic_limit: 120,
+          max_limit: 125,
+          inflight: 9,
+          peak: 12,
+          detail_inflight: 7,
+          fallback_active: 2,
+          queued: 18,
+          cooldown_ms: 2500,
+          rate_limit_count: 1,
+          network_error_count: 2,
+          service_error_count: 3,
+          timeout_error_count: 4,
+          failure_count: 5,
+          retry_count: 2,
+          per_account: { A: 4 },
+        },
+      });
       await delayed;
       return { scope_hash: 'HASH', resolved_action: 'update' };
     },
     preparedPatch: (snapshot) => ({ ...snapshot, expires_at: '2026-07-15T04:15:00.000Z' }),
   });
+  store.flushProgress('prepare-delayed');
   const reloaded = createSubmissionPersistence({ stateDir, now: () => '2026-07-15T04:00:01.000Z' });
   assert.equal(reloaded.load('prepare-delayed').state, 'preparing');
   assert.equal(reloaded.load('prepare-delayed').progress.percent, 40);
+  assert.equal(reloaded.load('prepare-delayed').progress.read_scheduler.dynamic_limit, 120);
+  assert.equal(reloaded.load('prepare-delayed').progress.read_scheduler.per_account.A, 4);
+  assert.equal(reloaded.load('prepare-delayed').progress.read_scheduler.network_error_count, 2);
+  assert.equal(reloaded.load('prepare-delayed').progress.read_scheduler.service_error_count, 3);
+  assert.equal(reloaded.load('prepare-delayed').progress.read_scheduler.timeout_error_count, 4);
+  assert.equal(reloaded.load('prepare-delayed').progress.read_scheduler.failure_count, 5);
   releaseSnapshot();
   await running;
   const completed = createSubmissionPersistence({ stateDir, now: () => '2026-07-15T04:00:02.000Z' }).load('prepare-delayed');
@@ -166,6 +225,101 @@ test('submission preparation failure is terminal and never starts a group', asyn
   assert.equal(result.state, 'failed');
   assert.match(result.error, /范围读取失败/);
   assert.equal(result.group_id ?? null, null);
+});
+
+test('submission preparation failure preserves safe context, scheduler evidence and structured audit', async () => {
+  const stateDir = temporaryDirectory();
+  const store = createSubmissionPersistence({ stateDir, now: () => '2026-07-20T05:42:25.743Z' });
+  store.create({ id: 'prepare-observed-failure', client_submission_id: 'submit-observed-failure', state: 'preparing', request: {} });
+  const logged = [];
+  const result = await runSubmissionPreparation({
+    store,
+    prepareId: 'prepare-observed-failure',
+    buildSnapshot: async (_request, reportProgress) => {
+      reportProgress({
+        stage: 'catalog', percent: 8, completed: 0, total: 3,
+        current_store: '广州', current_site: '墨西哥站', current_activity: '95',
+        read_scheduler: { dynamic_limit: 120, max_limit: 125, inflight: 7, peak: 12, queued: 4 },
+      });
+      throw Object.assign(new Error('upstream service unavailable'), {
+        status: 503, code: 'HTTP_RESPONSE_ERROR', cause: { code: 'UND_ERR_SOCKET' }, operation: 'activity_catalog',
+      });
+    },
+    preparedPatch: () => ({}),
+    classifyError: classifyPrepareError,
+    formatError: (error) => prepareErrorMessage(classifyPrepareError(error)),
+    logFailure: (event) => logged.push(event),
+  });
+  assert.equal(result.state, 'failed');
+  assert.equal(result.error, '平台服务暂时异常，请稍后重新核对。');
+  assert.equal(result.error_kind, 'service');
+  assert.equal(result.http_status, 503);
+  assert.equal(result.code, 'HTTP_RESPONSE_ERROR');
+  assert.equal(result.cause_code, 'UND_ERR_SOCKET');
+  assert.equal(result.operation, 'activity_catalog');
+  assert.equal(result.stage, 'catalog');
+  assert.equal(result.account, '广州');
+  assert.equal(result.site, '墨西哥站');
+  assert.equal(result.activity, '95');
+  assert.equal(result.progress.current_store, '广州');
+  assert.equal(result.progress.current_site, '墨西哥站');
+  assert.equal(result.progress.current_activity, '95');
+  assert.equal(result.progress.read_scheduler.dynamic_limit, 120);
+  assert.equal(result.progress.read_scheduler.peak, 12);
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0].type, 'prepare_failed');
+  assert.equal(logged[0].error_kind, 'service');
+  assert.equal(logged[0].account, '广州');
+  assert.equal(logged[0].read_scheduler.dynamic_limit, 120);
+  const audit = fs.readFileSync(store.auditPath('prepare-observed-failure'), 'utf8').trim().split(/\r?\n/).map(JSON.parse);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].type, 'prepare_failed');
+  assert.equal(audit[0].error_kind, 'service');
+  assert.equal(audit[0].account, '广州');
+  assert.equal(audit[0].read_scheduler.dynamic_limit, 120);
+  assert.equal(JSON.stringify(audit).includes('upstream service unavailable'), false);
+});
+
+test('prepare errors classify rate limit, service, timeout, network, local contract, local storage and unknown safely', () => {
+  const cases = [
+    [Object.assign(new Error('limited'), { status: 429, code: 'HTTP_429' }), 'rate_limit'],
+    [Object.assign(new Error('unavailable'), { status: 502 }), 'service'],
+    [Object.assign(new Error('request timed out'), { code: 'ETIMEDOUT' }), 'timeout'],
+    [Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNRESET' } }), 'network'],
+    [new TypeError('(values || []).map is not a function'), 'local_contract'],
+    [Object.assign(new Error('sharing violation'), { code: 'EPERM', syscall: 'rename' }), 'local_storage'],
+    [new Error('opaque failure'), 'unknown'],
+  ];
+  for (const [error, expected] of cases) assert.equal(classifyPrepareError(error).error_kind, expected);
+});
+
+test('local storage preparation failures retain only a sanitized persistence context', async () => {
+  const stateDir = temporaryDirectory();
+  const store = createSubmissionPersistence({ stateDir });
+  store.create({ id: 'prepare-storage-context', client_submission_id: 'submit-storage-context', state: 'preparing', request: {} });
+  const error = Object.assign(new Error('rename C:\\private\\state\\prepare-storage-context.json failed'), {
+    code: 'EPERM',
+    syscall: 'rename',
+    storage_operation: 'submission_state_persist',
+    storage_syscall: 'rename',
+    storage_target: 'prepare-storage-context.json',
+  });
+  const result = await runSubmissionPreparation({
+    store,
+    prepareId: 'prepare-storage-context',
+    buildSnapshot: async () => { throw error; },
+    preparedPatch: () => ({}),
+    classifyError: classifyPrepareError,
+    formatError: (value) => prepareErrorMessage(classifyPrepareError(value)),
+  });
+  assert.equal(result.error_kind, 'local_storage');
+  assert.equal(result.storage_operation, 'submission_state_persist');
+  assert.equal(result.storage_syscall, 'rename');
+  assert.equal(result.storage_target, 'prepare-storage-context.json');
+  const audit = fs.readFileSync(store.auditPath('prepare-storage-context'), 'utf8');
+  assert.match(audit, /submission_state_persist/);
+  assert.match(audit, /prepare-storage-context\.json/);
+  assert.equal(audit.includes('C:\\private'), false);
 });
 
 test('submission preparation claim reuses one client id and blocks a second active client', () => {
@@ -619,7 +773,7 @@ test('final execution consumes the frozen intersection without a second full act
   assert.match(server, /const frozenScope = hasConfirmedExecutionScope\(request\)/);
   assert.match(server, /filterPromotionsByConfirmedScope\(\{ accountId: account\.account_id, promotions: localPromotions, request \}\)/);
   assert.match(server, /const itemPrep = frozenScope[\s\S]*使用最终确认商品关系，不再进行同级全量读取/);
-  assert.match(server, /filterItemsByConfirmedScope\(\{ accountId: account\.account_id, promotions, itemsByPromotion, request \}\)/);
+  assert.match(server, /filterItemsByConfirmedScope\(\{[\s\S]*?accountId: account\.account_id,[\s\S]*?requiredRecords: request\.resumePendingOnly \? pendingWriteRecords : null/);
   assert.match(server, /revalidateAfterCreation:/);
   assert.match(server, /buildFinalRevalidationPlan\(/);
   assert.match(server, /finalRevalidation: true/);

@@ -24,7 +24,12 @@ function activity(accountId, childUserId, promotionId, extra = {}) {
 
 function freshState() {
   return {
-    cache: { dirty: 0, continuity: 'continuous', items_full_checked_at: FRESH },
+    cache: {
+      dirty: 0,
+      continuity: 'continuous',
+      items_full_checked_at: FRESH,
+      updated_at: '2026-07-17T02:00:00.000Z',
+    },
     candidate: { detail_status: 'ok', saved_count: 2, platform_total: 2, updated_at: FRESH },
     started: { detail_status: 'ok', saved_count: 0, platform_total: 0, updated_at: FRESH },
     fallback: null,
@@ -58,6 +63,104 @@ test('unchanged prepared scope performs zero item reads during final revalidatio
   assert.equal(result.removed_identity_keys.size, 0);
 });
 
+test('unchanged scope with clean previous final revalidation skips all item reads', () => {
+  const rows = [activity('A', 'CH-A', 'P-1'), activity('B', 'CH-B', 'P-2')];
+  const confirmed = createConfirmedExecutionScope({
+    action: 'enroll',
+    activities: rows,
+    sellerCreateTargetKeys: ['A|CH-A|MLM'],
+  });
+  const states = new Map(rows.map((row) => [row.promotion_id, freshState()]));
+  const result = buildFinalRevalidationPlan({
+    confirmedScope: confirmed,
+    currentPromotions: rows,
+    catalogRefreshes: [],
+    action: confirmed.action,
+    explicitTargetKeys: [],
+    now: NOW,
+    previousRevalidationRecord: {
+      total_activity_count: 2,
+      item_read_activity_count: 0,
+      scope_review_activity_count: 0,
+      revalidation_reasons: {},
+    },
+    previousConfirmedScope: confirmed,
+    getCacheState: (row) => states.get(row.promotion_id)?.cache || null,
+    getFetchState: (row, status) => states.get(row.promotion_id)?.[status] || null,
+    getFallbackState: (row) => states.get(row.promotion_id)?.fallback || null,
+  });
+
+  assert.equal(result.total_activity_count, 2);
+  assert.equal(result.item_read_identity_keys.size, 0);
+  assert.equal(result.scope_review_identity_keys.size, 0);
+  assert.equal(result.blocked_identity_keys.size, 0);
+  assert.equal(result.removed_identity_keys.size, 0);
+  assert.equal(result.excluded_new_activity_count, 0);
+});
+
+test('same scope with historical reasons does not short-circuit final revalidation', () => {
+  const rows = [activity('A', 'CH-A', 'P-1'), activity('B', 'CH-B', 'P-2')];
+  const confirmed = createConfirmedExecutionScope({ action: 'enroll', activities: rows });
+  const states = new Map(rows.map((row) => [row.promotion_id, freshState()]));
+  const result = buildFinalRevalidationPlan({
+    confirmedScope: confirmed,
+    currentPromotions: rows,
+    catalogRefreshes: [],
+    action: confirmed.action,
+    explicitTargetKeys: [],
+    now: NOW,
+    previousRevalidationRecord: {
+      total_activity_count: 2,
+      item_read_activity_count: 0,
+      scope_review_activity_count: 0,
+      revalidation_reasons: {
+        'A|CH-A|MLM|P-1|DEAL': ['candidate:dirty'],
+      },
+    },
+    previousConfirmedScope: confirmed,
+    getCacheState: (row) => states.get(row.promotion_id)?.cache || null,
+    getFetchState: (row, status) => states.get(row.promotion_id)?.[status] || null,
+    getFallbackState: (row) => states.get(row.promotion_id)?.fallback || null,
+  });
+
+  assert.equal(result.item_read_identity_keys.size, 0);
+  assert.equal(result.scope_review_identity_keys.size, 0);
+  assert.equal(result.blocked_identity_keys.size, 0);
+  assert.equal(result.removed_identity_keys.size, 0);
+});
+
+test('explicit revalidate keys force final item read even with clean previous context', () => {
+  const rows = [activity('A', 'CH-A', 'P-1'), activity('B', 'CH-B', 'P-2')];
+  const confirmed = createConfirmedExecutionScope({ action: 'enroll', activities: rows });
+  const states = new Map(rows.map((row) => [row.promotion_id, freshState()]));
+  const result = buildFinalRevalidationPlan({
+    confirmedScope: confirmed,
+    currentPromotions: rows,
+    catalogRefreshes: [],
+    action: confirmed.action,
+    explicitTargetKeys: ['__ACTION__'],
+    now: NOW,
+    previousRevalidationRecord: {
+      total_activity_count: 2,
+      item_read_activity_count: 0,
+      scope_review_activity_count: 0,
+      revalidation_reasons: {},
+    },
+    previousConfirmedScope: confirmed,
+    getCacheState: (row) => states.get(row.promotion_id)?.cache || null,
+    getFetchState: (row, status) => states.get(row.promotion_id)?.[status] || null,
+    getFallbackState: (row) => states.get(row.promotion_id)?.fallback || null,
+  });
+
+  assert.equal(result.total_activity_count, 2);
+  assert.equal(result.item_read_identity_keys.size, 2);
+  assert.equal(result.scope_review_identity_keys.size, 2);
+  assert.deepEqual([...result.item_read_identity_keys], [
+    'A|CH-A|MLM|P-1|DEAL',
+    'B|CH-B|MLM|P-2|DEAL',
+  ]);
+});
+
 test('one dirty activity is the only item range re-read across multiple accounts', () => {
   const rows = [
     activity('A', 'CH-A', 'P-1'),
@@ -67,6 +170,7 @@ test('one dirty activity is the only item range re-read across multiple accounts
   const confirmed = createConfirmedExecutionScope({ action: 'enroll', activities: rows });
   const states = new Map(rows.map((row) => [row.promotion_id, freshState()]));
   states.get('P-2').cache.dirty = 1;
+  states.get('P-2').cache.updated_at = '2026-07-17T02:45:00.000Z';
   const result = plan({ confirmed, states });
 
   assert.deepEqual([...result.item_read_identity_keys], ['A|CH-A|MLM|P-2|DEAL']);
@@ -102,7 +206,7 @@ test('catalog metadata changes, removed activities and unreadable routes remain 
   ]);
 });
 
-test('fresh composite sparse candidate cache is stable while unreadable state is targeted', () => {
+test('fresh composite sparse candidate cache is stable while a same-day failed read is blocked without retry', () => {
   const seller = activity('A', 'CH-A', 'C-1', { promotion_type: 'SELLER_CAMPAIGN' });
   const deal = activity('A', 'CH-A', 'P-2');
   const confirmed = createConfirmedExecutionScope({ action: 'enroll', activities: [seller, deal] });
@@ -114,8 +218,9 @@ test('fresh composite sparse candidate cache is stable while unreadable state is
   const states = new Map([['C-1', composite], ['P-2', unreadable]]);
   const result = plan({ confirmed, states });
 
-  assert.deepEqual([...result.item_read_identity_keys], ['A|CH-A|MLM|P-2|DEAL']);
-  assert.equal(result.reasons_by_identity['A|CH-A|MLM|P-2|DEAL'].includes('candidate:unreadable'), true);
+  assert.deepEqual([...result.item_read_identity_keys], []);
+  assert.deepEqual([...result.blocked_identity_keys], ['A|CH-A|MLM|P-2|DEAL']);
+  assert.equal(result.reasons_by_identity['A|CH-A|MLM|P-2|DEAL'].includes('candidate:same_day_failed'), true);
 });
 
 test('new catalog activities are excluded, except a newly verified seller activity explicitly created for a confirmed route', () => {
@@ -141,4 +246,3 @@ test('new catalog activities are excluded, except a newly verified seller activi
   assert.deepEqual([...afterCreate.item_read_identity_keys], ['A|CH-A|MLM|C-NEW|SELLER_CAMPAIGN']);
   assert.equal(afterCreate.excluded_new_activity_count, 1);
 });
-

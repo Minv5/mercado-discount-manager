@@ -49,7 +49,7 @@ export function prepareOAuthStartFromConfig(config, { pkce, state, redirectUri, 
       }),
       redirectUri: effectiveRedirectUri,
       authDomain,
-      configSource: 'standalone-auth-dir',
+      configSource: text(config.config_source) || 'standalone-auth-dir',
       warning: configuredRedirectUri || tokenRedirectUri
         ? null
         : `当前配置未提供 redirect_uri，已使用已验证的授权回调 ${effectiveRedirectUri}。如果授权页面仍提示 redirect_uri 不匹配，请在 Mercado App 后台确认该回调地址已登记。`

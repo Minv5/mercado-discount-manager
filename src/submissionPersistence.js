@@ -31,6 +31,18 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+const RETRYABLE_STORAGE_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+
+function safeStorageToken(value) {
+  const text = String(value || '').trim();
+  return /^[A-Za-z0-9_.-]{1,160}$/.test(text) ? text : null;
+}
+
+function sleepSync(milliseconds) {
+  if (milliseconds <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
 export function submissionScopeHash(value) {
   return crypto.createHash('sha256').update(JSON.stringify(stable(value ?? null))).digest('hex').toUpperCase();
 }
@@ -55,8 +67,18 @@ export function submissionRequestFingerprint(request = {}) {
   return submissionScopeHash(value);
 }
 
-export function createSubmissionPersistence({ stateDir, now = () => new Date().toISOString() }) {
+export function createSubmissionPersistence({
+  stateDir,
+  now = () => new Date().toISOString(),
+  fsOps = fs,
+  retryDelaysMs = [20, 50, 100],
+  progressCoalesceMs = 80,
+} = {}) {
   const records = new Map();
+  const pendingProgress = new Map();
+  const progressTimers = new Map();
+  const progressErrors = new Map();
+  let temporarySequence = 0;
 
   function statePath(id) {
     return path.join(stateDir, `${safeId(id)}.json`);
@@ -66,53 +88,107 @@ export function createSubmissionPersistence({ stateDir, now = () => new Date().t
     return path.join(stateDir, `${safeId(id)}.audit.jsonl`);
   }
 
+  function storageError(error, operation, target) {
+    const wrapped = error instanceof Error ? error : new Error(String(error || 'local storage failure'));
+    wrapped.storage_operation = safeStorageToken(operation);
+    wrapped.storage_syscall = safeStorageToken(wrapped.syscall);
+    wrapped.storage_target = safeStorageToken(path.basename(String(target || wrapped.path || wrapped.dest || '')));
+    wrapped.prepare_context = {
+      ...(wrapped.prepare_context && typeof wrapped.prepare_context === 'object' ? wrapped.prepare_context : {}),
+      operation: wrapped.prepare_context?.operation || 'submission_state_persist',
+      storage_operation: wrapped.storage_operation,
+      storage_syscall: wrapped.storage_syscall,
+      storage_target: wrapped.storage_target,
+    };
+    return wrapped;
+  }
+
+  function withStorageRetry(operation, target, action) {
+    let lastError = null;
+    for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+      try {
+        return action(attempt);
+      } catch (error) {
+        lastError = storageError(error, operation, target);
+        if (!RETRYABLE_STORAGE_CODES.has(String(lastError.code || '')) || attempt >= retryDelaysMs.length) throw lastError;
+        sleepSync(Number(retryDelaysMs[attempt] || 0));
+      }
+    }
+    throw lastError;
+  }
+
   function appendAudit(id, event = {}) {
     const current = load(id);
     if (!current) return false;
-    fs.mkdirSync(stateDir, { recursive: true });
-    fs.appendFileSync(auditPath(id), `${JSON.stringify({
+    fsOps.mkdirSync(stateDir, { recursive: true });
+    const safeEvent = {
       at: now(),
       type: String(event.type || ''),
       reason: event.reason ? String(event.reason) : undefined,
       state: event.state ? String(event.state) : undefined,
-    })}\n`, 'utf8');
+    };
+    if (safeEvent.type === 'prepare_failed') {
+      for (const key of ['error_kind', 'code', 'cause_code', 'operation', 'stage', 'account', 'site', 'activity', 'storage_operation', 'storage_syscall', 'storage_target']) {
+        if (event[key] != null && String(event[key])) safeEvent[key] = String(event[key]).slice(0, 160);
+      }
+      if (event.http_status != null) safeEvent.http_status = Number(event.http_status);
+      if (event.read_scheduler && typeof event.read_scheduler === 'object' && !Array.isArray(event.read_scheduler)) {
+        const { per_account: _privateAccountMetrics, ...scheduler } = event.read_scheduler;
+        safeEvent.read_scheduler = clone(scheduler);
+      }
+    }
+    const target = auditPath(id);
+    withStorageRetry('submission_audit_append', target, () => fsOps.appendFileSync(target, `${JSON.stringify(safeEvent)}\n`, 'utf8'));
     return true;
   }
 
   function persist(prepare) {
     if (!prepare?.id || !prepare?.client_submission_id) throw new Error('prepare id and client submission id are required');
     if (!SUBMISSION_STATES.has(String(prepare.state || ''))) throw new Error('invalid submission state');
-    fs.mkdirSync(stateDir, { recursive: true });
+    fsOps.mkdirSync(stateDir, { recursive: true });
     const saved = clone(prepare);
     saved.version = Math.max(1, Number(saved.version || 1));
     saved.updated_at = now();
     const target = statePath(saved.id);
-    const temporary = `${target}.${process.pid}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(saved), 'utf8');
-    fs.renameSync(temporary, target);
+    withStorageRetry('submission_state_persist', target, () => {
+      const temporary = `${target}.${process.pid}.${Date.now()}.${++temporarySequence}.tmp`;
+      try {
+        fsOps.writeFileSync(temporary, JSON.stringify(saved), 'utf8');
+        fsOps.renameSync(temporary, target);
+      } finally {
+        try {
+          if (fsOps.existsSync(temporary)) fsOps.unlinkSync(temporary);
+        } catch {}
+      }
+    });
     records.set(String(saved.id), saved);
     return saved;
   }
 
   function load(id) {
     const key = String(id || '');
-    if (records.has(key)) return records.get(key);
+    if (records.has(key)) {
+      const record = records.get(key);
+      const pending = pendingProgress.get(key);
+      return pending ? { ...record, progress: { ...(record.progress || {}), ...pending } } : record;
+    }
     const target = statePath(key);
-    if (!fs.existsSync(target)) return null;
+    if (!fsOps.existsSync(target)) return null;
     try {
-      const value = JSON.parse(fs.readFileSync(target, 'utf8'));
+      const value = JSON.parse(fsOps.readFileSync(target, 'utf8'));
       if (!value || String(value.id || '') !== key) return null;
       value.version = Math.max(1, Number(value.version || 1));
       records.set(key, value);
-      return value;
+      const pending = pendingProgress.get(key);
+      return pending ? { ...value, progress: { ...(value.progress || {}), ...pending } } : value;
     } catch {
       return null;
     }
   }
 
   function loadAll() {
-    fs.mkdirSync(stateDir, { recursive: true });
-    for (const file of fs.readdirSync(stateDir).filter((name) => name.endsWith('.json'))) load(file.slice(0, -5));
+    fsOps.mkdirSync(stateDir, { recursive: true });
+    for (const file of fsOps.readdirSync(stateDir).filter((name) => name.endsWith('.json'))) load(file.slice(0, -5));
     return [...records.values()];
   }
 
@@ -130,13 +206,57 @@ export function createSubmissionPersistence({ stateDir, now = () => new Date().t
     return { prepare: load(prepared.id), reused: false };
   }
 
+  function flushProgress(id) {
+    const key = String(id || '');
+    const timer = progressTimers.get(key);
+    if (timer) clearTimeout(timer);
+    progressTimers.delete(key);
+    const progress = pendingProgress.get(key);
+    if (!progress) return load(key);
+    pendingProgress.delete(key);
+    const current = load(key);
+    if (!current) return null;
+    try {
+      const saved = persist({ ...clone(current), progress: clone(progress), version: Number(current.version || 1) + 1 });
+      progressErrors.delete(key);
+      return saved;
+    } catch (error) {
+      pendingProgress.set(key, progress);
+      progressErrors.set(key, error);
+      throw error;
+    }
+  }
+
+  function queueProgress(id, progress) {
+    const key = String(id || '');
+    const pendingError = progressErrors.get(key);
+    if (pendingError) {
+      progressErrors.delete(key);
+      throw pendingError;
+    }
+    const current = load(key);
+    if (!current) return null;
+    const pending = { ...(pendingProgress.get(key) || current.progress || {}), ...clone(progress || {}) };
+    pendingProgress.set(key, pending);
+    if (!progressTimers.has(key)) {
+      const timer = setTimeout(() => {
+        try { flushProgress(key); } catch {}
+      }, Math.max(1, Number(progressCoalesceMs || 1)));
+      timer.unref?.();
+      progressTimers.set(key, timer);
+    }
+    return { ...current, progress: pending };
+  }
+
   function update(id, patch) {
+    flushProgress(id);
     const current = load(id);
     if (!current) return null;
     return persist({ ...clone(current), ...clone(patch || {}), version: Number(current.version || 1) + 1 });
   }
 
   function compareAndSwap(id, expected = {}, patch = {}) {
+    flushProgress(id);
     const current = load(id);
     if (!current) return { ok: false, prepare: null };
     const expectedStates = Array.isArray(expected.state) ? expected.state.map(String) : null;
@@ -153,7 +273,7 @@ export function createSubmissionPersistence({ stateDir, now = () => new Date().t
   }
 
   loadAll();
-  return { appendAudit, auditPath, compareAndSwap, create, findBySubmissionId, load, loadAll, persist, statePath, update };
+  return { appendAudit, auditPath, compareAndSwap, create, findBySubmissionId, flushProgress, load, loadAll, persist, queueProgress, statePath, update };
 }
 
 export async function runSubmissionPreparation({
@@ -162,9 +282,45 @@ export async function runSubmissionPreparation({
   buildSnapshot,
   preparedPatch,
   formatError = (error) => String(error?.message || error || '准备执行范围失败'),
+  classifyError = () => ({ error_kind: 'unknown', http_status: null, code: null, cause_code: null, operation: null }),
+  logFailure = () => {},
 }) {
   let prepare = store.load(prepareId);
   if (!prepare || prepare.state !== 'preparing') return prepare;
+  const normalizeSchedulerProgress = (value, fallback = null) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return fallback;
+    const number = (key) => Math.max(0, Number(value[key] || 0));
+    const perAccount = value.per_account && typeof value.per_account === 'object' && !Array.isArray(value.per_account)
+      ? Object.fromEntries(Object.entries(value.per_account).map(([key, count]) => [String(key), Math.max(0, Number(count || 0))]))
+      : {};
+    return {
+      dynamic_limit: number('dynamic_limit'),
+      max_limit: number('max_limit'),
+      per_account_limit: number('per_account_limit'),
+      detail_limit: number('detail_limit'),
+      activity_limit: number('activity_limit'),
+      fallback_per_account: number('fallback_per_account'),
+      inflight: number('inflight'),
+      peak: number('peak'),
+      detail_inflight: number('detail_inflight'),
+      detail_peak: number('detail_peak'),
+      activity_inflight: number('activity_inflight'),
+      activity_peak: number('activity_peak'),
+      fallback_active: number('fallback_active'),
+      fallback_peak: number('fallback_peak'),
+      queued: number('queued'),
+      cooldown_ms: number('cooldown_ms'),
+      rate_limit_count: number('rate_limit_count'),
+      network_error_count: number('network_error_count'),
+      service_error_count: number('service_error_count'),
+      timeout_error_count: number('timeout_error_count'),
+      failure_count: number('failure_count'),
+      retry_count: number('retry_count'),
+      per_account: perAccount,
+      local_work_concurrency: Math.max(1, Number(value.local_work_concurrency || 1)),
+      local_db_batch_queries: number('local_db_batch_queries'),
+    };
+  };
   const reportProgress = (progress = {}) => {
     const current = store.load(prepareId);
     if (!current || current.state !== 'preparing') {
@@ -172,17 +328,16 @@ export async function runSubmissionPreparation({
       stopped.code = 'PREPARATION_STOPPED';
       throw stopped;
     }
-    return store.update(prepareId, {
-      progress: {
-        stage: String(progress.stage || current.progress?.stage || 'preparing'),
-        percent: Math.max(0, Math.min(99, Number(progress.percent || 0))),
-        completed: Math.max(0, Number(progress.completed || 0)),
-        total: Math.max(0, Number(progress.total || 0)),
-        message: String(progress.message || current.progress?.message || '正在核对执行范围'),
-        current_store: String(progress.current_store || ''),
-        current_site: String(progress.current_site || ''),
-        current_activity: String(progress.current_activity || ''),
-      },
+    return store.queueProgress(prepareId, {
+      stage: String(progress.stage || current.progress?.stage || 'preparing'),
+      percent: Math.max(0, Math.min(99, Number(progress.percent ?? current.progress?.percent ?? 0))),
+      completed: Math.max(0, Number(progress.completed ?? current.progress?.completed ?? 0)),
+      total: Math.max(0, Number(progress.total ?? current.progress?.total ?? 0)),
+      message: String(progress.message || current.progress?.message || '正在核对执行范围'),
+      current_store: String(progress.current_store ?? current.progress?.current_store ?? ''),
+      current_site: String(progress.current_site ?? current.progress?.current_site ?? ''),
+      current_activity: String(progress.current_activity ?? current.progress?.current_activity ?? ''),
+      read_scheduler: normalizeSchedulerProgress(progress.read_scheduler, current.progress?.read_scheduler || null),
     });
   };
   try {
@@ -199,17 +354,58 @@ export async function runSubmissionPreparation({
       error: null,
     });
   } catch (error) {
+    try { store.flushProgress?.(prepareId); } catch {}
     const current = store.load(prepareId);
     if (!current || current.state !== 'preparing') return current;
-    return store.update(prepareId, {
+    const classified = classifyError(error) || {};
+    const errorContext = error?.prepare_context && typeof error.prepare_context === 'object' ? error.prepare_context : {};
+    const safeText = (value, fallback = '') => String(value ?? fallback ?? '').slice(0, 160);
+    const failure = {
+      type: 'prepare_failed',
+      prepare_id: prepareId,
+      state: 'failed',
+      error_kind: safeText(classified.error_kind, 'unknown') || 'unknown',
+      http_status: classified.http_status == null ? null : Number(classified.http_status),
+      code: classified.code ? safeText(classified.code) : null,
+      cause_code: classified.cause_code ? safeText(classified.cause_code) : null,
+      operation: safeText(classified.operation || errorContext.operation || current.progress?.stage),
+      stage: safeText(errorContext.stage || current.progress?.stage),
+      account: safeText(errorContext.account || current.progress?.current_store),
+      site: safeText(errorContext.site || current.progress?.current_site),
+      activity: safeText(errorContext.activity || current.progress?.current_activity),
+      storage_operation: safeText(classified.storage_operation || errorContext.storage_operation),
+      storage_syscall: safeText(classified.storage_syscall || errorContext.storage_syscall),
+      storage_target: safeText(classified.storage_target || errorContext.storage_target),
+      read_scheduler: normalizeSchedulerProgress(current.progress?.read_scheduler, null),
+    };
+    const failed = store.update(prepareId, {
       state: 'failed',
       error: formatError(error),
+      error_kind: failure.error_kind,
+      http_status: failure.http_status,
+      code: failure.code,
+      cause_code: failure.cause_code,
+      operation: failure.operation,
+      stage: failure.stage,
+      account: failure.account,
+      site: failure.site,
+      activity: failure.activity,
+      storage_operation: failure.storage_operation,
+      storage_syscall: failure.storage_syscall,
+      storage_target: failure.storage_target,
       progress: {
         stage: 'failed', percent: Number(current.progress?.percent || 0),
         completed: Number(current.progress?.completed || 0), total: Number(current.progress?.total || 0),
-        message: '执行范围准备失败', current_store: '', current_site: '', current_activity: '',
+        message: '执行范围准备失败',
+        current_store: safeText(current.progress?.current_store),
+        current_site: safeText(current.progress?.current_site),
+        current_activity: safeText(current.progress?.current_activity),
+        read_scheduler: failure.read_scheduler,
       },
     });
+    store.appendAudit(prepareId, failure);
+    try { logFailure(failure); } catch {}
+    return failed;
   }
 }
 

@@ -291,7 +291,7 @@ export function createSameDayConfirmationStore({ stateDir, now = () => new Date(
 }
 
 export function sameDayCompletionGate({
-  groups = [], request = {}, confirmationStore, now = () => new Date().toISOString(), deferManualConfirmation = false,
+  groups = [], request = {}, now = () => new Date().toISOString(),
 }) {
   const timestamp = typeof now === 'function' ? now() : now;
   const completedGroup = findSameDayTerminalGroup(groups, request, timestamp);
@@ -303,38 +303,7 @@ export function sameDayCompletionGate({
     throw gateError('今天当前范围已有真实任务完成，自动模式不会重复准备。', 'TODAY_COMPLETED', { completed });
   }
 
-  const scope = executionRequestScope(request);
-  const binding = {
-    client_submission_id: String(request.client_submission_id || ''),
-    scope_key: executionScopeKey(scope),
-    scope_hash: stableHash(scope),
-    requested_action: requestedAction,
-    completed_group_id: completed.group_id,
-    business_date: businessDateInShanghai(timestamp),
-  };
-  if (deferManualConfirmation) {
-    return {
-      allowed: true,
-      confirmed: false,
-      completed,
-      binding,
-      warning: {
-        same_action: completed.action === requestedAction,
-        completed,
-      },
-    };
-  }
-  const token = request.same_day_confirmation_token || request.sameDayConfirmationToken || '';
-  if (token) {
-    confirmationStore.consume(token, binding);
-    return { allowed: true, confirmed: true, completed, binding };
-  }
-
-  const issued = confirmationStore.issue(binding, completed);
-  throw gateError('今天当前范围已执行过真实任务，请确认是否继续另一项真实操作。', 'CONFIRM_SAME_DAY_ACTION', {
-    confirmation_token: issued.token,
-    expires_at: issued.record.expires_at,
-    same_action: completed.action === requestedAction,
-    completed,
-  });
+  // Manual actions retain the normal final confirmation only. The auto gate
+  // above remains the server-side replay protection for the current scope.
+  return { allowed: true, confirmed: false, completed, binding: null };
 }

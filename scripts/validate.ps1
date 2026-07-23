@@ -84,7 +84,7 @@ function Get-StringHash([string]$Value) {
 }
 
 $Python = (Get-Command python -ErrorAction Stop).Source
-$ExpectedServiceName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x52A9,0x624B))
+$ExpectedServiceName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x7BA1,0x5BB6))
 $ExpectedProduct = 'mercado-discount-manager'
 $ExpectedProtocolVersion = '3'
 $Environment = [ordered]@{

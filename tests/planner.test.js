@@ -9,7 +9,7 @@ import { MercadoLibreClient, extractMarketplaceUsers, extractPromotions, mergePr
 import { realSubmitProtection } from '../src/protection.js';
 import { buildBatchConfirmationPackage, buildConfirmationPackage } from '../src/confirmationPackage.js';
 import { ADAPTER_STATES, buildSubmitPayloadPreview, getPromotionAdapterState, requireExecutableSubmitPayload, requireItemStatus, summarizeSpecialPromotionFields } from '../src/promotionPayload.js';
-import { normalizeSettings } from '../src/settings.js';
+import { hasConfiguredCycleMaximums, normalizeSettings } from '../src/settings.js';
 import { exportWorkspace } from '../src/exporter.js';
 import { decideToday } from '../src/today.js';
 import { queryFiltersFromSearchParams } from '../src/filterQuery.js';
@@ -42,10 +42,12 @@ import {
   limitSmartCancelPlan
 } from '../src/smartCancel.js';
 import {
+  filterPendingRecordsByConfirmedScope,
   filterPromotionsByConfirmedScope,
   filterItemsByConfirmedScope,
   filterItemsByRequestedIds,
   hasConfirmedExecutionScope,
+  partitionItemsByAllowedIds,
   requestedExecutionItemIds,
   requestedItemFilterErrorMessage
 } from '../src/executionItemFilter.js';
@@ -98,6 +100,21 @@ test('account profile display name uses verified cache before safe local fallbac
     fetched_at: '2026-07-12T00:00:00.000Z',
     source: 'users_me',
   });
+});
+
+test('offer item ids containing 401 are not reported as expired authorization', () => {
+  const error = {
+    status: 400,
+    body: {
+      message: 'Errors: OFFER_ALREADY_EXISTS - Offer already exists for item MLA1866024019',
+      error: 'bad_request',
+      status: 400,
+    },
+  };
+  assert.equal(toChineseError(error), '缺少或无效的活动报价信息');
+  const serverSource = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
+  assert.match(serverSource, /invalid_token\|unauthorized\|\\b401\\b/);
+  assert.doesNotMatch(serverSource, /invalid_token\|unauthorized\|401\//);
 });
 
 test('account profile refresh stays read-only and serves stale cache while refreshing', () => {
@@ -548,6 +565,38 @@ test('cycle discounts increment only after complete run and cancel only after a 
     promotionType: 'DEAL', currentDiscount: 10, lastDiscount: 10,
     lastUpdatedAt: '2026-07-14T10:00:00+08:00', today: new Date('2026-07-15T10:00:00+08:00'),
     hasStartedItems: true
+  }).action, 'cancel');
+  assert.equal(nextDiscountFor({
+    promotionType: 'SELLER_CAMPAIGN', lastDiscount: 14, lastStatus: 'completed', maxDiscount: 15
+  }), 15);
+  assert.equal(decideCycleAction({
+    promotionType: 'SELLER_CAMPAIGN', currentDiscount: 15, lastDiscount: 15, maxDiscount: 15,
+    lastUpdatedAt: '2026-07-14T10:00:00+08:00', today: new Date('2026-07-15T10:00:00+08:00'),
+    hasStartedItems: true
+  }).action, 'cancel');
+});
+
+test('custom seller and official maximums cancel only on the next cycle after both reach their limits', () => {
+  const promotions = [
+    { account_id: 'A', site_id: 'MLM', promotion_id: 'C-15', promotion_type: 'SELLER_CAMPAIGN', name: '95' },
+    { account_id: 'A', site_id: 'MLM', promotion_id: 'P-15', promotion_type: 'DEAL', name: 'Deal' }
+  ];
+  const started = new Map(promotions.map((promotion) => [promotionKey(promotion), 2]));
+  const sameDayCycle = {
+    source: 'latest_effective_discount', source_time: '2026-07-14T10:00:00+08:00',
+    base_seller_discount: 15, base_official_discount: 15,
+    seller_discount: 15, official_discount: 15,
+    seller_max_discount: 15, official_max_discount: 15
+  };
+  assert.equal(decideToday({
+    promotions, startedCountsByPromotion: started, globalCycle: sameDayCycle,
+    sellerMaxDiscount: 15, officialMaxDiscount: 15,
+    today: new Date('2026-07-14T18:00:00+08:00')
+  }).action, 'update');
+  assert.equal(decideToday({
+    promotions, startedCountsByPromotion: started, globalCycle: sameDayCycle,
+    sellerMaxDiscount: 15, officialMaxDiscount: 15,
+    today: new Date('2026-07-15T09:00:00+08:00')
   }).action, 'cancel');
 });
 
@@ -2096,6 +2145,7 @@ test('cancel request success is not final success until live removal is verified
   assert.deepEqual(contract.counts, {
     relation_count: 4, unique_item_count: 4, activity_failure_count: 0,
     request_success_count: 2, live_verified_removed_count: 1, pending_verification_count: 0,
+    platform_pending_count: 0, retryable_pending_count: 0,
     success: 1, failed: 2, skipped: 1
   });
   assert.equal(contract.final_status_by_item.A, CANCEL_RESULT_STATUS.liveVerifiedRemoved);
@@ -2110,6 +2160,42 @@ test('cancel request success is not final success until live removal is verified
   assert.equal(noRecheck.counts.skipped, 1);
 });
 
+test('cancel live verification waits for propagation and only retries request-success items', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  assert.match(serverSource, /settleDelaysMs = \[5_000, 15_000, 30_000\]/);
+  assert.match(serverSource, /retryableItemIds/);
+  assert.match(serverSource, /remaining\.filter\(\(item\) => retryable\.has/);
+  assert.match(serverSource, /business_failures_only: true/);
+  assert.match(serverSource, /delay_ms: delayMs/);
+});
+
+test('enroll and update require live target state before the task counts request success', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  assert.match(serverSource, /async function waitForAppliedWriteRows/);
+  assert.match(serverSource, /repeated_write_requests: 0/);
+  assert.doesNotMatch(serverSource, /verificationRetryRound:/);
+  assert.match(serverSource, /targetPrice == null \|\| livePrice === targetPrice/);
+  assert.equal(
+    (serverSource.match(/headers: client\.promotionItemWriteHeaders\(\)/g) || []).length,
+    2,
+    'planned cancel and enroll/update writes must use the complete marketplace identity headers',
+  );
+  assert.match(serverSource, /userId: targetUserId,[\s\S]*callerId: account\.account_id/);
+  assert.equal(
+    (serverSource.match(/includeResponseMeta: true/g) || []).length >= 2,
+    true,
+    'planned writes must preserve sanitized HTTP response evidence',
+  );
+  assert.match(serverSource, /write_live_verification_round/);
+  assert.match(serverSource, /confirmed_candidate_after_write/);
+  assert.match(serverSource, /confirmed_pending/);
+  assert.match(serverSource, /retryable_pending_count/);
+  assert.match(serverSource, /started_price_mismatch/);
+  assert.match(serverSource, /平台仍明确返回可报名/);
+  assert.match(serverSource, /MAX_CONFIRMED_CANDIDATE_WRITE_ATTEMPTS = 3/);
+  assert.match(serverSource, /execution\.counts\.pending_verification_count = unresolvedRows\.length/);
+});
+
 test('result contract separates relation items from activity failures and exposes stable counts', () => {
   const summary = summarizeResultContractRows([
     { id: 1, account_id: 'A', promotion_id: 'P-1', promotion_type: 'DEAL', action: 'cancel', item_id: 'I-1', status: 'request_success' },
@@ -2120,8 +2206,23 @@ test('result contract separates relation items from activity failures and expose
   assert.deepEqual(summary, {
     relation_count: 2, unique_item_count: 1, activity_failure_count: 1,
     request_success_count: 1, live_verified_removed_count: 1, pending_verification_count: 1,
+    platform_pending_count: 0, retryable_pending_count: 1,
     success: 1, failed: 0, skipped: 1
   });
+});
+
+test('result contract keeps explicit platform pending separate from skipped and retryable work', () => {
+  const summary = summarizeResultContractRows([
+    {
+      account_id: 'A', promotion_id: 'P-1', promotion_type: 'DEAL', action: 'enroll', item_id: 'I-1',
+      status: 'pending_verification', error_cn: '平台已明确返回 pending（待生效），本地执行已完成且不会重复提交',
+    },
+  ]);
+  assert.equal(summary.relation_count, 1);
+  assert.equal(summary.platform_pending_count, 1);
+  assert.equal(summary.pending_verification_count, 0);
+  assert.equal(summary.retryable_pending_count, 0);
+  assert.equal(summary.skipped, 0);
 });
 
 test('cancel history rows do not display discount columns', () => {
@@ -2659,6 +2760,65 @@ test('confirmed execution scope filters by activity-item relation instead of glo
   assert.deepEqual(filtered.itemsByPromotion.get(promotionKey(promotions[1])).map((row) => row.item_id), ['ITEM-P2']);
 });
 
+test('pending recovery validates only persisted pending relations inside the confirmed scope', () => {
+  const request = {
+    action: 'enroll',
+    confirmedExecutionScope: {
+      action: 'enroll',
+      activities: [{
+        account_id: 'A',
+        child_user_id: 'CHILD-A',
+        site_id: 'MLM',
+        promotion_id: 'P-1',
+        promotion_type: 'DEAL',
+        item_ids: ['ITEM-SUCCESS', 'ITEM-PENDING'],
+      }],
+    },
+  };
+  const filtered = filterPendingRecordsByConfirmedScope({
+    accountId: 'A',
+    request,
+    records: [{
+      account_id: 'A',
+      child_user_id: 'CHILD-A',
+      site_id: 'MLM',
+      promotion_id: 'P-1',
+      promotion_type: 'DEAL',
+      item_id: 'ITEM-PENDING',
+      action: 'enroll',
+    }],
+  });
+
+  assert.equal(filtered.requestedRelationCount, 1);
+  assert.equal(filtered.matchedRelationCount, 1);
+  assert.deepEqual(filtered.missingRelations, []);
+  assert.deepEqual(filtered.records.map((row) => row.item_id), ['ITEM-PENDING']);
+});
+
+test('pending recovery rejects a relation outside the confirmed account child site activity and item scope', () => {
+  const request = {
+    action: 'enroll',
+    confirmedExecutionScope: {
+      activities: [{
+        account_id: 'A', child_user_id: 'CHILD-A', site_id: 'MLM',
+        promotion_id: 'P-1', promotion_type: 'DEAL', item_ids: ['ITEM-1'],
+      }],
+    },
+  };
+  const filtered = filterPendingRecordsByConfirmedScope({
+    accountId: 'A',
+    request,
+    records: [{
+      account_id: 'A', child_user_id: 'CHILD-B', site_id: 'MLM',
+      promotion_id: 'P-1', promotion_type: 'DEAL', item_id: 'ITEM-1', action: 'enroll',
+    }],
+  });
+
+  assert.equal(filtered.matchedRelationCount, 0);
+  assert.equal(filtered.missingRelations.length, 1);
+  assert.deepEqual(filtered.records, []);
+});
+
 test('confirmed execution scope excludes newly discovered activities and matches site identity exactly', () => {
   const promotions = [
     { account_id: 'A', site_id: 'MLM', promotion_id: 'P-1', promotion_type: 'DEAL' },
@@ -3078,10 +3238,12 @@ test('settings normalization stores only non-sensitive paths and numeric workflo
     outputDir: 'C:/out',
     sellerDefaultDiscount: 0,
     officialDefaultDiscount: 99,
+    sellerMaxDiscount: 15,
+    officialMaxDiscount: 16,
     cancelMaxRounds: 3,
     maxItemsPerPromotion: 20,
-    readConcurrency: 99,
-    previewConcurrency: 0,
+    readConcurrency: 999,
+    previewConcurrency: 99,
     writeConcurrency: 999,
     storeAliases: { '2651442567': '湖北', empty: '', blank: '   ' },
     operatingSites: { '2651442567': ['mlm', 'MLB', 'MLM'], empty: [] },
@@ -3091,9 +3253,11 @@ test('settings normalization stores only non-sensitive paths and numeric workflo
   assert.equal(settings.outputDir, 'C:/out');
   assert.equal(settings.sellerDefaultDiscount, 1);
   assert.equal(settings.officialDefaultDiscount, 90);
+  assert.equal(settings.sellerMaxDiscount, 15);
+  assert.equal(settings.officialMaxDiscount, 16);
   assert.equal(settings.cancelMaxRounds, 3);
   assert.equal(settings.readConcurrency, MAX_READ_CONCURRENCY);
-  assert.equal(settings.previewConcurrency, 1);
+  assert.equal(settings.previewConcurrency, 99);
   assert.equal(settings.writeConcurrency, MAX_WRITE_CONCURRENCY);
   assert.deepEqual(settings.storeAliases, { '2651442567': '湖北' });
   assert.deepEqual(settings.operatingSites, { '2651442567': ['MLB', 'MLM'], empty: [] });
@@ -3199,9 +3363,9 @@ test('under review item status is not mislabeled as account permission failure',
 });
 
 test('concurrency settings default, cap, min, and preserve per-item failures', async () => {
-  assert.equal(normalizeConcurrency(undefined), 2);
-  assert.equal(normalizeConcurrency(99), MAX_READ_CONCURRENCY);
-  assert.equal(normalizeConcurrency('bad'), 2);
+  assert.equal(normalizeConcurrency(undefined), MAX_READ_CONCURRENCY);
+  assert.equal(normalizeConcurrency(999), MAX_READ_CONCURRENCY);
+  assert.equal(normalizeConcurrency('bad'), MAX_READ_CONCURRENCY);
   assert.equal(normalizeWriteConcurrency(undefined), DEFAULT_WRITE_CONCURRENCY);
   assert.equal(normalizeWriteConcurrency(999), MAX_WRITE_CONCURRENCY);
   assert.equal(normalizeWriteConcurrency(0), 1);
@@ -3226,9 +3390,9 @@ test('concurrency settings default, cap, min, and preserve per-item failures', a
   assert.match(results[2].error.message, /single failure/);
 });
 
-test('read benchmark can test readonly tiers up to 20', async () => {
-  assert.equal(MAX_READ_CONCURRENCY, 20);
-  assert.equal(normalizeConcurrency(99), MAX_READ_CONCURRENCY);
+test('read benchmark keeps its separate readonly tiers while the main read ceiling is 125', async () => {
+  assert.equal(MAX_READ_CONCURRENCY, 125);
+  assert.equal(normalizeConcurrency(999), MAX_READ_CONCURRENCY);
 
   let active = 0;
   let observedMax = 0;
@@ -3361,7 +3525,7 @@ test('single promotion can submit multiple planned rows concurrently without sto
   assert.equal(saved.length, 5);
 });
 
-test('single promotion write concurrency is not capped by read concurrency', async () => {
+test('single promotion write concurrency uses the separate write ceiling', async () => {
   let active = 0;
   let observedMax = 0;
   const plan = {
@@ -3389,9 +3553,8 @@ test('single promotion write concurrency is not capped by read concurrency', asy
     }
   });
 
-  assert.equal(observedMax > MAX_READ_CONCURRENCY, true);
-  assert.equal(result.maxActive > MAX_READ_CONCURRENCY, true);
-  assert.equal(result.maxActive <= 30, true);
+  assert.equal(observedMax <= MAX_WRITE_CONCURRENCY, true);
+  assert.equal(result.maxActive <= MAX_WRITE_CONCURRENCY, true);
   assert.equal(result.counts.success, 30);
 });
 
@@ -3636,8 +3799,9 @@ test('execution job path carries normalized write concurrency into real executio
   assert.match(standaloneSource, /activityConcurrency/);
   assert.match(serverSource, /\/api\/execution\/jobs\/start[\s\S]*normalizeWriteConcurrency\(body\.writeConcurrency, settings\.writeConcurrency\)/);
   assert.match(serverSource, /const jobReadConcurrency = normalizeConcurrency\(request\.readConcurrency, settings\.readConcurrency\)/);
-  assert.match(serverSource, /const jobActivityConcurrency = normalizeConcurrency/);
-  assert.match(serverSource, /const jobWriteConcurrency = normalizeWriteConcurrency\(request\.writeConcurrency, settings\.writeConcurrency\)/);
+  assert.match(serverSource, /const jobActivityConcurrency = normalizeActivityConcurrency/);
+  assert.match(serverSource, /const requestedJobWriteConcurrency = normalizeWriteConcurrency\(request\.writeConcurrency, settings\.writeConcurrency\)/);
+  assert.match(serverSource, /const jobWriteProfile = adaptiveWriteProfileForAction\(request\.action, requestedJobGlobalWriteConcurrency\)/);
   assert.equal(serverSource.includes('\u8bfb\u53d6\u5e76\u53d1=${jobReadConcurrency}\uff0c\u7ad9\u70b9\u5e76\u53d1=${jobSiteConcurrency}\uff0c\u6d3b\u52a8\u5e76\u53d1=${jobActivityConcurrency}\uff0c\u5546\u54c1\u5199\u5165\u5e76\u53d1=${jobWriteConcurrency}'), true);
   assert.match(serverSource, /并发读取站点活动/);
   assert.match(serverSource, /并发读取活动商品/);
@@ -3646,10 +3810,11 @@ test('execution job path carries normalized write concurrency into real executio
   assert.equal(serverSource.includes('\u6309\u6d3b\u52a8\u5e76\u53d1 ${event.activityConcurrency || jobActivityConcurrency}\u3001\u5546\u54c1\u5199\u5165\u5e76\u53d1 ${event.writeConcurrency || jobWriteConcurrency}'), true);
   assert.match(serverSource, /writeConcurrency: jobWriteConcurrency/);
   assert.match(serverSource, /activityConcurrency: jobActivityConcurrency/);
-  assert.match(serverSource, /getSharedWriteLimiter\(request\.executionGroupId, normalizedGlobalWriteConcurrency/);
+  assert.match(serverSource, /getSharedWriteLimiter\(request\.executionGroupId, action, normalizedGlobalWriteConcurrency/);
   assert.match(serverSource, /sharedWriteLimiters/);
   assert.match(serverSource, /const requestedNormalizedWriteConcurrency = normalizeWriteConcurrency\(writeConcurrency, readSettings\(\)\.writeConcurrency\)/);
-  assert.match(serverSource, /Math\.min\(requestedNormalizedWriteConcurrency, ADAPTIVE_WRITE_PROFILE\.perRoute\)/);
+  assert.match(serverSource, /adaptiveWriteProfileForAction\(action, requestedGlobalWriteConcurrency\)/);
+  assert.match(serverSource, /Math\.min\(requestedNormalizedWriteConcurrency, actionWriteProfile\.perRoute\)/);
   assert.match(serverSource, /mapLimited\(indexedPlans, normalizedActivityConcurrency/);
   assert.match(serverSource, /requestedWriteConcurrency/);
   assert.match(serverSource, /requestedGlobalWriteConcurrency/);
@@ -3689,6 +3854,53 @@ test('execution job path carries normalized write concurrency into real executio
   assert.match(serverSource, /ensureFreshAccount\(accountId, \{ force: true \}\)/);
 });
 
+test('automatic cycle maximums have no implicit defaults', () => {
+  const settings = normalizeSettings({});
+  assert.equal(settings.sellerMaxDiscount, null);
+  assert.equal(settings.officialMaxDiscount, null);
+  assert.equal(hasConfiguredCycleMaximums(settings), false);
+  assert.equal(hasConfiguredCycleMaximums({ sellerMaxDiscount: '', officialMaxDiscount: 15 }), false);
+  assert.equal(hasConfiguredCycleMaximums({ sellerMaxDiscount: 15, officialMaxDiscount: 15 }), true);
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src', 'server.js'), 'utf8');
+  assert.match(serverSource, /action: 'configuration_required'/);
+  assert.match(serverSource, /请先在设置的日常设置中填写自建最高折扣和官方最高折扣/);
+});
+
+test('legacy concurrency settings keep valid read caps and migrate the retired write ceiling', () => {
+  const settings = normalizeSettings({ readConcurrency: 20, previewConcurrency: 20, writeConcurrency: 350 });
+  assert.equal(settings.readConcurrency, 20);
+  assert.equal(settings.previewConcurrency, 20);
+  assert.equal(settings.writeConcurrency, 160);
+});
+
+test('default concurrency settings use the verified scheduler limits', () => {
+  const settings = normalizeSettings({});
+  assert.equal(settings.readConcurrency, 125);
+  assert.equal(settings.previewConcurrency, 192);
+  assert.equal(settings.writeConcurrency, 160);
+});
+
+test('cancel live recheck keeps the confirmed item set closed and never retries newly observed items', () => {
+  const partition = partitionItemsByAllowedIds([
+    { item_id: 'MLA-CONFIRMED' },
+    { item_id: 'MLA-NEW-LIVE' },
+  ], ['MLA-CONFIRMED']);
+  assert.deepEqual(partition.inScope.map((item) => item.item_id), ['MLA-CONFIRMED']);
+  assert.deepEqual(partition.outOfScope.map((item) => item.item_id), ['MLA-NEW-LIVE']);
+
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  assert.match(serverSource, /recheckAndCancelRemainingStarted\([\s\S]*?allowedItemIds:\s*\(plan\.rows \|\| \[\]\)/);
+  assert.match(serverSource, /partitionItemsByAllowedIds\(after\.results, allowedItemIds\)/);
+  assert.match(serverSource, /item_out_of_confirmed_scope/);
+});
+
+test('execution job completion consumes the scheduler snapshot returned by executeBatchPlans', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  assert.doesNotMatch(serverSource, /job\.progress\.write_queue\s*=\s*globalWriteLimiter/);
+  assert.match(serverSource, /job\.progress\.write_queue\s*=\s*execution\.write_queue/);
+  assert.match(serverSource, /summary\.write_queue\s*=\s*globalWriteLimiter\.snapshot/);
+});
+
 test('read benchmark and write plan remain while the synchronous write benchmark is retired', () => {
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
   const standaloneSource = fs.readFileSync(path.join(process.cwd(), 'standalone/Program.cs'), 'utf8');
@@ -3714,7 +3926,7 @@ test('settings window keeps daily settings simple and moves concurrency to advan
   const concurrencySource = fs.readFileSync(path.join(process.cwd(), 'src/concurrency.js'), 'utf8');
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
 
-  assert.match(concurrencySource, /MAX_WRITE_CONCURRENCY = 700/);
+  assert.match(concurrencySource, /MAX_WRITE_CONCURRENCY = 160/);
   assert.match(standaloneSource, /自动并发策略（推荐）/);
   assert.match(standaloneSource, /高级设置 \/ 诊断/);
   assert.match(standaloneSource, /AddRowTo\(advancedGroup, "诊断文件目录"/);
@@ -3723,9 +3935,10 @@ test('settings window keeps daily settings simple and moves concurrency to advan
   assert.doesNotMatch(standaloneSource, /AddNumberRow\("读取并发（高级）"/);
   assert.doesNotMatch(standaloneSource, /AddNumberRow\("活动并发（高级）"/);
   assert.match(serverSource, /write_latest_status/);
-  assert.match(serverSource, /verified_stable_concurrency: 350/);
-  assert.match(serverSource, /daily_recommended_min: 300/);
-  assert.match(serverSource, /daily_recommended_max: 320/);
+  assert.match(serverSource, /verified_stable_concurrency: 160/);
+  assert.match(serverSource, /cancel: \{ initial: 160, max: 160/);
+  assert.match(serverSource, /enroll: \{ initial: 160, max: 160/);
+  assert.match(serverSource, /update: \{ initial: 128, max: 128/);
   assert.doesNotMatch(standaloneSource, /最高稳定写入并发 2/);
   assert.doesNotMatch(standaloneSource, /日常建议 2/);
 });
@@ -3752,13 +3965,111 @@ test('write benchmark job API persists per-item events and protects unfinished j
   assert.match(serverSource, /fakeBenchmarkWrite/);
   assert.match(serverSource, /sampleOffset/);
   assert.match(serverSource, /excludeItemIds/);
+  assert.match(serverSource, /includeRelationKeys/);
+  assert.match(serverSource, /allowedIdentityKeys = includedRelations\.size[\s\S]*collectWriteBenchmarkRows\([\s\S]*allowedIdentityKeys/);
+  assert.match(serverSource, /childUserId: String\(campaign\.child_user_id/);
   assert.match(serverSource, /targetMatch/);
   assert.match(serverSource, /fetchFailed/);
   assert.match(serverSource, /items: writeBenchmarkItemsFromEvents\(events\)/);
   assert.match(serverSource, /function writeBenchmarkItemsFromEvents/);
+  assert.match(serverSource, /function readWriteBenchmarkJobEventPage/);
+  assert.match(serverSource, /url\.searchParams\.has\('offset'\)/);
+  assert.match(serverSource, /event_total: lines\.length/);
+  assert.match(serverSource, /next_offset: nextOffset/);
+  assert.match(serverSource, /has_more: nextOffset < lines\.length/);
   assert.match(serverSource, /activeWrites \+= 1/);
   assert.match(serverSource, /job\.progress\.peak_in_flight = Math\.max\(job\.progress\.peak_in_flight, maxActiveWrites\)/);
   assert.match(serverSource, /report_path = null/);
+});
+
+test('write benchmark supports cancel with started rows and no price calculation', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+
+  assert.match(serverSource, /function normalizeWriteBenchmarkAction/);
+  assert.match(serverSource, /\['enroll', 'update', 'cancel'\]/);
+  assert.match(serverSource, /writeBenchmarkItemStatus\(action\)/);
+  assert.match(serverSource, /action === 'cancel' \? null : benchmarkDealPrice/);
+  assert.match(serverSource, /action === 'cancel' \? 'started'/);
+  assert.match(serverSource, /真实写入并发取消压测样本/);
+});
+
+test('write benchmark keeps seller and official discount targets independent', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+
+  assert.match(serverSource, /seller_discount_percent:\s*Number\(input\.sellerDiscountPercent\)/);
+  assert.match(serverSource, /official_discount_percent:\s*Number\(input\.officialDiscountPercent\)/);
+  assert.match(serverSource, /const sellerExplicit = Number\(input\.sellerDiscountPercent\);[\s\S]*promotionType === 'SELLER_CAMPAIGN'/);
+  assert.match(serverSource, /const officialExplicit = Number\(input\.officialDiscountPercent\);[\s\S]*promotionType !== 'SELLER_CAMPAIGN'/);
+});
+
+test('write benchmark samples all actions fairly across accounts and campaigns', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+
+  assert.match(serverSource, /const useRoundRobinSamplePool = input\.roundRobinSamplePool !== false/);
+  assert.match(serverSource, /if \(input\.useCachedSamplePool !== false\)/);
+  assert.match(serverSource, /sample_source: 'confirmed_cached_items'[\s\S]*selected_rows: selectedFromCache\.length[\s\S]*continue;/);
+  assert.doesNotMatch(serverSource, /if \(\['update', 'cancel'\]\.includes\(action\) && input\.useCachedSamplePool !== false\)/);
+  assert.match(serverSource, /rowBuckets\.push\(\{ account_id: String\(account\.account_id\), rows: selected/);
+  assert.match(serverSource, /interleaveBenchmarkRowsByAccountAndCampaign\(rowBuckets, requiredItems, sampleOffset\)/);
+  assert.match(serverSource, /function interleaveBenchmarkRowsByAccountAndCampaign/);
+  assert.match(serverSource, /campaignBucketsByAccount/);
+  assert.match(serverSource, /persistWriteBenchmarkLevelCacheEffects\(\{ job, rows, items \}\)/);
+  assert.match(serverSource, /invalidatePromotionItemFetchStates\(\{[\s\S]*promotionId: activity\.campaign\.promotion_id/);
+  assert.match(serverSource, /markActivityCacheDirty\(\{[\s\S]*promotionId: activity\.campaign\.promotion_id/);
+  assert.match(serverSource, /job\.action !== 'cancel'[\s\S]*applySuccessfulPromotionItemWrites/);
+});
+
+test('real write benchmark is restricted to one confirmed prepare scope', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+
+  assert.match(serverSource, /真实写入并发测试必须绑定已冻结的 prepare_id/);
+  assert.match(serverSource, /resolveWriteBenchmarkConfirmedScope\(job\.input \|\| \{\}, job\.action\)/);
+  assert.match(serverSource, /allowedIdentityKeys = includedRelations\.size/);
+  assert.match(serverSource, /allowedIdentityKeys\s*\n\s*\}\);/);
+  assert.match(serverSource, /allowedIdentityKeys\.has\(writeBenchmarkRelationIdentity\(row\)\)/);
+  assert.match(serverSource, /prepare\.group_id \|\| prepare\.commit_lease/);
+  assert.match(serverSource, /expectedHash !== actualHash/);
+  assert.match(serverSource, /scopeAction !== normalizedAction/);
+  assert.match(serverSource, /sellerDiscount !== Number\(prepare\.discounts\?\.seller\)/);
+  assert.match(serverSource, /WRITE_BENCHMARK_AUTHORIZATION_DIR/);
+  assert.match(serverSource, /loadWriteBenchmarkAuthorizedScope\(input\)/);
+  assert.match(serverSource, /authorizedScope\.identityKeys\.has\(key\)/);
+  assert.match(serverSource, /actualHash !== scopeHash/);
+});
+
+test('write benchmark accepts an ordered repeated level sequence for full frozen scope coverage', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+
+  assert.match(serverSource, /function normalizeWriteBenchmarkLevelSequence/);
+  assert.match(serverSource, /value\.length > 10_000/);
+  assert.match(serverSource, /input\.levelSequence \|\| input\.level_sequence/);
+  assert.match(serverSource, /return sequence\.length \? sequence : normalizeWriteBenchmarkLevels/);
+  assert.match(serverSource, /const levels = writeBenchmarkLevelsFromInput\(input\)/);
+  assert.match(serverSource, /const requiredItems = levels\.reduce\(\(sum, level\) => sum \+ level, 0\)/);
+  assert.match(serverSource, /const sampleSize = level/);
+  assert.doesNotMatch(serverSource, /Math\.max\(level, 3\)/);
+});
+
+test('strict real write benchmark stops on the first interface error window', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+
+  assert.match(serverSource, /job\.input\?\.strictInterfaceStop === true/);
+  assert.match(serverSource, /writeBenchmarkStrictInterfaceFailureCount\(levelResult\.summary\)/);
+  assert.match(serverSource, /严格模式检测到/);
+  assert.match(serverSource, /\[401, 403, 404, 429\]\.includes\(Number\(itemError\.status\)\)/);
+  assert.match(serverSource, /http_401:/);
+  assert.match(serverSource, /http_403:/);
+  assert.match(serverSource, /http_404:/);
+});
+
+test('write benchmark can cool down between probe levels without slowing full-volume chunks', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+
+  assert.match(serverSource, /cooldownSecondsBetweenLevels/);
+  assert.match(serverSource, /level_cooldown_started/);
+  assert.match(serverSource, /await sleep\(cooldownSeconds \* 1000\)/);
+  assert.match(serverSource, /level_cooldown_completed/);
+  assert.match(serverSource, /levelIndex < job\.levels\.length - 1/);
 });
 
 test('WinForms all-store execution logs every queued store before concurrency slots run', () => {
@@ -4522,7 +4833,7 @@ test('WinForms does not merge backend batch rows from separate executions', () =
   assert.doesNotMatch(taskMergeKey, /isBatch && string\.Equals\(action, "enroll"/);
 });
 
-test('global today discount uses the latest effective real update and ignores other actions', () => {
+test('global today discount uses the latest effective real enroll or update and ignores cancel', () => {
   const rows = [
     { id: 800, action: 'cancel', mode: 'real', status: 'completed', updated_at: '2026-07-10T01:00:00Z', seller_activity_text: '9%', official_activity_text: '10%', total_count: 10 },
     { id: 799, action: 'enroll', mode: 'real', status: 'completed', updated_at: '2026-07-10T00:30:00Z', seller_activity_text: '8%', official_activity_text: '9%', total_count: 10 },
@@ -4530,16 +4841,18 @@ test('global today discount uses the latest effective real update and ignores ot
     { id: 530, action: 'update', mode: 'real', status: 'cancelled', updated_at: '2026-07-08T21:04:40.313Z', seller_activity_text: '7%', official_activity_text: '8%', total_count: 17787, success_count: 12403 }
   ];
   const latest = findLatestEffectiveUpdate(rows);
-  assert.equal(latest.id, 714);
+  assert.equal(latest.id, 799);
   const result = buildGlobalTodayDiscount({
     tasks: rows,
-    settings: { sellerDefaultDiscount: 5, officialDefaultDiscount: 6 },
+    settings: { sellerDefaultDiscount: 5, officialDefaultDiscount: 6, sellerMaxDiscount: 15, officialMaxDiscount: 15 },
     today: new Date('2026-07-10T02:00:00+08:00')
   });
-  assert.equal(result.seller_discount, 6);
-  assert.equal(result.official_discount, 7);
-  assert.equal(result.source_task_id, 714);
-  assert.equal(result.source, 'latest_effective_update');
+  assert.equal(result.seller_discount, 8);
+  assert.equal(result.official_discount, 9);
+  assert.equal(result.source_task_id, 799);
+  assert.equal(result.source, 'latest_effective_discount');
+  assert.equal(result.seller_max_discount, 15);
+  assert.equal(result.official_max_discount, 15);
 });
 
 test('global today discount keeps same-day partial values and picks the latest completion time', () => {
@@ -4573,6 +4886,7 @@ test('global today discount advances a previous-day cancelled update but not a s
   };
   const nextDay = buildGlobalTodayDiscount({
     tasks: [task],
+    settings: { sellerMaxDiscount: 10, officialMaxDiscount: 10 },
     today: new Date('2026-07-13T08:00:00+08:00')
   });
   assert.equal(nextDay.seller_discount, 8);
@@ -4581,6 +4895,7 @@ test('global today discount advances a previous-day cancelled update but not a s
 
   const sameDay = buildGlobalTodayDiscount({
     tasks: [task],
+    settings: { sellerMaxDiscount: 10, officialMaxDiscount: 10 },
     today: new Date('2026-07-12T23:00:00+08:00')
   });
   assert.equal(sameDay.seller_discount, 7);
@@ -4601,6 +4916,7 @@ test('global today discount handles UTC timestamps at the China local-day bounda
       total_count: 1,
       success_count: 1
     }],
+    settings: { sellerMaxDiscount: 10, officialMaxDiscount: 10 },
     today: new Date('2026-07-13T00:00:00+08:00')
   });
   assert.equal(result.seller_discount, 10);
@@ -4624,6 +4940,7 @@ test('global today discount keeps advancing completed and partial previous-day u
   for (const status of ['completed', 'partial_or_failed']) {
     const result = buildGlobalTodayDiscount({
       tasks: [{ ...base, status }],
+      settings: { sellerMaxDiscount: 10, officialMaxDiscount: 10 },
       today: new Date('2026-07-13T08:00:00+08:00')
     });
     assert.equal(result.seller_discount, 8);
@@ -4637,13 +4954,13 @@ test('global today discount falls back to saved settings when no effective updat
       { id: 1, action: 'update', mode: 'dry-run', status: 'completed', updated_at: '2026-07-09T10:00:00Z', seller_activity_text: '8%', official_activity_text: '9%', total_count: 10 },
       { id: 2, action: 'update', mode: 'real', status: 'running', updated_at: '2026-07-09T11:00:00Z', seller_activity_text: '8%', official_activity_text: '9%', total_count: 10 }
     ],
-    settings: { sellerDefaultDiscount: 5, officialDefaultDiscount: 6 },
+    settings: { sellerDefaultDiscount: 5, officialDefaultDiscount: 6, sellerMaxDiscount: 15, officialMaxDiscount: 15 },
     today: new Date('2026-07-10T09:00:00+08:00')
   });
   assert.equal(result.source, 'settings_fallback');
   assert.equal(result.seller_discount, 5);
   assert.equal(result.official_discount, 6);
-  assert.match(result.message, /未找到可用更新历史/);
+  assert.match(result.message, /未找到可用报名或更新历史/);
 });
 
 test('WinForms keeps global today discounts independent from scoped action conflicts', () => {
@@ -4697,7 +5014,7 @@ test('global today discount uses lightweight update summaries instead of full hi
     serverSource.indexOf("if (method === 'GET' && url.pathname === '/api/tasks/details')")
   );
   const repositorySource = fs.readFileSync(path.join(process.cwd(), 'src', 'repository.js'), 'utf8');
-  assert.match(route, /listGlobalDiscountUpdateSummaries/);
+  assert.match(route, /listGlobalDiscountExecutionSummaries/);
   assert.doesNotMatch(route, /listTaskSummaries/);
   assert.match(repositorySource, /skipActionResults/);
 });
@@ -4724,7 +5041,11 @@ test('lightweight update summaries keep cross-store discounts and the latest com
   assert.equal(summaries[0].seller_activity_text, '7%');
   assert.equal(summaries[0].official_activity_text, '8%');
   assert.equal(summaries[0].updated_at, '2026-07-12T14:01:21Z');
-  const discount = buildGlobalTodayDiscount({ tasks: summaries, today: new Date('2026-07-13T08:00:00+08:00') });
+  const discount = buildGlobalTodayDiscount({
+    tasks: summaries,
+    settings: { sellerMaxDiscount: 10, officialMaxDiscount: 10 },
+    today: new Date('2026-07-13T08:00:00+08:00')
+  });
   assert.equal(discount.seller_discount, 8);
   assert.equal(discount.official_discount, 9);
 });

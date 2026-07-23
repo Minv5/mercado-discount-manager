@@ -66,11 +66,12 @@ export class MercadoLibreClient {
     return this.request(`/seller-promotions/users/${encodeURIComponent(userId)}?app_version=${APP_VERSION}`, {
       headers,
       signal,
+      readKind: 'activity',
     });
   }
 
   async getMarketplaceUsers(merchantId, { signal = null } = {}) {
-    return this.request(`/marketplace/users/${encodeURIComponent(merchantId)}`, { signal });
+    return this.request(`/marketplace/users/${encodeURIComponent(merchantId)}`, { signal, readKind: 'activity' });
   }
 
   async getMarketplacePromotions(childUserId, {
@@ -99,6 +100,7 @@ export class MercadoLibreClient {
       const data = await this.request(path, {
         headers: { version: APP_VERSION, 'X-Caller-Id': String(callerId || childUserId) },
         signal,
+        readKind: 'activity',
       });
       lastData = data && typeof data === 'object' ? data : {};
       const rows = extractPromotions(data);
@@ -178,7 +180,7 @@ export class MercadoLibreClient {
     else path.searchParams.set('offset', String(offset));
     path.searchParams.set('app_version', APP_VERSION);
     if (status) path.searchParams.set('status', status);
-    return this.request(path, this.marketplace ? { headers: { version: APP_VERSION }, signal } : { signal });
+    return this.request(path, this.marketplace ? { headers: { version: APP_VERSION }, signal, readKind: 'detail' } : { signal, readKind: 'detail' });
   }
 
   async searchMarketplaceUserItems({ userId = this.userId, status = null, limit = 50, scrollId = null, searchType = 'scan', signal = null } = {}) {
@@ -187,7 +189,7 @@ export class MercadoLibreClient {
     if (searchType) path.searchParams.set('search_type', searchType);
     if (status && status !== 'all') path.searchParams.set('status', status);
     if (scrollId) path.searchParams.set('scroll_id', String(scrollId));
-    return this.request(path, { headers: { version: APP_VERSION }, signal });
+    return this.request(path, { headers: { version: APP_VERSION }, signal, readKind: 'detail' });
   }
 
   async scanMarketplaceUserItems({ userId = this.userId, status = 'active', limit = 50, maxItems = 'all', maxPages = 500, signal = null } = {}) {
@@ -424,30 +426,45 @@ export class MercadoLibreClient {
 
   async enrollItem({ itemId, promotionId, promotionType, dealPrice }) {
     const prefix = this.marketplace ? '/marketplace/seller-promotions' : '/seller-promotions';
-    return this.request(`${prefix}/items/${encodeURIComponent(itemId)}?app_version=${APP_VERSION}`, {
+    const path = this.promotionItemWritePath(prefix, itemId);
+    return this.request(path, {
       method: 'POST',
       body: { promotion_id: promotionId, promotion_type: promotionType, deal_price: dealPrice },
-      headers: this.marketplace ? { version: APP_VERSION } : {}
+      headers: this.promotionItemWriteHeaders()
     });
   }
 
   async updateItem({ itemId, promotionId, promotionType, dealPrice }) {
     const prefix = this.marketplace ? '/marketplace/seller-promotions' : '/seller-promotions';
-    return this.request(`${prefix}/items/${encodeURIComponent(itemId)}?app_version=${APP_VERSION}`, {
+    const path = this.promotionItemWritePath(prefix, itemId);
+    return this.request(path, {
       method: 'PUT',
       body: { promotion_id: promotionId, promotion_type: promotionType, deal_price: dealPrice },
-      headers: this.marketplace ? { version: APP_VERSION } : {}
+      headers: this.promotionItemWriteHeaders()
     });
   }
 
   async cancelItem({ itemId, promotionId, promotionType, offerId }) {
     const prefix = this.marketplace ? '/marketplace/seller-promotions' : '/seller-promotions';
-    const path = new URL(`${prefix}/items/${encodeURIComponent(itemId)}`, this.apiBaseUrl);
+    const path = this.promotionItemWritePath(prefix, itemId);
     path.searchParams.set('promotion_type', promotionType);
     path.searchParams.set('promotion_id', promotionId);
     if (offerId) path.searchParams.set('offer_id', offerId);
+    return this.request(path, { method: 'DELETE', headers: this.promotionItemWriteHeaders() });
+  }
+
+  promotionItemWritePath(prefix, itemId) {
+    const path = new URL(`${prefix}/items/${encodeURIComponent(itemId)}`, this.apiBaseUrl);
+    if (this.userId) path.searchParams.set('user_id', String(this.userId));
     path.searchParams.set('app_version', APP_VERSION);
-    return this.request(path, { method: 'DELETE', headers: this.marketplace ? { version: APP_VERSION } : {} });
+    return path;
+  }
+
+  promotionItemWriteHeaders() {
+    if (!this.marketplace) return {};
+    const headers = { version: APP_VERSION };
+    if (this.callerId) headers['X-Client-Id'] = String(this.callerId);
+    return headers;
   }
 
   async createSellerCampaign({

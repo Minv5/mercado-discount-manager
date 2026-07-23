@@ -1,7 +1,9 @@
-export const DEFAULT_READ_CONCURRENCY = 2;
-export const MAX_READ_CONCURRENCY = 20;
-export const DEFAULT_WRITE_CONCURRENCY = 2;
-export const MAX_WRITE_CONCURRENCY = 700;
+export const DEFAULT_READ_CONCURRENCY = 125;
+export const MAX_READ_CONCURRENCY = 125;
+export const DEFAULT_ACTIVITY_CONCURRENCY = 192;
+export const MAX_ACTIVITY_CONCURRENCY = 192;
+export const DEFAULT_WRITE_CONCURRENCY = 160;
+export const MAX_WRITE_CONCURRENCY = 160;
 
 export function normalizeConcurrency(value, fallback = DEFAULT_READ_CONCURRENCY) {
   const n = Number(value);
@@ -13,6 +15,12 @@ export function normalizeWriteConcurrency(value, fallback = DEFAULT_WRITE_CONCUR
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(MAX_WRITE_CONCURRENCY, Math.max(1, Math.floor(n)));
+}
+
+export function normalizeActivityConcurrency(value, fallback = DEFAULT_ACTIVITY_CONCURRENCY) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(MAX_ACTIVITY_CONCURRENCY, Math.max(1, Math.floor(n)));
 }
 
 export function normalizeConcurrencyWithCap(value, fallback = DEFAULT_READ_CONCURRENCY, max = MAX_READ_CONCURRENCY) {

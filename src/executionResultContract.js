@@ -87,9 +87,13 @@ export function summarizeResultContractRows(rows = []) {
     if (status === 'success' || status === CANCEL_RESULT_STATUS.liveVerifiedRemoved) {
       counts.success += 1;
       if (status === CANCEL_RESULT_STATUS.liveVerifiedRemoved) counts.live_verified_removed_count += 1;
+    } else if (status === CANCEL_RESULT_STATUS.pendingVerification
+      && String(row.error_cn || '').startsWith('平台已明确返回 pending（待生效）')) {
+      counts.platform_pending_count += 1;
     } else if (status === CANCEL_RESULT_STATUS.requestSuccess || status === CANCEL_RESULT_STATUS.pendingVerification) {
       counts.skipped += 1;
       counts.pending_verification_count += 1;
+      counts.retryable_pending_count += 1;
     } else if (status === 'skipped') {
       counts.skipped += 1;
     } else {
@@ -108,6 +112,8 @@ export function stableContractCounts({ relationCount = 0, uniqueItemCount = 0, a
     request_success_count: 0,
     live_verified_removed_count: 0,
     pending_verification_count: 0,
+    platform_pending_count: 0,
+    retryable_pending_count: 0,
     success: 0,
     failed: 0,
     skipped: 0,

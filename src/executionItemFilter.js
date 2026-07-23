@@ -16,6 +16,56 @@ function confirmedActivitiesForAccount(accountId, request = {}) {
     .filter((activity) => String(activity.account_id ?? activity.accountId ?? '') === String(accountId || ''));
 }
 
+function pendingRecordIdentity(record = {}) {
+  return activityIdentityKey({
+    account_id: record.account_id ?? record.accountId,
+    child_user_id: record.child_user_id ?? record.childUserId,
+    site_id: record.site_id ?? record.siteId,
+    promotion_id: record.promotion_id ?? record.promotionId,
+    promotion_type: record.promotion_type ?? record.promotionType,
+  });
+}
+
+function pendingRecordItemId(record = {}) {
+  return normalizeItemId(record.item_id ?? record.itemId ?? record.row?.item?.item_id);
+}
+
+export function filterPendingRecordsByConfirmedScope({ accountId = '', records = [], request = {} } = {}) {
+  if (!hasConfirmedExecutionScope(request)) {
+    return {
+      hasFilter: false,
+      requestedRelationCount: (records || []).length,
+      matchedRelationCount: (records || []).length,
+      missingRelations: [],
+      records: records || [],
+    };
+  }
+  const action = String(request.action || confirmedScopeFromRequest(request)?.action || '').toLowerCase();
+  const wantedByActivity = new Map(confirmedActivitiesForAccount(accountId, request).map((activity) => [
+    activityIdentityKey(activity),
+    new Set((activity.item_ids ?? activity.itemIds ?? []).map(normalizeItemId).filter(Boolean)),
+  ]));
+  const matched = [];
+  const missingRelations = [];
+  for (const record of records || []) {
+    const identity = pendingRecordIdentity(record);
+    const itemId = pendingRecordItemId(record);
+    const recordAction = String(record.action || '').toLowerCase();
+    if (wantedByActivity.get(identity)?.has(itemId) && (!action || recordAction === action)) {
+      matched.push(record);
+    } else {
+      missingRelations.push(`${identity}|${itemId}|${recordAction}`);
+    }
+  }
+  return {
+    hasFilter: true,
+    requestedRelationCount: (records || []).length,
+    matchedRelationCount: matched.length,
+    missingRelations,
+    records: matched,
+  };
+}
+
 export function filterPromotionsByConfirmedScope({ accountId = '', promotions = [], request = {} } = {}) {
   if (!hasConfirmedExecutionScope(request)) {
     return { hasFilter: false, promotions, missingActivityKeys: [] };
@@ -103,7 +153,7 @@ export function filterItemsByRequestedIds({ promotions = [], itemsByPromotion = 
   };
 }
 
-export function filterItemsByConfirmedScope({ accountId = '', promotions = [], itemsByPromotion = new Map(), request = {} } = {}) {
+export function filterItemsByConfirmedScope({ accountId = '', promotions = [], itemsByPromotion = new Map(), request = {}, requiredRecords = null } = {}) {
   if (!hasConfirmedExecutionScope(request)) {
     return {
       hasFilter: false,
@@ -120,6 +170,19 @@ export function filterItemsByConfirmedScope({ accountId = '', promotions = [], i
       activityIdentityKey(activity),
       new Set((activity.item_ids ?? activity.itemIds ?? []).map(normalizeItemId).filter(Boolean)),
     );
+  }
+  if (requiredRecords !== null) {
+    const requiredByActivity = new Map();
+    for (const record of requiredRecords || []) {
+      const identity = pendingRecordIdentity(record);
+      const itemId = pendingRecordItemId(record);
+      if (!requiredByActivity.has(identity)) requiredByActivity.set(identity, new Set());
+      if (itemId) requiredByActivity.get(identity).add(itemId);
+    }
+    for (const [identity, itemIds] of wantedByActivity) {
+      const required = requiredByActivity.get(identity) || new Set();
+      wantedByActivity.set(identity, new Set([...itemIds].filter((itemId) => required.has(itemId))));
+    }
   }
   const filtered = new Map();
   const missingRelations = [];
@@ -155,6 +218,22 @@ export function filterItemsByConfirmedScope({ accountId = '', promotions = [], i
     missingRelations,
     itemsByPromotion: filtered,
   };
+}
+
+export function partitionItemsByAllowedIds(items = [], allowedItemIds = null) {
+  const rows = Array.isArray(items) ? items : [];
+  if (allowedItemIds === null || allowedItemIds === undefined) {
+    return { inScope: rows, outOfScope: [] };
+  }
+  const allowed = new Set((Array.isArray(allowedItemIds) ? allowedItemIds : [])
+    .map(normalizeItemId)
+    .filter(Boolean));
+  const inScope = [];
+  const outOfScope = [];
+  for (const item of rows) {
+    (allowed.has(normalizeItemId(itemIdOf(item))) ? inScope : outOfScope).push(item);
+  }
+  return { inScope, outOfScope };
 }
 
 export function requestedItemFilterErrorMessage(result, itemStatus = '') {

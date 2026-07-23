@@ -14,12 +14,14 @@ const started = new Map(promotions.map((row) => [promotionKey(row), 3]));
 
 function baseline(baseSeller, baseOfficial, seller, official, sourceTime) {
   return {
-    source: 'latest_effective_update',
+    source: 'latest_effective_discount',
     source_time: sourceTime,
     base_seller_discount: baseSeller,
     base_official_discount: baseOfficial,
     seller_discount: seller,
     official_discount: official,
+    seller_max_discount: 10,
+    official_max_discount: 10,
   };
 }
 

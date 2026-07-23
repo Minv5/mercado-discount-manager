@@ -2,31 +2,37 @@ import { get, nowIso, run } from './db.js';
 import { defaultDiscountForPromotion } from './planner.js';
 import { promotionDiscountKind } from './promotionDomain.js';
 
-const MAX_DISCOUNT = 10;
+const LEGACY_MAX_DISCOUNT = 10;
 
 export function classifyPromotionType(promotionType) {
   return promotionDiscountKind(promotionType);
 }
 
-export function nextDiscountFor({ promotionType, lastDiscount, lastStatus, advanceAfterIncomplete = false }) {
+export function nextDiscountFor({ promotionType, lastDiscount, lastStatus, advanceAfterIncomplete = false, maxDiscount = LEGACY_MAX_DISCOUNT }) {
   const base = defaultDiscountForPromotion(promotionType);
   if (base === null) return null;
   if (!Number.isFinite(Number(lastDiscount))) return base;
   if (lastStatus !== 'completed' && !advanceAfterIncomplete) return Number(lastDiscount);
-  return Math.min(MAX_DISCOUNT, Number(lastDiscount) + 1);
+  return Math.min(normalizedMaximum(maxDiscount), Number(lastDiscount) + 1);
 }
 
-export function decideCycleAction({ promotionType, currentDiscount, lastDiscount, lastUpdatedAt, today = new Date(), hasStartedItems }) {
+export function decideCycleAction({ promotionType, currentDiscount, lastDiscount, lastUpdatedAt, today = new Date(), hasStartedItems, maxDiscount = LEGACY_MAX_DISCOUNT }) {
   const base = defaultDiscountForPromotion(promotionType);
   if (base === null) return { action: 'excluded', discount: null, reason: '该活动类型不参与普通批量折扣流程' };
   const discount = Number(currentDiscount ?? base);
   const priorDiscount = Number(lastDiscount);
-  const priorReachedMaximum = Number.isFinite(priorDiscount) && priorDiscount >= MAX_DISCOUNT;
+  const maximum = normalizedMaximum(maxDiscount);
+  const priorReachedMaximum = Number.isFinite(priorDiscount) && priorDiscount >= maximum;
   const priorCompletedBeforeToday = Boolean(lastUpdatedAt) && localDateNumber(lastUpdatedAt) < localDateNumber(today);
   if (priorReachedMaximum && priorCompletedBeforeToday && hasStartedItems) {
-    return { action: 'cancel', discount, reason: '折扣已到 10%，应进入取消阶段' };
+    return { action: 'cancel', discount, reason: `折扣已到最高 ${maximum}%，应进入取消阶段` };
   }
   return { action: 'enroll', discount, reason: '按当前周期折扣报名或补报名' };
+}
+
+function normalizedMaximum(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.min(90, Math.max(1, parsed)) : LEGACY_MAX_DISCOUNT;
 }
 
 function localDateNumber(value) {

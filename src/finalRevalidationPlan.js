@@ -38,6 +38,40 @@ function targetStatuses(action) {
   return String(action || '').toLowerCase() === 'enroll' ? ['candidate', 'started'] : ['started'];
 }
 
+function normalizeScopeSignatures(activities = [], sellerCreateTargetKeys = []) {
+  const activityKeys = new Set();
+  for (const row of activities || []) {
+    const key = activityIdentityKey(row);
+    if (key) activityKeys.add(key);
+  }
+  const sellerKeys = new Set(
+    (sellerCreateTargetKeys || [])
+      .map((value) => String(value || '').trim().toUpperCase())
+      .filter(Boolean),
+  );
+  return { activityKeys, sellerKeys, count: activityKeys.size };
+}
+
+function isSameFinalScope(signature, previousSignature) {
+  if (!previousSignature || !signature) return false;
+  if (signature.action !== previousSignature.action) return false;
+  if (signature.count !== previousSignature.count) return false;
+  if (signature.sellerKeys.size !== previousSignature.sellerKeys.size) return false;
+  for (const key of signature.sellerKeys) {
+    if (!previousSignature.sellerKeys.has(key)) return false;
+  }
+  for (const key of previousSignature.sellerKeys) {
+    if (!signature.sellerKeys.has(key)) return false;
+  }
+  for (const key of signature.activityKeys) {
+    if (!previousSignature.activityKeys.has(key)) return false;
+  }
+  for (const key of previousSignature.activityKeys) {
+    if (!signature.activityKeys.has(key)) return false;
+  }
+  return true;
+}
+
 export function buildFinalRevalidationPlan({
   confirmedScope = {},
   currentPromotions = [],
@@ -48,6 +82,8 @@ export function buildFinalRevalidationPlan({
   getFetchState = () => null,
   getFallbackState = () => null,
   now = new Date(),
+  previousRevalidationRecord = null,
+  previousConfirmedScope = null,
 } = {}) {
   const confirmedActivities = Array.isArray(confirmedScope?.activities) ? confirmedScope.activities : [];
   const currentRows = Array.isArray(currentPromotions) ? currentPromotions : [];
@@ -60,6 +96,41 @@ export function buildFinalRevalidationPlan({
   const removed = new Set();
   const reasons = new Map();
   const acceptedNewIdentities = new Set();
+  const explicit = [...new Set((explicitTargetKeys || []).map(String).filter(Boolean))];
+  const scopeSignature = {
+    action: String(action || confirmedScope.action || '').toLowerCase(),
+    ...normalizeScopeSignatures(
+      confirmedActivities,
+      confirmedScope?.seller_create_target_keys || [],
+    ),
+  };
+  const previousScopeSignature = normalizeScopeSignatures(
+    Array.isArray(previousConfirmedScope?.activities) ? previousConfirmedScope.activities : [],
+    previousConfirmedScope?.seller_create_target_keys || [],
+  );
+  previousScopeSignature.action = String(previousConfirmedScope?.action || '').toLowerCase();
+
+  const previousReasons = previousRevalidationRecord?.revalidation_reasons;
+  const hasPreviousReasonFlags = previousReasons && Object.keys(previousReasons).length > 0;
+  const shouldSkipByPreviousRevalidation = isSameFinalScope(scopeSignature, previousScopeSignature)
+    && explicit.length === 0
+    && !hasPreviousReasonFlags
+    && Number(previousRevalidationRecord?.total_activity_count || 0) === scopeSignature.count
+    && Number(previousRevalidationRecord?.item_read_activity_count || 0) === 0
+    && Number(previousRevalidationRecord?.scope_review_activity_count || 0) === 0;
+
+  if (shouldSkipByPreviousRevalidation) {
+    return {
+      total_activity_count: confirmedByIdentity.size,
+      item_read_identity_keys: orderedSet([]),
+      scope_review_identity_keys: orderedSet([]),
+      blocked_identity_keys: orderedSet([]),
+      removed_identity_keys: orderedSet([]),
+      excluded_new_identity_keys: orderedSet([]),
+      excluded_new_activity_count: 0,
+      reasons_by_identity: {},
+    };
+  }
 
   const markRead = (key, reason) => {
     itemRead.add(key);
@@ -94,14 +165,15 @@ export function buildFinalRevalidationPlan({
         cacheState: getCacheState(current),
         fetchState: getFetchState(current, status),
         fallbackState: status === 'candidate' ? getFallbackState(current) : null,
+        itemStatus: status,
         now,
       });
-      if (decision.blocked) markRemoved(key, `${status}:${decision.reason}`);
+      if (decision.blocked && decision.reason === 'expired') markRemoved(key, `${status}:${decision.reason}`);
+      else if (decision.blocked) markBlocked(key, `${status}:${decision.reason}`);
       else if (decision.refresh) markRead(key, `${status}:${decision.reason}`);
     }
   }
 
-  const explicit = [...new Set((explicitTargetKeys || []).map(String).filter(Boolean))];
   if (explicit.includes('__ACTION__')) {
     for (const key of confirmedByIdentity.keys()) {
       if (currentByIdentity.has(key)) markRead(key, 'explicit:action');
@@ -138,4 +210,3 @@ export function buildFinalRevalidationPlan({
     reasons_by_identity: reasonsByIdentity,
   };
 }
-

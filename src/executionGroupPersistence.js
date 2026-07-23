@@ -27,6 +27,8 @@ function childCounts(child = {}) {
     request_success_count: execution.request_success_count ?? null,
     live_verified_removed_count: execution.live_verified_removed_count ?? null,
     pending_verification_count: execution.pending_verification_count ?? null,
+    platform_pending_count: execution.platform_pending_count ?? null,
+    retryable_pending_count: execution.retryable_pending_count ?? null,
   };
 }
 
@@ -74,7 +76,7 @@ export function summarizeExecutionGroup(group = {}) {
     summary.failed += store.failed;
     summary.skipped += store.skipped;
     summary.pending += store.pending;
-    for (const field of ['relation_count', 'unique_item_count', 'activity_failure_count', 'request_success_count', 'live_verified_removed_count', 'pending_verification_count']) {
+    for (const field of ['relation_count', 'unique_item_count', 'activity_failure_count', 'request_success_count', 'live_verified_removed_count', 'pending_verification_count', 'platform_pending_count', 'retryable_pending_count']) {
       if (store[field] !== null && store[field] !== undefined) summary[field] += Number(store[field] || 0);
     }
     return summary;
@@ -92,7 +94,22 @@ export function summarizeExecutionGroup(group = {}) {
     request_success_count: 0,
     live_verified_removed_count: 0,
     pending_verification_count: 0,
+    platform_pending_count: 0,
+    retryable_pending_count: 0,
     stores,
+  });
+}
+
+export function projectLiveExecutionGroupChildren(group = {}, resolveJob = () => null, projectJob = (job) => job) {
+  return (group.children || []).map((child) => {
+    const jobId = String(child.job_id || child.id || '');
+    const job = jobId ? resolveJob(jobId) : null;
+    if (!job) return { ...child };
+    return {
+      ...child,
+      ...projectJob(job),
+      job_id: jobId,
+    };
   });
 }
 
