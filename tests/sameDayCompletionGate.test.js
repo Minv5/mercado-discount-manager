@@ -11,6 +11,7 @@ import {
   executionRequestScope,
   executionScopeKey,
   findSameDayTerminalGroup,
+  shanghaiBusinessDayEndIso,
   sameDayCompletionGate,
 } from '../src/sameDayCompletionGate.js';
 import { createExecutionGroupPersistence } from '../src/executionGroupPersistence.js';
@@ -53,7 +54,17 @@ function completedGroup(overrides = {}) {
       requested_action: 'update',
       action: 'update',
     }),
-    result: { total: 1307, success: 809, failed: 9, skipped: 489 },
+    result: {
+      accounting_complete: true,
+      relation_count: 1307,
+      success: 809,
+      failed: 0,
+      skipped: 498,
+      activity_failure_count: 0,
+      platform_pending_count: 0,
+      retryable_pending_count: 0,
+      unresolved_count: 0,
+    },
     ...overrides,
   };
 }
@@ -97,6 +108,8 @@ test('same-day scope canonicalization ignores account order and display-only tex
 test('Shanghai business date and terminal group matching use exact normalized scope', () => {
   assert.equal(businessDateInShanghai('2026-07-15T15:59:59.999Z'), '2026-07-15');
   assert.equal(businessDateInShanghai('2026-07-15T16:00:00.000Z'), '2026-07-16');
+  assert.equal(shanghaiBusinessDayEndIso('2026-07-15T13:01:47.000Z'), '2026-07-15T16:00:00.000Z');
+  assert.equal(shanghaiBusinessDayEndIso('2026-07-15T16:00:00.000Z'), '2026-07-16T16:00:00.000Z');
   const request = requestFixture();
   assert.equal(findSameDayTerminalGroup([completedGroup()], request, '2026-07-15T15:30:00.000Z')?.id, 'group-today');
   assert.equal(findSameDayTerminalGroup([completedGroup()], request, '2026-07-16T00:00:00.000Z'), null);
@@ -125,6 +138,81 @@ test('auto same-scope gate returns TODAY_COMPLETED without issuing a token', () 
   assert.equal(store.loadAll().length, 0);
 });
 
+test('auto gate does not treat failed, cancelled, interrupted, or incomplete completed groups as today completed', () => {
+  const automaticRequest = requestFixture({ action: 'auto', requested_action: 'auto' });
+  const cases = [
+    ['failed', completedGroup({ status: 'failed' }), 'group_status_failed'],
+    ['cancelled', completedGroup({ status: 'cancelled' }), 'group_status_cancelled'],
+    ['interrupted', completedGroup({ status: 'interrupted' }), 'group_status_interrupted'],
+    ['null result', completedGroup({ result: null }), 'result_missing'],
+    ['legacy result', completedGroup({
+      result: { total: 1307, success: 1307, failed: 0, skipped: 0 },
+    }), 'accounting_not_proven'],
+    ['incomplete accounting', completedGroup({
+      result: { ...completedGroup().result, accounting_complete: false },
+    }), 'accounting_incomplete'],
+    ['failed relation', completedGroup({
+      result: { ...completedGroup().result, failed: 1, success: 808 },
+    }), 'failed_relations_present'],
+    ['activity failure', completedGroup({
+      result: { ...completedGroup().result, activity_failure_count: 1 },
+    }), 'activity_failures_present'],
+    ['retryable pending', completedGroup({
+      result: { ...completedGroup().result, retryable_pending_count: 1 },
+    }), 'retryable_pending_present'],
+    ['unresolved', completedGroup({
+      result: {
+        ...completedGroup().result,
+        unresolved_count: 1,
+        success: 808,
+      },
+    }), 'unresolved_relations_present'],
+    ['platform pending', completedGroup({
+      result: {
+        ...completedGroup().result,
+        platform_pending_count: 1,
+        success: 808,
+      },
+    }), 'platform_pending_requires_recovery'],
+    ['count gap', completedGroup({
+      result: {
+        ...completedGroup().result,
+        relation_count: 1308,
+      },
+    }), 'relation_count_gap'],
+  ];
+
+  for (const [label, group, reason] of cases) {
+    const result = sameDayCompletionGate({
+      groups: [group],
+      request: automaticRequest,
+      now: () => '2026-07-15T15:30:00.000Z',
+    });
+    assert.equal(result.allowed, true, label);
+    assert.equal(result.completed, null, label);
+    assert.equal(result.completion_audit?.eligible, false, label);
+    assert.equal(result.completion_audit?.reason, reason, label);
+    assert.equal(result.completion_audit?.group_id, 'group-today', label);
+  }
+});
+
+test('auto gate blocks only a fully accounted completed group even when a newer terminal attempt is incomplete', () => {
+  const newerFailed = completedGroup({
+    id: 'group-newer-failed',
+    status: 'failed',
+    finished_at: '2026-07-15T14:23:48.975Z',
+  });
+  assert.throws(
+    () => sameDayCompletionGate({
+      groups: [completedGroup(), newerFailed],
+      request: requestFixture({ action: 'auto', requested_action: 'auto' }),
+      now: () => '2026-07-15T15:30:00.000Z',
+    }),
+    (error) => error.code === 'TODAY_COMPLETED'
+      && error.details.completed.group_id === 'group-today',
+  );
+});
+
 test('manual same-day actions bypass the retired secondary confirmation without issuing a token', () => {
   const store = createSameDayConfirmationStore({ stateDir: temporaryDirectory() });
   for (const action of ['enroll', 'update', 'cancel']) {
@@ -140,6 +228,16 @@ test('manual same-day actions bypass the retired secondary confirmation without 
     assert.equal(result.completed?.action, 'update');
   }
   assert.equal(store.loadAll().length, 0);
+  const incompleteManual = sameDayCompletionGate({
+    groups: [completedGroup({ status: 'failed' })],
+    request: requestFixture({ action: 'cancel', requested_action: 'cancel' }),
+    now: () => '2026-07-15T15:30:00.000Z',
+  });
+  assert.equal(incompleteManual.allowed, true);
+  assert.equal(incompleteManual.confirmed, false);
+  assert.equal(incompleteManual.completed, null);
+  assert.equal(incompleteManual.binding, null);
+  assert.equal(incompleteManual.completion_audit.reason, 'group_status_failed');
   assert.deepEqual(sameDayCompletionGate({
     groups: [completedGroup()],
     request: requestFixture({

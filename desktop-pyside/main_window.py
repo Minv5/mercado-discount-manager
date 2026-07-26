@@ -48,7 +48,6 @@ from core import (
     business_date_from_timestamp,
     build_filters,
     completed_execution_for_scope,
-    confirmation_text,
     discount_inputs_enabled,
     execution_completion_text,
     execution_group_payload,
@@ -59,14 +58,14 @@ from core import (
     site_name,
     task_display_counts,
 )
-from dialogs import ConfirmDialog, DetailsDialog, SellerCampaignCreateDialog, SettingsDialog, target_label
+from dialogs import DetailsDialog, SellerCampaignCreateDialog, SettingsDialog
 from diagnostics import diagnostic_event
 from service_manager import NodeServiceManager, ServiceError
 from theme import APP_QSS
 from workers import Worker
 
 
-TASK_HEADERS = ["时间", "动作", "活动", "类型", "商品（唯一/活动关系）", "结果", "失败（商品/活动）", "失败原因"]
+TASK_HEADERS = ["时间", "动作", "活动", "类型", "商品 / 处理项", "结果", "失败", "失败原因"]
 ACTIVITY_HEADERS = ["店铺", "站点", "类型", "活动", "状态", "商品数"]
 RECORD_VIEW_LIMITS = {"recent": 20, "all": 300}
 
@@ -97,6 +96,9 @@ class MainWindow(QMainWindow):
         self.global_official_discount = 6
         self.auto_action = ""
         self.scope_refresh_token = 0
+        self.site_discovery_attempted: set[str] = set()
+        self.initial_site_discovery_consumed = False
+        self.initial_site_discovery_pending = False
         self.auto_decision_token = 0
         self.scope_ready = False
         self.running_group: dict[str, Any] = {}
@@ -106,7 +108,7 @@ class MainWindow(QMainWindow):
         self.prepare_poll_busy = False
         self.prepare_poll_failure_count = 0
         self.prepare_progress_key = ""
-        self.job_log_counts: dict[str, int] = {}
+        self.job_log_seen: dict[str, set[str]] = {}
         self.poll_failure_count = 0
         self.commit_recovery_poll_count = 0
         self.poll_busy = False
@@ -307,17 +309,22 @@ class MainWindow(QMainWindow):
         top.addWidget(self.records_view_combo)
         top.addWidget(self.records_refresh_button)
         layout.addLayout(top)
+        self.records_delta_label = QLabel("较昨日商品变化：暂无可比较快照，数据不足")
+        self.records_delta_label.setObjectName("muted")
+        self.records_delta_label.setToolTip("需要服务端提供前一日和当日的完整商品身份快照后才能计算，界面不会根据不完整数据推算。")
+        layout.addWidget(self.records_delta_label)
         table = make_table(TASK_HEADERS)
         table.horizontalHeaderItem(4).setToolTip(
-            "前者是唯一商品，同一商品跨多个活动只计算一次；后者是活动商品关系，同一商品在每个活动中分别计算。"
+            "涉及商品是按商品编号去重后的件数；处理项是商品×活动的组合数，同一商品参加多个活动会生成多条任务。"
         )
         table.horizontalHeaderItem(5).setToolTip("批量取消显示取消请求成功、成功取消和待平台确认；其它动作显示成功与跳过。")
         table.horizontalHeaderItem(6).setToolTip("前者是商品失败，后者是活动失败；活动失败不计入商品失败。")
         header = table.horizontalHeader()
-        for column, width in enumerate((75, 72, 100, 52, 145, 118, 110)):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
-            table.setColumnWidth(column, width)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        header.setMinimumSectionSize(54)
+        for column in (0, 1, 3, 6):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        for column in (2, 4, 5, 7):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         table.itemDoubleClicked.connect(lambda _item: self._show_task_details())
         table.itemSelectionChanged.connect(self._show_selected_summary)
@@ -349,6 +356,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(section_label("运行日志"))
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
+        self.log_box.document().setMaximumBlockCount(1000)
         layout.addWidget(self.log_box, 1)
         return surface
 
@@ -400,6 +408,9 @@ class MainWindow(QMainWindow):
                 self.log("检测到已确认但尚未建立执行组的提交，正在安全恢复。")
                 self._set_execution_busy(True)
                 self.poll_timer.start()
+        if not self.initial_site_discovery_consumed:
+            self.initial_site_discovery_pending = True
+            self.initial_site_discovery_consumed = True
         self.refresh_scope()
         self.ready.emit()
         QTimer.singleShot(0, self.refresh_records)
@@ -451,8 +462,14 @@ class MainWindow(QMainWindow):
         self.scope_refresh_token += 1
         token = self.scope_refresh_token
         selected_site = self.selected_site_id()
+        discover_missing_sites = self.initial_site_discovery_pending
+        self.initial_site_discovery_pending = False
         self._run_worker(
-            lambda: self._load_scope_bundle(account_ids, selected_site),
+            lambda: self._load_scope_bundle(
+                account_ids,
+                selected_site,
+                discover_missing_sites=discover_missing_sites,
+            ),
             lambda result: self._apply_scope_bundle(token, result),
             lambda error: self._scope_load_failed(token, error),
         )
@@ -464,11 +481,32 @@ class MainWindow(QMainWindow):
         self._set_busy(False, "店铺站点未准备好")
         self.log("活动范围读取失败：" + product_error(error))
 
-    def _load_scope_bundle(self, account_ids: list[str], selected_site: str) -> dict[str, Any]:
+    def _load_scope_bundle(
+        self,
+        account_ids: list[str],
+        selected_site: str,
+        *,
+        discover_missing_sites: bool = False,
+    ) -> dict[str, Any]:
         sites: list[dict[str, Any]] = []
         promotions: list[dict[str, Any]] = []
         for account_id in account_ids:
-            for row in self.api.get(f"/api/accounts/{account_id}/sites").get("sites", []):
+            account_sites = list(
+                self.api.get(f"/api/accounts/{account_id}/sites").get("sites", [])
+            )
+            if (
+                discover_missing_sites
+                and not account_sites
+                and account_id not in self.site_discovery_attempted
+            ):
+                self.site_discovery_attempted.add(account_id)
+                account_sites = list(
+                    self.api.get(
+                        f"/api/accounts/{account_id}/sites?refresh=1",
+                        timeout=30,
+                    ).get("sites", [])
+                )
+            for row in account_sites:
                 sites.append({**row, "account_id": account_id})
             path = ApiClient.query(f"/api/accounts/{account_id}/promotions", siteId=selected_site)
             for row in self.api.get(path).get("promotions", []):
@@ -760,6 +798,13 @@ class MainWindow(QMainWindow):
 
     def _apply_current_records(self, records: list[dict[str, Any]]) -> None:
         self.records = list(records)
+        latest_delta = next(
+            (dict(task.get("daily_item_delta") or {}) for task in self.records if isinstance(task.get("daily_item_delta"), dict)),
+            {},
+        )
+        delta_text, delta_tooltip = daily_item_delta_text(latest_delta)
+        self.records_delta_label.setText(delta_text)
+        self.records_delta_label.setToolTip(delta_tooltip)
         self._populate_records_table()
 
     def _populate_records_table(self) -> None:
@@ -771,19 +816,25 @@ class MainWindow(QMainWindow):
             unique_items = optional_contract_count(task, "unique_item_count")
             relation_count = optional_contract_count(task, "relation_count")
             activity_failures = optional_contract_count(task, "activity_failure_count")
+            created_at = str(task.get("created_at") or task.get("updated_at") or "")
+            time_text, time_tooltip = record_timestamp_text(created_at)
             values = [
-                short_date(str(task.get("created_at") or task.get("updated_at") or "")),
+                time_text,
                 action_label(str(task.get("action") or "")),
                 activity_summary_text(task),
                 "提交" if str(task.get("mode") or "real") == "real" else "预览",
-                f"{count_or_marker(unique_items, '旧记录未区分')} / {count_or_marker(relation_count)}",
+                record_scope_text(unique_items, relation_count),
                 record_result_text(task),
                 f"商品 {failed} / 活动 {count_or_marker(activity_failures)}",
                 str(task.get("short_failure_reason") or task.get("failure_reason") or ""),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                item.setToolTip(value)
+                item.setToolTip(
+                    time_tooltip if column == 0
+                    else record_scope_tooltip(unique_items, relation_count) if column == 4
+                    else value
+                )
                 item.setData(Qt.ItemDataRole.UserRole, task)
                 self.records_table.setItem(row, column, item)
         self.records_table.resizeRowsToContents()
@@ -1139,7 +1190,7 @@ class MainWindow(QMainWindow):
                 lambda error: self._operation_error("保存创建范围", error, execution=True),
             )
             return
-        self._confirm_submission(prepare)
+        self._submit_prepared_submission(prepare)
 
     def _submission_input_saved(self, response: object) -> None:
         prepare = dict(dict(response or {}).get("prepare") or {})
@@ -1147,19 +1198,10 @@ class MainWindow(QMainWindow):
         if errors:
             self._operation_error("创建自建活动", "创建参数未通过检查：" + "；".join(str(value) for value in errors), execution=True)
             return
-        self._confirm_submission(prepare)
+        self._submit_prepared_submission(prepare)
 
-    def _confirm_submission(self, prepare: dict[str, Any]) -> None:
-        self._set_prepare_busy(False)
-        summary = str(prepare.get("confirmation_summary") or "请确认本次最终执行范围。")
+    def _submit_prepared_submission(self, prepare: dict[str, Any]) -> None:
         selected = list(dict(prepare.get("seller_input") or {}).get("selected_targets") or [])
-        if selected:
-            summary += f"\n将创建自建活动的店铺站点：{len(selected)} 个。\n" + "\n".join(target_label(row) for row in selected)
-        dialog = ConfirmDialog("最终执行确认", summary, "确认执行", "取消", self)
-        if dialog.exec() != QDialogAccepted:
-            self.log("提交执行已取消，未创建活动、未启动执行任务。")
-            self._discard_prepared_submission(str(prepare.get("prepare_id") or ""))
-            return
         commit_body = {
             "confirmText": "REAL_SUBMIT",
             "confirmationToken": str(prepare.get("confirmation_token") or ""),
@@ -1169,7 +1211,7 @@ class MainWindow(QMainWindow):
         self.pending_group_payload = {"prepare_id": prepare["prepare_id"], "commit_body": commit_body}
         self.pending_group_payload["commit_sent"] = True
         self._set_execution_busy(True)
-        self.log("最终范围已确认，正在提交本次执行。")
+        self.log("准备完成，正在启动任务。")
         self._run_worker(
             lambda: self.api.post(f"/api/execution/submissions/{prepare['prepare_id']}/commit", commit_body, timeout=30),
             self._commit_accepted,
@@ -1210,7 +1252,7 @@ class MainWindow(QMainWindow):
         self.preparing_submission = {}
         self.pending_prepare_payload = None
         self.pending_group_payload = None
-        self.job_log_counts = {str(child.get("job_id") or ""): 0 for child in group.get("children") or []}
+        self.job_log_seen = {str(child.get("job_id") or ""): set() for child in group.get("children") or []}
         self.poll_failure_count = 0
         self.commit_recovery_poll_count = 0
         self.poll_timer.setInterval(900)
@@ -1284,11 +1326,16 @@ class MainWindow(QMainWindow):
         for child_index, child in enumerate(list(group.get("children") or [])):
             job_id = str(child.get("job_id") or child.get("id") or "")
             logs = list(child.get("userLogs") or child.get("user_logs") or [])
-            start = self.job_log_counts.get(job_id, 0)
-            for line_index, line in enumerate(logs[start:], start=start):
+            current_keys = {execution_log_identity(line) for line in logs}
+            seen = self.job_log_seen.setdefault(job_id, set())
+            seen.intersection_update(current_keys)
+            for line_index, line in enumerate(logs):
+                identity = execution_log_identity(line)
+                if identity in seen:
+                    continue
                 at = str(line.get("at") or "") if isinstance(line, dict) else ""
                 pending_log_lines.append((at, child_index, line_index, line))
-            self.job_log_counts[job_id] = len(logs)
+                seen.add(identity)
         for _at, _child_index, _line_index, line in sorted(
             pending_log_lines,
             key=lambda entry: (not entry[0], entry[0], entry[1], entry[2]),
@@ -1319,7 +1366,7 @@ class MainWindow(QMainWindow):
             )
             self.running_group.clear()
             self.pending_group_payload = None
-            self.job_log_counts.clear()
+            self.job_log_seen.clear()
             self.poll_failure_count = 0
             self._set_execution_busy(False)
             self._refresh_records_after_group()
@@ -1466,7 +1513,10 @@ class MainWindow(QMainWindow):
         accounts = [account_from_json(row) for row in refreshed.get("accounts") or []]
 
         def load_sites(account: Account) -> list[dict[str, Any]]:
-            result = self.api.get(f"/api/accounts/{account.account_id}/sites?includeAll=1&probeBusiness=1", timeout=120)
+            result = self.api.get(
+                f"/api/accounts/{account.account_id}/sites?includeAll=1&probeBusiness=1&refresh=1",
+                timeout=120,
+            )
             return [
                 {**site, "account_id": account.account_id, "store_name": account.store_name}
                 for site in result.get("sites", [])
@@ -1754,6 +1804,17 @@ def short_date(value: str) -> str:
     return value[:10].replace("-", "/")
 
 
+def record_timestamp_text(value: str) -> tuple[str, str]:
+    if not value:
+        return "", ""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+    except (TypeError, ValueError):
+        return value, value
+    compact = parsed.strftime("%Y/%m/%d\n%H:%M:%S")
+    return compact, f"{parsed:%Y-%m-%d %H:%M:%S %Z}\n原始时间：{value}"
+
+
 def optional_contract_count(source: dict[str, Any], key: str) -> int | None:
     value = source.get(key)
     if value is None:
@@ -1766,6 +1827,37 @@ def optional_contract_count(source: dict[str, Any], key: str) -> int | None:
 
 def count_or_marker(value: int | None, missing: str = "-") -> str:
     return str(value) if value is not None else missing
+
+
+def record_scope_text(unique_items: int | None, relations: int | None) -> str:
+    if unique_items is None and relations is None:
+        return "旧记录未区分 / -"
+    return f"{count_or_marker(unique_items, '旧记录未区分')} 件 / {count_or_marker(relations)} 项"
+
+
+def record_scope_tooltip(unique_items: int | None, relations: int | None) -> str:
+    return (
+        f"涉及商品：{count_or_marker(unique_items, '旧记录未区分')} 件（按商品编号去重）\n"
+        f"处理项：{count_or_marker(relations, '旧记录未区分')} 项（商品×活动）"
+    )
+
+
+def daily_item_delta_text(delta: dict[str, Any]) -> tuple[str, str]:
+    status = str(delta.get("status") or "").lower()
+    added = optional_contract_count(delta, "added_count")
+    removed = optional_contract_count(delta, "removed_count")
+    current_date = str(delta.get("current_date") or "")
+    baseline_date = str(delta.get("baseline_date") or "")
+    if status in {"ready", "complete"} and added is not None and removed is not None and current_date and baseline_date:
+        return (
+            f"较昨日：新增 {added} 件，减少 {removed} 件",
+            f"比较区间：{baseline_date} → {current_date}\n仅使用服务端确认完整的每日商品身份快照。",
+        )
+    reason = str(delta.get("reason") or "").strip()
+    tooltip = "需要服务端提供前一日和当日的完整商品身份快照后才能计算，界面不会根据不完整数据推算。"
+    if reason:
+        tooltip += "\n数据状态：" + reason
+    return "较昨日商品变化：暂无可比较快照，数据不足", tooltip
 
 
 def activity_summary_text(task: dict[str, Any]) -> str:
@@ -1783,7 +1875,16 @@ def record_result_text(task: dict[str, Any]) -> str:
     action = str(task.get("action") or "").lower()
     _total, success, _failed, skipped = task_display_counts(task)
     if action != "cancel":
-        return f"成功 {success} / 跳过 {skipped}"
+        platform_pending = optional_contract_count(task, "platform_pending_count")
+        action_success = {
+            "enroll": "报名成功",
+            "update": "更新成功",
+        }.get(action, "成功")
+        lines = [f"{action_success} {success}"]
+        if platform_pending is not None:
+            lines.append(f"平台待生效 {platform_pending}")
+        lines.append(f"跳过 {skipped}")
+        return "\n".join(lines)
     request_success = optional_contract_count(task, "request_success_count")
     verified_removed = optional_contract_count(task, "live_verified_removed_count")
     pending = optional_contract_count(task, "pending_verification_count")
@@ -1803,10 +1904,11 @@ def execution_result_text(result: dict[str, Any], action: str) -> str:
     failed = int(result.get("failed") or result.get("failed_count") or 0)
     skipped = int(result.get("skipped") or result.get("skipped_count") or 0)
     common = (
-        f"唯一商品 {count_or_marker(unique_items, '旧记录未区分')}，"
-        f"活动商品关系 {count_or_marker(relations)}"
+        f"处理 {count_or_marker(relations)} 项，"
+        f"涉及 {count_or_marker(unique_items, '旧记录未区分')} 件商品"
     )
-    if str(action or "").lower() == "cancel":
+    normalized_action = str(action or "").lower()
+    if normalized_action == "cancel":
         request_success = optional_contract_count(result, "request_success_count")
         verified_removed = optional_contract_count(result, "live_verified_removed_count")
         pending = optional_contract_count(result, "pending_verification_count")
@@ -1822,10 +1924,11 @@ def execution_result_text(result: dict[str, Any], action: str) -> str:
     success = int(result.get("success") or result.get("success_count") or 0)
     platform_pending = optional_contract_count(result, "platform_pending_count")
     pending_text = ""
-    if platform_pending:
+    if platform_pending is not None:
         pending_text = f"，平台已接受待生效 {platform_pending}"
+    success_label = {"enroll": "报名成功", "update": "更新成功"}.get(normalized_action, "成功")
     return (
-        f"{common}，成功 {success}{pending_text}，商品失败 {failed}，"
+        f"{common}，{success_label} {success}{pending_text}，商品失败 {failed}，"
         f"活动失败 {count_or_marker(activity_failures)}，跳过 {skipped}"
     )
 
@@ -1871,8 +1974,24 @@ def execution_log_message(value: object) -> str:
             or "完成：活动" in text
         ):
             return ""
+        important_markers = ("失败", "异常", "错误", "限流", "冷却", "重试", "恢复", "中断", "停止", "待平台", "完成")
+        low_value_markers = ("正在处理活动", "正在读取", "正在核对", "详情 ", "排队 ", "并发 ", "本地整理", "分页 ")
+        if any(marker in text for marker in low_value_markers) and not any(marker in text for marker in important_markers):
+            return ""
         return text
     return ""
+
+
+def execution_log_identity(value: object) -> str:
+    if isinstance(value, dict):
+        explicit = value.get("event_id") or value.get("id")
+        if explicit:
+            return "id:" + str(explicit)
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return repr(value)
+    return str(value)
 
 
 def execution_job_summary(job: dict[str, Any]) -> tuple[str, dict[str, int]]:
@@ -1897,8 +2016,8 @@ def business_task_text(task: dict[str, Any]) -> str:
         f"动作：{action_label(str(task.get('action') or ''))}\n"
         f"自建折扣：{task.get('seller_activity_text') or '-'}\n"
         f"官方折扣：{task.get('official_activity_text') or '-'}",
-        f"唯一商品：{count_or_marker(unique_items, '旧记录未区分')}",
-        f"活动商品关系：{count_or_marker(relations, '旧记录未区分')}",
+        f"涉及商品：{count_or_marker(unique_items, '旧记录未区分')} 件（按商品编号去重）",
+        f"需处理项：{count_or_marker(relations, '旧记录未区分')} 项（商品×活动）",
     ]
     if str(task.get("action") or "").lower() == "cancel":
         lines.extend([
@@ -1908,7 +2027,11 @@ def business_task_text(task: dict[str, Any]) -> str:
             + count_or_marker(optional_contract_count(task, "pending_verification_count"), "旧记录未区分"),
         ])
     else:
-        lines.append(f"成功：{success}")
+        success_label = {
+            "enroll": "报名成功",
+            "update": "更新成功",
+        }.get(str(task.get("action") or "").lower(), "成功")
+        lines.append(f"{success_label}：{success}")
         platform_pending = optional_contract_count(task, "platform_pending_count")
         if platform_pending:
             lines.append(f"平台已接受待生效：{platform_pending}")

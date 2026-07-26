@@ -4,6 +4,11 @@ import { DATA_DIR, STANDALONE_AUTH_DIR } from './config.js';
 import { DEFAULT_ACTIVITY_CONCURRENCY, DEFAULT_READ_CONCURRENCY, DEFAULT_WRITE_CONCURRENCY, normalizeActivityConcurrency, normalizeConcurrency, normalizeWriteConcurrency } from './concurrency.js';
 import { normalizeOperatingSites } from './operatingSites.js';
 import { decryptSecret, encryptSecret } from './security.js';
+import {
+  JsonFilePersistenceError,
+  readJsonFileSync,
+  writeJsonFileAtomicallySync,
+} from './jsonFilePersistence.js';
 
 export const SETTINGS_PATH = path.join(DATA_DIR, 'settings.json');
 const CONCURRENCY_POLICY_VERSION = 2;
@@ -59,7 +64,10 @@ export function saveSettings(input) {
     defaultFilters: { ...current.defaultFilters, ...(input.defaultFilters || {}) },
   });
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(SETTINGS_PATH, JSON.stringify({ ...settings, oauthClientSecretCipher: secretCipher }, null, 2), 'utf8');
+  writeJsonFileAtomicallySync({
+    target: SETTINGS_PATH,
+    value: { ...settings, oauthClientSecretCipher: secretCipher },
+  });
   return settings;
 }
 
@@ -178,17 +186,43 @@ function arrayOfText(value) {
   return String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
 }
 
-function safeJson(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return {};
-  }
-}
-
 function readStoredSettings() {
-  if (!fs.existsSync(SETTINGS_PATH)) return {};
-  return safeJson(fs.readFileSync(SETTINGS_PATH, 'utf8'));
+  try {
+    const result = readJsonFileSync({
+      target: SETTINGS_PATH,
+      backupPath: `${SETTINGS_PATH}.bak`,
+      allowMissing: true,
+    });
+    if (!result.exists) return {};
+    if (!result.value || typeof result.value !== 'object' || Array.isArray(result.value)) {
+      throw new JsonFilePersistenceError('JSON 文件内容不是配置对象', {
+        code: 'JSON_FILE_CORRUPT',
+        cause_code: 'INVALID_SETTINGS_SHAPE',
+        operation: 'parse_json_file',
+        storage_target: path.basename(SETTINGS_PATH),
+        backup_target: path.basename(`${SETTINGS_PATH}.bak`),
+        backup_available: result.backup_available,
+      });
+    }
+    return result.value;
+  } catch (error) {
+    if (!(error instanceof JsonFilePersistenceError)) throw error;
+    const corrupt = error.code === 'JSON_FILE_CORRUPT';
+    const settingsError = new Error(
+      corrupt
+        ? '设置文件损坏，已停止加载；不会使用默认值覆盖，请从备份恢复。'
+        : '设置文件暂时无法读取，已停止加载；不会使用默认值覆盖。',
+      { cause: error },
+    );
+    settingsError.name = 'SettingsPersistenceError';
+    settingsError.code = corrupt ? 'SETTINGS_JSON_CORRUPT' : 'SETTINGS_FILE_UNREADABLE';
+    settingsError.cause_code = error.cause_code || error.code;
+    settingsError.operation = 'read_settings';
+    settingsError.storage_target = path.basename(SETTINGS_PATH);
+    settingsError.backup_target = path.basename(`${SETTINGS_PATH}.bak`);
+    settingsError.backup_available = Boolean(error.backup_available);
+    throw settingsError;
+  }
 }
 
 function text(value) {

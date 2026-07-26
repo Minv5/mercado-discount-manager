@@ -85,31 +85,6 @@ function retryAfterMs(error) {
   return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
 }
 
-function waitWithSignal(ms, signal, sleep) {
-  if (signal?.aborted) return Promise.reject(abortError());
-  if (!signal) return sleep(ms);
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const abort = () => {
-      if (settled) return;
-      settled = true;
-      reject(abortError());
-    };
-    signal.addEventListener('abort', abort, { once: true });
-    Promise.resolve(sleep(ms)).then(() => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener('abort', abort);
-      resolve();
-    }, (error) => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener('abort', abort);
-      reject(error);
-    });
-  });
-}
-
 export class BalancedReadScheduler {
   constructor({
     initialLimit = DEFAULT_INITIAL_LIMIT,
@@ -152,8 +127,13 @@ export class BalancedReadScheduler {
     this.accountDetailInflight = new Map();
     this.accountActivityInflight = new Map();
     this.accountCooldownUntil = new Map();
+    this.accountCooldownTokens = new Map();
     this.globalCooldownUntil = 0;
+    this.globalCooldownToken = null;
     this.inflight = 0;
+    this.inflightByGeneration = new Map();
+    this.retryGeneration = 0;
+    this.overloadGenerations = new Set();
     this.detailInflight = 0;
     this.activityInflight = 0;
     this.peakInflight = 0;
@@ -211,24 +191,11 @@ export class BalancedReadScheduler {
       resolve: resolvePromise,
       reject: rejectPromise,
       abortListener: null,
+      attempt: 0,
+      generation: this.retryGeneration,
     };
-    if (!this.queues.has(account)) {
-      this.queues.set(account, []);
-      this.accountOrder.push(account);
-    }
-    this.queues.get(account).push(job);
     if (requestKey) this.deduped.set(requestKey, promise);
-    if (signal) {
-      job.abortListener = () => {
-        const queue = this.queues.get(account) || [];
-        const index = queue.indexOf(job);
-        if (index < 0) return;
-        queue.splice(index, 1);
-        this.#settle(job, null, abortError());
-        this.#queuePump();
-      };
-      signal.addEventListener('abort', job.abortListener, { once: true });
-    }
+    this.#enqueue(job);
     this.#queuePump();
     this.#emitSnapshot();
     return promise;
@@ -373,11 +340,7 @@ export class BalancedReadScheduler {
   #nextJob() {
     if (!this.accountOrder.length) return null;
     const now = this.now();
-    if (this.globalCooldownUntil > now) {
-      const delay = this.globalCooldownUntil - now;
-      this.sleep(delay).finally(() => this.#queuePump());
-      return null;
-    }
+    if (this.globalCooldownToken || this.globalCooldownUntil > now) return null;
     const count = this.accountOrder.length;
     for (let offset = 0; offset < count; offset += 1) {
       const index = (this.accountCursor + offset) % count;
@@ -385,8 +348,10 @@ export class BalancedReadScheduler {
       const queue = this.queues.get(account) || [];
       if (!queue.length) continue;
       if (Number(this.accountInflight.get(account) || 0) >= this.perAccountLimit) continue;
-      if (Number(this.accountCooldownUntil.get(account) || 0) > now) continue;
+      if (this.accountCooldownTokens.has(account) || Number(this.accountCooldownUntil.get(account) || 0) > now) continue;
       const runnableIndex = queue.findIndex((job) => (
+        !this.#hasOlderInflight(job.generation)
+        &&
         (job.kind !== 'detail' || this.detailInflight < this.detailLimit)
         && (job.kind !== 'detail' || Number(this.accountDetailInflight.get(account) || 0) < this.detailPerAccountLimit)
         && (job.kind !== 'activity' || this.activityInflight < this.activityLimit)
@@ -396,9 +361,82 @@ export class BalancedReadScheduler {
       this.accountCursor = (index + 1) % count;
       return queue.splice(runnableIndex, 1)[0];
     }
-    const wakeAt = Math.min(...[...this.accountCooldownUntil.values()].filter((value) => value > now));
-    if (Number.isFinite(wakeAt)) this.sleep(wakeAt - now).finally(() => this.#queuePump());
     return null;
+  }
+
+  #enqueue(job) {
+    if (!this.queues.has(job.account)) {
+      this.queues.set(job.account, []);
+      this.accountOrder.push(job.account);
+    }
+    this.queues.get(job.account).push(job);
+    if (job.signal) {
+      job.abortListener = () => {
+        const queue = this.queues.get(job.account) || [];
+        const index = queue.indexOf(job);
+        if (index < 0) return;
+        queue.splice(index, 1);
+        this.#settle(job, null, abortError());
+        this.#queuePump();
+      };
+      job.signal.addEventListener('abort', job.abortListener, { once: true });
+    }
+  }
+
+  #hasOlderInflight(generation) {
+    for (const [activeGeneration, count] of this.inflightByGeneration) {
+      if (activeGeneration < generation && count > 0) return true;
+    }
+    return false;
+  }
+
+  #setGlobalCooldown(delay) {
+    const boundedDelay = Math.max(0, Number(delay || 0));
+    const until = this.now() + boundedDelay;
+    if (this.globalCooldownToken && this.globalCooldownUntil >= until) return;
+    const token = Symbol('global-read-cooldown');
+    this.globalCooldownToken = token;
+    this.globalCooldownUntil = Math.max(this.globalCooldownUntil, until);
+    Promise.resolve(this.sleep(boundedDelay)).finally(() => {
+      if (this.globalCooldownToken !== token) return;
+      this.globalCooldownToken = null;
+      this.globalCooldownUntil = 0;
+      this.#emitSnapshot(true);
+      this.#queuePump();
+    });
+  }
+
+  #setAccountCooldown(account, delay) {
+    const boundedDelay = Math.max(0, Number(delay || 0));
+    const until = this.now() + boundedDelay;
+    const currentToken = this.accountCooldownTokens.get(account);
+    if (currentToken && Number(this.accountCooldownUntil.get(account) || 0) >= until) return;
+    const token = Symbol(`account-read-cooldown:${account}`);
+    this.accountCooldownTokens.set(account, token);
+    this.accountCooldownUntil.set(account, Math.max(Number(this.accountCooldownUntil.get(account) || 0), until));
+    Promise.resolve(this.sleep(boundedDelay)).finally(() => {
+      if (this.accountCooldownTokens.get(account) !== token) return;
+      this.accountCooldownTokens.delete(account);
+      this.accountCooldownUntil.delete(account);
+      this.#emitSnapshot(true);
+      this.#queuePump();
+    });
+  }
+
+  #openRetryGeneration(failedGeneration) {
+    const nextGeneration = Math.max(this.retryGeneration, failedGeneration + 1);
+    this.retryGeneration = nextGeneration;
+    for (const queue of this.queues.values()) {
+      for (const queuedJob of queue) {
+        if (queuedJob.generation <= failedGeneration) queuedJob.generation = nextGeneration;
+      }
+    }
+    if (!this.overloadGenerations.has(failedGeneration)) {
+      this.overloadGenerations.add(failedGeneration);
+      this.dynamicLimit = Math.max(this.minLimit, this.dynamicLimit - this.rateLimitDecreaseStep);
+      this.stableSuccesses = 0;
+    }
+    return nextGeneration;
   }
 
   #start(job) {
@@ -408,10 +446,14 @@ export class BalancedReadScheduler {
       this.#queuePump();
       return;
     }
+    const attemptGeneration = job.generation;
     this.inflight += 1;
-    job.metricStartedAt = this.now();
-    if (this.metricStartedAt == null) this.metricStartedAt = job.metricStartedAt;
-    this.metricLogicalRequests += 1;
+    this.inflightByGeneration.set(attemptGeneration, Number(this.inflightByGeneration.get(attemptGeneration) || 0) + 1);
+    if (!Number.isFinite(job.metricStartedAt)) {
+      job.metricStartedAt = this.now();
+      if (this.metricStartedAt == null) this.metricStartedAt = job.metricStartedAt;
+      this.metricLogicalRequests += 1;
+    }
     this.peakInflight = Math.max(this.peakInflight, this.inflight);
     this.accountInflight.set(job.account, Number(this.accountInflight.get(job.account) || 0) + 1);
     if (job.kind === 'detail') {
@@ -425,16 +467,56 @@ export class BalancedReadScheduler {
       this.peakActivity = Math.max(this.peakActivity, this.activityInflight);
     }
     this.#emitSnapshot();
-    this.#runWithRetry(job).then((value) => {
-      this.#release(job);
+    this.metricRequestAttempts += 1;
+    Promise.resolve().then(() => job.task({
+      attempt: job.attempt + 1,
+      signal: job.signal,
+    })).then((value) => {
+      if (attemptGeneration === this.retryGeneration) {
+        this.stableSuccesses += 1;
+        if (this.stableSuccesses >= this.successesPerIncrease && this.dynamicLimit < this.maxLimit) {
+          this.dynamicLimit += 1;
+          this.stableSuccesses = 0;
+          this.#emitSnapshot(true);
+        }
+      }
+      this.#release(job, true, attemptGeneration);
       this.#settle(job, value, null);
     }, (error) => {
-      this.#release(job);
-      this.#settle(job, null, error);
+      if (job.signal?.aborted || error?.name === 'AbortError') {
+        this.#release(job, true, attemptGeneration);
+        this.#settle(job, null, abortError());
+        return;
+      }
+      const kind = transientKind(error);
+      if (kind === 'rate_limit') this.metricRateLimits += 1;
+      if (kind === 'network') this.metricNetworkErrors += 1;
+      if (kind === 'service') this.metricServiceErrors += 1;
+      if (kind === 'timeout') this.metricTimeoutErrors += 1;
+      if (!kind || job.attempt >= TRANSIENT_RETRY_DELAYS_MS.length) {
+        this.#release(job, true, attemptGeneration);
+        this.#settle(job, null, error);
+        return;
+      }
+      this.metricRetries += 1;
+      const generation = this.#openRetryGeneration(attemptGeneration);
+      let delay = TRANSIENT_RETRY_DELAYS_MS[job.attempt];
+      if (kind === 'rate_limit') delay = Math.max(delay, retryAfterMs(error));
+      const jitter = Math.floor(delay * 0.2 * Math.max(0, Number(this.random() || 0)));
+      if (kind === 'rate_limit') this.#setGlobalCooldown(delay + jitter);
+      else this.#setAccountCooldown(job.account, delay + jitter);
+      job.attempt += 1;
+      this.#release(job, false, attemptGeneration);
+      job.generation = generation;
+      this.#enqueue(job);
+      this.#emitSnapshot(true);
+      this.#queuePump();
     });
   }
 
-  #release(job) {
+  #release(job, queuePump = true, generation = job.generation) {
+      this.inflightByGeneration.set(generation, Math.max(0, Number(this.inflightByGeneration.get(generation) || 0) - 1));
+      if (this.inflightByGeneration.get(generation) === 0) this.inflightByGeneration.delete(generation);
       this.inflight = Math.max(0, this.inflight - 1);
       this.accountInflight.set(job.account, Math.max(0, Number(this.accountInflight.get(job.account) || 0) - 1));
       if (job.kind === 'detail') {
@@ -446,47 +528,7 @@ export class BalancedReadScheduler {
         this.accountActivityInflight.set(job.account, Math.max(0, Number(this.accountActivityInflight.get(job.account) || 0) - 1));
       }
       this.#emitSnapshot();
-      this.#queuePump();
-  }
-
-  async #runWithRetry(job) {
-    let attempt = 0;
-    while (true) {
-      if (job.signal?.aborted) throw abortError();
-      try {
-        this.metricRequestAttempts += 1;
-        const result = await job.task({ attempt: attempt + 1, signal: job.signal });
-        this.stableSuccesses += 1;
-        if (this.stableSuccesses >= this.successesPerIncrease && this.dynamicLimit < this.maxLimit) {
-          this.dynamicLimit += 1;
-          this.stableSuccesses = 0;
-          this.#emitSnapshot(true);
-        }
-        return result;
-      } catch (error) {
-        if (job.signal?.aborted || error?.name === 'AbortError') throw abortError();
-        const kind = transientKind(error);
-        if (kind === 'rate_limit') this.metricRateLimits += 1;
-        if (kind === 'network') this.metricNetworkErrors += 1;
-        if (kind === 'service') this.metricServiceErrors += 1;
-        if (kind === 'timeout') this.metricTimeoutErrors += 1;
-        if (!kind || attempt >= TRANSIENT_RETRY_DELAYS_MS.length) throw error;
-        this.metricRetries += 1;
-        this.dynamicLimit = Math.max(this.minLimit, this.dynamicLimit - this.rateLimitDecreaseStep);
-        let delay = TRANSIENT_RETRY_DELAYS_MS[attempt];
-        if (kind === 'rate_limit') {
-          delay = Math.max(delay, retryAfterMs(error));
-          this.globalCooldownUntil = Math.max(this.globalCooldownUntil, this.now() + delay);
-        } else {
-          this.accountCooldownUntil.set(job.account, Math.max(Number(this.accountCooldownUntil.get(job.account) || 0), this.now() + delay));
-        }
-        this.stableSuccesses = 0;
-        this.#emitSnapshot(true);
-        const jitter = Math.floor(delay * 0.2 * Math.max(0, Number(this.random() || 0)));
-        await waitWithSignal(delay + jitter, job.signal, this.sleep);
-        attempt += 1;
-      }
-    }
+      if (queuePump) this.#queuePump();
   }
 
   #settle(job, value, error) {

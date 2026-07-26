@@ -754,6 +754,10 @@ test('server and PySide expose one prepare/commit product path and retire old or
   assert.match(server, /deprecated: true/);
   assert.match(mainWindow, /\/api\/execution\/submissions\/prepare/);
   assert.match(mainWindow, /\/commit/);
+  assert.match(mainWindow, /def _submit_prepared_submission/);
+  assert.doesNotMatch(mainWindow, /ConfirmDialog\("最终执行确认"/);
+  assert.match(server, /expires_at: shanghaiBusinessDayEndIso\(preparedAt\)/);
+  assert.doesNotMatch(server, /preparedAt\.getTime\(\) \+ 15 \* 60 \* 1000/);
   assert.doesNotMatch(mainWindow, /batch-precheck|batch-create|\/api\/execution\/groups\/start/);
 });
 
@@ -779,7 +783,9 @@ test('final execution consumes the frozen intersection without a second full act
   assert.match(server, /finalRevalidation: true/);
   assert.match(server, /selectedForLiveRead = targetedRevalidate \? selected\.filter\(promotionNeedsItemRead\) : selected/);
   assert.match(server, /item_read_activity_count/);
-  assert.match(server, /提交前轻量复核完成/);
+  assert.match(server, /正在启动任务/);
+  assert.match(server, /正在复核变化活动/);
+  assert.doesNotMatch(server, /提交前轻量复核完成/);
   assert.doesNotMatch(server, /function submissionRevalidationDiff/);
 });
 

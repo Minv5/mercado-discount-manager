@@ -165,6 +165,31 @@ test('item identity drift only shrinks the confirmed set and persists exact adde
   assert.match(result.messages.join('；'), /剔除 1 个/);
 });
 
+test('items missing from the current platform read are skipped until a later preparation sees them', () => {
+  const previousCacheScope = createConfirmedExecutionScope({
+    action: 'enroll',
+    activities: [activity('P-1', ['I-KEEP', 'I-NOT-RETURNED'])],
+  });
+  const currentRead = createConfirmedExecutionScope({
+    action: 'enroll',
+    activities: [activity('P-1', ['I-KEEP'])],
+  });
+  const currentCycle = reconcileConfirmedExecutionScope({
+    confirmedScope: previousCacheScope,
+    observedScope: currentRead,
+  });
+
+  assert.deepEqual(currentCycle.execution_scope.activities[0].item_ids, ['I-KEEP']);
+  assert.equal(currentCycle.auto_removed_item_count, 1);
+  assert.equal(currentCycle.excluded_new_item_count, 0);
+
+  const nextCycle = createConfirmedExecutionScope({
+    action: 'enroll',
+    activities: [activity('P-1', ['I-KEEP', 'I-NOT-RETURNED'])],
+  });
+  assert.deepEqual(nextCycle.activities[0].item_ids, ['I-KEEP', 'I-NOT-RETURNED']);
+});
+
 test('duplicate observations collapse to one activity and structural definition drift requires one reconfirm', () => {
   const confirmed = createConfirmedExecutionScope({
     action: 'enroll', activities: [activity('P-1', ['I-1'])],

@@ -16,14 +16,15 @@ sys.path.insert(0, str(ROOT))
 
 from PySide6.QtCore import QDate, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QAbstractItemView, QDialog, QFrame, QLabel, QLineEdit, QMessageBox, QStyle, QStyleOptionSpinBox  # noqa: E402
+from PySide6.QtWidgets import QAbstractItemView, QDialog, QFrame, QHeaderView, QLabel, QLineEdit, QMessageBox, QStyle, QStyleOptionSpinBox  # noqa: E402
 
 from app import create_application  # noqa: E402
 from core import Account, account_from_json, completed_execution_for_scope, execution_completion_text  # noqa: E402
 from core import execution_group_payload  # noqa: E402
 from dialogs import ConfirmDialog, SellerCampaignCreateDialog, SettingsDialog, target_label  # noqa: E402
-from main_window import MainWindow, benchmark_text, business_details_text, business_task_text, execution_log_message  # noqa: E402
+from main_window import TASK_HEADERS, MainWindow, benchmark_text, business_details_text, business_task_text, execution_log_message  # noqa: E402
 from api_client import ApiError  # noqa: E402
+from service_manager import ServiceError  # noqa: E402
 from theme import APP_QSS, COLORS  # noqa: E402
 
 
@@ -31,9 +32,15 @@ class FakeService:
     def __init__(self) -> None:
         self.stopped = False
         self.detached = False
+        self.ensure_calls = 0
+        self.start_result = False
+        self.start_error: Exception | None = None
 
     def ensure_started(self) -> bool:
-        return False
+        self.ensure_calls += 1
+        if self.start_error:
+            raise self.start_error
+        return self.start_result
 
     def stop(self) -> None:
         self.stopped = True
@@ -111,13 +118,28 @@ class QtUiTests(unittest.TestCase):
             self.assertLessEqual(dialog.height(), screen_height)
             dialog.reject()
 
-    def test_final_confirmation_cancel_never_starts_execution_job(self) -> None:
-        with patch("main_window.ConfirmDialog.exec", return_value=QDialog.DialogCode.Rejected):
-            self.window._confirm_submission({
+    def test_prepared_submission_auto_commits_without_final_confirmation(self) -> None:
+        self.window._run_worker = lambda operation, success, _failure: success(operation())  # type: ignore[method-assign]
+        self.api.post = lambda path, body=None, **_kwargs: self.api.calls.append(("POST", path, body or {})) or {
+            "accepted": True,
+            "prepare": {"prepare_id": "P1", "state": "committing"},
+        }  # type: ignore[method-assign]
+        with patch.object(ConfirmDialog, "exec") as final_confirmation:
+            self.window._submission_prepared({"prepare": {
                 "prepare_id": "P1", "resolved_action": "update",
-                "confirmation_summary": "批量更新最终范围", "seller_input": {"selected_targets": []},
-            })
-        self.assertFalse(any(path.endswith("/commit") for _method, path, _body in self.api.calls))
+                "confirmation_summary": "批量更新最终范围",
+                "confirmation_token": "TOKEN-1",
+                "seller_input": {"selected_targets": []},
+            }})
+        final_confirmation.assert_not_called()
+        commits = [(path, body) for method, path, body in self.api.calls if method == "POST" and path.endswith("/commit")]
+        self.assertEqual(commits, [("/api/execution/submissions/P1/commit", {
+            "confirmText": "REAL_SUBMIT",
+            "confirmationToken": "TOKEN-1",
+        })])
+        self.assertIn("准备完成，正在启动任务", self.window.log_box.toPlainText())
+        self.window.poll_timer.stop()
+        self.window.pending_group_payload = None
 
     def test_cancel_mode_disables_both_discount_inputs(self) -> None:
         self.window.mode_combo.setCurrentText("批量取消")
@@ -151,6 +173,80 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.seller_discount.value(), 8)
         self.assertEqual(self.window.official_discount.value(), 9)
         self.assertIn("今日折扣：自建8%，官方9%", self.window.today_label.text())
+
+    def test_first_empty_account_sites_use_one_bounded_discovery_then_local_cache(self) -> None:
+        responses = {
+            "/api/accounts/A1/sites": [
+                {"ok": True, "sites": []},
+                {"ok": True, "sites": []},
+            ],
+            "/api/accounts/A1/sites?refresh=1": [
+                {"ok": True, "sites": [{
+                    "child_user_id": "CH1",
+                    "site_id": "MLM",
+                    "logistic_type": "remote",
+                }]},
+            ],
+            "/api/accounts/A1/promotions": [
+                {"ok": True, "promotions": []},
+                {"ok": True, "promotions": []},
+            ],
+        }
+
+        def get(path: str, **_kwargs):
+            self.api.calls.append(("GET", path, None))
+            key = path.split("?siteId=", 1)[0]
+            values = responses.get(key, [{"ok": True}])
+            return values.pop(0)
+
+        self.api.get = get  # type: ignore[method-assign]
+        first = self.window._load_scope_bundle(["A1"], "", discover_missing_sites=True)
+        second = self.window._load_scope_bundle(["A1"], "", discover_missing_sites=True)
+        self.assertEqual([row["site_id"] for row in first["sites"]], ["MLM"])
+        self.assertEqual(second["sites"], [])
+        refresh_calls = [
+            path for method, path, _body in self.api.calls
+            if method == "GET" and path.endswith("/sites?refresh=1")
+        ]
+        self.assertEqual(refresh_calls, ["/api/accounts/A1/sites?refresh=1"])
+
+    def test_cached_account_sites_never_trigger_startup_discovery(self) -> None:
+        def get(path: str, **_kwargs):
+            self.api.calls.append(("GET", path, None))
+            if path == "/api/accounts/A1/sites":
+                return {"ok": True, "sites": [{
+                    "child_user_id": "CH1",
+                    "site_id": "MLM",
+                    "logistic_type": "remote",
+                }]}
+            return {"ok": True, "promotions": []}
+
+        self.api.get = get  # type: ignore[method-assign]
+        result = self.window._load_scope_bundle(["A1"], "", discover_missing_sites=True)
+        self.assertEqual([row["site_id"] for row in result["sites"]], ["MLM"])
+        self.assertFalse(any(path.endswith("/sites?refresh=1") for _method, path, _body in self.api.calls))
+
+    def test_initial_bundle_arms_discovery_only_for_its_first_scope_load(self) -> None:
+        discovery_flags: list[bool] = []
+
+        def capture_refresh() -> None:
+            discovery_flags.append(self.window.initial_site_discovery_pending)
+            self.window.initial_site_discovery_pending = False
+
+        self.window.refresh_scope = capture_refresh  # type: ignore[method-assign]
+        self.window._apply_initial_bundle({
+            "settings": {},
+            "accounts": [],
+            "discount": {},
+        })
+        self.window._apply_initial_bundle({
+            "settings": {},
+            "accounts": [],
+            "discount": {},
+        })
+        self.assertEqual(discovery_flags, [True, False])
+        self.assertTrue(self.window.initial_site_discovery_consumed)
+        self.assertFalse(self.window.initial_site_discovery_pending)
 
     def test_today_completion_matches_only_same_business_day_and_exact_scope(self) -> None:
         group = self._completed_update()
@@ -293,9 +389,7 @@ class QtUiTests(unittest.TestCase):
         self.api.post = lambda path, body=None, **_kwargs: self.api.calls.append(("POST", path, body or {})) or {
             "prepare": {"prepare_id": "P-OTHER-SCOPE", "state": "preparing"}
         }  # type: ignore[method-assign]
-        with patch("main_window.ConfirmDialog") as dialog_class:
-            self.window._on_execute_clicked()
-        dialog_class.assert_not_called()
+        self.window._on_execute_clicked()
         self.assertEqual(
             sum(method == "POST" and path == "/api/execution/submissions/prepare" for method, path, _body in self.api.calls),
             1,
@@ -404,7 +498,7 @@ class QtUiTests(unittest.TestCase):
     def test_execution_records_use_business_result_contract_without_mixing_counts(self) -> None:
         self.window._apply_current_records([
             {
-                "id": 1, "action": "cancel", "mode": "real",
+                "id": 1, "action": "cancel", "mode": "real", "created_at": "2026-07-26T01:02:03.456Z",
                 "relation_count": 140, "unique_item_count": 100, "activity_failure_count": 2,
                 "request_success_count": 100, "live_verified_removed_count": 80, "pending_verification_count": 20,
                 "success_count": 80, "failed_count": 5, "skipped_count": 15,
@@ -415,6 +509,7 @@ class QtUiTests(unittest.TestCase):
                 "seller_activity_text": "6%", "official_activity_text": "7%",
                 "relation_count": 120, "unique_item_count": 90, "activity_failure_count": 1,
                 "request_success_count": 88, "live_verified_removed_count": 77, "pending_verification_count": 11,
+                "platform_pending_count": 11,
                 "success_count": 84, "failed_count": 1, "skipped_count": 5,
             },
             {
@@ -425,14 +520,16 @@ class QtUiTests(unittest.TestCase):
             },
         ])
         headers = [self.window.records_table.horizontalHeaderItem(index).text() for index in range(self.window.records_table.columnCount())]
-        self.assertEqual(headers, ["时间", "动作", "活动", "类型", "商品（唯一/活动关系）", "结果", "失败（商品/活动）", "失败原因"])
-        self.assertIn("跨多个活动", self.window.records_table.horizontalHeaderItem(4).toolTip())
-        self.assertIn("每个活动", self.window.records_table.horizontalHeaderItem(4).toolTip())
+        self.assertEqual(headers, ["时间", "动作", "活动", "类型", "商品 / 处理项", "结果", "失败", "失败原因"])
+        self.assertIn("参加多个活动会生成多条任务", self.window.records_table.horizontalHeaderItem(4).toolTip())
+        self.assertIn("商品×活动", self.window.records_table.horizontalHeaderItem(4).toolTip())
         self.assertIn("活动失败不计入商品失败", self.window.records_table.horizontalHeaderItem(6).toolTip())
-        self.assertEqual(self.window.records_table.item(0, 4).text(), "100 / 140")
+        self.assertIn("09:02:03", self.window.records_table.item(0, 0).text())
+        self.assertIn("2026-07-26T01:02:03.456Z", self.window.records_table.item(0, 0).toolTip())
+        self.assertEqual(self.window.records_table.item(0, 4).text(), "100 件 / 140 项")
         self.assertEqual(self.window.records_table.item(0, 5).text(), "取消请求 100\n成功取消 80\n待平台确认 20")
         self.assertEqual(self.window.records_table.item(0, 6).text(), "商品 5 / 活动 2")
-        self.assertEqual(self.window.records_table.item(1, 5).text(), "成功 84 / 跳过 5")
+        self.assertEqual(self.window.records_table.item(1, 5).text(), "更新成功 84\n平台待生效 11\n跳过 5")
         self.assertNotIn("成功取消", self.window.records_table.item(1, 5).text())
         self.assertEqual(self.window.records_table.item(2, 4).text(), "旧记录未区分 / -")
         self.assertEqual(self.window.records_table.item(2, 5).text(), "旧记录未区分")
@@ -445,7 +542,32 @@ class QtUiTests(unittest.TestCase):
         visible_width = self.window.records_table.viewport().width()
         used_width = sum(self.window.records_table.columnWidth(index) for index in range(self.window.records_table.columnCount()))
         self.assertLessEqual(used_width, visible_width + 2)
+        header = self.window.records_table.horizontalHeader()
+        for column in (2, 4, 5, 7):
+            self.assertEqual(header.sectionResizeMode(column), QHeaderView.ResizeMode.Stretch)
+        for column in range(self.window.records_table.columnCount()):
+            self.assertGreaterEqual(
+                self.window.records_table.columnWidth(column),
+                header.fontMetrics().horizontalAdvance(TASK_HEADERS[column]) + 18,
+            )
         self.window.thread_pool.waitForDone(5000)
+
+    def test_records_show_daily_item_delta_or_explicit_insufficient_snapshot(self) -> None:
+        self.window._apply_current_records([])
+        self.assertEqual(self.window.records_delta_label.text(), "较昨日商品变化：暂无可比较快照，数据不足")
+        self.window._apply_current_records([{
+            "id": 1,
+            "daily_item_delta": {
+                "status": "ready",
+                "current_date": "2026-07-26",
+                "baseline_date": "2026-07-25",
+                "added_count": 18,
+                "removed_count": 7,
+            },
+        }])
+        self.assertEqual(self.window.records_delta_label.text(), "较昨日：新增 18 件，减少 7 件")
+        self.assertIn("2026-07-25", self.window.records_delta_label.toolTip())
+        self.assertIn("2026-07-26", self.window.records_delta_label.toolTip())
 
     def test_cancel_details_distinguish_request_verified_pending_and_legacy(self) -> None:
         cancel = {
@@ -464,17 +586,17 @@ class QtUiTests(unittest.TestCase):
 
         old = {"action": "cancel", "total_count": 12, "success_count": 12, "failed_count": 3}
         old_text = business_task_text(old)
-        self.assertIn("唯一商品：旧记录未区分", old_text)
+        self.assertIn("涉及商品：旧记录未区分", old_text)
         self.assertIn("成功取消：旧记录未区分", old_text)
         self.assertNotIn("成功取消：12", old_text)
 
         details = business_details_text(cancel, [{**cancel, "store_name": "测试店", "site_name": "墨西哥站", "promotion_name": "活动A"}])
-        self.assertIn("活动商品关系 100", details)
+        self.assertIn("需处理项：100 项（商品×活动）", details)
         self.assertIn("商品失败 4，活动失败 2", details)
 
     def test_backend_legacy_terminal_summary_is_not_shown_before_authoritative_ui_summary(self) -> None:
         self.assertEqual(execution_log_message("结束：总商品 100，成功 100，失败 0，跳过 0，用时 3 秒。"), "")
-        self.assertEqual(execution_log_message("正在处理活动。"), "正在处理活动。")
+        self.assertEqual(execution_log_message("正在处理活动。"), "")
 
     def test_initial_bundle_does_not_load_history(self) -> None:
         self.api.get = lambda path, **_kwargs: {  # type: ignore[method-assign]
@@ -553,16 +675,16 @@ class QtUiTests(unittest.TestCase):
         self.assertTrue(self.window.poll_timer.isActive())
         self.assertEqual(self.window.pending_group_payload["prepare_id"], "P-ASYNC")
 
-        confirmations: list[dict[str, object]] = []
+        automatic_submissions: list[dict[str, object]] = []
         errors: list[str] = []
-        self.window._confirm_submission = lambda prepare: confirmations.append(prepare)  # type: ignore[method-assign]
+        self.window._submit_prepared_submission = lambda prepare: automatic_submissions.append(prepare)  # type: ignore[method-assign]
         self.window._operation_error = lambda _title, message, **_kwargs: errors.append(message)  # type: ignore[method-assign]
         self.window._commit_submission_polled({
             "prepare_id": "P-ASYNC", "state": "reconfirm_required",
             "confirmation_summary": "候选商品数量已变化，请再次确认。",
             "reconfirm_changes": ["候选商品数量已变化"],
         })
-        self.assertEqual(confirmations, [])
+        self.assertEqual(automatic_submissions, [])
         self.assertTrue(any("重新开始核对范围" in message for message in errors))
         self.assertIsNone(self.window.pending_group_payload)
         self.window.poll_timer.stop()
@@ -818,7 +940,7 @@ class QtUiTests(unittest.TestCase):
         self.window.poll_timer.stop()
         self.window.running_group.clear()
 
-    def test_running_group_logs_from_all_stores_are_displayed_in_timestamp_order(self) -> None:
+    def test_running_group_logs_keep_important_store_messages_in_timestamp_order(self) -> None:
         self.window.running_group = {"id": "G1", "status": "running", "children": []}
         response = {"group": {
             "id": "G1",
@@ -826,24 +948,80 @@ class QtUiTests(unittest.TestCase):
             "action": "cancel",
             "children": [
                 {"job_id": "JOB-B", "userLogs": [
-                    {"at": "2026-07-23T05:47:29.000Z", "message": "广州实时日志"},
+                    {"at": "2026-07-23T05:47:29.000Z", "message": "广州：平台限流，冷却后重试"},
                 ]},
                 {"job_id": "JOB-A", "userLogs": [
-                    {"at": "2026-07-23T05:47:28.000Z", "message": "湖北实时日志"},
+                    {"at": "2026-07-23T05:47:28.000Z", "message": "湖北：任务恢复，继续处理"},
                 ]},
                 {"job_id": "JOB-C", "userLogs": [
-                    {"at": "2026-07-23T05:47:30.000Z", "message": "湖南实时日志"},
+                    {"at": "2026-07-23T05:47:30.000Z", "message": "湖南：商品失败 1"},
+                    {"at": "2026-07-23T05:47:31.000Z", "message": "详情 28/125，排队 97"},
                 ]},
             ],
         }}
         self.window._group_polled(response)
         text = self.window.log_box.toPlainText()
-        self.assertLess(text.index("湖北实时日志"), text.index("广州实时日志"))
-        self.assertLess(text.index("广州实时日志"), text.index("湖南实时日志"))
-        self.window._group_polled(response)
-        self.assertEqual(self.window.log_box.toPlainText().count("湖北实时日志"), 1)
         self.window.poll_timer.stop()
         self.window.running_group.clear()
+        self.assertLess(text.index("湖北：任务恢复"), text.index("广州：平台限流"))
+        self.assertLess(text.index("广州：平台限流"), text.index("湖南：商品失败"))
+        self.assertNotIn("详情 28/125", text)
+        self.window.running_group = {"id": "G1", "status": "running", "children": []}
+        self.window._group_polled(response)
+        self.window.poll_timer.stop()
+        self.window.running_group.clear()
+        self.assertEqual(self.window.log_box.toPlainText().count("湖北：任务恢复"), 1)
+
+    def test_running_group_log_cursor_survives_fixed_length_backend_rollover(self) -> None:
+        self.window.running_group = {"id": "G1", "status": "running", "children": []}
+        first = [
+            {"at": f"2026-07-23T05:47:{index:02d}.000Z", "message": f"恢复进度 {index}"}
+            for index in range(3)
+        ]
+        self.window._group_polled({"group": {
+            "id": "G1", "status": "running", "action": "update",
+            "children": [{"job_id": "JOB-A", "userLogs": first}],
+        }})
+        rolled = first[1:] + [{"at": "2026-07-23T05:48:00.000Z", "message": "恢复进度 新消息"}]
+        self.window._group_polled({"group": {
+            "id": "G1", "status": "running", "action": "update",
+            "children": [{"job_id": "JOB-A", "userLogs": rolled}],
+        }})
+        text = self.window.log_box.toPlainText()
+        self.window.poll_timer.stop()
+        self.window.running_group.clear()
+        self.assertEqual(text.count("恢复进度 1"), 1)
+        self.assertEqual(text.count("恢复进度 2"), 1)
+        self.assertEqual(text.count("恢复进度 新消息"), 1)
+
+    def test_ui_log_document_keeps_latest_thousand_lines(self) -> None:
+        for index in range(1005):
+            self.window.log(f"重要日志 {index}")
+        text = self.window.log_box.toPlainText()
+        self.assertLessEqual(self.window.log_box.document().blockCount(), 1000)
+        self.assertNotIn("重要日志 0\n", text)
+        self.assertIn("重要日志 1004", text)
+
+    def test_startup_reuses_compatible_service_and_blocks_incompatible_port_once(self) -> None:
+        callbacks: list[tuple[object, object, object]] = []
+        self.window._run_worker = lambda function, result, error: callbacks.append((function, result, error))  # type: ignore[method-assign]
+        self.window.startup()
+        function, result, error = callbacks.pop()
+        result(function())
+        self.assertEqual(self.service.ensure_calls, 1)
+        self.assertIn("已连接现有程序组件", self.window.log_box.toPlainText())
+        callbacks.clear()
+
+        self.service.start_error = ServiceError("本软件组件协议不兼容，请先关闭占用该端口的旧版本。")
+        self.window.startup()
+        function, _result, error = callbacks.pop()
+        with self.assertRaises(ServiceError) as raised:
+            function()
+        with patch.object(QMessageBox, "warning"):
+            error(str(raised.exception))
+        self.assertEqual(self.service.ensure_calls, 2)
+        self.assertEqual(self.window.component_label.text(), "程序组件未连接")
+        self.assertIn("协议不兼容", self.window.log_box.toPlainText())
 
     def test_poll_timeout_never_unlocks_or_starts_duplicate_group(self) -> None:
         self.window.running_group = {"id": "G1", "status": "running", "children": []}
@@ -1029,6 +1207,7 @@ class QtUiTests(unittest.TestCase):
         self.api.get = get  # type: ignore[method-assign]
         context = self.window._load_settings_context()
         self.assertIn("/api/settings", calls)
+        self.assertIn("/api/accounts/A1/sites?includeAll=1&probeBusiness=1&refresh=1", calls)
         self.assertEqual(context["settings"], {"readConcurrency": 20, "previewConcurrency": 20, "writeConcurrency": 24})
 
     def test_settings_background_merge_is_keyed_and_preserves_current_edits(self) -> None:
@@ -1193,6 +1372,44 @@ class QtUiTests(unittest.TestCase):
         for account in reopened_accounts:
             self.assertNotIn(account.account_id, daily_text)
 
+    def test_operating_sites_are_stably_grouped_after_initial_and_background_merge(self) -> None:
+        accounts = [
+            Account("3408885754", "RAW-340", "CBT", "湖南"),
+            Account("2651442567", "RAW-265", "CBT", "湖北"),
+            Account("3332096437", "RAW-333", "CBT", "广州"),
+        ]
+        dialog = SettingsDialog(
+            {"operatingSites": {"3408885754": ["MLM"], "2651442567": ["MLB"], "3332096437": ["MLC"]}},
+            accounts,
+            [
+                {"account_id": "3408885754", "site_id": "MLM", "store_name": "湖南", "operating": True},
+                {"account_id": "2651442567", "site_id": "MLB", "store_name": "湖北", "operating": True},
+                {"account_id": "3332096437", "site_id": "MLC", "store_name": "广州", "operating": True},
+            ],
+            "",
+        )
+        self.assertEqual(
+            [dialog.site_list.item(index).data(Qt.ItemDataRole.UserRole) for index in range(dialog.site_list.count())],
+            [("3332096437", "MLC"), ("2651442567", "MLB"), ("3408885754", "MLM")],
+        )
+        dialog.apply_background_context(accounts, [
+            {"account_id": "3408885754", "site_id": "MLB", "store_name": "湖南"},
+            {"account_id": "3332096437", "site_id": "MLA", "store_name": "广州"},
+            {"account_id": "2651442567", "site_id": "MLM", "store_name": "湖北"},
+        ], "")
+        keys = [dialog.site_list.item(index).data(Qt.ItemDataRole.UserRole) for index in range(dialog.site_list.count())]
+        self.assertEqual(keys, [
+            ("3332096437", "MLA"), ("3332096437", "MLC"),
+            ("2651442567", "MLB"), ("2651442567", "MLM"),
+            ("3408885754", "MLB"), ("3408885754", "MLM"),
+        ])
+        checked = {
+            dialog.site_list.item(index).data(Qt.ItemDataRole.UserRole)
+            for index in range(dialog.site_list.count())
+            if dialog.site_list.item(index).checkState() == Qt.CheckState.Checked
+        }
+        self.assertEqual(checked, {("3332096437", "MLC"), ("2651442567", "MLB"), ("3408885754", "MLM")})
+
     def test_settings_store_name_validation_blocks_empty_and_duplicates(self) -> None:
         accounts = [
             Account("2651442567", "RAW-A", "CBT", "湖北"),
@@ -1247,11 +1464,11 @@ class QtUiTests(unittest.TestCase):
                        "unique_item_count": 13820, "relation_count": 14000, "activity_failure_count": 2},
         }})
         text = self.window.log_box.toPlainText()
-        self.assertIn("湖北 / 全部站点：批量更新完成，唯一商品 15，活动商品关系 17，成功 0，商品失败 15，活动失败 1，跳过 0", text)
-        self.assertIn("广州 / 全部站点：批量更新完成，唯一商品 9319，活动商品关系 9400，成功 73，商品失败 283，活动失败 0，跳过 8963", text)
-        self.assertIn("湖南 / 全部站点：批量更新完成，唯一商品 4486，活动商品关系 4583，成功 19，商品失败 21，活动失败 1，跳过 4446", text)
+        self.assertIn("湖北 / 全部站点：批量更新完成，处理 17 项，涉及 15 件商品，更新成功 0，商品失败 15，活动失败 1，跳过 0", text)
+        self.assertIn("广州 / 全部站点：批量更新完成，处理 9400 项，涉及 9319 件商品，更新成功 73，商品失败 283，活动失败 0，跳过 8963", text)
+        self.assertIn("湖南 / 全部站点：批量更新完成，处理 4583 项，涉及 4486 件商品，更新成功 19，商品失败 21，活动失败 1，跳过 4446", text)
         self.assertEqual(text.count("本次批量更新总汇总"), 1)
-        self.assertIn("店铺 3 个，唯一商品 13820，活动商品关系 14000，成功 92，商品失败 319，活动失败 2，跳过 13409", text)
+        self.assertIn("店铺 3 个，处理 14000 项，涉及 13820 件商品，更新成功 92，商品失败 319，活动失败 2，跳过 13409", text)
         self.assertNotIn("{'at':", text)
 
     def test_cancel_terminal_log_uses_request_verified_and_pending_counts(self) -> None:
@@ -1290,7 +1507,7 @@ class QtUiTests(unittest.TestCase):
                        "stores": [{**counts, "account_id": "A1", "status": "completed"}]},
         }})
         text = self.window.log_box.toPlainText()
-        self.assertIn("成功 100，平台已接受待生效 20，商品失败 10", text)
+        self.assertIn("报名成功 100，平台已接受待生效 20，商品失败 10", text)
         self.assertNotIn("待平台回查确认 20", text)
 
     def test_terminal_null_result_is_safe(self) -> None:
@@ -1302,7 +1519,7 @@ class QtUiTests(unittest.TestCase):
             "result": {"action": "update", "store_count": 1, "total": 0, "success": 0, "failed": 0, "skipped": 0,
                        "stores": [{"account_id": "3408885754", "status": "failed", "total": 0, "success": 0, "failed": 0, "skipped": 0}]},
         }})
-        self.assertIn("湖南 / 全部站点：批量更新未完整完成，唯一商品 旧记录未区分，活动商品关系 -，成功 0，商品失败 0，活动失败 -，跳过 0", self.window.log_box.toPlainText())
+        self.assertIn("湖南 / 全部站点：批量更新未完整完成，处理 - 项，涉及 旧记录未区分 件商品，更新成功 0，商品失败 0，活动失败 -，跳过 0", self.window.log_box.toPlainText())
 
     def test_theme_uses_project_icons_and_complete_dark_scrollbars(self) -> None:
         self.assertIn("@CHEVRON_DOWN@", APP_QSS)

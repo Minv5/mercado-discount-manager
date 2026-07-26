@@ -6,6 +6,9 @@ export const PARTIAL_FETCH_STATUSES = new Set(['partial', 'partial_api_sparse_ma
 export const INVENTORY_FALLBACK_READY_STATUSES = new Set(['inventory_scan_fallback_ready', 'inventory_scan_fallback_partial']);
 export const NOT_FULL_FETCH_STATUS = 'not_full_fetch';
 
+const ZERO_DECIMAL_CURRENCIES = new Set(['CLP', 'COP']);
+const DEFAULT_CURRENCY_PRECISION = 2;
+
 export function defaultDiscountForPromotion(promotionType) {
   const bucket = promotionBucket(promotionType);
   if (bucket === PROMOTION_BUCKETS.seller) return 5;
@@ -48,6 +51,22 @@ export function normalizeItem(raw) {
     suggested_discounted_price: numberOrNull(raw.suggested_discounted_price),
     min_discounted_price: numberOrNull(raw.min_discounted_price),
     max_discounted_price: numberOrNull(raw.max_discounted_price),
+    currency_precision: nonNegativeIntegerOrNull(
+      raw.currency_precision
+      ?? raw.currencyPrecision
+      ?? raw.decimal_places
+      ?? raw.currency?.decimal_places
+      ?? rawJson.currency_precision
+      ?? rawJson.decimal_places
+      ?? rawJson.currency?.decimal_places
+    ),
+    currency_minor_unit: positiveNumberOrNull(
+      raw.currency_minor_unit
+      ?? raw.currencyMinorUnit
+      ?? raw.minor_unit
+      ?? rawJson.currency_minor_unit
+      ?? rawJson.minor_unit
+    ),
     offer_id: offerId,
     raw_json: raw.raw_json || null,
     raw
@@ -73,13 +92,41 @@ export function roundMoney(value) {
   return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 }
 
+export function moneyRuleForCurrency(currencyId, { precision, minorUnit } = {}) {
+  const normalizedCurrency = String(currencyId || '').trim().toUpperCase();
+  const explicitMinorUnit = positiveNumberOrNull(minorUnit);
+  const resolvedPrecision = nonNegativeIntegerOrNull(precision)
+    ?? precisionFromMinorUnit(explicitMinorUnit)
+    ?? (ZERO_DECIMAL_CURRENCIES.has(normalizedCurrency) ? 0 : DEFAULT_CURRENCY_PRECISION);
+  const resolvedMinorUnit = explicitMinorUnit ?? 10 ** -resolvedPrecision;
+  return {
+    currency_id: normalizedCurrency || null,
+    precision: resolvedPrecision,
+    minor_unit: resolvedMinorUnit,
+  };
+}
+
+export function moneyRuleForItem(item = {}) {
+  return moneyRuleForCurrency(item.currency_id, {
+    precision: item.currency_precision,
+    minorUnit: item.currency_minor_unit,
+  });
+}
+
+export function normalizeDealPriceForPayload(value, item = {}) {
+  const numeric = numberOrNull(value);
+  if (numeric === null) return null;
+  return quantizeToMinorUnit(numeric, moneyRuleForItem(item), 'floor');
+}
+
 export function calculateDealPrice(item, options) {
   if (options.priceMode === 'direct') {
-    return roundMoney(options.directPrice);
+    return normalizeDealPriceForPayload(options.directPrice, item);
   }
   const base = item.original_price ?? item.price;
   if (!Number.isFinite(base) || base <= 0) return null;
-  return roundMoney(base * (100 - options.discountPercent) / 100);
+  const exactDiscountedPrice = base * (100 - options.discountPercent) / 100;
+  return quantizeToMinorUnit(exactDiscountedPrice, moneyRuleForItem(item), 'floor');
 }
 
 export function validateDealPrice(item, dealPrice) {
@@ -313,6 +360,39 @@ export function promotionKey(promotion) {
 
 function planSkip(item, reason) {
   return { item, action: null, status: 'skipped', deal_price: null, reason };
+}
+
+function quantizeToMinorUnit(value, rule, mode) {
+  const unit = rule.minor_unit;
+  const scaled = Number(value) / unit;
+  const tolerance = Number.EPSILON * Math.max(1, Math.abs(scaled)) * 8;
+  const units = mode === 'floor'
+    ? Math.floor(scaled + tolerance)
+    : Math.round(scaled + tolerance);
+  return Number((units * unit).toFixed(rule.precision));
+}
+
+function nonNegativeIntegerOrNull(value) {
+  const numeric = numberOrNull(value);
+  if (numeric === null || numeric < 0 || !Number.isInteger(numeric)) return null;
+  return numeric;
+}
+
+function positiveNumberOrNull(value) {
+  const numeric = numberOrNull(value);
+  return numeric !== null && numeric > 0 ? numeric : null;
+}
+
+function precisionFromMinorUnit(minorUnit) {
+  if (minorUnit === null) return null;
+  let scaled = minorUnit;
+  for (let precision = 0; precision <= 8; precision += 1) {
+    if (Math.abs(scaled - Math.round(scaled)) <= Number.EPSILON * Math.max(1, Math.abs(scaled)) * 8) {
+      return precision;
+    }
+    scaled *= 10;
+  }
+  return null;
 }
 
 function candidateIncompleteWarning(warning, detailStatus = 'api_incomplete') {

@@ -30,7 +30,14 @@ function migrate(database) {
       auth_domain TEXT NOT NULL,
       code_verifier TEXT NOT NULL,
       code_challenge TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      processing_state TEXT NOT NULL DEFAULT 'pending',
+      claim_token TEXT,
+      claimed_at TEXT,
+      claim_expires_at TEXT,
+      consumed_at TEXT,
+      last_error_code TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS oauth_tokens (
@@ -247,6 +254,7 @@ function migrate(database) {
 
     CREATE TABLE IF NOT EXISTS activity_cache_states (
       account_id TEXT NOT NULL,
+      child_user_id TEXT NOT NULL DEFAULT '',
       site_id TEXT NOT NULL DEFAULT '',
       promotion_id TEXT NOT NULL DEFAULT '',
       promotion_type TEXT NOT NULL DEFAULT '',
@@ -258,7 +266,7 @@ function migrate(database) {
       event_cursor TEXT,
       last_error TEXT,
       updated_at TEXT NOT NULL,
-      PRIMARY KEY (account_id, site_id, promotion_id, promotion_type)
+      PRIMARY KEY (account_id, child_user_id, site_id, promotion_id, promotion_type)
     );
 
     CREATE INDEX IF NOT EXISTS idx_activity_cache_due
@@ -274,7 +282,14 @@ function migrate(database) {
       cursor TEXT,
       previous_cursor TEXT,
       gap INTEGER NOT NULL DEFAULT 0,
-      received_at TEXT NOT NULL
+      received_at TEXT NOT NULL,
+      processing_state TEXT NOT NULL DEFAULT 'completed',
+      claim_token TEXT,
+      claimed_at TEXT,
+      claim_expires_at TEXT,
+      completed_at TEXT,
+      last_error TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE INDEX IF NOT EXISTS idx_activity_callback_scope
@@ -292,6 +307,16 @@ function migrate(database) {
       updated_at TEXT NOT NULL,
       UNIQUE(account_id, promotion_id, promotion_type)
     );
+  `);
+  migrateOAuthStateClaimsAndDailySnapshots(database);
+  migrateActivityCacheIdentity(database);
+  database.exec(`
+    DROP INDEX IF EXISTS idx_activity_cache_due;
+    CREATE INDEX idx_activity_cache_due
+      ON activity_cache_states(
+        account_id, child_user_id, site_id, dirty, continuity,
+        catalog_checked_at, items_full_checked_at
+      );
   `);
   addColumnIfMissing(database, 'promo_campaigns', 'merchant_id', 'TEXT');
   addColumnIfMissing(database, 'promo_campaigns', 'child_user_id', 'TEXT');
@@ -314,6 +339,13 @@ function migrate(database) {
   addColumnIfMissing(database, 'activity_callback_events', 'outcome', 'TEXT');
   addColumnIfMissing(database, 'activity_callback_events', 'resource_status', 'TEXT');
   addColumnIfMissing(database, 'activity_callback_events', 'raw_json', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'processing_state', "TEXT NOT NULL DEFAULT 'completed'");
+  addColumnIfMissing(database, 'activity_callback_events', 'claim_token', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'claimed_at', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'claim_expires_at', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'completed_at', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'last_error', 'TEXT');
+  addColumnIfMissing(database, 'activity_callback_events', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
   addColumnIfMissing(database, 'seller_campaign_create_results', 'child_user_id', 'TEXT');
   addColumnIfMissing(database, 'seller_campaign_create_results', 'detection_status', 'TEXT');
   database.exec(`
@@ -323,9 +355,121 @@ function migrate(database) {
       ON promo_tasks(execution_job_id, id);
     CREATE INDEX IF NOT EXISTS idx_activity_callback_remote
       ON activity_callback_events(remote_user_id, child_user_id, site_id, received_at);
+    CREATE INDEX IF NOT EXISTS idx_activity_callback_processing
+      ON activity_callback_events(processing_state, claim_expires_at, received_at);
     CREATE INDEX IF NOT EXISTS idx_seller_campaign_create_results_route_name
       ON seller_campaign_create_results(account_id, child_user_id, site_id, promotion_name, created_at);
   `);
+}
+
+function migrateOAuthStateClaimsAndDailySnapshots(database) {
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    addColumnIfMissing(database, 'oauth_states', 'processing_state', "TEXT NOT NULL DEFAULT 'pending'");
+    addColumnIfMissing(database, 'oauth_states', 'claim_token', 'TEXT');
+    addColumnIfMissing(database, 'oauth_states', 'claimed_at', 'TEXT');
+    addColumnIfMissing(database, 'oauth_states', 'claim_expires_at', 'TEXT');
+    addColumnIfMissing(database, 'oauth_states', 'consumed_at', 'TEXT');
+    addColumnIfMissing(database, 'oauth_states', 'last_error_code', 'TEXT');
+    addColumnIfMissing(database, 'oauth_states', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
+    database.exec(`
+      UPDATE oauth_states
+      SET processing_state = 'pending'
+      WHERE processing_state IS NULL OR processing_state = '';
+
+      CREATE INDEX IF NOT EXISTS idx_oauth_states_processing
+        ON oauth_states(processing_state, claim_expires_at, created_at);
+
+      CREATE TABLE IF NOT EXISTS daily_item_identity_snapshots (
+        business_date TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        child_user_id TEXT NOT NULL,
+        site_id TEXT NOT NULL,
+        complete INTEGER NOT NULL DEFAULT 0,
+        item_count INTEGER NOT NULL DEFAULT 0,
+        item_ids_hash TEXT NOT NULL,
+        item_ids_json TEXT NOT NULL,
+        source TEXT,
+        captured_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (business_date, account_id, child_user_id, site_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_daily_item_identity_route
+        ON daily_item_identity_snapshots(
+          account_id, child_user_id, site_id, business_date, complete
+        );
+    `);
+    database.exec('COMMIT');
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      // Preserve the migration error.
+    }
+    throw error;
+  }
+}
+
+function migrateActivityCacheIdentity(database) {
+  const columns = database.prepare('PRAGMA table_info(activity_cache_states)').all();
+  const primaryKey = columns
+    .filter((row) => Number(row.pk) > 0)
+    .sort((left, right) => Number(left.pk) - Number(right.pk))
+    .map((row) => String(row.name));
+  const expectedPrimaryKey = ['account_id', 'child_user_id', 'site_id', 'promotion_id', 'promotion_type'];
+  if (primaryKey.length === expectedPrimaryKey.length
+    && primaryKey.every((name, index) => name === expectedPrimaryKey[index])) {
+    return;
+  }
+
+  const childExpression = columns.some((row) => row.name === 'child_user_id')
+    ? "COALESCE(child_user_id, '')"
+    : "''";
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec('ALTER TABLE activity_cache_states RENAME TO activity_cache_states_legacy_identity');
+    database.exec(`
+      CREATE TABLE activity_cache_states (
+        account_id TEXT NOT NULL,
+        child_user_id TEXT NOT NULL DEFAULT '',
+        site_id TEXT NOT NULL DEFAULT '',
+        promotion_id TEXT NOT NULL DEFAULT '',
+        promotion_type TEXT NOT NULL DEFAULT '',
+        catalog_checked_at TEXT,
+        items_full_checked_at TEXT,
+        dirty INTEGER NOT NULL DEFAULT 0,
+        expired INTEGER NOT NULL DEFAULT 0,
+        continuity TEXT NOT NULL DEFAULT 'continuous',
+        event_cursor TEXT,
+        last_error TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (account_id, child_user_id, site_id, promotion_id, promotion_type)
+      );
+      INSERT INTO activity_cache_states
+        (account_id, child_user_id, site_id, promotion_id, promotion_type,
+         catalog_checked_at, items_full_checked_at, dirty, expired, continuity,
+         event_cursor, last_error, updated_at)
+      SELECT account_id, ${childExpression}, site_id, promotion_id, promotion_type,
+             catalog_checked_at, items_full_checked_at, dirty, expired, continuity,
+             event_cursor, last_error, updated_at
+      FROM activity_cache_states_legacy_identity;
+      DROP TABLE activity_cache_states_legacy_identity;
+      CREATE INDEX idx_activity_cache_due
+        ON activity_cache_states(
+          account_id, child_user_id, site_id, dirty, continuity,
+          catalog_checked_at, items_full_checked_at
+        );
+    `);
+    database.exec('COMMIT');
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      // Preserve the migration error.
+    }
+    throw error;
+  }
 }
 
 function addColumnIfMissing(database, table, column, type) {

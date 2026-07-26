@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildBatchPlans, buildPlan, cancelUntilEmpty, fetchCompleteness, filterPromotions, normalizeActivityName, promotionKey, summarizeSites } from '../src/planner.js';
+import { buildItemIdentitySummary } from '../src/activityChangeCache.js';
 import { decideCycleAction, nextDiscountFor } from '../src/cycle.js';
 import { MercadoLibreClient, extractMarketplaceUsers, extractPromotions, mergePromotionsByIdentity } from '../src/mlClient.js';
 import { realSubmitProtection } from '../src/protection.js';
@@ -346,7 +347,94 @@ test('scanMarketplaceUserItems uses scan scroll_id for marketplace child invento
   assert.equal(result.total, 3);
   assert.equal(result.isFullFetch, true);
   assert.equal(result.rawSummary.duplicate_count, 1);
+  assert.deepEqual(result.rawSummary.inventory_first_page_item_ids, ['MLB1', 'MLB2']);
   assert.deepEqual(calls.map((call) => call.scrollId), [null, 'next-1']);
+});
+
+test('probeMarketplaceUserItems reads one inventory page and returns a stable route total', async () => {
+  const client = new MercadoLibreClient({ marketplace: true });
+  const calls = [];
+  client.searchMarketplaceUserItems = async (request) => {
+    calls.push(request);
+    return { results: ['MLB2', 'MLB1', 'MLB2'], paging: { total: 80 } };
+  };
+
+  const result = await client.probeMarketplaceUserItems({ userId: 'CH-1', status: 'all' });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].scrollId, null);
+  assert.equal(calls[0].searchType, 'scan');
+  assert.equal(result.platform_total, 80);
+  assert.deepEqual(result.first_page_item_ids, ['MLB1', 'MLB2']);
+});
+
+test('probePromotionItems reads exactly one page and returns a stable total and item identity sample', async () => {
+  const client = new MercadoLibreClient({ marketplace: true });
+  const calls = [];
+  client.getPromotionItems = async (request) => {
+    calls.push(request);
+    return {
+      results: [{ id: 'MLB2' }, { item_id: 'MLB1' }, { id: 'MLB2' }],
+      paging: { total: 125, searchAfter: 'opaque' },
+    };
+  };
+
+  const result = await client.probePromotionItems({
+    promotionId: 'P-1',
+    promotionType: 'DEAL',
+    status: 'candidate',
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].offset, 0);
+  assert.equal(calls[0].searchAfter, null);
+  assert.equal(result.platform_total, 125);
+  assert.deepEqual(result.first_page_item_ids, ['MLB1', 'MLB2']);
+  assert.equal(result.identity_summary, null);
+  assert.equal(result.identity_summary_complete, false);
+  assert.equal(result.probe_scope, 'first_page_only');
+});
+
+test('full promotion item pagination reuses the probe page instead of requesting page zero twice', async () => {
+  const client = new MercadoLibreClient({ marketplace: true });
+  const calls = [];
+  client.getPromotionItems = async (request) => {
+    calls.push(request);
+    if (calls.length === 1) {
+      return {
+        results: [{ id: 'MLB1' }, { id: 'MLB2' }],
+        paging: { total: 3, limit: 2, offset: 0 },
+      };
+    }
+    return {
+      results: [{ id: 'MLB3' }],
+      paging: { total: 3, limit: 2, offset: 2 },
+    };
+  };
+
+  const probe = await client.probePromotionItems({
+    promotionId: 'P-1',
+    promotionType: 'DEAL',
+    status: 'candidate',
+    limit: 2,
+  });
+  const result = await client.fetchAllPromotionItems({
+    promotionId: 'P-1',
+    promotionType: 'DEAL',
+    status: 'candidate',
+    limit: 2,
+    maxItems: 'all',
+    initialPage: probe.page,
+  });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].offset, 2);
+  assert.deepEqual(result.results.map((row) => row.id), ['MLB1', 'MLB2', 'MLB3']);
+  assert.deepEqual(result.rawSummary.first_page_item_ids, ['MLB1', 'MLB2']);
+  assert.deepEqual(
+    result.rawSummary.identity_summary,
+    buildItemIdentitySummary(result.results, { complete: true }),
+  );
 });
 
 test('fetchAllPromotionItems marks total without details as api_incomplete', async () => {

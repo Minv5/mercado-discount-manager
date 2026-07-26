@@ -160,10 +160,23 @@ export function createActivityWebhookConsumer({
         promotionType: activity.promotion_type,
         eventCursor: null,
         gap: false,
+      }, {
+        accountId: activity.account_id,
+        childUserId: activity.child_user_id,
+        siteId: activity.site_id,
       });
     }
     if (classified.catalog_dirty) {
-      await markDirty({ accountId: route.account_id, siteId: route.site_id, eventCursor: null, gap: false });
+      await markDirty({
+        accountId: route.account_id,
+        siteId: route.site_id,
+        eventCursor: null,
+        gap: false,
+      }, {
+        accountId: route.account_id,
+        childUserId: route.child_user_id,
+        siteId: route.site_id,
+      });
       await invalidateCatalog({ accountId: route.account_id, childUserId: route.child_user_id, siteId: route.site_id });
     }
     return {

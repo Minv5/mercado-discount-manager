@@ -1,3 +1,5 @@
+import { normalizeDealPriceForPayload } from './planner.js';
+
 export const ITEM_STATUS_WHITELIST = new Set(['candidate', 'pending', 'started']);
 export const DIRECT_PAYLOAD_PROMOTION_TYPES = new Set(['SELLER_CAMPAIGN', 'DEAL']);
 export const SPECIAL_PROMOTION_TYPES = new Set(['SMART', 'LIGHTNING']);
@@ -109,7 +111,7 @@ export function buildSubmitPayloadPreview({ promotion, row, action }) {
   const payload = {
     promotion_id: promotionId,
     promotion_type: promotionType,
-    deal_price: row.deal_price
+    deal_price: normalizeDealPriceForPayload(row.deal_price, row.item || {})
   };
   const topDealPrice = topDealPriceFromRow(row);
   if (topDealPrice !== null) payload.top_deal_price = topDealPrice;

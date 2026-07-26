@@ -1,7 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { writeJsonFileAtomicallySync } from './processInstanceLock.js';
 
-export function createPendingWriteQueue({ stateDir, now = () => new Date().toISOString() } = {}) {
+export function createPendingWriteQueue({
+  stateDir,
+  now = () => new Date().toISOString(),
+  currentPid = process.pid,
+  fsImpl = fs,
+  retryDelaysMs,
+  sleepSync,
+} = {}) {
   if (!stateDir) throw new Error('pending write queue stateDir is required');
 
   function statePath(jobId) {
@@ -10,17 +18,25 @@ export function createPendingWriteQueue({ stateDir, now = () => new Date().toISO
 
   function load(jobId) {
     const target = statePath(jobId);
-    if (!fs.existsSync(target)) return { version: 1, job_id: String(jobId), records: {} };
-    return JSON.parse(fs.readFileSync(target, 'utf8'));
+    try {
+      return JSON.parse(fsImpl.readFileSync(target, 'utf8'));
+    } catch (error) {
+      if (String(error?.code || '') === 'ENOENT') return { version: 1, job_id: String(jobId), records: {} };
+      throw error;
+    }
   }
 
   function persist(state) {
-    fs.mkdirSync(stateDir, { recursive: true });
     state.updated_at = now();
     const target = statePath(state.job_id);
-    const temporary = `${target}.${process.pid}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(state), 'utf8');
-    fs.renameSync(temporary, target);
+    writeJsonFileAtomicallySync({
+      target,
+      value: state,
+      currentPid,
+      fsImpl,
+      retryDelaysMs,
+      sleepSync,
+    });
     return state;
   }
 

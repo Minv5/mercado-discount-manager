@@ -1,6 +1,7 @@
 import { API_BASE_URL, APP_VERSION, DEFAULT_AUTH_DOMAIN } from './config.js';
 import { ApiError } from './errors.js';
 import { CANDIDATE_INCOMPLETE_CODE, MARKETPLACE_CANDIDATE_INCOMPLETE_CODE, candidateIncompleteMessage } from './candidateResolution.js';
+import { buildItemIdentitySummary } from './activityChangeCache.js';
 
 export const PARTIAL_SPARSE_MARKETPLACE_CANDIDATE = 'partial_api_sparse_marketplace_candidate';
 const REQUEST_TIMEOUT_MS = Math.max(5000, Number(process.env.ML_REQUEST_TIMEOUT_MS || 45000));
@@ -183,6 +184,36 @@ export class MercadoLibreClient {
     return this.request(path, this.marketplace ? { headers: { version: APP_VERSION }, signal, readKind: 'detail' } : { signal, readKind: 'detail' });
   }
 
+  async probePromotionItems({
+    promotionId,
+    promotionType,
+    status,
+    limit = 50,
+    signal = null,
+  }) {
+    const page = await this.getPromotionItems({
+      promotionId,
+      promotionType,
+      status,
+      limit,
+      offset: 0,
+      searchAfter: null,
+      signal,
+    });
+    const results = Array.isArray(page?.results) ? page.results : Array.isArray(page) ? page : [];
+    const total = Number(page?.paging?.total);
+    return {
+      platform_total: Number.isFinite(total) ? total : null,
+      first_page_item_ids: stableItemIds(results),
+      identity_summary: null,
+      identity_summary_complete: false,
+      probe_scope: 'first_page_only',
+      results_type: Array.isArray(page?.results) ? 'array' : page?.results === null ? 'null' : typeof page?.results,
+      has_search_after: Boolean(page?.paging?.searchAfter || page?.paging?.search_after || page?.searchAfter || page?.search_after),
+      page,
+    };
+  }
+
   async searchMarketplaceUserItems({ userId = this.userId, status = null, limit = 50, scrollId = null, searchType = 'scan', signal = null } = {}) {
     const path = new URL(`/marketplace/users/${encodeURIComponent(userId)}/items/search`, this.apiBaseUrl);
     path.searchParams.set('limit', String(clampLimit(limit)));
@@ -190,6 +221,29 @@ export class MercadoLibreClient {
     if (status && status !== 'all') path.searchParams.set('status', status);
     if (scrollId) path.searchParams.set('scroll_id', String(scrollId));
     return this.request(path, { headers: { version: APP_VERSION }, signal, readKind: 'detail' });
+  }
+
+  async probeMarketplaceUserItems({
+    userId = this.userId,
+    status = 'all',
+    limit = 50,
+    signal = null,
+  } = {}) {
+    const page = await this.searchMarketplaceUserItems({
+      userId,
+      status,
+      limit,
+      scrollId: null,
+      searchType: 'scan',
+      signal,
+    });
+    const results = Array.isArray(page?.results) ? page.results : [];
+    const total = Number(page?.paging?.total);
+    return {
+      platform_total: Number.isFinite(total) ? total : null,
+      first_page_item_ids: stableItemIds(results),
+      page,
+    };
   }
 
   async scanMarketplaceUserItems({ userId = this.userId, status = 'active', limit = 50, maxItems = 'all', maxPages = 500, signal = null } = {}) {
@@ -201,10 +255,12 @@ export class MercadoLibreClient {
     let pagesRead = 0;
     let duplicateCount = 0;
     let stopReason = null;
+    let firstPageItemIds = null;
     while (ids.length < maxToCollect && pagesRead < maxPages) {
       const data = await this.searchMarketplaceUserItems({ userId, status, limit, scrollId, searchType: 'scan', signal });
       pagesRead += 1;
       const results = Array.isArray(data?.results) ? data.results : [];
+      if (firstPageItemIds === null) firstPageItemIds = stableItemIds(results);
       total = data?.paging?.total ?? total;
       for (const id of results) {
         const key = String(id);
@@ -241,7 +297,8 @@ export class MercadoLibreClient {
         pages_read: pagesRead,
         duplicate_count: duplicateCount,
         stop_reason: stopReason,
-        requested_max_items: Number.isFinite(maxToCollect) ? maxToCollect : 'all'
+        requested_max_items: Number.isFinite(maxToCollect) ? maxToCollect : 'all',
+        inventory_first_page_item_ids: firstPageItemIds || [],
       }
     };
   }
@@ -280,6 +337,7 @@ export class MercadoLibreClient {
     maxPages = 500,
     maxConsecutiveEmptyPages = 25,
     maxTotalEmptyPages = 120,
+    initialPage = null,
     signal = null,
   }) {
     const pageLimit = clampPromotionItemLimit(limit, promotionType);
@@ -299,7 +357,9 @@ export class MercadoLibreClient {
     let lastSearchAfter = null;
     let stopReason = null;
     while (collected.length < maxToCollect && pagesRead < maxPages) {
-      const data = await this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset, searchAfter, signal });
+      const data = pagesRead === 0 && initialPage
+        ? initialPage
+        : await this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset, searchAfter, signal });
       pagesRead += 1;
       const resultValue = data?.results;
       const results = Array.isArray(resultValue) ? resultValue : Array.isArray(data) ? data : [];
@@ -332,7 +392,8 @@ export class MercadoLibreClient {
           keys: data && typeof data === 'object' ? Object.keys(data) : [],
           hasResultsKey: Boolean(data && Object.hasOwn(data, 'results')),
           resultsType: Array.isArray(resultValue) ? 'array' : resultValue === null ? 'null' : typeof resultValue,
-          paging: data?.paging ? { total: data.paging.total, limit: data.paging.limit, offset: data.paging.offset, hasSearchAfter: Boolean(data.paging.searchAfter || data.paging.search_after) } : null
+          paging: data?.paging ? { total: data.paging.total, limit: data.paging.limit, offset: data.paging.offset, hasSearchAfter: Boolean(data.paging.searchAfter || data.paging.search_after) } : null,
+          first_page_item_ids: stableItemIds(results),
         };
       }
       const marketplaceCandidate = this.marketplace && status === 'candidate';
@@ -419,7 +480,8 @@ export class MercadoLibreClient {
         stop_reason: stopReason,
         requested_max_items: Number.isFinite(maxToCollect) ? maxToCollect : 'all',
         is_full_fetch: full,
-        sample_only: detailStatus === 'partial' || detailStatus === PARTIAL_SPARSE_MARKETPLACE_CANDIDATE
+        sample_only: detailStatus === 'partial' || detailStatus === PARTIAL_SPARSE_MARKETPLACE_CANDIDATE,
+        identity_summary: buildItemIdentitySummary(collected, { complete: full }),
       }
     };
   }
@@ -672,6 +734,14 @@ function clampPromotionItemLimit(limit, promotionType) {
   return String(promotionType || '').toUpperCase() === 'SMART'
     ? Math.min(49, safeLimit)
     : safeLimit;
+}
+
+function stableItemIds(rows = []) {
+  return [...new Set((Array.isArray(rows) ? rows : [])
+    .map((row) => typeof row === 'string' ? row : row?.item_id || row?.id)
+    .map((value) => String(value || '').trim())
+    .filter(Boolean))]
+    .sort();
 }
 
 function sparsePartialWarning({ saved, total, emptyPageCount, pagesRead }) {

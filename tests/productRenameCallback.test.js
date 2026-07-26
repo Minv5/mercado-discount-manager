@@ -34,7 +34,7 @@ test('activity callback is disabled by default and cannot dirty cache', async ()
   assert.equal(marked.length, 0);
 });
 
-test('activity callback verifies signature, is idempotent and marks only the target with continuity evidence', async () => {
+test('legacy activity callback v1 is rejected because it cannot identify the child route', async () => {
   const secret = 'local-forwarder-secret';
   const saved = new Set();
   const marked = [];
@@ -45,16 +45,15 @@ test('activity callback verifies signature, is idempotent and marks only the tar
     getCacheState: () => ({ event_cursor: '9' }),
     markDirty: (row) => marked.push(row),
   });
-  await assert.rejects(() => adapter.accept(EVENT, 'bad'), /签名/);
   const signature = signActivityCallbackEvent(EVENT, secret);
-  const first = await adapter.accept(EVENT, signature);
-  const duplicate = await adapter.accept(EVENT, signature);
-  assert.equal(first.status, 'accepted');
-  assert.equal(first.gap, true);
-  assert.equal(duplicate.status, 'duplicate');
-  assert.deepEqual(marked, [{
-    accountId: 'A1', siteId: 'MLM', promotionId: 'P-1', promotionType: 'DEAL', eventCursor: '11', gap: true,
-  }]);
+  await assert.rejects(
+    () => adapter.accept(EVENT, signature),
+    (error) => error?.status === 400
+      && error?.code === 'ACTIVITY_CALLBACK_UNSUPPORTED_VERSION'
+      && error?.audit_reason === 'unsupported_version',
+  );
+  assert.equal(saved.size, 0);
+  assert.deepEqual(marked, []);
 });
 
 test('visible product name changes while internal compatibility identity remains stable', () => {

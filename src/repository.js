@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+
 import { all, get, nowIso, run, transaction } from './db.js';
 import { decryptSecret, encryptSecret } from './security.js';
 import { filterPromotions, normalizeItem, normalizePromotion, promotionKey, summarizeSites } from './planner.js';
@@ -7,6 +9,9 @@ import { RESULT_CONTRACT_VERSION, summarizeResultContractRows } from './executio
 
 const TASK_SUMMARY_CANONICAL_LIMIT = 300;
 const HISTORY_SUMMARY_SCHEMA_VERSION = 1;
+const DEFAULT_OAUTH_STATE_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_OAUTH_CLAIM_LEASE_MS = 5 * 60 * 1000;
+const DAILY_ITEM_SNAPSHOT_RETENTION_DAYS = 90;
 
 function cloneJson(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -26,9 +31,26 @@ function taskSummaryStamp() {
 
 export function saveOAuthState(stateRecord) {
   run(
-    `INSERT OR REPLACE INTO oauth_states
-      (state, client_id, client_secret_cipher, redirect_uri, auth_domain, code_verifier, code_challenge, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO oauth_states
+      (state, client_id, client_secret_cipher, redirect_uri, auth_domain,
+       code_verifier, code_challenge, created_at, processing_state,
+       claim_token, claimed_at, claim_expires_at, consumed_at, last_error_code, attempt_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, 0)
+     ON CONFLICT(state) DO UPDATE SET
+       client_id = excluded.client_id,
+       client_secret_cipher = excluded.client_secret_cipher,
+       redirect_uri = excluded.redirect_uri,
+       auth_domain = excluded.auth_domain,
+       code_verifier = excluded.code_verifier,
+       code_challenge = excluded.code_challenge,
+       created_at = excluded.created_at,
+       processing_state = 'pending',
+       claim_token = NULL,
+       claimed_at = NULL,
+       claim_expires_at = NULL,
+       consumed_at = NULL,
+       last_error_code = NULL,
+       attempt_count = 0`,
     [
       stateRecord.state,
       stateRecord.clientId,
@@ -37,23 +59,249 @@ export function saveOAuthState(stateRecord) {
       stateRecord.authDomain,
       stateRecord.codeVerifier,
       stateRecord.codeChallenge,
-      nowIso()
+      stateRecord.createdAt || nowIso()
     ]
   );
 }
 
-export function consumeOAuthState(state) {
-  const row = get('SELECT * FROM oauth_states WHERE state = ?', [state]);
+function oauthStateRecord(row) {
   if (!row) return null;
-  run('DELETE FROM oauth_states WHERE state = ?', [state]);
   return {
     state: row.state,
     clientId: row.client_id,
     clientSecret: decryptSecret(row.client_secret_cipher),
     redirectUri: row.redirect_uri,
     authDomain: row.auth_domain,
-    codeVerifier: row.code_verifier
+    codeVerifier: row.code_verifier,
+    createdAt: row.created_at,
   };
+}
+
+function normalizedDate(value = new Date()) {
+  const result = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (!Number.isFinite(result.getTime())) throw new Error('时间参数无效。');
+  return result;
+}
+
+function oauthStateLifecycle(row, { now, maxAgeMs }) {
+  if (!row) return 'missing';
+  if (String(row.processing_state || '') === 'consumed') return 'consumed';
+  if (String(row.processing_state || '') === 'expired') return 'expired';
+  const createdAt = Date.parse(String(row.created_at || ''));
+  if (!Number.isFinite(createdAt)
+    || now.getTime() - createdAt > Math.max(1, Number(maxAgeMs) || DEFAULT_OAUTH_STATE_TTL_MS)) {
+    return 'expired';
+  }
+  return String(row.processing_state || 'pending');
+}
+
+export function peekOAuthState(state, {
+  maxAgeMs = DEFAULT_OAUTH_STATE_TTL_MS,
+  now = new Date(),
+} = {}) {
+  const nowDate = normalizedDate(now);
+  const row = get('SELECT * FROM oauth_states WHERE state = ?', [String(state || '')]);
+  const status = oauthStateLifecycle(row, { now: nowDate, maxAgeMs });
+  return {
+    status,
+    state: String(state || ''),
+    record: ['pending', 'processing'].includes(status) ? oauthStateRecord(row) : null,
+    claim_expires_at: row?.claim_expires_at || null,
+  };
+}
+
+export function claimOAuthState(state, {
+  maxAgeMs = DEFAULT_OAUTH_STATE_TTL_MS,
+  leaseMs = DEFAULT_OAUTH_CLAIM_LEASE_MS,
+  now = new Date(),
+} = {}) {
+  const normalizedState = String(state || '');
+  const nowDate = normalizedDate(now);
+  const claimedAt = nowDate.toISOString();
+  const claimExpiresAt = new Date(
+    nowDate.getTime() + Math.max(1_000, Number(leaseMs) || DEFAULT_OAUTH_CLAIM_LEASE_MS),
+  ).toISOString();
+  const claimToken = crypto.randomUUID();
+  return transaction((database) => {
+    const row = database.prepare('SELECT * FROM oauth_states WHERE state = ?').get(normalizedState);
+    const lifecycle = oauthStateLifecycle(row, { now: nowDate, maxAgeMs });
+    if (lifecycle === 'missing') {
+      return { status: 'missing', state: normalizedState, claim_token: null, record: null };
+    }
+    if (lifecycle === 'consumed') {
+      return { status: 'consumed', state: normalizedState, claim_token: null, record: null };
+    }
+    if (lifecycle === 'expired') {
+      database.prepare(
+        `UPDATE oauth_states
+         SET processing_state = 'expired',
+             claim_token = NULL,
+             claimed_at = NULL,
+             claim_expires_at = NULL
+         WHERE state = ? AND processing_state <> 'consumed'`,
+      ).run(normalizedState);
+      return { status: 'expired', state: normalizedState, claim_token: null, record: null };
+    }
+    if (lifecycle === 'processing'
+      && Date.parse(String(row.claim_expires_at || '')) > nowDate.getTime()) {
+      return {
+        status: 'in_progress',
+        state: normalizedState,
+        claim_token: null,
+        record: null,
+        claim_expires_at: row.claim_expires_at,
+      };
+    }
+    const result = database.prepare(
+      `UPDATE oauth_states
+       SET processing_state = 'processing',
+           claim_token = ?,
+           claimed_at = ?,
+           claim_expires_at = ?,
+           consumed_at = NULL,
+           last_error_code = NULL,
+           attempt_count = COALESCE(attempt_count, 0) + 1
+       WHERE state = ? AND processing_state <> 'consumed'`,
+    ).run(claimToken, claimedAt, claimExpiresAt, normalizedState);
+    if (Number(result.changes || 0) !== 1) {
+      return { status: 'consumed', state: normalizedState, claim_token: null, record: null };
+    }
+    return {
+      status: 'claimed',
+      state: normalizedState,
+      claim_token: claimToken,
+      claim_expires_at: claimExpiresAt,
+      record: oauthStateRecord(row),
+    };
+  });
+}
+
+export function renewOAuthStateClaim({
+  state,
+  claimToken,
+  leaseMs = DEFAULT_OAUTH_CLAIM_LEASE_MS,
+  maxAgeMs = DEFAULT_OAUTH_STATE_TTL_MS,
+  now = new Date(),
+} = {}) {
+  const normalizedState = String(state || '');
+  const normalizedClaimToken = String(claimToken || '');
+  const nowDate = normalizedDate(now);
+  const nowText = nowDate.toISOString();
+  const claimExpiresAt = new Date(
+    nowDate.getTime() + Math.max(1_000, Number(leaseMs) || DEFAULT_OAUTH_CLAIM_LEASE_MS),
+  ).toISOString();
+  return transaction((database) => {
+    const row = database.prepare('SELECT * FROM oauth_states WHERE state = ?').get(normalizedState);
+    const lifecycle = oauthStateLifecycle(row, { now: nowDate, maxAgeMs });
+    if (lifecycle === 'missing') {
+      return { status: 'missing', state: normalizedState, claim_token: null };
+    }
+    if (lifecycle === 'consumed') {
+      return { status: 'consumed', state: normalizedState, claim_token: null };
+    }
+    if (lifecycle === 'expired') {
+      database.prepare(
+        `UPDATE oauth_states
+         SET processing_state = 'expired',
+             claim_token = NULL,
+             claimed_at = NULL,
+             claim_expires_at = NULL
+         WHERE state = ? AND processing_state <> 'consumed'`,
+      ).run(normalizedState);
+      return { status: 'expired', state: normalizedState, claim_token: null };
+    }
+    if (String(row.processing_state || '') !== 'processing'
+      || String(row.claim_token || '') !== normalizedClaimToken) {
+      return { status: 'claim_mismatch', state: normalizedState, claim_token: null };
+    }
+    if (Date.parse(String(row.claim_expires_at || '')) <= nowDate.getTime()) {
+      return { status: 'claim_expired', state: normalizedState, claim_token: null };
+    }
+    const renewed = database.prepare(
+      `UPDATE oauth_states
+       SET claim_expires_at = ?
+       WHERE state = ?
+         AND processing_state = 'processing'
+         AND claim_token = ?
+         AND claim_expires_at > ?`,
+    ).run(claimExpiresAt, normalizedState, normalizedClaimToken, nowText);
+    if (Number(renewed.changes || 0) !== 1) {
+      return { status: 'claim_mismatch', state: normalizedState, claim_token: null };
+    }
+    return {
+      status: 'renewed',
+      state: normalizedState,
+      claim_token: normalizedClaimToken,
+      claim_expires_at: claimExpiresAt,
+    };
+  });
+}
+
+export function releaseOAuthStateClaim({
+  state,
+  claimToken,
+  errorCode = 'TOKEN_EXCHANGE_FAILED',
+  now = new Date(),
+} = {}) {
+  const releasedAt = normalizedDate(now).toISOString();
+  return transaction((database) => {
+    const result = database.prepare(
+      `UPDATE oauth_states
+       SET processing_state = 'pending',
+           claim_token = NULL,
+           claimed_at = NULL,
+           claim_expires_at = NULL,
+           last_error_code = ?
+       WHERE state = ? AND processing_state = 'processing' AND claim_token = ?`,
+    ).run(
+      String(errorCode || 'TOKEN_EXCHANGE_FAILED').replace(/[^A-Z0-9_.-]+/gi, '_').slice(0, 100),
+      String(state || ''),
+      String(claimToken || ''),
+    );
+    return {
+      status: Number(result.changes || 0) === 1 ? 'released' : 'claim_mismatch',
+      state: String(state || ''),
+      claim_token: null,
+      released_at: releasedAt,
+    };
+  });
+}
+
+export function consumeClaimedOAuthState({
+  state,
+  claimToken,
+  now = new Date(),
+} = {}) {
+  const consumedAt = normalizedDate(now).toISOString();
+  return transaction((database) => {
+    const row = database.prepare('SELECT * FROM oauth_states WHERE state = ?').get(String(state || ''));
+    if (!row) return { status: 'missing', state: String(state || ''), record: null };
+    if (String(row.processing_state || '') === 'consumed') {
+      return { status: 'consumed', state: String(state || ''), record: null };
+    }
+    const result = database.prepare(
+      `UPDATE oauth_states
+       SET processing_state = 'consumed',
+           claim_token = NULL,
+           claimed_at = NULL,
+           claim_expires_at = NULL,
+           consumed_at = ?,
+           last_error_code = NULL
+       WHERE state = ? AND processing_state = 'processing' AND claim_token = ?`,
+    ).run(consumedAt, String(state || ''), String(claimToken || ''));
+    if (Number(result.changes || 0) !== 1) {
+      return { status: 'claim_mismatch', state: String(state || ''), record: null };
+    }
+    return { status: 'consumed', state: String(state || ''), record: oauthStateRecord(row) };
+  });
+}
+
+/** @deprecated Server integration uses atomic token persistence and state consumption. */
+export function consumeOAuthState(state) {
+  const claim = claimOAuthState(state);
+  if (claim.status !== 'claimed') return null;
+  const consumed = consumeClaimedOAuthState({ state, claimToken: claim.claim_token });
+  return consumed.status === 'consumed' ? consumed.record : null;
 }
 
 export function listPendingOAuthStates({ maxAgeMs = 15 * 60 * 1000 } = {}) {
@@ -71,11 +319,260 @@ export function clearOAuthStates() {
   run('DELETE FROM oauth_states');
 }
 
-export function saveTokenAccount({ token, profile, clientId, clientSecret, redirectUri, authDomain }) {
-  const now = nowIso();
+function normalizedBusinessDate(value) {
+  const text = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) throw new Error('业务日期必须使用 YYYY-MM-DD。');
+  const parsed = new Date(`${text}T00:00:00.000Z`);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== text) {
+    throw new Error('业务日期无效。');
+  }
+  return text;
+}
+
+function previousBusinessDate(value) {
+  const current = new Date(`${normalizedBusinessDate(value)}T00:00:00.000Z`);
+  current.setUTCDate(current.getUTCDate() - 1);
+  return current.toISOString().slice(0, 10);
+}
+
+function normalizedDailySnapshotIdentity(input = {}) {
+  const identity = {
+    businessDate: normalizedBusinessDate(input.businessDate ?? input.business_date),
+    accountId: String(input.accountId ?? input.account_id ?? '').trim(),
+    childUserId: String(input.childUserId ?? input.child_user_id ?? '').trim(),
+    siteId: String(input.siteId ?? input.site_id ?? '').trim().toUpperCase(),
+  };
+  if (!identity.accountId || !identity.childUserId || !identity.siteId) {
+    throw new Error('每日商品身份快照必须包含账号、子账号和站点。');
+  }
+  return identity;
+}
+
+function normalizedItemIds(itemIds = []) {
+  if (!Array.isArray(itemIds)) throw new Error('商品身份集合必须是数组。');
+  return [...new Set(itemIds.map((itemId) => String(itemId || '').trim()).filter(Boolean))].sort();
+}
+
+function publicDailyItemIdentitySnapshot(row) {
+  if (!row) return null;
+  let itemIds = [];
+  let parseError = false;
+  try {
+    const parsed = JSON.parse(String(row.item_ids_json || '[]'));
+    itemIds = normalizedItemIds(parsed);
+  } catch {
+    parseError = true;
+  }
+  const storedCount = Number(row.item_count || 0);
+  const storedHash = String(row.item_ids_hash || '');
+  const actualHash = crypto.createHash('sha256').update(JSON.stringify(itemIds)).digest('hex').toUpperCase();
+  const identityValid = !parseError && storedCount === itemIds.length && storedHash === actualHash;
+  return {
+    business_date: String(row.business_date),
+    account_id: String(row.account_id),
+    child_user_id: String(row.child_user_id),
+    site_id: String(row.site_id),
+    complete: Boolean(row.complete) && identityValid,
+    item_count: itemIds.length,
+    item_ids_hash: actualHash,
+    item_ids: itemIds,
+    source: row.source || '',
+    captured_at: row.captured_at,
+    updated_at: row.updated_at,
+    integrity_status: identityValid ? 'ok' : 'invalid',
+  };
+}
+
+export function saveDailyItemIdentitySnapshot({
+  businessDate,
+  business_date,
+  accountId,
+  account_id,
+  childUserId,
+  child_user_id,
+  siteId,
+  site_id,
+  itemIds = [],
+  item_ids,
+  complete = false,
+  source = '',
+  capturedAt,
+  captured_at,
+} = {}) {
+  const identity = normalizedDailySnapshotIdentity({
+    businessDate: businessDate ?? business_date,
+    accountId: accountId ?? account_id,
+    childUserId: childUserId ?? child_user_id,
+    siteId: siteId ?? site_id,
+  });
+  const ids = normalizedItemIds(item_ids ?? itemIds);
+  const itemIdsJson = JSON.stringify(ids);
+  const itemIdsHash = crypto.createHash('sha256').update(itemIdsJson).digest('hex').toUpperCase();
+  const timestamp = normalizedDate(capturedAt ?? captured_at ?? new Date()).toISOString();
+  return transaction((database) => {
+    database.prepare(
+      `INSERT INTO daily_item_identity_snapshots
+        (business_date, account_id, child_user_id, site_id, complete, item_count,
+         item_ids_hash, item_ids_json, source, captured_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(business_date, account_id, child_user_id, site_id) DO UPDATE SET
+         complete = excluded.complete,
+         item_count = excluded.item_count,
+         item_ids_hash = excluded.item_ids_hash,
+         item_ids_json = excluded.item_ids_json,
+         source = excluded.source,
+         captured_at = excluded.captured_at,
+         updated_at = excluded.updated_at`,
+    ).run(
+      identity.businessDate,
+      identity.accountId,
+      identity.childUserId,
+      identity.siteId,
+      Number(Boolean(complete)),
+      ids.length,
+      itemIdsHash,
+      itemIdsJson,
+      String(source || ''),
+      timestamp,
+      nowIso(),
+    );
+    const latest = database.prepare(
+      'SELECT MAX(business_date) AS business_date FROM daily_item_identity_snapshots',
+    ).get()?.business_date;
+    if (latest) {
+      const cutoff = new Date(`${normalizedBusinessDate(latest)}T00:00:00.000Z`);
+      cutoff.setUTCDate(cutoff.getUTCDate() - (DAILY_ITEM_SNAPSHOT_RETENTION_DAYS - 1));
+      database.prepare(
+        'DELETE FROM daily_item_identity_snapshots WHERE business_date < ?',
+      ).run(cutoff.toISOString().slice(0, 10));
+    }
+    const row = database.prepare(
+      `SELECT *
+       FROM daily_item_identity_snapshots
+       WHERE business_date = ? AND account_id = ? AND child_user_id = ? AND site_id = ?`,
+    ).get(identity.businessDate, identity.accountId, identity.childUserId, identity.siteId);
+    return publicDailyItemIdentitySnapshot(row);
+  });
+}
+
+export function getDailyItemIdentitySnapshot(input = {}) {
+  const identity = normalizedDailySnapshotIdentity(input);
+  const row = get(
+    `SELECT *
+     FROM daily_item_identity_snapshots
+     WHERE business_date = ? AND account_id = ? AND child_user_id = ? AND site_id = ?`,
+    [identity.businessDate, identity.accountId, identity.childUserId, identity.siteId],
+  );
+  return publicDailyItemIdentitySnapshot(row);
+}
+
+function insufficientDailyDelta(identity, baselineDate, reason) {
+  return {
+    status: 'insufficient',
+    baseline_date: baselineDate,
+    current_date: identity.businessDate,
+    account_id: identity.accountId,
+    child_user_id: identity.childUserId,
+    site_id: identity.siteId,
+    added_count: null,
+    removed_count: null,
+    added_item_ids: [],
+    removed_item_ids: [],
+    reason,
+  };
+}
+
+export function getDailyItemIdentityDelta(input = {}) {
+  const identity = normalizedDailySnapshotIdentity(input);
+  const baselineDate = previousBusinessDate(identity.businessDate);
+  const current = getDailyItemIdentitySnapshot(identity);
+  if (!current) return insufficientDailyDelta(identity, baselineDate, 'current_snapshot_missing');
+  if (current.integrity_status !== 'ok') {
+    return insufficientDailyDelta(identity, baselineDate, 'current_snapshot_invalid');
+  }
+  if (!current.complete) return insufficientDailyDelta(identity, baselineDate, 'current_snapshot_incomplete');
+  const baseline = getDailyItemIdentitySnapshot({ ...identity, businessDate: baselineDate });
+  if (!baseline) return insufficientDailyDelta(identity, baselineDate, 'baseline_snapshot_missing');
+  if (baseline.integrity_status !== 'ok') {
+    return insufficientDailyDelta(identity, baselineDate, 'baseline_snapshot_invalid');
+  }
+  if (!baseline.complete) return insufficientDailyDelta(identity, baselineDate, 'baseline_snapshot_incomplete');
+
+  const currentIds = new Set(current.item_ids);
+  const baselineIds = new Set(baseline.item_ids);
+  const addedItemIds = current.item_ids.filter((itemId) => !baselineIds.has(itemId));
+  const removedItemIds = baseline.item_ids.filter((itemId) => !currentIds.has(itemId));
+  return {
+    status: 'ready',
+    baseline_date: baselineDate,
+    current_date: identity.businessDate,
+    account_id: identity.accountId,
+    child_user_id: identity.childUserId,
+    site_id: identity.siteId,
+    added_count: addedItemIds.length,
+    removed_count: removedItemIds.length,
+    added_item_ids: addedItemIds,
+    removed_item_ids: removedItemIds,
+    reason: '',
+  };
+}
+
+export function summarizeDailyItemIdentityDeltas({
+  businessDate,
+  business_date,
+  routes = [],
+} = {}) {
+  const currentDate = normalizedBusinessDate(businessDate ?? business_date);
+  const baselineDate = previousBusinessDate(currentDate);
+  const routeDeltas = routes.map((route) => getDailyItemIdentityDelta({
+    ...route,
+    businessDate: currentDate,
+  }));
+  const ready = routeDeltas.filter((row) => row.status === 'ready');
+  const insufficient = routeDeltas.filter((row) => row.status !== 'ready');
+  return {
+    status: routeDeltas.length > 0 && insufficient.length === 0 ? 'ready' : 'insufficient',
+    baseline_date: baselineDate,
+    current_date: currentDate,
+    added_count: insufficient.length === 0
+      ? ready.reduce((sum, row) => sum + row.added_count, 0)
+      : null,
+    removed_count: insufficient.length === 0
+      ? ready.reduce((sum, row) => sum + row.removed_count, 0)
+      : null,
+    route_count: routeDeltas.length,
+    ready_route_count: ready.length,
+    insufficient_route_count: insufficient.length,
+    reason: routeDeltas.length === 0
+      ? 'no_routes'
+      : insufficient.map((row) => row.reason).filter(Boolean).join(','),
+  };
+}
+
+function accountRecordFromDatabase(database, accountId) {
+  return database.prepare(
+    `SELECT id, provider, account_id, display_name, site_id, scopes, token_type,
+            expires_at, created_at, updated_at
+     FROM oauth_tokens WHERE account_id = ?`,
+  ).get(String(accountId)) || null;
+}
+
+function upsertTokenAccount(database, {
+  token,
+  profile,
+  clientId,
+  clientSecret,
+  redirectUri,
+  authDomain,
+  now = new Date(),
+}) {
+  const nowDate = normalizedDate(now);
+  const nowText = nowDate.toISOString();
   const accountId = String(token.user_id || profile.id);
-  const expiresAt = token.expires_in ? new Date(Date.now() + Number(token.expires_in) * 1000).toISOString() : null;
-  run(
+  const expiresAt = token.expires_in
+    ? new Date(nowDate.getTime() + Number(token.expires_in) * 1000).toISOString()
+    : null;
+  database.prepare(
     `INSERT INTO oauth_tokens
       (provider, account_id, display_name, site_id, scopes, access_token_cipher, refresh_token_cipher, token_type, expires_at,
        raw_json, client_id, client_secret_cipher, redirect_uri, auth_domain, created_at, updated_at)
@@ -94,25 +591,125 @@ export function saveTokenAccount({ token, profile, clientId, clientSecret, redir
         redirect_uri = excluded.redirect_uri,
         auth_domain = excluded.auth_domain,
         updated_at = excluded.updated_at`,
-    [
-      accountId,
-      profile.nickname || profile.first_name || accountId,
-      profile.site_id || null,
-      token.scope || null,
-      encryptSecret(token.access_token),
-      encryptSecret(token.refresh_token),
-      token.token_type || null,
-      expiresAt,
-      JSON.stringify({ token: redactToken(token), profile }),
+  ).run(
+    accountId,
+    profile.nickname || profile.first_name || accountId,
+    profile.site_id || null,
+    token.scope || null,
+    encryptSecret(token.access_token),
+    encryptSecret(token.refresh_token),
+    token.token_type || null,
+    expiresAt,
+    JSON.stringify({ token: redactToken(token), profile }),
+    clientId,
+    encryptSecret(clientSecret),
+    redirectUri,
+    authDomain,
+    nowText,
+    nowText,
+  );
+  return accountRecordFromDatabase(database, accountId);
+}
+
+export function saveTokenAccount({ token, profile, clientId, clientSecret, redirectUri, authDomain }) {
+  return transaction((database) => upsertTokenAccount(database, {
+    token,
+    profile,
+    clientId,
+    clientSecret,
+    redirectUri,
+    authDomain,
+  }));
+}
+
+export function saveTokenAccountAndConsumeOAuthState({
+  state,
+  claimToken,
+  token,
+  profile,
+  clientId,
+  clientSecret,
+  redirectUri,
+  authDomain,
+  now = new Date(),
+  maxAgeMs = DEFAULT_OAUTH_STATE_TTL_MS,
+} = {}) {
+  const normalizedState = String(state || '');
+  const normalizedClaimToken = String(claimToken || '');
+  const nowDate = normalizedDate(now);
+  const consumedAt = nowDate.toISOString();
+  return transaction((database) => {
+    const oauth = database.prepare(
+      `SELECT processing_state, claim_token, created_at, claim_expires_at
+       FROM oauth_states WHERE state = ?`,
+    ).get(normalizedState);
+    if (!oauth) return { status: 'missing', state: normalizedState, account: null };
+    if (String(oauth.processing_state || '') === 'consumed') {
+      const accountId = String(token?.user_id || profile?.id || '');
+      return {
+        status: 'consumed',
+        state: normalizedState,
+        account: accountId ? accountRecordFromDatabase(database, accountId) : null,
+      };
+    }
+    const lifecycle = oauthStateLifecycle(oauth, {
+      now: nowDate,
+      maxAgeMs,
+    });
+    if (lifecycle === 'expired') {
+      database.prepare(
+        `UPDATE oauth_states
+         SET processing_state = 'expired',
+             claim_token = NULL,
+             claimed_at = NULL,
+             claim_expires_at = NULL
+         WHERE state = ? AND processing_state <> 'consumed'`,
+      ).run(normalizedState);
+      return { status: 'expired', state: normalizedState, account: null };
+    }
+    if (String(oauth.processing_state || '') !== 'processing'
+      || String(oauth.claim_token || '') !== normalizedClaimToken) {
+      return { status: 'claim_mismatch', state: normalizedState, account: null };
+    }
+    if (Date.parse(String(oauth.claim_expires_at || '')) <= nowDate.getTime()) {
+      database.prepare(
+        `UPDATE oauth_states
+         SET processing_state = 'pending',
+             claim_token = NULL,
+             claimed_at = NULL,
+             claim_expires_at = NULL,
+             last_error_code = 'OAUTH_STATE_CLAIM_EXPIRED'
+         WHERE state = ? AND processing_state = 'processing' AND claim_token = ?`,
+      ).run(normalizedState, normalizedClaimToken);
+      return { status: 'claim_expired', state: normalizedState, account: null };
+    }
+
+    const account = upsertTokenAccount(database, {
+      token,
+      profile,
       clientId,
-      encryptSecret(clientSecret),
+      clientSecret,
       redirectUri,
       authDomain,
       now,
-      now
-    ]
-  );
-  return getAccount(accountId);
+    });
+    const consumed = database.prepare(
+      `UPDATE oauth_states
+       SET processing_state = 'consumed',
+           claim_token = NULL,
+           claimed_at = NULL,
+           claim_expires_at = NULL,
+           consumed_at = ?,
+           last_error_code = NULL
+       WHERE state = ? AND processing_state = 'processing' AND claim_token = ?`,
+    ).run(consumedAt, normalizedState, normalizedClaimToken);
+    if (Number(consumed.changes || 0) !== 1) {
+      const error = new Error('OAuth状态认领已变化，token与状态均未保存。');
+      error.code = 'OAUTH_STATE_CLAIM_MISMATCH';
+      throw error;
+    }
+    return { status: 'consumed', state: normalizedState, account };
+  });
 }
 
 export function updateAccountToken(accountId, token) {
@@ -570,11 +1167,31 @@ export function invalidatePromotionItemFetchStates({ accountId, promotionId, pro
   );
 }
 
-export function getActivityCacheState(accountId, siteId = '', promotionId = '', promotionType = '') {
+function activityCacheIdentity(input, siteId = '', promotionId = '', promotionType = '') {
+  if (input && typeof input === 'object' && !Array.isArray(input)) {
+    return {
+      accountId: String(input.accountId ?? input.account_id ?? ''),
+      childUserId: String(input.childUserId ?? input.child_user_id ?? ''),
+      siteId: String(input.siteId ?? input.site_id ?? '').toUpperCase(),
+      promotionId: String(input.promotionId ?? input.promotion_id ?? ''),
+      promotionType: String(input.promotionType ?? input.promotion_type ?? '').toUpperCase(),
+    };
+  }
+  return {
+    accountId: String(input ?? ''),
+    childUserId: '',
+    siteId: String(siteId || '').toUpperCase(),
+    promotionId: String(promotionId || ''),
+    promotionType: String(promotionType || '').toUpperCase(),
+  };
+}
+
+export function getActivityCacheState(accountOrIdentity, siteId = '', promotionId = '', promotionType = '') {
+  const identity = activityCacheIdentity(accountOrIdentity, siteId, promotionId, promotionType);
   return get(
     `SELECT * FROM activity_cache_states
-     WHERE account_id = ? AND site_id = ? AND promotion_id = ? AND promotion_type = ?`,
-    [String(accountId), String(siteId || '').toUpperCase(), String(promotionId || ''), String(promotionType || '').toUpperCase()]
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND promotion_id = ? AND promotion_type = ?`,
+    [identity.accountId, identity.childUserId, identity.siteId, identity.promotionId, identity.promotionType]
   );
 }
 
@@ -595,8 +1212,16 @@ export function listPreparationReadStates(accountIds = []) {
   };
 }
 
-export function saveActivityCacheState({ accountId, siteId = '', promotionId = '', promotionType = '', ...changes }) {
-  const current = getActivityCacheState(accountId, siteId, promotionId, promotionType) || {};
+export function saveActivityCacheState({
+  accountId,
+  childUserId = '',
+  siteId = '',
+  promotionId = '',
+  promotionType = '',
+  ...changes
+}) {
+  const identity = activityCacheIdentity({ accountId, childUserId, siteId, promotionId, promotionType });
+  const current = getActivityCacheState(identity) || {};
   const row = {
     catalog_checked_at: changes.catalogCheckedAt ?? current.catalog_checked_at ?? null,
     items_full_checked_at: changes.itemsFullCheckedAt ?? current.items_full_checked_at ?? null,
@@ -608,10 +1233,10 @@ export function saveActivityCacheState({ accountId, siteId = '', promotionId = '
   };
   run(
     `INSERT INTO activity_cache_states
-      (account_id, site_id, promotion_id, promotion_type, catalog_checked_at, items_full_checked_at,
+      (account_id, child_user_id, site_id, promotion_id, promotion_type, catalog_checked_at, items_full_checked_at,
        dirty, expired, continuity, event_cursor, last_error, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(account_id, site_id, promotion_id, promotion_type) DO UPDATE SET
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(account_id, child_user_id, site_id, promotion_id, promotion_type) DO UPDATE SET
        catalog_checked_at = excluded.catalog_checked_at,
        items_full_checked_at = excluded.items_full_checked_at,
        dirty = excluded.dirty,
@@ -620,34 +1245,214 @@ export function saveActivityCacheState({ accountId, siteId = '', promotionId = '
        event_cursor = excluded.event_cursor,
        last_error = excluded.last_error,
        updated_at = excluded.updated_at`,
-    [String(accountId), String(siteId || '').toUpperCase(), String(promotionId || ''), String(promotionType || '').toUpperCase(),
+    [identity.accountId, identity.childUserId, identity.siteId, identity.promotionId, identity.promotionType,
       row.catalog_checked_at, row.items_full_checked_at, row.dirty, row.expired, row.continuity,
       row.event_cursor, row.last_error, nowIso()]
   );
-  return getActivityCacheState(accountId, siteId, promotionId, promotionType);
+  return getActivityCacheState(identity);
 }
 
-export function markActivityCacheDirty({ accountId, siteId = '', promotionId = '', promotionType = '', eventCursor = null, gap = false }) {
-  return saveActivityCacheState({
-    accountId, siteId, promotionId, promotionType, dirty: true,
+export function markActivityCacheDirty({
+  accountId,
+  childUserId = '',
+  siteId = '',
+  promotionId = '',
+  promotionType = '',
+  eventCursor = null,
+  gap = false,
+}, routeIdentity = {}) {
+  const route = {
+    accountId: accountId || routeIdentity.accountId || routeIdentity.account_id,
+    childUserId: childUserId || routeIdentity.childUserId || routeIdentity.child_user_id,
+    siteId: siteId || routeIdentity.siteId || routeIdentity.site_id,
+  };
+  const activityState = saveActivityCacheState({
+    ...route,
+    promotionId,
+    promotionType,
+    dirty: true,
     continuity: gap ? 'gap' : undefined, eventCursor, lastError: null,
   });
+  if (promotionId || promotionType) {
+    saveActivityCacheState({
+      ...route,
+      promotionId: '',
+      promotionType: '',
+      dirty: true,
+      continuity: gap ? 'gap' : undefined,
+      eventCursor,
+      lastError: null,
+    });
+  }
+  return activityState;
 }
 
 export function hasActivityCallbackEvent(eventId) {
-  return Boolean(get('SELECT 1 AS found FROM activity_callback_events WHERE event_id = ?', [String(eventId)]));
+  return Boolean(get(
+    `SELECT 1 AS found
+     FROM activity_callback_events
+     WHERE event_id = ? AND processing_state = 'completed'`,
+    [String(eventId)],
+  ));
+}
+
+export function getActivityCallbackEvent(eventId) {
+  return get('SELECT * FROM activity_callback_events WHERE event_id = ?', [String(eventId)]);
+}
+
+export function claimActivityCallbackEvent(event, {
+  leaseMs = 2 * 60 * 1000,
+  now = new Date(),
+} = {}) {
+  const eventId = String(event?.event_id || '').trim();
+  if (!eventId) throw new Error('活动通知缺少事件编号，无法原子认领。');
+  const nowDate = now instanceof Date ? now : new Date(now);
+  const claimedAt = nowDate.toISOString();
+  const claimExpiresAt = new Date(nowDate.getTime() + Math.max(1_000, Number(leaseMs) || 0)).toISOString();
+  const claimToken = crypto.randomUUID();
+  return transaction((database) => {
+    const existing = database.prepare(
+      'SELECT event_id, processing_state, claim_expires_at, attempt_count FROM activity_callback_events WHERE event_id = ?',
+    ).get(eventId);
+    if (existing?.processing_state === 'completed') {
+      return { status: 'duplicate', event_id: eventId, claim_token: null };
+    }
+    if (existing?.processing_state === 'processing'
+      && Date.parse(String(existing.claim_expires_at || '')) > nowDate.getTime()) {
+      return { status: 'in_progress', event_id: eventId, claim_token: null };
+    }
+
+    if (!existing) {
+      database.prepare(
+        `INSERT INTO activity_callback_events
+          (event_id, schema_version, account_id, site_id, promotion_id, promotion_type,
+           cursor, previous_cursor, gap, received_at, topic, resource, remote_user_id,
+           child_user_id, application_id, outcome, resource_status, raw_json,
+           processing_state, claim_token, claimed_at, claim_expires_at, completed_at,
+           last_error, attempt_count)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, ?, NULL, NULL, 1)`,
+      ).run(
+        eventId,
+        String(event.schema_version || ''),
+        String(event.account_id || ''),
+        String(event.site_id || '').toUpperCase(),
+        String(event.promotion_id || ''),
+        String(event.promotion_type || '').toUpperCase(),
+        event.cursor || null,
+        event.previous_cursor || null,
+        Number(Boolean(event.gap)),
+        event.received_at || claimedAt,
+        event.topic || null,
+        event.resource || null,
+        event.remote_user_id || null,
+        event.child_user_id || null,
+        event.application_id || null,
+        event.outcome || null,
+        event.resource_status || null,
+        event.raw_json || null,
+        claimToken,
+        claimedAt,
+        claimExpiresAt,
+      );
+    } else {
+      database.prepare(
+        `UPDATE activity_callback_events
+         SET processing_state = 'processing',
+             claim_token = ?,
+             claimed_at = ?,
+             claim_expires_at = ?,
+             completed_at = NULL,
+             last_error = NULL,
+             attempt_count = COALESCE(attempt_count, 0) + 1
+         WHERE event_id = ?`,
+      ).run(claimToken, claimedAt, claimExpiresAt, eventId);
+    }
+    return { status: 'claimed', event_id: eventId, claim_token: claimToken };
+  });
+}
+
+export function finalizeActivityCallbackEvent({
+  eventId,
+  claimToken,
+  status,
+  event = {},
+  error = '',
+  now = new Date(),
+} = {}) {
+  const normalizedStatus = status === 'failed' ? 'failed' : 'completed';
+  const completedAt = (now instanceof Date ? now : new Date(now)).toISOString();
+  const lastError = normalizedStatus === 'failed'
+    ? String(error || '活动通知处理失败。').replace(/[\r\n]+/g, ' ').slice(0, 500)
+    : null;
+  return transaction((database) => {
+    const result = database.prepare(
+      `UPDATE activity_callback_events
+       SET schema_version = COALESCE(NULLIF(?, ''), schema_version),
+           account_id = COALESCE(NULLIF(?, ''), account_id),
+           child_user_id = COALESCE(NULLIF(?, ''), child_user_id),
+           site_id = COALESCE(NULLIF(?, ''), site_id),
+           promotion_id = COALESCE(NULLIF(?, ''), promotion_id),
+           promotion_type = COALESCE(NULLIF(?, ''), promotion_type),
+           cursor = COALESCE(?, cursor),
+           previous_cursor = COALESCE(?, previous_cursor),
+           gap = ?,
+           received_at = COALESCE(NULLIF(?, ''), received_at),
+           topic = COALESCE(NULLIF(?, ''), topic),
+           resource = COALESCE(NULLIF(?, ''), resource),
+           remote_user_id = COALESCE(NULLIF(?, ''), remote_user_id),
+           application_id = COALESCE(NULLIF(?, ''), application_id),
+           outcome = COALESCE(NULLIF(?, ''), outcome),
+           resource_status = COALESCE(NULLIF(?, ''), resource_status),
+           raw_json = COALESCE(?, raw_json),
+           processing_state = ?,
+           claim_token = NULL,
+           claim_expires_at = NULL,
+           completed_at = ?,
+           last_error = ?
+       WHERE event_id = ? AND processing_state = 'processing' AND claim_token = ?`,
+    ).run(
+      String(event.schema_version || ''),
+      String(event.account_id || ''),
+      String(event.child_user_id || ''),
+      String(event.site_id || '').toUpperCase(),
+      String(event.promotion_id || ''),
+      String(event.promotion_type || '').toUpperCase(),
+      event.cursor || null,
+      event.previous_cursor || null,
+      Number(Boolean(event.gap)),
+      event.received_at || '',
+      event.topic || '',
+      event.resource || '',
+      event.remote_user_id || '',
+      event.application_id || '',
+      event.outcome || '',
+      event.resource_status || '',
+      event.raw_json || null,
+      normalizedStatus,
+      completedAt,
+      lastError,
+      String(eventId || ''),
+      String(claimToken || ''),
+    );
+    if (Number(result.changes || 0) !== 1) {
+      throw new Error('活动通知认领已失效，未写入处理结果。');
+    }
+    return database.prepare('SELECT * FROM activity_callback_events WHERE event_id = ?').get(String(eventId || ''));
+  });
 }
 
 export function saveActivityCallbackEvent(event) {
-  run(
+  return run(
     `INSERT OR IGNORE INTO activity_callback_events
       (event_id, schema_version, account_id, site_id, promotion_id, promotion_type, cursor, previous_cursor, gap, received_at,
-       topic, resource, remote_user_id, child_user_id, application_id, outcome, resource_status, raw_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       topic, resource, remote_user_id, child_user_id, application_id, outcome, resource_status, raw_json,
+       processing_state, completed_at, attempt_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, 1)`,
     [event.event_id, event.schema_version, event.account_id, event.site_id, event.promotion_id || '',
       event.promotion_type || '', event.cursor || null, event.previous_cursor || null, Number(Boolean(event.gap)), event.received_at || nowIso(),
       event.topic || null, event.resource || null, event.remote_user_id || null, event.child_user_id || null,
-      event.application_id || null, event.outcome || null, event.resource_status || null, event.raw_json || null]
+      event.application_id || null, event.outcome || null, event.resource_status || null, event.raw_json || null,
+      event.received_at || nowIso()]
   );
 }
 
@@ -665,6 +1470,7 @@ export function listVerifiedActivityCallbackPromotionMappings({
        AND account_id = ? AND child_user_id = ? AND site_id = ?
        AND promotion_id <> '' AND promotion_type = ?
        AND outcome = 'activity_dirty'
+       AND processing_state = 'completed'
      ORDER BY received_at DESC`,
     [String(accountId || ''), String(childUserId || ''), String(siteId || '').toUpperCase(), String(promotionType || '').toUpperCase()]
   );

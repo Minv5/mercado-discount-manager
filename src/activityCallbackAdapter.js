@@ -24,7 +24,7 @@ export function activityCallbackConfig(env = process.env) {
 }
 
 export function activityCallbackSigningText(input = {}) {
-  const event = normalizeEvent(input);
+  const event = normalizeEvent(input, { allowLegacySigning: true });
   if (event.schema_version === '2') {
     return [
       event.schema_version,
@@ -52,7 +52,16 @@ export function signActivityCallbackEvent(event, secret) {
   return crypto.createHmac('sha256', String(secret || '')).update(activityCallbackSigningText(event)).digest('hex');
 }
 
-export function createActivityCallbackAdapter({ config, hasEvent, saveEvent, getCacheState, markDirty, consumeEvent }) {
+export function createActivityCallbackAdapter({
+  config,
+  hasEvent,
+  saveEvent,
+  claimEvent,
+  finalizeEvent,
+  getCacheState,
+  markDirty,
+  consumeEvent,
+}) {
   const options = config || activityCallbackConfig();
   return {
     async accept(input, signature) {
@@ -64,37 +73,84 @@ export function createActivityCallbackAdapter({ config, hasEvent, saveEvent, get
         if (event.application_id !== options.applicationId) throw callbackError('活动变化回调的应用标识不匹配。', 403);
       }
       verifySignature(event, signature, options.secret);
-      if (await hasEvent(event.event_id)) return { accepted: true, status: 'duplicate', event_id: event.event_id };
-      if (event.schema_version === '2') {
-        if (typeof consumeEvent !== 'function') throw callbackError('活动变化回调消费器尚未就绪。', 503);
-        const outcome = await consumeEvent(event);
-        await saveEvent({
-          ...event,
-          ...outcome,
-          received_at: event.received_at || new Date().toISOString(),
-          raw_json: JSON.stringify({ event, outcome }),
-        });
-        return { accepted: true, status: 'accepted', event_id: event.event_id, outcome: outcome.outcome };
+      const atomic = typeof claimEvent === 'function' && typeof finalizeEvent === 'function';
+      if (atomic) {
+        const claim = await claimEvent(event);
+        if (claim?.status === 'duplicate') {
+          return { accepted: true, status: 'duplicate', event_id: event.event_id };
+        }
+        if (claim?.status === 'in_progress') {
+          return { accepted: true, status: 'in_progress', event_id: event.event_id };
+        }
+        if (claim?.status !== 'claimed' || !claim?.claim_token) {
+          throw callbackError('活动变化回调未取得原子处理权。', 503);
+        }
+        try {
+          const processed = await processActivityEvent({
+            event,
+            getCacheState,
+            markDirty,
+            consumeEvent,
+          });
+          await finalizeEvent({
+            eventId: event.event_id,
+            claimToken: claim.claim_token,
+            status: 'completed',
+            event: processed.persisted,
+          });
+          return processed.response;
+        } catch (error) {
+          try {
+            await finalizeEvent({
+              eventId: event.event_id,
+              claimToken: claim.claim_token,
+              status: 'failed',
+              event,
+              error: error?.message || String(error),
+            });
+          } catch {
+            // Preserve the processing error; an expired claim remains recoverable.
+          }
+          throw error;
+        }
       }
-      const current = await getCacheState(event.account_id, event.site_id, event.promotion_id, event.promotion_type);
-      const currentCursor = String(current?.event_cursor || '');
-      const gap = Boolean(event.previous_cursor && currentCursor && event.previous_cursor !== currentCursor);
-      await markDirty({
-        accountId: event.account_id,
-        siteId: event.site_id,
-        promotionId: event.promotion_id,
-        promotionType: event.promotion_type,
-        eventCursor: event.cursor || null,
-        gap,
+
+      if (await hasEvent(event.event_id)) return { accepted: true, status: 'duplicate', event_id: event.event_id };
+      const processed = await processActivityEvent({
+        event,
+        getCacheState,
+        markDirty,
+        consumeEvent,
       });
-      await saveEvent({ ...event, gap, received_at: new Date().toISOString() });
-      return { accepted: true, status: 'accepted', event_id: event.event_id, gap };
+      await saveEvent(processed.persisted);
+      return processed.response;
     },
   };
 }
 
-function normalizeEvent(input = {}) {
+async function processActivityEvent({ event, consumeEvent }) {
+  if (event.schema_version !== '2') throw unsupportedVersionError();
+  if (typeof consumeEvent !== 'function') throw callbackError('活动变化回调消费器尚未就绪。', 503);
+  const outcome = await consumeEvent(event);
+  return {
+    persisted: {
+      ...event,
+      ...outcome,
+      received_at: event.received_at || new Date().toISOString(),
+      raw_json: JSON.stringify({ event, outcome }),
+    },
+    response: {
+      accepted: true,
+      status: 'accepted',
+      event_id: event.event_id,
+      outcome: outcome.outcome,
+    },
+  };
+}
+
+function normalizeEvent(input = {}, { allowLegacySigning = false } = {}) {
   if (String(input.schema_version || '') === '2') return normalizeV2Event(input);
+  if (!allowLegacySigning) throw unsupportedVersionError();
   const event = {
     schema_version: String(input.schema_version || ''),
     event_id: String(input.event_id || '').trim(),
@@ -145,5 +201,12 @@ function verifySignature(event, signature, secret) {
 function callbackError(message, status) {
   const error = new Error(message);
   error.status = status;
+  return error;
+}
+
+function unsupportedVersionError() {
+  const error = callbackError('活动变化回调仅支持包含子账号身份的 v2 版本。', 400);
+  error.code = 'ACTIVITY_CALLBACK_UNSUPPORTED_VERSION';
+  error.audit_reason = 'unsupported_version';
   return error;
 }

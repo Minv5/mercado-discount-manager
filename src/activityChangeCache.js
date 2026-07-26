@@ -1,13 +1,21 @@
+import crypto from 'node:crypto';
+
 export const ACTIVITY_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 export const ACTIVITY_ITEMS_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 export const ACTIVITY_PARTIAL_ITEMS_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function activityCacheKey(value = {}) {
-  return [
-    String(value.account_id || value.accountId || ''),
+  const accountId = String(value.account_id || value.accountId || '');
+  const childUserId = String(value.child_user_id || value.childUserId || '');
+  const tail = [
     String(value.site_id || value.siteId || '').toUpperCase(),
     String(value.promotion_id || value.promotionId || ''),
     String(value.promotion_type || value.promotionType || '').toUpperCase(),
+  ];
+  return [
+    accountId,
+    ...(childUserId ? [childUserId] : []),
+    ...tail,
   ].join('|');
 }
 
@@ -120,6 +128,190 @@ export function activityItemsDecision({
   return { refresh: false, reason: 'verified_cache' };
 }
 
+export function shouldProbeFreshPreparationItems({
+  action = '',
+  itemStatus = '',
+  finalRevalidation = false,
+  cacheDecision = null,
+  fetchState = null,
+  now = new Date(),
+} = {}) {
+  return candidatePreparationReadDecision({
+    action,
+    itemStatus,
+    finalRevalidation,
+    cacheDecision,
+    fetchState,
+    now,
+  }).probe;
+}
+
+export function candidatePreparationReadDecision({
+  action = '',
+  itemStatus = '',
+  finalRevalidation = false,
+  cacheDecision = null,
+  fetchState = null,
+  now = new Date(),
+} = {}) {
+  const normalizedAction = String(action || '').toLowerCase();
+  const normalizedStatus = String(itemStatus || '').toLowerCase();
+  if (finalRevalidation || normalizedAction !== 'enroll' || normalizedStatus !== 'candidate') {
+    return { probe: false, reason: 'candidate_probe_not_applicable' };
+  }
+  if (!cacheDecision) {
+    return { probe: true, reason: 'candidate_probe_legacy_call' };
+  }
+  if (cacheDecision.refresh || cacheDecision.blocked) {
+    return { probe: false, reason: String(cacheDecision.reason || 'candidate_cache_not_reusable') };
+  }
+  const sameDayCache = isSameShanghaiDay(fetchState?.updated_at, now)
+    || ['same_day_cache', 'same_day_partial_cache'].includes(String(cacheDecision.reason || ''));
+  if (sameDayCache) {
+    return { probe: false, reason: 'same_day_candidate_cache' };
+  }
+  return { probe: true, reason: 'candidate_daily_probe_due' };
+}
+
+export function candidateTotalProbeDecision({
+  fetchState = null,
+  probe = null,
+  now = new Date(),
+} = {}) {
+  const baselineSummary = fetchStateRaw(fetchState)?.identity_summary;
+  if (baselineSummary || probe?.identity_summary) {
+    return candidateIdentityProbeDecision({ fetchState, probe, now });
+  }
+  if (!fetchState) return { refresh: true, reason: 'candidate_baseline_missing' };
+  const previousTotal = finiteNumberOrNull(fetchState.platform_total);
+  const currentTotal = finiteNumberOrNull(probe?.platform_total);
+  if (previousTotal === null || currentTotal === null) {
+    return { refresh: true, reason: 'candidate_total_unavailable' };
+  }
+  if (previousTotal !== currentTotal) {
+    return { refresh: true, reason: 'candidate_total_changed' };
+  }
+  if (!isSameShanghaiDay(fetchState.updated_at, now)) {
+    return { refresh: true, reason: 'candidate_daily_identity_due' };
+  }
+  const previousFirstPageIds = fetchStateFirstPageItemIds(fetchState);
+  if (!previousFirstPageIds) {
+    return { refresh: true, reason: 'candidate_identity_baseline_missing' };
+  }
+  const currentFirstPageIds = normalizedItemIds(probe?.first_page_item_ids);
+  if (!sameStringArray(previousFirstPageIds, currentFirstPageIds)) {
+    return { refresh: true, reason: 'candidate_first_page_changed' };
+  }
+  return { refresh: false, reason: 'candidate_total_unchanged' };
+}
+
+export function candidateIdentityProbeDecision({
+  fetchState = null,
+  probe = null,
+  now = new Date(),
+} = {}) {
+  if (!fetchState) return { refresh: true, reason: 'candidate_baseline_missing' };
+  const previousTotal = finiteNumberOrNull(fetchState.platform_total);
+  const currentTotal = finiteNumberOrNull(probe?.platform_total);
+  if (previousTotal === null || currentTotal === null) {
+    return { refresh: true, reason: 'candidate_total_unavailable' };
+  }
+  if (previousTotal !== currentTotal) {
+    return { refresh: true, reason: 'candidate_total_changed' };
+  }
+  const sameDay = isSameShanghaiDay(fetchState.updated_at, now);
+  const baseline = normalizeIdentitySummary(fetchStateRaw(fetchState)?.identity_summary);
+  const current = normalizeIdentitySummary(probe?.identity_summary);
+  if (!baseline) return { refresh: true, reason: 'candidate_identity_baseline_missing' };
+  if (!current || !current.complete) {
+    if (sameDay) {
+      return {
+        refresh: false,
+        reason: 'same_day_candidate_cache',
+        verification_source: 'same_day_cached_identity',
+      };
+    }
+    return { refresh: true, reason: 'candidate_probe_not_authoritative' };
+  }
+  if (!baseline.complete) {
+    return { refresh: true, reason: 'candidate_probe_not_authoritative' };
+  }
+  if (baseline.algorithm !== current.algorithm
+    || baseline.item_count !== current.item_count
+    || baseline.digest !== current.digest) {
+    return { refresh: true, reason: 'candidate_identity_changed' };
+  }
+  return {
+    refresh: false,
+    reason: 'candidate_identity_verified',
+    verification_source: 'complete_identity_digest',
+  };
+}
+
+export function inventoryTotalProbeDecision({
+  fallbackState = null,
+  probe = null,
+  now = new Date(),
+} = {}) {
+  if (!fallbackState) return { refresh: true, reason: 'inventory_baseline_missing' };
+  const raw = fetchStateRaw(fallbackState);
+  const previousTotal = finiteNumberOrNull(raw?.scan_total);
+  const currentTotal = finiteNumberOrNull(probe?.platform_total);
+  if (previousTotal === null || currentTotal === null) {
+    return { refresh: true, reason: 'inventory_total_unavailable' };
+  }
+  if (previousTotal !== currentTotal) {
+    return { refresh: true, reason: 'inventory_total_changed' };
+  }
+  if (!isSameShanghaiDay(fallbackState.updated_at, now)) {
+    return { refresh: true, reason: 'inventory_daily_identity_due' };
+  }
+  const baselineIds = raw?.inventory_first_page_item_ids ?? raw?.scan?.inventory_first_page_item_ids;
+  if (!Array.isArray(baselineIds)) {
+    return { refresh: true, reason: 'inventory_identity_baseline_missing' };
+  }
+  const previousFirstPageIds = normalizedItemIds(baselineIds);
+  const currentFirstPageIds = normalizedItemIds(probe?.first_page_item_ids);
+  if (!sameStringArray(previousFirstPageIds, currentFirstPageIds)) {
+    return { refresh: true, reason: 'inventory_first_page_changed' };
+  }
+  return { refresh: false, reason: 'inventory_total_unchanged' };
+}
+
+export function buildItemIdentitySummary(values = [], {
+  complete = false,
+  cursor = null,
+} = {}) {
+  const itemIds = itemIdsFromRows(values);
+  return {
+    algorithm: 'sha256-sorted-item-ids-v1',
+    item_count: itemIds.length,
+    digest: crypto.createHash('sha256').update(itemIds.join('\n'), 'utf8').digest('hex').toUpperCase(),
+    complete: Boolean(complete),
+    cursor: cursor == null ? null : String(cursor),
+  };
+}
+
+export function itemIdentityDelta(previousRows = [], nextRows = [], { complete = false } = {}) {
+  const previous = new Set(itemIdsFromRows(previousRows));
+  const next = new Set(itemIdsFromRows(nextRows));
+  let addedCount = 0;
+  let missingCount = 0;
+  for (const itemId of next) {
+    if (!previous.has(itemId)) addedCount += 1;
+  }
+  for (const itemId of previous) {
+    if (!next.has(itemId)) missingCount += 1;
+  }
+  return {
+    previous_count: previous.size,
+    current_count: next.size,
+    added_count: addedCount,
+    removed_count: complete ? missingCount : 0,
+    unreturned_count: complete ? 0 : missingCount,
+  };
+}
+
 function isCompositeCandidateState(fetchState = {}, fallbackState = {}) {
   const primary = String(fetchState.detail_status || '').toLowerCase();
   const fallback = String(fallbackState?.detail_status || '').toLowerCase();
@@ -183,4 +375,64 @@ function isNewer(left, right) {
   const leftTime = Date.parse(String(left || ''));
   const rightTime = Date.parse(String(right || ''));
   return Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime > rightTime;
+}
+
+function finiteNumberOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function fetchStateFirstPageItemIds(fetchState = {}) {
+  const raw = fetchStateRaw(fetchState);
+  if (!raw || !Array.isArray(raw.first_page_item_ids)) return null;
+  return normalizedItemIds(raw.first_page_item_ids);
+}
+
+function fetchStateRaw(fetchState = {}) {
+  if (!fetchState || typeof fetchState !== 'object') return null;
+  let raw = fetchState.raw_json;
+  if (typeof raw !== 'string') return raw && typeof raw === 'object' ? raw : null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeIdentitySummary(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const algorithm = String(value.algorithm || '');
+  const itemCount = finiteNumberOrNull(value.item_count);
+  const digest = String(value.digest || '').trim().toUpperCase();
+  if (algorithm !== 'sha256-sorted-item-ids-v1'
+    || itemCount === null
+    || itemCount < 0
+    || !/^[A-F0-9]{64}$/.test(digest)) {
+    return null;
+  }
+  return {
+    algorithm,
+    item_count: itemCount,
+    digest,
+    complete: value.complete === true,
+    cursor: value.cursor == null ? null : String(value.cursor),
+  };
+}
+
+function normalizedItemIds(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => String(value || '').trim())
+    .filter(Boolean))]
+    .sort();
+}
+
+function itemIdsFromRows(rows = []) {
+  return normalizedItemIds((Array.isArray(rows) ? rows : []).map((row) => (
+    typeof row === 'string' ? row : row?.item_id ?? row?.itemId ?? row?.id
+  )));
+}
+
+function sameStringArray(left = [], right = []) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }

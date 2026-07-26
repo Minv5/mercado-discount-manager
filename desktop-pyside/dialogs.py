@@ -321,6 +321,7 @@ class SettingsDialog(QDialog):
                     "store_name": account_names.get(account_id, "当前店铺"),
                     "operating": True,
                 })
+        self._sort_site_entries()
         self.site_list.itemChanged.connect(self._site_selection_changed)
         layout.addWidget(QLabel("经营站点"))
         layout.addWidget(self.site_list, 1)
@@ -353,6 +354,17 @@ class SettingsDialog(QDialog):
         checked = site_id in configured if configured is not None else suggested
         item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
         self.site_list.addItem(item)
+
+    def _sort_site_entries(self) -> None:
+        items = [self.site_list.takeItem(0) for _ in range(self.site_list.count())]
+
+        def sort_key(item: QListWidgetItem) -> tuple[str, str, str]:
+            account_id, site_id = item.data(Qt.ItemDataRole.UserRole)
+            store_name = item.text().partition(" / ")[0].strip()
+            return store_name.casefold(), str(account_id), str(site_id)
+
+        for item in sorted(items, key=sort_key):
+            self.site_list.addItem(item)
 
     def apply_background_context(
         self,
@@ -390,6 +402,7 @@ class SettingsDialog(QDialog):
         try:
             for entry in operating_rows:
                 self._upsert_site_entry(entry)
+            self._sort_site_entries()
         finally:
             self._merging_sites = False
         self.benchmark_note.setText(benchmark_text)

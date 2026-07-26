@@ -81,8 +81,116 @@ function actionOf(value = {}) {
   return String(value.action || value.resolved_action || value.request?.action || value.request?.requested_action || '').trim().toLowerCase();
 }
 
+function resultSources(group = {}) {
+  const outer = group.result || group.summary || group.result_summary || null;
+  if (!outer || typeof outer !== 'object') return [];
+  const nested = [
+    outer.terminal_counts,
+    outer.execution?.terminal_counts,
+    outer.result?.execution?.terminal_counts,
+    outer.execution,
+    outer.result?.execution,
+    outer,
+  ];
+  return nested.filter((value, index) => value && typeof value === 'object' && nested.indexOf(value) === index);
+}
+
+function resultField(sources, names) {
+  for (const source of sources) {
+    for (const name of names) {
+      if (Object.prototype.hasOwnProperty.call(source, name)) {
+        return { present: true, value: source[name], field: name };
+      }
+    }
+  }
+  return { present: false, value: undefined, field: null };
+}
+
+function nonNegativeCount(field) {
+  const value = Number(field.value);
+  return field.present && Number.isFinite(value) && Number.isInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+function sameDayTerminalGroups(groups = [], request = {}, now = new Date()) {
+  const businessDate = businessDateInShanghai(now);
+  const wantedScope = executionScopeKey(executionRequestScope(request));
+  return (groups || [])
+    .filter((group) => TERMINAL_GROUP_STATUSES.has(String(group?.status || '').toLowerCase()))
+    .filter(groupIsReal)
+    .filter((group) => businessDateInShanghai(groupFinishedAt(group)) === businessDate)
+    .filter((group) => executionScopeKey(executionRequestScope(groupRequest(group))) === wantedScope)
+    .sort((left, right) => String(groupFinishedAt(right) || '').localeCompare(String(groupFinishedAt(left) || '')));
+}
+
+function completionAudit(group = {}) {
+  const groupId = String(group.id || group.group_id || '');
+  const status = String(group.status || '').toLowerCase();
+  const audit = {
+    group_id: groupId,
+    status,
+    eligible: false,
+    reason: '',
+  };
+  if (status !== 'completed') {
+    return { ...audit, reason: `group_status_${status || 'unknown'}` };
+  }
+
+  const sources = resultSources(group);
+  if (!sources.length) return { ...audit, reason: 'result_missing' };
+
+  const accounting = resultField(sources, ['accounting_complete']);
+  if (!accounting.present) return { ...audit, reason: 'accounting_not_proven' };
+  if (accounting.value !== true) return { ...audit, reason: 'accounting_incomplete' };
+
+  const fields = {
+    relation_count: resultField(sources, ['relation_count']),
+    success: resultField(sources, ['success', 'success_count']),
+    failed: resultField(sources, ['failed', 'failed_count']),
+    skipped: resultField(sources, ['skipped', 'skipped_count']),
+    activity_failure_count: resultField(sources, ['activity_failure_count']),
+    platform_pending: resultField(sources, ['platform_pending', 'platform_pending_count']),
+    retryable_pending: resultField(sources, ['retryable_pending', 'retryable_pending_count']),
+    unresolved: resultField(sources, ['unresolved', 'unresolved_count']),
+  };
+  const counts = Object.fromEntries(Object.entries(fields).map(([name, field]) => [name, nonNegativeCount(field)]));
+  const missingFields = Object.entries(counts)
+    .filter(([, value]) => value === null)
+    .map(([name]) => name);
+  if (missingFields.length) {
+    return { ...audit, reason: 'relation_counts_not_proven', missing_fields: missingFields };
+  }
+  if (counts.failed > 0) return { ...audit, reason: 'failed_relations_present', counts };
+  if (counts.activity_failure_count > 0) return { ...audit, reason: 'activity_failures_present', counts };
+  if (counts.retryable_pending > 0) return { ...audit, reason: 'retryable_pending_present', counts };
+  if (counts.unresolved > 0) return { ...audit, reason: 'unresolved_relations_present', counts };
+  if (counts.platform_pending > 0) return { ...audit, reason: 'platform_pending_requires_recovery', counts };
+
+  const classifiedCount = counts.success
+    + counts.failed
+    + counts.skipped
+    + counts.platform_pending
+    + counts.unresolved;
+  const closedField = resultField(sources, ['is_closed']);
+  if (classifiedCount !== counts.relation_count || (closedField.present && closedField.value !== true)) {
+    return {
+      ...audit,
+      reason: 'relation_count_gap',
+      counts: { ...counts, classified_count: classifiedCount },
+    };
+  }
+  return {
+    ...audit,
+    eligible: true,
+    reason: 'completed_and_accounted',
+    counts: { ...counts, classified_count: classifiedCount },
+  };
+}
+
 function completedSummary(group = {}) {
   const source = group.result || group.summary || group.result_summary || {};
+  const audit = completionAudit(group);
   const success = Math.max(0, Number(source.success ?? source.success_count ?? 0));
   const failed = Math.max(0, Number(source.failed ?? source.failed_count ?? 0));
   const skipped = Math.max(0, Number(source.skipped ?? source.skipped_count ?? 0));
@@ -101,6 +209,8 @@ function completedSummary(group = {}) {
     success,
     failed,
     skipped,
+    accounting_complete: audit.eligible,
+    completion_reason: audit.reason,
     scope,
     result: { total, success, failed, skipped },
   };
@@ -143,6 +253,13 @@ export function businessDateInShanghai(value = new Date()) {
   return `${mapped.year}-${mapped.month}-${mapped.day}`;
 }
 
+export function shanghaiBusinessDayEndIso(value = new Date()) {
+  const businessDate = businessDateInShanghai(value);
+  if (!businessDate) return null;
+  const dayStart = new Date(`${businessDate}T00:00:00+08:00`);
+  return new Date(dayStart.getTime() + 24 * 60 * 60 * 1000).toISOString();
+}
+
 export function executionRequestScope(request = {}) {
   const filters = request.filters && typeof request.filters === 'object' ? request.filters : {};
   return {
@@ -170,14 +287,7 @@ export function executionScopeKey(scopeOrRequest = {}) {
 }
 
 export function findSameDayTerminalGroup(groups = [], request = {}, now = new Date()) {
-  const businessDate = businessDateInShanghai(now);
-  const wantedScope = executionScopeKey(executionRequestScope(request));
-  return (groups || [])
-    .filter((group) => TERMINAL_GROUP_STATUSES.has(String(group?.status || '').toLowerCase()))
-    .filter(groupIsReal)
-    .filter((group) => businessDateInShanghai(groupFinishedAt(group)) === businessDate)
-    .filter((group) => executionScopeKey(executionRequestScope(groupRequest(group))) === wantedScope)
-    .sort((left, right) => String(groupFinishedAt(right) || '').localeCompare(String(groupFinishedAt(left) || '')))[0] || null;
+  return sameDayTerminalGroups(groups, request, now)[0] || null;
 }
 
 export function createSameDayConfirmationStore({ stateDir, now = () => new Date().toISOString(), ttlMs = DEFAULT_TTL_MS }) {
@@ -294,10 +404,22 @@ export function sameDayCompletionGate({
   groups = [], request = {}, now = () => new Date().toISOString(),
 }) {
   const timestamp = typeof now === 'function' ? now() : now;
-  const completedGroup = findSameDayTerminalGroup(groups, request, timestamp);
-  if (!completedGroup) return { allowed: true, confirmed: false, completed: null, binding: null };
+  const candidates = sameDayTerminalGroups(groups, request, timestamp);
+  if (!candidates.length) return { allowed: true, confirmed: false, completed: null, binding: null };
 
-  const completed = completedSummary(completedGroup);
+  const audited = candidates.map((group) => ({ group, audit: completionAudit(group) }));
+  const completedEntry = audited.find((entry) => entry.audit.eligible);
+  if (!completedEntry) {
+    return {
+      allowed: true,
+      confirmed: false,
+      completed: null,
+      binding: null,
+      completion_audit: audited[0].audit,
+    };
+  }
+
+  const completed = completedSummary(completedEntry.group);
   const requestedAction = actionOf(request);
   if (AUTO_ACTIONS.has(requestedAction)) {
     throw gateError('今天当前范围已有真实任务完成，自动模式不会重复准备。', 'TODAY_COMPLETED', { completed });

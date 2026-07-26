@@ -9,9 +9,15 @@ import {
   activityCatalogDecision,
   activityItemsDecision,
   applyActivityChangeEvent,
+  buildItemIdentitySummary,
+  candidatePreparationReadDecision,
+  candidateTotalProbeDecision,
   isActivityExpired,
+  inventoryTotalProbeDecision,
+  itemIdentityDelta,
   nextNonPeakCalibrationAt,
   planActivityCatalogRoutes,
+  shouldProbeFreshPreparationItems,
 } from '../src/activityChangeCache.js';
 
 const NOW = new Date('2026-07-15T06:00:00.000Z');
@@ -189,6 +195,168 @@ test('started activities never reuse sparse candidate window', () => {
   assert.equal(startedDecision.reason, 'not_full');
 });
 
+test('only a new enrollment probes candidate totals while fixed update and cancel scopes reuse cache', () => {
+  assert.equal(shouldProbeFreshPreparationItems({ action: 'enroll', itemStatus: 'candidate' }), true);
+  assert.equal(shouldProbeFreshPreparationItems({ action: 'enroll', itemStatus: 'started' }), false);
+  assert.equal(shouldProbeFreshPreparationItems({ action: 'update', itemStatus: 'started' }), false);
+  assert.equal(shouldProbeFreshPreparationItems({ action: 'cancel', itemStatus: 'started' }), false);
+  assert.equal(shouldProbeFreshPreparationItems({
+    action: 'enroll',
+    itemStatus: 'candidate',
+    finalRevalidation: true,
+  }), false);
+});
+
+test('same-day clean candidate preparation performs zero probe while a new business day may probe', () => {
+  const sameDayFetchState = {
+    detail_status: 'ok',
+    updated_at: new Date(NOW.getTime() - 60_000).toISOString(),
+  };
+  for (const cacheDecision of [
+    { refresh: false, reason: 'same_day_cache' },
+    { refresh: false, reason: 'same_day_partial_cache', effective_state: 'partial_api_sparse_marketplace_candidate' },
+    { refresh: false, reason: 'verified_composite_cache', effective_state: 'candidate_plus_inventory_fallback' },
+  ]) {
+    assert.deepEqual(candidatePreparationReadDecision({
+      action: 'enroll',
+      itemStatus: 'candidate',
+      cacheDecision,
+      fetchState: sameDayFetchState,
+      now: NOW,
+    }), {
+      probe: false,
+      reason: 'same_day_candidate_cache',
+    });
+  }
+
+  assert.deepEqual(candidatePreparationReadDecision({
+    action: 'enroll',
+    itemStatus: 'candidate',
+    cacheDecision: { refresh: false, reason: 'verified_cache' },
+    fetchState: { ...sameDayFetchState, updated_at: '2026-07-14T06:00:00.000Z' },
+    now: NOW,
+  }), {
+    probe: true,
+    reason: 'candidate_daily_probe_due',
+  });
+});
+
+test('item identity summary is stable across duplicates, row shapes and ordering', () => {
+  const expected = buildItemIdentitySummary(['I-2', 'I-1', 'I-2'], { complete: true });
+  assert.deepEqual(
+    buildItemIdentitySummary([{ id: 'I-1' }, { item_id: 'I-2' }], { complete: true }),
+    expected,
+  );
+  assert.equal(expected.algorithm, 'sha256-sorted-item-ids-v1');
+  assert.equal(expected.item_count, 2);
+  assert.equal(expected.complete, true);
+});
+
+test('candidate total probe refreshes only changed, unverified, first-page drift or new-day activities', () => {
+  const sameDayState = {
+    platform_total: 80,
+    detail_status: 'ok',
+    updated_at: new Date(NOW.getTime() - 60_000).toISOString(),
+    raw_json: JSON.stringify({ first_page_item_ids: ['I-1', 'I-2'] }),
+  };
+  assert.deepEqual(candidateTotalProbeDecision({
+    fetchState: sameDayState,
+    probe: { platform_total: 80, first_page_item_ids: ['I-2', 'I-1'] },
+    now: NOW,
+  }), { refresh: false, reason: 'candidate_total_unchanged' });
+  assert.equal(candidateTotalProbeDecision({
+    fetchState: sameDayState,
+    probe: { platform_total: 81, first_page_item_ids: ['I-1', 'I-2'] },
+    now: NOW,
+  }).reason, 'candidate_total_changed');
+  assert.equal(candidateTotalProbeDecision({
+    fetchState: sameDayState,
+    probe: { platform_total: 80, first_page_item_ids: ['I-1', 'I-3'] },
+    now: NOW,
+  }).reason, 'candidate_first_page_changed');
+  assert.equal(candidateTotalProbeDecision({
+    fetchState: { ...sameDayState, updated_at: '2026-07-14T06:00:00.000Z' },
+    probe: { platform_total: 80, first_page_item_ids: ['I-1', 'I-2'] },
+    now: NOW,
+  }).reason, 'candidate_daily_identity_due');
+  assert.equal(candidateTotalProbeDecision({
+    fetchState: null,
+    probe: { platform_total: 80, first_page_item_ids: ['I-1'] },
+    now: NOW,
+  }).reason, 'candidate_baseline_missing');
+  assert.equal(candidateTotalProbeDecision({
+    fetchState: sameDayState,
+    probe: { platform_total: null, first_page_item_ids: [] },
+    now: NOW,
+  }).reason, 'candidate_total_unavailable');
+  assert.equal(candidateTotalProbeDecision({
+    fetchState: { ...sameDayState, raw_json: '{}' },
+    probe: { platform_total: 80, first_page_item_ids: ['I-1'] },
+    now: NOW,
+  }).reason, 'candidate_identity_baseline_missing');
+});
+
+test('seller inventory probe detects route inventory changes and requires a migration identity baseline', () => {
+  const fallbackState = {
+    updated_at: new Date(NOW.getTime() - 60_000).toISOString(),
+    raw_json: JSON.stringify({
+      scan_total: 100,
+      inventory_first_page_item_ids: ['I-1', 'I-2'],
+    }),
+  };
+  assert.deepEqual(inventoryTotalProbeDecision({
+    fallbackState,
+    probe: { platform_total: 100, first_page_item_ids: ['I-2', 'I-1'] },
+    now: NOW,
+  }), { refresh: false, reason: 'inventory_total_unchanged' });
+  assert.equal(inventoryTotalProbeDecision({
+    fallbackState,
+    probe: { platform_total: 101, first_page_item_ids: ['I-1', 'I-2'] },
+    now: NOW,
+  }).reason, 'inventory_total_changed');
+  assert.equal(inventoryTotalProbeDecision({
+    fallbackState: { ...fallbackState, raw_json: JSON.stringify({ scan_total: 100 }) },
+    probe: { platform_total: 100, first_page_item_ids: ['I-1'] },
+    now: NOW,
+  }).reason, 'inventory_identity_baseline_missing');
+  assert.equal(inventoryTotalProbeDecision({
+    fallbackState: {
+      ...fallbackState,
+      raw_json: JSON.stringify({
+        scan_total: 100,
+        scan: { inventory_first_page_item_ids: ['I-1', 'I-2'] },
+      }),
+    },
+    probe: { platform_total: 100, first_page_item_ids: ['I-1', 'I-2'] },
+    now: NOW,
+  }).reason, 'inventory_total_unchanged');
+});
+
+test('item identity delta only confirms removals after a complete read', () => {
+  assert.deepEqual(itemIdentityDelta(
+    [{ item_id: 'I-1' }, { item_id: 'I-2' }],
+    [{ item_id: 'I-2' }, { item_id: 'I-3' }],
+    { complete: true },
+  ), {
+    previous_count: 2,
+    current_count: 2,
+    added_count: 1,
+    removed_count: 1,
+    unreturned_count: 0,
+  });
+  assert.deepEqual(itemIdentityDelta(
+    [{ item_id: 'I-1' }, { item_id: 'I-2' }],
+    [{ item_id: 'I-2' }, { item_id: 'I-3' }],
+    { complete: false },
+  ), {
+    previous_count: 2,
+    current_count: 2,
+    added_count: 1,
+    removed_count: 0,
+    unreturned_count: 1,
+  });
+});
+
 test('finish date expires locally after the Shanghai business day without a network read', () => {
   assert.equal(isActivityExpired({ finish_date: '2026-07-14' }, NOW), true);
   assert.equal(isActivityExpired({ finish_date: '2026-07-15' }, NOW), false);
@@ -206,8 +374,19 @@ test('prepare source uses hybrid catalog and item cache gates without weakening 
   const server = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
   assert.match(server, /refreshActivityCatalogForPrepare\(/);
   assert.match(server, /activityItemsDecision\(/);
+  assert.match(server, /probeCandidateTotals:\s*candidateProbeEnabled/);
+  assert.match(server, /candidatePreparationReadDecision\(\{/);
+  assert.match(server, /candidateTotalProbeDecision\(\{\s*fetchState,\s*probe\s*\}\)/);
+  assert.match(server, /probeInventoryItemsForCampaign\(/);
+  assert.match(server, /inventoryTotalProbeDecision\(\{\s*fallbackState,\s*probe:\s*inventoryProbe\s*\}\)/);
+  assert.match(server, /initialPage:\s*probe\.page/);
+  assert.match(server, /!String\(row\.probe_reason \|\| ''\)\.endsWith\('_probe_failed'\)/);
+  assert.doesNotMatch(server, /for\s*\(const promotion of selectedForLiveRead\)\s*\{\s*keys\.add\(operationActivityReadKey/);
   assert.match(server, /cache_reused:\s*true/);
   assert.match(server, /scheduleLowFrequencyActivityCalibration\(\)/);
   assert.match(server, /detail_status:\s*'error'[\s\S]*blocked:\s*true/);
+  assert.match(server, /正在实时核对已报名商品/);
+  assert.match(server, /正在实时核对可报名商品/);
+  assert.doesNotMatch(server, /正在读取需更新的(?:已报名|可报名)商品缓存/);
   assert.doesNotMatch(server, /buildExecutionSubmissionSnapshot[\s\S]{0,1800}await fetchAndSavePromotions\(account/);
 });
