@@ -6,7 +6,7 @@ import path from 'node:path';
 import { buildBatchPlans, buildPlan, cancelUntilEmpty, fetchCompleteness, filterPromotions, normalizeActivityName, promotionKey, summarizeSites } from '../src/planner.js';
 import { buildItemIdentitySummary } from '../src/activityChangeCache.js';
 import { decideCycleAction, nextDiscountFor } from '../src/cycle.js';
-import { MercadoLibreClient, extractMarketplaceUsers, extractPromotions, mergePromotionsByIdentity } from '../src/mlClient.js';
+import { MercadoLibreClient, PROMOTION_ITEMS_UNREADABLE_CODE, extractMarketplaceUsers, extractPromotions, mergePromotionsByIdentity } from '../src/mlClient.js';
 import { realSubmitProtection } from '../src/protection.js';
 import { buildBatchConfirmationPackage, buildConfirmationPackage } from '../src/confirmationPackage.js';
 import { ADAPTER_STATES, buildSubmitPayloadPreview, getPromotionAdapterState, requireExecutableSubmitPayload, requireItemStatus, summarizeSpecialPromotionFields } from '../src/promotionPayload.js';
@@ -437,37 +437,38 @@ test('full promotion item pagination reuses the probe page instead of requesting
   );
 });
 
-test('fetchAllPromotionItems marks total without details as api_incomplete', async () => {
+test('fetchAllPromotionItems rejects a denormalized results page as PROMOTION_ITEMS_UNREADABLE', async () => {
   const client = new MercadoLibreClient();
   client.getPromotionItems = async () => ({
     results: null,
     paging: { total: 1108, limit: 10, offset: 0, searchAfter: 'opaque' }
   });
 
-  const result = await client.fetchAllPromotionItems({ promotionId: 'C-1', promotionType: 'SELLER_CAMPAIGN', status: 'candidate', limit: 10 });
-
-  assert.equal(result.total, 1108);
-  assert.equal(result.results.length, 0);
-  assert.equal(result.detailStatus, 'api_incomplete');
-  assert.equal(result.blocked, true);
-  assert.match(result.warning, /未返回候选明细/);
-  assert.match(result.warning, /人工导入/);
+  await assert.rejects(
+    client.fetchAllPromotionItems({ promotionId: 'C-1', promotionType: 'SELLER_CAMPAIGN', status: 'candidate', limit: 10 }),
+    (error) => {
+      assert.equal(error.code, PROMOTION_ITEMS_UNREADABLE_CODE);
+      assert.equal(error.status, 422);
+      assert.equal(error.kind, 'unreadable_items');
+      assert.equal(error.diagnostics[0].results_kind, 'null');
+      assert.equal(error.diagnostics[0].total, 1108);
+      assert.equal(error.diagnostics[0].stable_code, 'PROMOTION_ITEMS_UNREADABLE');
+      return true;
+    },
+  );
 });
 
-test('fetchAllPromotionItems marks marketplace candidate detail gap with precise status', async () => {
+test('fetchAllPromotionItems blocks marketplace candidate detail gaps the same way', async () => {
   const client = new MercadoLibreClient({ marketplace: true });
   client.getPromotionItems = async () => ({
     results: null,
     paging: { total: 1108, limit: 10, offset: 0, searchAfter: 'opaque' }
   });
 
-  const result = await client.fetchAllPromotionItems({ promotionId: 'C-MLB4605191', promotionType: 'SELLER_CAMPAIGN', status: 'candidate', limit: 10 });
-
-  assert.equal(result.total, 1108);
-  assert.equal(result.detailStatus, 'api_incomplete_marketplace_candidate');
-  assert.equal(result.blocked, true);
-  assert.match(result.warning, /marketplace child/);
-  assert.match(result.warning, /禁止作为 fallback/);
+  await assert.rejects(
+    client.fetchAllPromotionItems({ promotionId: 'C-MLB4605191', promotionType: 'SELLER_CAMPAIGN', status: 'candidate', limit: 10 }),
+    (error) => error.code === PROMOTION_ITEMS_UNREADABLE_CODE && error.status === 422,
+  );
 });
 
 test('fetchAllPromotionItems distinguishes sample partial fetch from full fetch', async () => {
@@ -539,12 +540,12 @@ test('fetchAllPromotionItems uses searchAfter when offset repeats first page', a
   assert.equal(result.results.at(-1).id, 'MLB120');
 });
 
-test('marketplace candidate pagination crosses null and empty searchAfter pages', async () => {
+test('marketplace candidate pagination crosses empty searchAfter pages after a readable first page', async () => {
   const client = new MercadoLibreClient({ marketplace: true });
   const calls = [];
   client.getPromotionItems = async ({ searchAfter, limit }) => {
     calls.push({ searchAfter: searchAfter || null, limit });
-    if (!searchAfter) return { paging: { total: 4, searchAfter: 'token-a' }, results: null };
+    if (!searchAfter) return { paging: { total: 4, searchAfter: 'token-a' }, results: [{ id: 'MLB0', status: 'candidate' }] };
     if (searchAfter === 'token-a') return { paging: { total: 4, searchAfter: 'token-b' }, results: [] };
     if (searchAfter === 'token-b') return { paging: { total: 4, searchAfter: 'token-c' }, results: [{ id: 'MLB1', status: 'candidate' }, { id: 'MLB2', status: 'candidate' }] };
     return { paging: { total: 4 }, results: [{ id: 'MLB3', status: 'candidate' }, { id: 'MLB4', status: 'candidate' }] };
@@ -555,9 +556,22 @@ test('marketplace candidate pagination crosses null and empty searchAfter pages'
   assert.equal(result.saved, 4);
   assert.equal(result.detailStatus, 'ok');
   assert.equal(result.isFullFetch, true);
-  assert.equal(result.rawSummary.empty_page_count, 2);
+  assert.equal(result.rawSummary.empty_page_count, 1);
   assert.deepEqual(calls.map((call) => call.searchAfter), [null, 'token-a', 'token-b', 'token-c']);
   assert.ok(calls.every((call) => call.limit <= 50));
+});
+
+test('marketplace candidate null results page is rejected before sparse continuation', async () => {
+  const client = new MercadoLibreClient({ marketplace: true });
+  client.getPromotionItems = async ({ searchAfter }) => {
+    if (!searchAfter) return { paging: { total: 4, searchAfter: 'token-a' }, results: null };
+    return { paging: { total: 4 }, results: [{ id: 'MLB1', status: 'candidate' }] };
+  };
+
+  await assert.rejects(
+    client.fetchAllPromotionItems({ promotionId: 'C-1', promotionType: 'SELLER_CAMPAIGN', status: 'candidate', maxItems: 'all' }),
+    (error) => error.code === PROMOTION_ITEMS_UNREADABLE_CODE && error.status === 422,
+  );
 });
 
 test('marketplace candidate empty page safety limit marks readable subset as partial sparse', async () => {
@@ -602,7 +616,7 @@ test('marketplace candidate repeated token or duplicate page is treated as stall
   assert.equal(result.rawSummary.stop_reason, 'duplicate_page_stalled');
 });
 
-test('C-MLB style first null page can still save later searchAfter candidates as partial', async () => {
+test('C-MLB style first null page is rejected as unreadable instead of saving partial candidates', async () => {
   const client = new MercadoLibreClient({ marketplace: true });
   client.getPromotionItems = async ({ searchAfter }) => {
     if (!searchAfter) return { paging: { total: 964, searchAfter: 'after-null' }, results: null };
@@ -610,19 +624,16 @@ test('C-MLB style first null page can still save later searchAfter candidates as
     return { paging: { total: 964 }, results: [] };
   };
 
-  const result = await client.fetchAllPromotionItems({
-    promotionId: 'C-MLB4605191',
-    promotionType: 'SELLER_CAMPAIGN',
-    status: 'candidate',
-    maxItems: 'all',
-    maxConsecutiveEmptyPages: 2
-  });
-
-  assert.equal(result.saved, 1);
-  assert.equal(result.results[0].id, 'MLB6729392606');
-  assert.equal(result.detailStatus, 'partial_api_sparse_marketplace_candidate');
-  assert.equal(result.sampleOnly, true);
-  assert.equal(result.isFullFetch, false);
+  await assert.rejects(
+    client.fetchAllPromotionItems({
+      promotionId: 'C-MLB4605191',
+      promotionType: 'SELLER_CAMPAIGN',
+      status: 'candidate',
+      maxItems: 'all',
+      maxConsecutiveEmptyPages: 2
+    }),
+    (error) => error.code === PROMOTION_ITEMS_UNREADABLE_CODE && error.status === 422,
+  );
 });
 
 test('cancelUntilEmpty keeps checking started items until none remain', async () => {

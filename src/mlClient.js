@@ -4,7 +4,93 @@ import { CANDIDATE_INCOMPLETE_CODE, MARKETPLACE_CANDIDATE_INCOMPLETE_CODE, candi
 import { buildItemIdentitySummary } from './activityChangeCache.js';
 
 export const PARTIAL_SPARSE_MARKETPLACE_CANDIDATE = 'partial_api_sparse_marketplace_candidate';
+export const PROMOTION_ITEMS_UNREADABLE_CODE = 'PROMOTION_ITEMS_UNREADABLE';
 const REQUEST_TIMEOUT_MS = Math.max(5000, Number(process.env.ML_REQUEST_TIMEOUT_MS || 45000));
+const SAFE_UNREADABLE_TOP_LEVEL_KEYS = new Set([
+  'results', 'paging', 'total', 'offset', 'limit', 'search_after', 'errors', 'code', 'message', 'status'
+]);
+
+function safeResponseKind(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (typeof value === 'object') return 'object';
+  if (typeof value === 'string') return 'string';
+  if (typeof value === 'number') return 'number';
+  if (typeof value === 'boolean') return 'bool';
+  return 'unknown';
+}
+
+function safeNonNegativeNumber(value) {
+  if (value === null || value === undefined || (typeof value === 'string' && !value.trim())) return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function safeHttpStatus(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 100 && number <= 599 ? number : null;
+}
+
+function isExplicitEmptyPromotionItemsPage(page) {
+  if (page === null || typeof page !== 'object' || Array.isArray(page)) return false;
+  if (!Object.hasOwn(page, 'results') || page.results !== null) return false;
+  if (!Object.hasOwn(page, 'paging') || page.paging === null || typeof page.paging !== 'object' || Array.isArray(page.paging)) {
+    return false;
+  }
+  return Object.hasOwn(page.paging, 'total')
+    && typeof page.paging.total === 'number'
+    && Number.isFinite(page.paging.total)
+    && page.paging.total === 0;
+}
+
+function normalizePromotionItemsPage(page) {
+  return isExplicitEmptyPromotionItemsPage(page)
+    ? { ...page, results: [] }
+    : page;
+}
+
+function buildPromotionItemsUnreadableDiagnostics(page, { endpointFamily = 'unknown', httpStatus = null } = {}) {
+  const isObject = page !== null && typeof page === 'object' && !Array.isArray(page);
+  const hasResults = isObject && Object.hasOwn(page, 'results');
+  const hasPaging = isObject && Object.hasOwn(page, 'paging');
+  const paging = hasPaging && page.paging && typeof page.paging === 'object' && !Array.isArray(page.paging)
+    ? page.paging
+    : null;
+  const topLevelKeys = isObject
+    ? [...new Set(Object.keys(page).filter((key) => SAFE_UNREADABLE_TOP_LEVEL_KEYS.has(key)))].sort()
+    : [];
+  const totalValue = paging && Object.hasOwn(paging, 'total')
+    ? paging.total
+    : isObject && Object.hasOwn(page, 'total') ? page.total : null;
+  return [{
+    endpoint_family: ['marketplace', 'regular'].includes(endpointFamily) ? endpointFamily : 'unknown',
+    http_status: safeHttpStatus(httpStatus),
+    response_kind: safeResponseKind(page),
+    top_level_keys: topLevelKeys,
+    results_kind: hasResults ? safeResponseKind(page.results) : 'unknown',
+    paging_kind: hasPaging ? safeResponseKind(page.paging) : 'unknown',
+    total: safeNonNegativeNumber(totalValue),
+    stable_code: PROMOTION_ITEMS_UNREADABLE_CODE,
+    error_class: 'unreadable_items',
+  }];
+}
+
+function promotionItemsShapeError(page, context = {}) {
+  if (Array.isArray(page)
+    || (page && typeof page === 'object' && Array.isArray(page.results))
+    || isExplicitEmptyPromotionItemsPage(page)) return null;
+  const error = new ApiError('平台商品明细不可验证：results 必须为数组，本次未保存商品缓存。', 422, {
+    code: PROMOTION_ITEMS_UNREADABLE_CODE,
+    has_results: Boolean(page && typeof page === 'object' && Object.hasOwn(page, 'results')),
+    results_type: page === null ? 'null_response' : page && typeof page === 'object' && Object.hasOwn(page, 'results')
+      ? (page.results === null ? 'null' : typeof page.results)
+      : 'missing',
+  });
+  error.code = PROMOTION_ITEMS_UNREADABLE_CODE;
+  error.kind = 'unreadable_items';
+  error.diagnostics = buildPromotionItemsUnreadableDiagnostics(page, context);
+  return error;
+}
 
 export function buildAuthorizationUrl({ authDomain = DEFAULT_AUTH_DOMAIN, clientId, redirectUri, state, codeChallenge }) {
   const url = new URL('/authorization', authDomain);
@@ -92,6 +178,8 @@ export class MercadoLibreClient {
     let fetchedRows = 0;
     let lastPaging = {};
     let lastData = {};
+    let resultsWereArray = true;
+    let stalled = false;
 
     while (pages < safeMaxPages) {
       const path = new URL(`/marketplace/seller-promotions/users/${encodeURIComponent(childUserId)}`, this.apiBaseUrl);
@@ -104,6 +192,7 @@ export class MercadoLibreClient {
         readKind: 'activity',
       });
       lastData = data && typeof data === 'object' ? data : {};
+      if (!Array.isArray(data?.results)) resultsWereArray = false;
       const rows = extractPromotions(data);
       const paging = data?.paging && typeof data.paging === 'object' ? data.paging : {};
       lastPaging = paging;
@@ -125,12 +214,19 @@ export class MercadoLibreClient {
         searchAfter = nextSearchAfter;
         continue;
       }
+      if (nextSearchAfter && seenSearchAfter.has(nextSearchAfter)) {
+        stalled = true;
+        break;
+      }
 
       const pageOffset = Number(paging.offset);
       const pageLimit = Number(paging.limit);
       const nextOffset = (Number.isFinite(pageOffset) ? pageOffset : offset)
         + (Number.isFinite(pageLimit) && pageLimit > 0 ? pageLimit : safeLimit);
-      if (nextOffset <= offset) break;
+      if (nextOffset <= offset) {
+        stalled = true;
+        break;
+      }
       offset = nextOffset;
       searchAfter = null;
       if (total === null && rows.length < safeLimit) break;
@@ -141,12 +237,20 @@ export class MercadoLibreClient {
       results: [...promotions.values()],
       paging: {
         ...lastPaging,
+        results_is_array: resultsWereArray,
         offset: 0,
         limit: safeLimit,
-        total: total ?? promotions.size,
+        total,
+        returned: promotions.size,
+        unique: promotions.size,
         fetched: promotions.size,
+        fetched_rows: fetchedRows,
         pages,
-        complete: total === null ? true : fetchedRows >= total
+        stalled,
+        complete: total !== null
+          && fetchedRows >= total
+          && promotions.size >= total
+          && !stalled
       }
     };
   }
@@ -181,7 +285,18 @@ export class MercadoLibreClient {
     else path.searchParams.set('offset', String(offset));
     path.searchParams.set('app_version', APP_VERSION);
     if (status) path.searchParams.set('status', status);
-    return this.request(path, this.marketplace ? { headers: { version: APP_VERSION }, signal, readKind: 'detail' } : { signal, readKind: 'detail' });
+    const response = await this.request(path, this.marketplace
+      ? { headers: { version: APP_VERSION }, signal, readKind: 'detail', includeResponseMeta: true }
+      : { signal, readKind: 'detail', includeResponseMeta: true });
+    const hasResponseMeta = response && typeof response === 'object'
+      && Object.hasOwn(response, 'body') && Object.hasOwn(response, 'http_status');
+    const page = normalizePromotionItemsPage(hasResponseMeta ? response.body : response);
+    const shapeError = promotionItemsShapeError(page, {
+      endpointFamily: this.marketplace ? 'marketplace' : 'regular',
+      httpStatus: hasResponseMeta ? response.http_status : null,
+    });
+    if (shapeError) throw shapeError;
+    return page;
   }
 
   async probePromotionItems({
@@ -191,7 +306,7 @@ export class MercadoLibreClient {
     limit = 50,
     signal = null,
   }) {
-    const page = await this.getPromotionItems({
+    const page = normalizePromotionItemsPage(await this.getPromotionItems({
       promotionId,
       promotionType,
       status,
@@ -199,8 +314,10 @@ export class MercadoLibreClient {
       offset: 0,
       searchAfter: null,
       signal,
-    });
-    const results = Array.isArray(page?.results) ? page.results : Array.isArray(page) ? page : [];
+    }));
+    const shapeError = promotionItemsShapeError(page);
+    if (shapeError) throw shapeError;
+    const results = Array.isArray(page?.results) ? page.results : page;
     const total = Number(page?.paging?.total);
     return {
       platform_total: Number.isFinite(total) ? total : null,
@@ -357,12 +474,14 @@ export class MercadoLibreClient {
     let lastSearchAfter = null;
     let stopReason = null;
     while (collected.length < maxToCollect && pagesRead < maxPages) {
-      const data = pagesRead === 0 && initialPage
+      const data = normalizePromotionItemsPage(pagesRead === 0 && initialPage
         ? initialPage
-        : await this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset, searchAfter, signal });
+        : await this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset, searchAfter, signal }));
       pagesRead += 1;
+      const shapeError = promotionItemsShapeError(data);
+      if (shapeError) throw shapeError;
       const resultValue = data?.results;
-      const results = Array.isArray(resultValue) ? resultValue : Array.isArray(data) ? data : [];
+      const results = Array.isArray(resultValue) ? resultValue : data;
       total = data.paging?.total ?? total;
       const nextSearchAfter = data?.paging?.searchAfter || data?.paging?.search_after || data?.searchAfter || data?.search_after || null;
       if (nextSearchAfter) lastSearchAfter = String(nextSearchAfter);

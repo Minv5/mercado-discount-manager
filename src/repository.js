@@ -13,6 +13,79 @@ const DEFAULT_OAUTH_STATE_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_OAUTH_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const DAILY_ITEM_SNAPSHOT_RETENTION_DAYS = 90;
 
+function routeIdentityError(message = '多路由场景缺少完整店铺、子账号和站点身份。') {
+  const error = new Error(message);
+  error.code = 'ROUTE_IDENTITY_REQUIRED';
+  error.status = 422;
+  return error;
+}
+
+function routeFields(value = {}) {
+  const child = value?.childUserId ?? value?.child_user_id;
+  const site = value?.siteId ?? value?.site_id;
+  return {
+    childUserId: child == null ? '' : String(child).trim(),
+    siteId: site == null ? '' : String(site).trim().toUpperCase(),
+  };
+}
+
+function routeFromPromotion(promotion = {}, context = {}) {
+  const contextRoute = routeFields(context);
+  if (contextRoute.childUserId || contextRoute.siteId) return contextRoute;
+  return routeFields(promotion);
+}
+
+function completeRoute(route = {}) {
+  return Boolean(route.childUserId && route.siteId);
+}
+
+function distinctCompleteRoutes(rows = []) {
+  const map = new Map();
+  for (const row of rows) {
+    const route = routeFields(row);
+    if (!completeRoute(route)) continue;
+    map.set(`${route.childUserId}|${route.siteId}`, route);
+  }
+  return [...map.values()];
+}
+
+function resolveRouteForIdentity({ accountId, promotionId, promotionType, route = null } = {}) {
+  const requested = routeFields(route || {});
+  if (requested.childUserId || requested.siteId) {
+    if (!completeRoute(requested)) throw routeIdentityError();
+    return requested;
+  }
+  const params = [String(accountId || ''), String(promotionId || ''), String(promotionType || '')];
+  const candidates = [
+    ...all(
+      `SELECT child_user_id, site_id FROM promo_campaigns
+       WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?`,
+      params,
+    ),
+    ...all(
+      `SELECT child_user_id, site_id FROM promo_items
+       WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?`,
+      params,
+    ),
+    ...all(
+      `SELECT child_user_id, site_id FROM promo_item_fetch_states
+       WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?`,
+      params,
+    ),
+  ];
+  const routes = distinctCompleteRoutes(candidates);
+  if (routes.length > 1) throw routeIdentityError();
+  return routes[0] || { childUserId: '', siteId: '' };
+}
+
+function routeSql(route, startIndex = 0) {
+  return {
+    sql: 'child_user_id = ? AND site_id = ?',
+    params: [route.childUserId, route.siteId],
+    startIndex,
+  };
+}
+
 function cloneJson(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
 }
@@ -569,9 +642,7 @@ function upsertTokenAccount(database, {
   const nowDate = normalizedDate(now);
   const nowText = nowDate.toISOString();
   const accountId = String(token.user_id || profile.id);
-  const expiresAt = token.expires_in
-    ? new Date(nowDate.getTime() + Number(token.expires_in) * 1000).toISOString()
-    : null;
+  const expiresAt = refreshTokenExpiresAt(token, nowDate);
   database.prepare(
     `INSERT INTO oauth_tokens
       (provider, account_id, display_name, site_id, scopes, access_token_cipher, refresh_token_cipher, token_type, expires_at,
@@ -712,8 +783,39 @@ export function saveTokenAccountAndConsumeOAuthState({
   });
 }
 
-export function updateAccountToken(accountId, token) {
-  const expiresAt = token.expires_in ? new Date(Date.now() + Number(token.expires_in) * 1000).toISOString() : null;
+function refreshTokenExpiresAt(token = {}, now = new Date()) {
+  const absolute = token.expires_at;
+  if (absolute !== undefined && absolute !== null && String(absolute).trim()) {
+    const text = String(absolute).trim();
+    if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(text)) return null;
+    const parsed = Date.parse(text);
+    return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+  }
+  const legacyExpiry = token.expiry;
+  if (typeof legacyExpiry === 'string' && legacyExpiry.trim()) {
+    const text = legacyExpiry.trim();
+    if (/(?:Z|[+-]\d{2}:\d{2})$/i.test(text)) {
+      const parsed = Date.parse(text);
+      return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+    }
+    return null;
+  }
+  const seconds = Number(token.expires_in ?? legacyExpiry);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  const parsed = new Date(now.getTime() + seconds * 1000);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
+}
+
+function invalidRefreshExpiryError() {
+  const error = new Error('刷新授权缺少有效的到期时间，未更新授权。');
+  error.code = 'TOKEN_EXPIRY_INVALID';
+  error.status = 422;
+  return error;
+}
+
+export function updateAccountToken(accountId, token, { now = new Date() } = {}) {
+  const expiresAt = refreshTokenExpiresAt(token, now);
+  if (!expiresAt) throw invalidRefreshExpiryError();
   run(
     `UPDATE oauth_tokens SET
       access_token_cipher = ?,
@@ -809,7 +911,7 @@ export function saveCampaigns(accountId, promotions, context = {}) {
         (account_id, promotion_id, promotion_type, merchant_id, child_user_id, site_id, logistic_type,
          name, status, start_date, finish_date, raw_json, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(account_id, promotion_id, promotion_type) DO UPDATE SET
+        ON CONFLICT(account_id, child_user_id, site_id, promotion_id, promotion_type) DO UPDATE SET
           merchant_id = excluded.merchant_id,
           child_user_id = excluded.child_user_id,
           site_id = excluded.site_id,
@@ -822,13 +924,19 @@ export function saveCampaigns(accountId, promotions, context = {}) {
           updated_at = excluded.updated_at`
     );
     for (const promo of rows) {
+      const route = resolveRouteForIdentity({
+        accountId,
+        promotionId: promo.promotion_id,
+        promotionType: promo.promotion_type,
+        route: routeFromPromotion(promo, context),
+      });
       statement.run(
         String(accountId),
         promo.promotion_id,
         promo.promotion_type,
         context.merchantId ? String(context.merchantId) : null,
-        context.childUserId ? String(context.childUserId) : null,
-        context.siteId || promo.raw?.site_id || null,
+        route.childUserId,
+        route.siteId,
         context.logisticType || promo.raw?.logistic_type || null,
         promo.name,
         promo.status,
@@ -868,12 +976,37 @@ export function markCampaignsCatalogRemoved({ accountId, childUserId, siteId, pr
   return changed;
 }
 
-export function listCampaigns(accountId) {
-  return all('SELECT * FROM promo_campaigns WHERE account_id = ? ORDER BY site_id, updated_at DESC, name', [String(accountId)]);
+export function listCampaignsAll(accountId) {
+  return all('SELECT * FROM promo_campaigns WHERE account_id = ? ORDER BY site_id, child_user_id, updated_at DESC, name', [String(accountId)]);
+}
+
+export function listCampaigns(accountId, route = null) {
+  const requested = routeFields(route || {});
+  if (requested.childUserId || requested.siteId) {
+    if (!completeRoute(requested)) throw routeIdentityError();
+    return all(
+      `SELECT * FROM promo_campaigns
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+       ORDER BY updated_at DESC, name`,
+      [String(accountId), requested.childUserId, requested.siteId],
+    );
+  }
+  const rows = listCampaignsAll(accountId);
+  const routes = distinctCompleteRoutes(rows);
+  if (routes.length > 1) throw routeIdentityError();
+  if (routes.length === 1) return rows.filter((row) => {
+    const rowRoute = routeFields(row);
+    return rowRoute.childUserId === routes[0].childUserId && rowRoute.siteId === routes[0].siteId;
+  });
+  return rows;
 }
 
 export function listCampaignsFiltered(accountId, filters = {}) {
-  return filterPromotions(listCampaigns(accountId), filters);
+  const requested = routeFields(filters.route || filters);
+  const campaigns = requested.childUserId && requested.siteId
+    ? listCampaigns(accountId, requested)
+    : listCampaignsAll(accountId);
+  return filterPromotions(campaigns, filters);
 }
 
 export function saveMarketplaceSites(accountId, sites) {
@@ -908,9 +1041,11 @@ export function saveMarketplaceSites(accountId, sites) {
 export function updateMarketplaceSitePromotionStatus({ accountId, childUserId, count = 0, status = 'ok', error = null }) {
   run(
     `UPDATE marketplace_sites
-     SET last_promotion_status = ?, last_promotion_count = ?, last_error = ?, updated_at = ?
+     SET last_promotion_status = ?,
+         last_promotion_count = CASE WHEN ? IS NULL THEN last_promotion_count ELSE ? END,
+         last_error = ?, updated_at = ?
      WHERE account_id = ? AND child_user_id = ?`,
-    [status, count ?? 0, error || null, nowIso(), String(accountId), String(childUserId)]
+    [status, count == null ? null : count, count == null ? null : count, error || null, nowIso(), String(accountId), String(childUserId)]
   );
 }
 
@@ -957,10 +1092,17 @@ export function listCycleStatesForPromotions(accountId, promotions) {
 export function listItemCountsForPromotions(accountId, promotions, status) {
   const map = new Map();
   for (const promo of promotions) {
+    const route = resolveRouteForIdentity({
+      accountId,
+      promotionId: promo.promotion_id,
+      promotionType: promo.promotion_type,
+      route: routeFromPromotion(promo),
+    });
     const row = get(
       `SELECT COUNT(*) AS count FROM promo_items
-       WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND status = ?`,
-      [String(accountId), promo.promotion_id, promo.promotion_type, status]
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ? AND status = ?`,
+      [String(accountId), route.childUserId, route.siteId, promo.promotion_id, promo.promotion_type, status]
     );
     map.set(promotionKey(promo), row?.count || 0);
   }
@@ -969,7 +1111,7 @@ export function listItemCountsForPromotions(accountId, promotions, status) {
 
 export function listSiteSummaries(accountId) {
   const childSites = listMarketplaceSites(accountId);
-  const activitySites = summarizeSites(listCampaigns(accountId));
+  const activitySites = summarizeSites(listCampaignsAll(accountId));
   if (!childSites.length) return activitySites;
   const activityByChild = new Map(activitySites.map((site) => [String(site.child_user_id || ''), site]));
   return childSites.map((site) => {
@@ -989,10 +1131,13 @@ export function listSiteSummaries(accountId) {
   });
 }
 
-export function getCampaign(accountId, promotionId, promotionType) {
+export function getCampaign(accountId, promotionId, promotionType, route = null) {
+  const resolvedRoute = resolveRouteForIdentity({ accountId, promotionId, promotionType, route });
   return get(
-    `SELECT * FROM promo_campaigns WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?`,
-    [String(accountId), promotionId, promotionType]
+    `SELECT * FROM promo_campaigns
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+       AND promotion_id = ? AND promotion_type = ?`,
+    [String(accountId), resolvedRoute.childUserId, resolvedRoute.siteId, promotionId, promotionType]
   );
 }
 
@@ -1003,12 +1148,19 @@ export function saveItems(accountId, promotionId, promotionType, items, context 
     return item;
   });
   const now = nowIso();
+  const route = resolveRouteForIdentity({
+    accountId,
+    promotionId,
+    promotionType,
+    route: routeFields(context),
+  });
   transaction((database) => {
     if (context.replaceStatus) {
       database.prepare(
         `DELETE FROM promo_items
-       WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND status = ?`,
-      ).run(String(accountId), promotionId, promotionType, String(context.replaceStatus));
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ? AND status = ?`,
+      ).run(String(accountId), route.childUserId, route.siteId, promotionId, promotionType, String(context.replaceStatus));
     }
     const statement = database.prepare(
       `INSERT INTO promo_items
@@ -1016,7 +1168,7 @@ export function saveItems(accountId, promotionId, promotionType, items, context 
          currency_id, original_price, price, suggested_discounted_price, min_discounted_price,
          max_discounted_price, source, raw_json, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(account_id, promotion_id, promotion_type, item_id) DO UPDATE SET
+        ON CONFLICT(account_id, child_user_id, site_id, promotion_id, promotion_type, item_id) DO UPDATE SET
           child_user_id = excluded.child_user_id,
           site_id = excluded.site_id,
           logistic_type = excluded.logistic_type,
@@ -1036,8 +1188,8 @@ export function saveItems(accountId, promotionId, promotionType, items, context 
         String(accountId),
         promotionId,
         promotionType,
-        context.childUserId ? String(context.childUserId) : null,
-        context.siteId || null,
+        route.childUserId,
+        route.siteId,
         context.logisticType || null,
         item.item_id,
         item.status,
@@ -1056,9 +1208,10 @@ export function saveItems(accountId, promotionId, promotionType, items, context 
   return rows;
 }
 
-export function applySuccessfulPromotionItemWrites({ accountId, promotionId, promotionType, action, items = [] }) {
+export function applySuccessfulPromotionItemWrites({ accountId, promotionId, promotionType, action, items = [], childUserId, siteId }) {
   const normalizedAction = String(action || '').toLowerCase();
-  const identity = [String(accountId), String(promotionId), String(promotionType)];
+  const route = resolveRouteForIdentity({ accountId, promotionId, promotionType, route: { childUserId, siteId } });
+  const identity = [String(accountId), route.childUserId, route.siteId, String(promotionId), String(promotionType)];
   const rows = (items || [])
     .map((item) => ({
       itemId: String(item?.itemId || item?.item_id || '').trim(),
@@ -1070,7 +1223,8 @@ export function applySuccessfulPromotionItemWrites({ accountId, promotionId, pro
     if (normalizedAction === 'cancel') {
       const statement = database.prepare(
         `DELETE FROM promo_items
-         WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND item_id = ?`,
+         WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+           AND promotion_id = ? AND promotion_type = ? AND item_id = ?`,
       );
       for (const row of rows) statement.run(...identity, row.itemId);
       return;
@@ -1079,7 +1233,8 @@ export function applySuccessfulPromotionItemWrites({ accountId, promotionId, pro
     const statement = database.prepare(
       `UPDATE promo_items
        SET status = 'started', price = COALESCE(?, price), updated_at = ?
-       WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND item_id = ?`,
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ? AND item_id = ?`,
     );
     const updatedAt = nowIso();
     for (const row of rows) {
@@ -1093,12 +1248,14 @@ export function applySuccessfulPromotionItemWrites({ accountId, promotionId, pro
   });
 }
 
-export function reconcilePromotionItemFetchCounts({ accountId, promotionId, promotionType }) {
-  const identity = [String(accountId), String(promotionId), String(promotionType)];
+export function reconcilePromotionItemFetchCounts({ accountId, promotionId, promotionType, childUserId, siteId }) {
+  const route = resolveRouteForIdentity({ accountId, promotionId, promotionType, route: { childUserId, siteId } });
+  const identity = [String(accountId), route.childUserId, route.siteId, String(promotionId), String(promotionType)];
   transaction((database) => {
     const countStatement = database.prepare(
       `SELECT COUNT(*) AS count FROM promo_items
-       WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND status = ?`,
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ? AND status = ?`,
     );
     const updateStatement = database.prepare(
       `UPDATE promo_item_fetch_states
@@ -1107,7 +1264,8 @@ export function reconcilePromotionItemFetchCounts({ accountId, promotionId, prom
              WHEN detail_status IN ('ok', 'full', 'empty') THEN ?
              ELSE platform_total
            END
-       WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND item_status = ?`,
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ? AND item_status = ?`,
     );
     for (const status of ['candidate', 'started']) {
       const count = Number(countStatement.get(...identity, status)?.count || 0);
@@ -1116,20 +1274,23 @@ export function reconcilePromotionItemFetchCounts({ accountId, promotionId, prom
   });
 }
 
-export function deleteItemsBySource(accountId, promotionId, promotionType, status, source) {
+export function deleteItemsBySource(accountId, promotionId, promotionType, status, source, route = null) {
+  const resolvedRoute = resolveRouteForIdentity({ accountId, promotionId, promotionType, route });
   run(
     `DELETE FROM promo_items
-     WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND status = ? AND source = ?`,
-    [String(accountId), promotionId, promotionType, status, source]
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+       AND promotion_id = ? AND promotion_type = ? AND status = ? AND source = ?`,
+    [String(accountId), resolvedRoute.childUserId, resolvedRoute.siteId, promotionId, promotionType, status, source]
   );
 }
 
-export function saveItemFetchState({ accountId, promotionId, promotionType, itemStatus, platformTotal, savedCount, detailStatus, warning, raw }) {
+export function saveItemFetchState({ accountId, promotionId, promotionType, itemStatus, platformTotal, savedCount, detailStatus, warning, raw, childUserId, siteId }) {
+  const route = resolveRouteForIdentity({ accountId, promotionId, promotionType, route: { childUserId, siteId } });
   run(
     `INSERT INTO promo_item_fetch_states
-      (account_id, promotion_id, promotion_type, item_status, platform_total, saved_count, detail_status, warning, raw_json, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(account_id, promotion_id, promotion_type, item_status) DO UPDATE SET
+      (account_id, child_user_id, site_id, promotion_id, promotion_type, item_status, platform_total, saved_count, detail_status, warning, raw_json, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, child_user_id, site_id, promotion_id, promotion_type, item_status) DO UPDATE SET
         platform_total = excluded.platform_total,
         saved_count = excluded.saved_count,
         detail_status = excluded.detail_status,
@@ -1138,6 +1299,8 @@ export function saveItemFetchState({ accountId, promotionId, promotionType, item
         updated_at = excluded.updated_at`,
     [
       String(accountId),
+      route.childUserId,
+      route.siteId,
       promotionId,
       promotionType,
       itemStatus,
@@ -1151,19 +1314,23 @@ export function saveItemFetchState({ accountId, promotionId, promotionType, item
   );
 }
 
-export function getItemFetchState(accountId, promotionId, promotionType, itemStatus) {
+export function getItemFetchState(accountId, promotionId, promotionType, itemStatus, route = null) {
+  const resolvedRoute = resolveRouteForIdentity({ accountId, promotionId, promotionType, route });
   return get(
     `SELECT * FROM promo_item_fetch_states
-     WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND item_status = ?`,
-    [String(accountId), promotionId, promotionType, itemStatus]
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+       AND promotion_id = ? AND promotion_type = ? AND item_status = ?`,
+    [String(accountId), resolvedRoute.childUserId, resolvedRoute.siteId, promotionId, promotionType, itemStatus]
   );
 }
 
-export function invalidatePromotionItemFetchStates({ accountId, promotionId, promotionType }) {
+export function invalidatePromotionItemFetchStates({ accountId, promotionId, promotionType, childUserId, siteId }) {
+  const route = resolveRouteForIdentity({ accountId, promotionId, promotionType, route: { childUserId, siteId } });
   run(
     `DELETE FROM promo_item_fetch_states
-     WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?`,
-    [String(accountId), String(promotionId), String(promotionType)]
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+       AND promotion_id = ? AND promotion_type = ?`,
+    [String(accountId), route.childUserId, route.siteId, String(promotionId), String(promotionType)]
   );
 }
 
@@ -1541,9 +1708,12 @@ export function recordActivityItemsCalibration({ accountId, siteId = '', promoti
   });
 }
 
-export function listItems(accountId, promotionId, promotionType, status) {
-  const params = [String(accountId), promotionId, promotionType];
-  let sql = `SELECT * FROM promo_items WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?`;
+export function listItems(accountId, promotionId, promotionType, status, route = null) {
+  const resolvedRoute = resolveRouteForIdentity({ accountId, promotionId, promotionType, route });
+  const params = [String(accountId), resolvedRoute.childUserId, resolvedRoute.siteId, promotionId, promotionType];
+  let sql = `SELECT * FROM promo_items
+             WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+               AND promotion_id = ? AND promotion_type = ?`;
   if (status) {
     sql += ' AND status = ?';
     params.push(status);
@@ -1555,7 +1725,7 @@ export function listItems(accountId, promotionId, promotionType, status) {
 export function listItemsForPromotions(accountId, promotions, status) {
   const map = new Map();
   for (const promo of promotions) {
-    map.set(promotionKey(promo), listItems(accountId, promo.promotion_id, promo.promotion_type, status));
+    map.set(promotionKey(promo), listItems(accountId, promo.promotion_id, promo.promotion_type, status, promo));
   }
   return map;
 }
@@ -1563,7 +1733,7 @@ export function listItemsForPromotions(accountId, promotions, status) {
 export function listItemFetchStatesForPromotions(accountId, promotions, status) {
   const map = new Map();
   for (const promo of promotions) {
-    const state = getItemFetchState(accountId, promo.promotion_id, promo.promotion_type, status);
+    const state = getItemFetchState(accountId, promo.promotion_id, promo.promotion_type, status, promo);
     if (state) map.set(promotionKey(promo), state);
   }
   return map;

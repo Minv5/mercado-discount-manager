@@ -122,7 +122,8 @@ test('OAuth start reads saved settings instead of requiring a standalone config 
     assert.equal(publicSettings.oauthClientSecret, undefined);
     assert.equal(publicSettings.oauthClientSecretConfigured, true);
     const started = await fetch(`${baseUrl}/api/oauth/start/from-config`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target_account_id: 'saved-account-1' }),
     });
     assert.equal(started.status, 200);
     const body = await started.json();

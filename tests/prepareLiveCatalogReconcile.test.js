@@ -205,9 +205,19 @@ test('same-site child users are selected by the full account route rather than s
 });
 
 test('a non-authoritative fallback cannot certify a live activity directory when official reads failed', () => {
+  const completeAuthoritative = {
+    source: 'child-hubei',
+    authoritative: true,
+    ok: true,
+    results_is_array: true,
+    total: 3,
+    returned: 3,
+    unique: 3,
+    paging: { total: 3, returned: 3, unique: 3, complete: true },
+  };
   assert.equal(requireAuthoritativeActivityCatalogRead([
-    { source: 'parent', authoritative: true, ok: false },
-    { source: 'child', authoritative: true, ok: true },
+    { source: 'parent', authoritative: true, ok: false, error_class: 'permission' },
+    completeAuthoritative,
     { source: 'fallback', authoritative: false, ok: true },
   ]), true);
   assert.throws(

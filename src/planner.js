@@ -184,6 +184,7 @@ export function buildPlan({ action, promotion, items, priceMode = 'discount', di
 
 export function filterPromotions(promotions, filters = {}) {
   const siteIds = splitFilter(filters.siteIds || filters.siteId);
+  const childUserIds = splitFilter(filters.childUserIds || filters.childUserId || filters.child_user_id);
   const promotionTypes = splitFilter(filters.promotionTypes || filters.promotionType).map((value) => value.toUpperCase());
   const keywords = splitFilter(filters.keywords || filters.name);
   const sellerActivityNames = splitFilter(filters.sellerActivityNames || filters.sellerActivityName).map(normalizeActivityName);
@@ -194,6 +195,7 @@ export function filterPromotions(promotions, filters = {}) {
     const activityName = normalizeActivityName(activityDisplayName(promo));
     const bucket = promotionBucket(type);
     if (siteIds.length && !siteIds.includes(String(promo.site_id || ''))) return false;
+    if (childUserIds.length && !childUserIds.includes(String(promo.child_user_id || ''))) return false;
     if (promotionTypes.length && !promotionTypes.includes(type)) return false;
     if (filters.status && promo.status !== filters.status) return false;
     if (ordinarySelectorActive && ![PROMOTION_BUCKETS.seller, PROMOTION_BUCKETS.official].includes(bucket)) return false;

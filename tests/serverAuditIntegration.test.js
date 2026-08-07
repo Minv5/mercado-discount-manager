@@ -158,6 +158,7 @@ test('OAuth completion uses one atomic persistence operation', async () => {
   try {
     const { commitOAuthAuthorizationState } = await import(`../src/server.js?oauth-atomic=${Date.now()}`);
     const input = {
+      targetAccountId: 'A-1',
       state: 'state-1',
       claimToken: 'claim-1',
       token: { user_id: 'A-1' },
@@ -183,6 +184,17 @@ test('OAuth completion uses one atomic persistence operation', async () => {
         },
       }),
       /atomic transaction rolled back/,
+    );
+    assert.throws(
+      () => commitOAuthAuthorizationState({
+        ...input,
+        targetAccountId: 'different-account',
+      }, {
+        commit: () => {
+          throw new Error('should not reach commit');
+        },
+      }),
+      (error) => error?.code === 'ACCOUNT_IDENTITY_MISMATCH' && error?.status === 422,
     );
   } finally {
     if (previous === undefined) delete process.env.MDM_SERVER_LIBRARY_MODE;

@@ -75,8 +75,8 @@ function migrate(database) {
       promotion_id TEXT NOT NULL,
       promotion_type TEXT NOT NULL,
       merchant_id TEXT,
-      child_user_id TEXT,
-      site_id TEXT,
+      child_user_id TEXT NOT NULL DEFAULT '',
+      site_id TEXT NOT NULL DEFAULT '',
       logistic_type TEXT,
       name TEXT,
       status TEXT,
@@ -84,7 +84,7 @@ function migrate(database) {
       finish_date TEXT,
       raw_json TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      UNIQUE(account_id, promotion_id, promotion_type)
+      UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type)
     );
 
     CREATE TABLE IF NOT EXISTS marketplace_sites (
@@ -106,8 +106,8 @@ function migrate(database) {
       account_id TEXT NOT NULL,
       promotion_id TEXT NOT NULL,
       promotion_type TEXT NOT NULL,
-      child_user_id TEXT,
-      site_id TEXT,
+      child_user_id TEXT NOT NULL DEFAULT '',
+      site_id TEXT NOT NULL DEFAULT '',
       logistic_type TEXT,
       item_id TEXT NOT NULL,
       status TEXT,
@@ -120,7 +120,7 @@ function migrate(database) {
       source TEXT,
       raw_json TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      UNIQUE(account_id, promotion_id, promotion_type, item_id)
+      UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type, item_id)
     );
 
     CREATE TABLE IF NOT EXISTS promo_tasks (
@@ -240,6 +240,8 @@ function migrate(database) {
     CREATE TABLE IF NOT EXISTS promo_item_fetch_states (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       account_id TEXT NOT NULL,
+      child_user_id TEXT NOT NULL DEFAULT '',
+      site_id TEXT NOT NULL DEFAULT '',
       promotion_id TEXT NOT NULL,
       promotion_type TEXT NOT NULL,
       item_status TEXT NOT NULL,
@@ -249,7 +251,7 @@ function migrate(database) {
       warning TEXT,
       raw_json TEXT,
       updated_at TEXT NOT NULL,
-      UNIQUE(account_id, promotion_id, promotion_type, item_status)
+      UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type, item_status)
     );
 
     CREATE TABLE IF NOT EXISTS activity_cache_states (
@@ -329,6 +331,8 @@ function migrate(database) {
   addColumnIfMissing(database, 'promo_items', 'site_id', 'TEXT');
   addColumnIfMissing(database, 'promo_items', 'logistic_type', 'TEXT');
   addColumnIfMissing(database, 'promo_items', 'source', 'TEXT');
+  addColumnIfMissing(database, 'promo_item_fetch_states', 'child_user_id', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(database, 'promo_item_fetch_states', 'site_id', "TEXT NOT NULL DEFAULT ''");
   addColumnIfMissing(database, 'promo_tasks', 'execution_group_id', 'TEXT');
   addColumnIfMissing(database, 'promo_tasks', 'execution_job_id', 'TEXT');
   addColumnIfMissing(database, 'activity_callback_events', 'topic', 'TEXT');
@@ -348,6 +352,7 @@ function migrate(database) {
   addColumnIfMissing(database, 'activity_callback_events', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
   addColumnIfMissing(database, 'seller_campaign_create_results', 'child_user_id', 'TEXT');
   addColumnIfMissing(database, 'seller_campaign_create_results', 'detection_status', 'TEXT');
+  migrateRouteIdentityTables(database);
   database.exec(`
     CREATE INDEX IF NOT EXISTS idx_promo_tasks_execution_group
       ON promo_tasks(execution_group_id, id);
@@ -360,6 +365,187 @@ function migrate(database) {
     CREATE INDEX IF NOT EXISTS idx_seller_campaign_create_results_route_name
       ON seller_campaign_create_results(account_id, child_user_id, site_id, promotion_name, created_at);
   `);
+}
+
+function migrateRouteIdentityTables(database) {
+  migrateRouteIdentityTable(database, {
+    table: 'promo_campaigns',
+    uniqueColumns: ['account_id', 'child_user_id', 'site_id', 'promotion_id', 'promotion_type'],
+    columns: [
+      'account_id', 'promotion_id', 'promotion_type', 'merchant_id', 'child_user_id', 'site_id',
+      'logistic_type', 'name', 'status', 'start_date', 'finish_date', 'raw_json', 'updated_at'
+    ],
+    createSql: `
+      CREATE TABLE promo_campaigns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id TEXT NOT NULL,
+        promotion_id TEXT NOT NULL,
+        promotion_type TEXT NOT NULL,
+        merchant_id TEXT,
+        child_user_id TEXT NOT NULL DEFAULT '',
+        site_id TEXT NOT NULL DEFAULT '',
+        logistic_type TEXT,
+        name TEXT,
+        status TEXT,
+        start_date TEXT,
+        finish_date TEXT,
+        raw_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type)
+      )`
+  });
+  migrateRouteIdentityTable(database, {
+    table: 'promo_items',
+    uniqueColumns: ['account_id', 'child_user_id', 'site_id', 'promotion_id', 'promotion_type', 'item_id'],
+    columns: [
+      'account_id', 'promotion_id', 'promotion_type', 'child_user_id', 'site_id', 'logistic_type',
+      'item_id', 'status', 'currency_id', 'original_price', 'price', 'suggested_discounted_price',
+      'min_discounted_price', 'max_discounted_price', 'source', 'raw_json', 'updated_at'
+    ],
+    createSql: `
+      CREATE TABLE promo_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id TEXT NOT NULL,
+        promotion_id TEXT NOT NULL,
+        promotion_type TEXT NOT NULL,
+        child_user_id TEXT NOT NULL DEFAULT '',
+        site_id TEXT NOT NULL DEFAULT '',
+        logistic_type TEXT,
+        item_id TEXT NOT NULL,
+        status TEXT,
+        currency_id TEXT,
+        original_price REAL,
+        price REAL,
+        suggested_discounted_price REAL,
+        min_discounted_price REAL,
+        max_discounted_price REAL,
+        source TEXT,
+        raw_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type, item_id)
+      )`
+  });
+  migrateRouteIdentityTable(database, {
+    table: 'promo_item_fetch_states',
+    uniqueColumns: ['account_id', 'child_user_id', 'site_id', 'promotion_id', 'promotion_type', 'item_status'],
+    columns: [
+      'account_id', 'child_user_id', 'site_id', 'promotion_id', 'promotion_type', 'item_status',
+      'platform_total', 'saved_count', 'detail_status', 'warning', 'raw_json', 'updated_at'
+    ],
+    createSql: `
+      CREATE TABLE promo_item_fetch_states (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id TEXT NOT NULL,
+        child_user_id TEXT NOT NULL DEFAULT '',
+        site_id TEXT NOT NULL DEFAULT '',
+        promotion_id TEXT NOT NULL,
+        promotion_type TEXT NOT NULL,
+        item_status TEXT NOT NULL,
+        platform_total INTEGER,
+        saved_count INTEGER NOT NULL DEFAULT 0,
+        detail_status TEXT NOT NULL,
+        warning TEXT,
+        raw_json TEXT,
+        updated_at TEXT NOT NULL,
+        UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type, item_status)
+      )`
+  });
+}
+
+function migrateRouteIdentityTable(database, { table, uniqueColumns, columns, createSql }) {
+  if (hasUniqueIndex(database, table, uniqueColumns)) return;
+  const sourceTable = `${table}_legacy_source`;
+  const unresolvedTable = `${table}_legacy_unresolved`;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`ALTER TABLE ${table} RENAME TO ${sourceTable}`);
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS ${unresolvedTable} AS
+      SELECT *, CAST(NULL AS TEXT) AS blocked_reason, CAST(NULL AS TEXT) AS blocked_at
+      FROM ${sourceTable} WHERE 0
+    `);
+    database.exec(createSql);
+    const sourceRows = database.prepare(`SELECT * FROM ${sourceTable} ORDER BY id`).all();
+    const insertable = database.prepare(
+      `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`
+    );
+    const unresolvedColumns = [...columns, 'blocked_reason', 'blocked_at'];
+    const unresolvedInsert = database.prepare(
+      `INSERT INTO ${unresolvedTable} (${unresolvedColumns.join(', ')}) VALUES (${unresolvedColumns.map(() => '?').join(', ')})`
+    );
+    const seen = new Set();
+    for (const row of sourceRows) {
+      const route = legacyRouteForRow(database, table, row);
+      const values = route
+        ? routeValuesForRow(table, row, route)
+        : null;
+      const key = values ? identityKeyForTable(table, values) : null;
+      if (!values || seen.has(key)) {
+        const reason = !values ? 'blocked_legacy_route' : 'duplicate_route_identity';
+        unresolvedInsert.run(...columns.map((column) => row[column] ?? null), reason, new Date().toISOString());
+        continue;
+      }
+      insertable.run(...columns.map((column) => values[column] ?? null));
+      seen.add(key);
+    }
+    database.exec(`DROP TABLE ${sourceTable}`);
+    database.exec('COMMIT');
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      // Preserve the original migration error.
+    }
+    throw error;
+  }
+}
+
+function hasUniqueIndex(database, table, expectedColumns) {
+  const indexes = database.prepare(`PRAGMA index_list(${table})`).all();
+  return indexes.some((index) => {
+    if (Number(index.unique) !== 1) return false;
+    const columns = database.prepare(`PRAGMA index_info(${index.name})`).all()
+      .sort((left, right) => Number(left.seqno) - Number(right.seqno))
+      .map((row) => String(row.name));
+    return columns.length === expectedColumns.length
+      && columns.every((name, indexPosition) => name === expectedColumns[indexPosition]);
+  });
+}
+
+function legacyRouteForRow(database, table, row) {
+  const directChild = String(row.child_user_id || '').trim();
+  const directSite = String(row.site_id || '').trim().toUpperCase();
+  if (directChild && directSite) return { child_user_id: directChild, site_id: directSite };
+  if (table === 'promo_campaigns') return null;
+  const routes = database.prepare(
+    `SELECT DISTINCT child_user_id, site_id
+     FROM promo_campaigns
+     WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?
+       AND child_user_id <> '' AND site_id <> ''`
+  ).all(String(row.account_id || ''), String(row.promotion_id || ''), String(row.promotion_type || ''))
+    .map((candidate) => ({
+      child_user_id: String(candidate.child_user_id || '').trim(),
+      site_id: String(candidate.site_id || '').trim().toUpperCase(),
+    }))
+    .filter((candidate) => candidate.child_user_id && candidate.site_id);
+  return routes.length === 1 ? routes[0] : null;
+}
+
+function routeValuesForRow(table, row, route) {
+  return {
+    ...row,
+    child_user_id: route.child_user_id,
+    site_id: route.site_id,
+    promotion_type: String(row.promotion_type || '').toUpperCase(),
+    ...(table === 'promo_items' ? { source: row.source || 'legacy_route_migration' } : {})
+  };
+}
+
+function identityKeyForTable(table, row) {
+  const base = [row.account_id, row.child_user_id, row.site_id, row.promotion_id, row.promotion_type];
+  if (table === 'promo_items') base.push(row.item_id);
+  if (table === 'promo_item_fetch_states') base.push(row.item_status);
+  return base.map((value) => String(value || '').toUpperCase()).join('|');
 }
 
 function migrateOAuthStateClaimsAndDailySnapshots(database) {

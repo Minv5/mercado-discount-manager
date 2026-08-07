@@ -46,8 +46,12 @@ import {
 } from './inventoryFallback.js';
 import { decideCycleAction, getCycleState, markCycleAfterTask, nextDiscountFor } from './cycle.js';
 import { ApiError, classifyPrepareError, prepareErrorMessage, toChineseError } from './errors.js';
-import { MercadoLibreClient, buildAuthorizationUrl, extractMarketplaceUsers, extractPromotions, mergePromotionsByIdentity } from './mlClient.js';
-import { accountProfileRecord } from './accountProfiles.js';
+import { MercadoLibreClient, PROMOTION_ITEMS_UNREADABLE_CODE, buildAuthorizationUrl, extractMarketplaceUsers, extractPromotions, mergePromotionsByIdentity } from './mlClient.js';
+import {
+  accountProfileRecord,
+  assertOAuthIdentityMatch,
+  requireOAuthTargetAccountId,
+} from './accountProfiles.js';
 import {
   HIDDEN_SELLER_CAMPAIGN_MESSAGE,
   HIDDEN_SELLER_CAMPAIGN_STATUS,
@@ -64,6 +68,8 @@ import {
   normalizeAccountRoute,
 } from './accountRouteIdentity.js';
 import {
+  buildActivityCatalogSourceSummary,
+  isCompleteAuthoritativeActivitySource,
   reconcileActivityCatalog,
   requireAuthoritativeActivityCatalogRead,
   selectMarketplaceUsersForCatalogRoutes,
@@ -108,6 +114,7 @@ import {
   finalizeActivityCallbackEvent,
   listAllMarketplaceSites,
   listStoredAccounts,
+  listCampaignsAll,
   listCampaigns,
   listCampaignsFiltered,
   listCycleStatesForPromotions,
@@ -212,6 +219,17 @@ import { acquireProcessInstanceLock } from './processInstanceLock.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+export const PROMOTION_ITEMS_INCOMPLETE_CODE = 'PROMOTION_ITEMS_INCOMPLETE';
+const SAFE_PROMOTION_ITEMS_DETAIL_STATUSES = new Set([
+  'empty',
+  'ok',
+  'partial',
+  'partial_api_sparse_marketplace_candidate',
+  'api_incomplete_marketplace_candidate',
+  'candidate_incomplete',
+  'unreadable',
+  'error',
+]);
 const batchFetchJobs = new Map();
 const inventoryFallbackJobs = new Map();
 const executionJobs = new Map();
@@ -220,6 +238,9 @@ const submissionPreparationTasks = new Map();
 const submissionCommitTasks = new Map();
 const submissionCommitControllers = new Map();
 const submissionRecoveryAuditAt = new Map();
+// The target is deliberately process-bound. A restart loses the binding and
+// therefore fails closed instead of allowing an unbound callback to mutate DB.
+const pendingOAuthTargetAccounts = new Map();
 const PRE_GROUP_SUBMISSION_STATES = new Set(['committing', 'creating', 'created', 'starting']);
 const sharedWriteLimiters = new Map();
 const writeBenchmarkJobs = new Map();
@@ -626,7 +647,7 @@ async function runLowFrequencyActivityCalibration() {
             promotionId: campaign.promotion_id,
             promotionType: campaign.promotion_type,
           });
-          const fetchState = getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, status);
+          const fetchState = getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, status, campaign);
           if (!activityItemsDecision({ promotion: campaign, cacheState, fetchState, itemStatus: status }).refresh) continue;
           await fetchAndSavePromotionItemsForCampaign({
             account,
@@ -1022,10 +1043,14 @@ async function handleApi(req, res) {
   if (method === 'POST' && url.pathname === '/api/oauth/start') {
     const body = await readJsonBody(req);
     requireFields(body, ['clientId', 'clientSecret', 'redirectUri']);
+    const targetAccountId = requireOAuthTargetAccountId(
+      body.targetAccountId || body.target_account_id || body.accountId || body.account_id,
+    );
     const { verifier, challenge } = createPkcePair();
     const state = createState();
     const authDomain = body.authDomain || DEFAULT_AUTH_DOMAIN;
     clearOAuthStates();
+    pendingOAuthTargetAccounts.clear();
     saveOAuthState({
       state,
       clientId: body.clientId,
@@ -1035,6 +1060,7 @@ async function handleApi(req, res) {
       codeVerifier: verifier,
       codeChallenge: challenge
     });
+    pendingOAuthTargetAccounts.set(state, targetAccountId);
     return sendJson(res, 200, {
       ok: true,
       authorizationUrl: buildAuthorizationUrl({
@@ -1048,6 +1074,10 @@ async function handleApi(req, res) {
   }
 
   if (method === 'POST' && url.pathname === '/api/oauth/start/from-config') {
+    const body = await readJsonBody(req);
+    const targetAccountId = requireOAuthTargetAccountId(
+      body.targetAccountId || body.target_account_id || body.accountId || body.account_id,
+    );
     const { verifier, challenge } = createPkcePair();
     const state = createState();
     const standaloneConfig = readStandaloneConfig();
@@ -1060,7 +1090,9 @@ async function handleApi(req, res) {
       tokenRedirectUri: standaloneToken?.redirect_uri
     });
     clearOAuthStates();
+    pendingOAuthTargetAccounts.clear();
     saveOAuthState(prepared.stateRecord);
+    pendingOAuthTargetAccounts.set(state, targetAccountId);
     return sendJson(res, 200, prepared.response);
   }
 
@@ -1133,17 +1165,36 @@ async function handleApi(req, res) {
   if (method === 'POST' && fetchPromosMatch) {
     const account = await ensureUsableAccount(fetchPromosMatch[1]);
     const result = await fetchAndSavePromotions(account);
+    if (!result.ok) {
+      return sendJson(res, 422, {
+        ok: false,
+        code: result.stable_code || 'ACTIVITY_DIRECTORY_INCOMPLETE',
+        status: result.status || 'blocked',
+        total: result.total,
+        children: result.children,
+        diagnostics: Array.isArray(result.diagnostics) ? result.diagnostics : [],
+      });
+    }
+    const promotions = result.children?.length
+      ? result.children.flatMap((child) => listCampaigns(account.account_id, {
+        childUserId: child.child_user_id,
+        siteId: child.site_id,
+      }))
+      : listCampaigns(account.account_id);
     return sendJson(res, 200, {
       ok: true,
       total: result.total,
       children: result.children,
-      promotions: listCampaigns(account.account_id)
+      promotions
     });
   }
 
   const listPromosMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/promotions$/);
   if (method === 'GET' && listPromosMatch) {
-    return sendJson(res, 200, { ok: true, promotions: listOperatingCampaignsFiltered(listPromosMatch[1], queryFiltersFromSearchParams(url.searchParams)) });
+    const filters = queryFiltersFromSearchParams(url.searchParams);
+    filters.childUserId = url.searchParams.get('childUserId') || url.searchParams.get('child_user_id') || undefined;
+    filters.siteId = url.searchParams.get('siteId') || url.searchParams.get('site_id') || filters.siteId;
+    return sendJson(res, 200, { ok: true, promotions: listOperatingCampaignsFiltered(listPromosMatch[1], filters) });
   }
 
   const sitesMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/sites$/);
@@ -1192,7 +1243,39 @@ async function handleApi(req, res) {
       marketplace: isMarketplaceCampaign(account, campaign)
     });
     const fetchMode = body.fetchMode === 'full' ? 'full' : 'sample';
-    const result = await client.fetchAllPromotionItems({ promotionId, promotionType, status, maxItems: fetchMode === 'full' ? 'all' : Number(body.maxItems || 5000) });
+    let result;
+    try {
+      result = await client.fetchAllPromotionItems({ promotionId, promotionType, status, maxItems: fetchMode === 'full' ? 'all' : Number(body.maxItems || 5000) });
+    } catch (error) {
+      if (error?.code === PROMOTION_ITEMS_UNREADABLE_CODE) {
+        return sendJson(res, 422, {
+          ok: false,
+          error: toChineseError(error),
+          details: {
+            ...safeErrorDetails(error),
+            diagnostics: sanitizePromotionItemsUnreadableDiagnostics(error.diagnostics),
+          },
+        });
+      }
+      throw error;
+    }
+    const incompleteFullFetch = buildPromotionItemsIncompleteResponse(result, fetchMode);
+    if (incompleteFullFetch) {
+      saveItemFetchState({
+        accountId: account.account_id,
+        childUserId: campaign?.child_user_id,
+        siteId: campaign?.site_id,
+        promotionId,
+        promotionType,
+        itemStatus: status,
+        platformTotal: result.total,
+        savedCount: result.saved,
+        detailStatus: result.detailStatus,
+        warning: 'full fetch incomplete; candidate cache was not replaced',
+        raw: result.rawSummary
+      });
+      return sendJson(res, incompleteFullFetch.status, incompleteFullFetch.body);
+    }
     saveItems(account.account_id, promotionId, promotionType, result.results, {
       childUserId: campaign?.child_user_id,
       siteId: campaign?.site_id,
@@ -1202,6 +1285,8 @@ async function handleApi(req, res) {
     });
     saveItemFetchState({
       accountId: account.account_id,
+      childUserId: campaign?.child_user_id,
+      siteId: campaign?.site_id,
       promotionId,
       promotionType,
       itemStatus: status,
@@ -1223,7 +1308,7 @@ async function handleApi(req, res) {
       warning: result.warning,
       blocked: result.blocked,
       fetch_stats: fetchStatsFromRaw(result.rawSummary),
-      items: listItems(account.account_id, promotionId, promotionType, status)
+      items: listItems(account.account_id, promotionId, promotionType, status, campaign)
     });
   }
 
@@ -1260,6 +1345,8 @@ async function handleApi(req, res) {
     });
     saveItemFetchState({
       accountId,
+      childUserId: campaign.child_user_id,
+      siteId: campaign.site_id,
       promotionId,
       promotionType,
       itemStatus: 'candidate',
@@ -1281,7 +1368,7 @@ async function handleApi(req, res) {
       can_real_enroll: false,
       requirement: '仅保存本地草案；缺少价格明细时计划会跳过，真实报名仍需预检包和主管最终确认门。',
       resolution: buildCandidateIncompleteResolution({ promotionId, promotionType, platformTotal: rows.length }),
-      items: listItems(accountId, promotionId, promotionType, 'candidate')
+      items: listItems(accountId, promotionId, promotionType, 'candidate', campaign)
     });
   }
 
@@ -1290,17 +1377,20 @@ async function handleApi(req, res) {
     const { accountId, promotionId, promotionType, action } = requireFields(body, ['accountId', 'promotionId', 'promotionType', 'action']);
     const campaign = getCampaign(accountId, promotionId, promotionType) || { promotion_id: promotionId, promotion_type: promotionType };
     const itemStatus = requireItemStatus(body.status || actionDefaultStatus(action));
-    const fetchState = getItemFetchState(accountId, promotionId, promotionType, itemStatus);
-    if (action === 'enroll' && CANDIDATE_INCOMPLETE_STATUSES.has(fetchState?.detail_status)) {
+    const fetchState = getItemFetchState(accountId, promotionId, promotionType, itemStatus, campaign);
+    if (String(fetchState?.detail_status || '').toLowerCase() === 'unreadable'
+        || (action === 'enroll' && CANDIDATE_INCOMPLETE_STATUSES.has(fetchState?.detail_status))) {
       return sendJson(res, 200, {
         ok: true,
         blocked: true,
         detail_status: fetchState.detail_status,
-        warning: fetchState.warning || '平台返回候选总数但未返回候选明细，需要接口专项处理',
+        warning: fetchState.warning || (fetchState.detail_status === 'unreadable'
+          ? '平台商品明细不可验证，本次不使用旧商品缓存生成计划。'
+          : '平台返回候选总数但未返回候选明细，需要接口专项处理'),
         plan: { promotion: campaign, action, total: 0, planned: 0, skipped: 0, rows: [] }
       });
     }
-    const items = body.items?.length ? body.items : listItems(accountId, promotionId, promotionType, body.status);
+    const items = body.items?.length ? body.items : listItems(accountId, promotionId, promotionType, body.status, campaign);
     const plan = buildPlan({
       action,
       promotion: campaign,
@@ -1750,7 +1840,7 @@ async function handleApi(req, res) {
     const account = await ensureUsableAccount(accountId);
     const promotion = getCampaign(account.account_id, promotionId, promotionType);
     if (!promotion) return sendJson(res, 404, { ok: false, error: '未找到 SMART 活动缓存，请先刷新活动。' });
-    const items = listItems(account.account_id, promotionId, promotionType, body.status || 'started');
+    const items = listItems(account.account_id, promotionId, promotionType, body.status || 'started', promotion);
     const item = itemId ? items.find((row) => String(row.item_id) === String(itemId)) : items[0];
     if (!item) return sendJson(res, 404, { ok: false, error: '未找到 SMART started 商品缓存，请先读取 started 商品。' });
     return sendJson(res, 200, {
@@ -1798,7 +1888,7 @@ async function handleApi(req, res) {
     const settings = readSettings();
     const accounts = listAccountsForUi();
     const sites = accountId ? listSiteSummaries(accountId) : [];
-    const activities = accountId ? listCampaigns(accountId) : [];
+    const activities = accountId ? listCampaignsAll(accountId) : [];
     const results = listResults(5000);
     return sendJson(res, 200, {
       ok: true,
@@ -1833,7 +1923,7 @@ async function handleOAuthCallback(req, res) {
 
 async function buildSmartCancelRemainingSummary({ account, live = true, promotionId = null, itemId = null } = {}) {
   const accountId = account?.account_id;
-  const campaigns = listCampaigns(accountId).filter((campaign) => {
+  const campaigns = listCampaignsAll(accountId).filter((campaign) => {
     if (String(campaign.promotion_type || '').toUpperCase() !== 'SMART') return false;
     if (promotionId && String(campaign.promotion_id) !== String(promotionId)) return false;
     return true;
@@ -1844,7 +1934,7 @@ async function buildSmartCancelRemainingSummary({ account, live = true, promotio
   let totalWithOfferId = 0;
   let totalStaleRemoved = 0;
   for (const campaign of campaigns) {
-    const localItems = listItems(accountId, campaign.promotion_id, campaign.promotion_type, 'started');
+    const localItems = listItems(accountId, campaign.promotion_id, campaign.promotion_type, 'started', campaign);
     const liveSync = live
       ? await fetchAndSyncSmartStarted({ account, campaign, itemId })
       : {
@@ -1933,7 +2023,7 @@ async function buildSmartCancelDetail({ account, promotionId, promotionType = 'S
   if (!campaign) {
     throw new ApiError('未找到 SMART 活动缓存，请先刷新活动。', 404);
   }
-  const localStartedItems = listItems(account.account_id, promotionId, promotionType, 'started');
+  const localStartedItems = listItems(account.account_id, promotionId, promotionType, 'started', campaign);
   const localItem = localStartedItems.find((row) => String(row.item_id) === String(itemId)) || null;
   const localPreview = localItem
     ? safeSmartCancelPreview({ account, campaign, item: localItem, marketplace: isMarketplaceCampaign(account, campaign) })
@@ -1998,7 +2088,7 @@ async function buildSmartCancelDetail({ account, promotionId, promotionType = 'S
 }
 
 async function fetchAndSyncSmartStarted({ account, campaign, itemId = null, promotionType = 'SMART' } = {}) {
-  const localItems = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, 'started');
+  const localItems = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, 'started', campaign);
   const client = makeWriteClient(account, campaign);
   const started = await client.fetchAllPromotionItems({
     promotionId: campaign.promotion_id,
@@ -2117,6 +2207,7 @@ async function completeOAuthAuthorization({ code, state }) {
   }
 
   const record = claim.record;
+  const targetAccountId = pendingOAuthTargetAccounts.get(String(state || '')) || null;
   let oauthCommitted = false;
   try {
     const { token, profile } = await runOAuthExternalStagesWithLease({
@@ -2128,6 +2219,7 @@ async function completeOAuthAuthorization({ code, state }) {
     const committed = commitOAuthAuthorizationState({
       state,
       claimToken: claim.claim_token,
+      targetAccountId,
       token,
       profile,
       clientId: record.clientId,
@@ -2142,6 +2234,7 @@ async function completeOAuthAuthorization({ code, state }) {
       throw error;
     }
     oauthCommitted = true;
+    pendingOAuthTargetAccounts.delete(String(state || ''));
     const account = committed.account;
     const cached = accountProfileRecord({
       accountId: account.account_id,
@@ -2158,6 +2251,9 @@ async function completeOAuthAuthorization({ code, state }) {
     }
     return account;
   } catch (error) {
+    if (error?.code === 'ACCOUNT_IDENTITY_MISMATCH') {
+      pendingOAuthTargetAccounts.delete(String(state || ''));
+    }
     if (!oauthCommitted) {
       releaseOAuthClaimAfterFailure({
         state,
@@ -2172,6 +2268,11 @@ async function completeOAuthAuthorization({ code, state }) {
 export function commitOAuthAuthorizationState(input, {
   commit = saveTokenAccountAndConsumeOAuthState,
 } = {}) {
+  assertOAuthIdentityMatch({
+    targetAccountId: input?.targetAccountId,
+    profileId: input?.profile?.id,
+    tokenUserId: input?.token?.user_id,
+  });
   return commit(input);
 }
 
@@ -2265,6 +2366,16 @@ async function executeAction(res, body) {
 
   const account = await ensureUsableAccount(accountId);
   const campaign = getCampaign(account.account_id, promotionId, promotionType) || { promotion_id: promotionId, promotion_type: promotionType, account_id: account.account_id };
+  const existingFetchState = getItemFetchState(account.account_id, promotionId, promotionType, itemStatus, campaign);
+  if (String(existingFetchState?.detail_status || '').toLowerCase() === 'unreadable') {
+    return sendJson(res, 409, {
+      ok: false,
+      blocked: true,
+      detail_status: 'unreadable',
+      error_code: PROMOTION_ITEMS_UNREADABLE_CODE,
+      error: existingFetchState.warning || '平台商品明细不可验证，本次不使用旧商品缓存执行。',
+    });
+  }
   const singlePrepare = await prepareItemsForExecution({
     account,
     promotions: [campaign],
@@ -2273,8 +2384,17 @@ async function executeAction(res, body) {
     settings,
     request
   });
-  const fetchState = getItemFetchState(account.account_id, promotionId, promotionType, itemStatus);
-  const items = body.items?.length ? body.items : listItems(account.account_id, promotionId, promotionType, itemStatus);
+  const fetchState = getItemFetchState(account.account_id, promotionId, promotionType, itemStatus, campaign);
+  if (String(fetchState?.detail_status || '').toLowerCase() === 'unreadable') {
+    return sendJson(res, 409, {
+      ok: false,
+      blocked: true,
+      detail_status: 'unreadable',
+      error_code: PROMOTION_ITEMS_UNREADABLE_CODE,
+      error: fetchState.warning || '平台商品明细不可验证，本次不使用旧商品缓存执行。',
+    });
+  }
+  const items = body.items?.length ? body.items : listItems(account.account_id, promotionId, promotionType, itemStatus, campaign);
   let plan = buildPlan({
     action,
     promotion: campaign,
@@ -2997,6 +3117,7 @@ async function recoverHiddenSellerCampaignsForPreparedAccount({
         target: route,
         name,
         forceCatalogRefresh: async () => listCampaignsFiltered(accountId, {
+          route: { childUserId: route.child_user_id, siteId: route.site_id },
           siteIds: [route.site_id], promotionTypes: ['SELLER_CAMPAIGN'],
         }).filter((campaign) => accountRouteKey(campaign) === accountRouteKey(route)),
         listHistoricalCandidates: async () => listSellerCampaignRecoveryCandidates({
@@ -3375,7 +3496,7 @@ async function createMissingSellerCampaigns({
               readScheduler,
             });
             checkpoint?.();
-            return listCampaignsFiltered(accountId, { siteIds: [siteId], promotionTypes: ['SELLER_CAMPAIGN'] })
+            return listCampaignsFiltered(accountId, { route: { childUserId, siteId }, siteIds: [siteId], promotionTypes: ['SELLER_CAMPAIGN'] })
               .filter((campaign) => accountRouteKey(campaign) === accountRouteKey(route));
           },
           listHistoricalCandidates: async () => listSellerCampaignRecoveryCandidates({
@@ -3673,7 +3794,7 @@ function publicSellerCampaignTarget(target = {}) {
 }
 
 function findSellerCampaignAfterCreate({ accountId, childUserId, siteId, name, promotionId }) {
-  const campaigns = listCampaignsFiltered(accountId, { siteIds: [siteId], promotionTypes: ['SELLER_CAMPAIGN'] });
+  const campaigns = listCampaignsFiltered(accountId, { route: { childUserId, siteId }, siteIds: [siteId], promotionTypes: ['SELLER_CAMPAIGN'] });
   const routed = campaigns.filter((campaign) => accountRouteKey(campaign) === accountRouteKey({
     account_id: accountId,
     child_user_id: childUserId,
@@ -4258,7 +4379,7 @@ function activityCatalogSellerStatus(accountId, refresh = {}, filters = {}, sett
       });
       continue;
     }
-    const sellerCount = listOperatingCampaignsFiltered(accountId, { siteId, promotionTypes: ['SELLER_CAMPAIGN'] }, settings)
+    const sellerCount = listOperatingCampaignsFiltered(accountId, { childUserId: target.child_user_id, siteId, promotionTypes: ['SELLER_CAMPAIGN'] }, settings)
       .filter((campaign) => accountRouteKey(campaign) === routeKey).length;
     rows.set(routeKey, {
       ok_count: 1,
@@ -4874,6 +4995,7 @@ function buildSnapshotExecutionScope({
       promotion.promotion_id,
       promotion.promotion_type,
       itemStatus,
+      promotion,
     ).map((item) => String(item.item_id ?? item.itemId ?? item.id ?? '')).filter(Boolean);
     activities.push({
       ...promotion,
@@ -5377,6 +5499,7 @@ async function startExecutionGroupInternal(body = {}) {
         activity.promotion_id ?? activity.promotionId,
         activity.promotion_type ?? activity.promotionType,
         activity.item_status ?? activity.itemStatus,
+        activity,
       ).map((item) => String(item.item_id ?? item.itemId ?? item.id ?? '').toUpperCase()));
       for (const itemId of activity.item_ids ?? activity.itemIds ?? []) {
         if (!available.has(String(itemId || '').toUpperCase())) missingRelations.push(`${activityIdentityKey(activity)}|${itemId}`);
@@ -6328,6 +6451,8 @@ async function recoverPendingVerificationRecords({ job, account, action, records
     const taskId = Number(campaignRecords[0]?.task_id || 0);
     applySuccessfulPromotionItemWrites({
       accountId: account.account_id,
+      childUserId: campaign.child_user_id,
+      siteId: campaign.site_id,
       promotionId: campaign.promotion_id,
       promotionType: campaign.promotion_type,
       action,
@@ -7330,6 +7455,8 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       const reason = warning || detailStatus || '该活动不满足真实执行条件';
       const taskId = createTask({
         accountId: account.account_id,
+        childUserId: promotion.child_user_id,
+        siteId: promotion.site_id,
         promotionId: promotion.promotion_id,
         promotionType: promotion.promotion_type,
         action,
@@ -7701,6 +7828,8 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       const unresolvedRows = verification.unresolved || [];
       applySuccessfulPromotionItemWrites({
         accountId: account.account_id,
+        childUserId: promotion.child_user_id,
+        siteId: promotion.site_id,
         promotionId: promotion.promotion_id,
         promotionType: promotion.promotion_type,
         action,
@@ -7801,6 +7930,8 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       execution.counts.retryable_pending_count = candidateRows.length + unresolvedRows.length;
       invalidatePromotionItemFetchStates({
         accountId: account.account_id,
+        childUserId: promotion.child_user_id,
+        siteId: promotion.site_id,
         promotionId: promotion.promotion_id,
         promotionType: promotion.promotion_type,
       });
@@ -7815,6 +7946,8 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
     if (Number(execution?.counts?.success || 0) > 0 || Number(execution?.counts?.request_success_count || 0) > 0) {
       reconcilePromotionItemFetchCounts({
         accountId: account.account_id,
+        childUserId: promotion.child_user_id,
+        siteId: promotion.site_id,
         promotionId: promotion.promotion_id,
         promotionType: promotion.promotion_type,
       });
@@ -8155,7 +8288,7 @@ function planningFetchStates(accountId, promotions, itemStatus, allowInventoryFa
   if (!allowInventoryFallback || itemStatus !== 'candidate') return states;
   for (const promotion of promotions) {
     if (!isSellerCampaign(promotion)) continue;
-    const fallbackState = getItemFetchState(accountId, promotion.promotion_id, promotion.promotion_type, INVENTORY_FALLBACK_ITEM_STATUS);
+    const fallbackState = getItemFetchState(accountId, promotion.promotion_id, promotion.promotion_type, INVENTORY_FALLBACK_ITEM_STATUS, promotion);
     if (!fallbackState) continue;
     const key = promotionKey(promotion);
     states.set(key, {
@@ -8197,7 +8330,7 @@ async function preparePromotionsForExecution({ account, filters = {}, settings =
   let promotions = listOperatingCampaignsFiltered(account.account_id, filters || {}, settings);
   if (request.executionGroupId || request.submissionPrepareId || request.submission_prepare_id) promotions = ordinaryPromotions(promotions);
   summary.matched_before_fetch = promotions.length;
-  const localTotal = listCampaigns(account.account_id).length;
+  const localTotal = listCampaignsAll(account.account_id).length;
   if (localTotal === 0 || promotions.length === 0) {
     const fetched = await fetchAndSavePromotions(account, { readConcurrency });
     summary.fetched = true;
@@ -8210,7 +8343,7 @@ async function preparePromotionsForExecution({ account, filters = {}, settings =
     summary.stages.push(`使用本地活动缓存：匹配 ${promotions.length} 个；如需重新读取站点活动，将使用读取并发 ${readConcurrency}。`);
   }
   summary.matched_after_fetch = promotions.length;
-  summary.total_after_fetch = listCampaigns(account.account_id).length;
+  summary.total_after_fetch = listCampaignsAll(account.account_id).length;
   if (promotions.length === 0) summary.stages.push('未找到匹配活动。');
   return { promotions, summary };
 }
@@ -8322,11 +8455,11 @@ export async function prepareItemsForExecution({
         });
     const fetchState = readStateSnapshot
       ? preparationItemFetchState(readStateSnapshot, { ...campaign, account_id: account.account_id }, itemStatus)
-      : getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, itemStatus);
+      : getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, itemStatus, campaign);
     const fallbackState = itemStatus === 'candidate' && isSellerCampaign(campaign)
       ? (readStateSnapshot
           ? preparationItemFetchState(readStateSnapshot, { ...campaign, account_id: account.account_id }, INVENTORY_FALLBACK_ITEM_STATUS)
-          : getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, INVENTORY_FALLBACK_ITEM_STATUS))
+          : getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, INVENTORY_FALLBACK_ITEM_STATUS, campaign))
       : null;
     const operationKey = operationActivityReadKey(account.account_id, campaign, itemStatus);
     const operationCached = operationReadCache?.get(operationKey) || null;
@@ -8414,15 +8547,16 @@ export async function prepareItemsForExecution({
         readScheduler,
       });
       if (probe.error) {
+        const probeUnreadable = probe.unreadable === true;
         row = batchFetchRow(campaign, itemStatus, {
-          total: Number(effectiveState?.platform_total ?? effectiveState?.saved_count ?? 0),
-          saved: Number(effectiveState?.saved_count || 0),
-          platform_total: effectiveState?.platform_total ?? effectiveState?.saved_count ?? 0,
-          saved_count: Number(effectiveState?.saved_count || 0),
+          total: probeUnreadable ? null : Number(effectiveState?.platform_total ?? effectiveState?.saved_count ?? 0),
+          saved: probeUnreadable ? 0 : Number(effectiveState?.saved_count || 0),
+          platform_total: probeUnreadable ? null : (effectiveState?.platform_total ?? effectiveState?.saved_count ?? 0),
+          saved_count: probeUnreadable ? 0 : Number(effectiveState?.saved_count || 0),
           is_full_fetch: false,
           sample_only: false,
           fetch_mode: 'candidate_total_probe',
-          detail_status: 'error',
+          detail_status: probeUnreadable ? 'unreadable' : 'error',
           blocked: true,
           probe_total: null,
           probe_reason: 'candidate_probe_failed',
@@ -8649,23 +8783,6 @@ async function readMarketplacePromotionsForChild({ account, childId, siteId, sig
         });
         return client.getMarketplacePromotions(targetChildId, { callerId: targetChildId, signal });
       }
-    },
-    {
-      source: 'read_promotions_regular_parent_caller',
-      authoritative: false,
-      marketplace: false,
-      callerId: parentCallerId || targetChildId,
-      read: async () => {
-        const client = new MercadoLibreClient({
-          accessToken: account.accessToken,
-          userId: targetChildId,
-          callerId: parentCallerId || targetChildId,
-          marketplace: false,
-          readScheduler,
-          readAccountId: account.account_id,
-        });
-        return client.getPromotions({ userId: targetChildId, callerId: parentCallerId || targetChildId, includeVersionHeader: true, signal });
-      }
     }
   ];
   const promotionGroups = [];
@@ -8677,47 +8794,74 @@ async function readMarketplacePromotionsForChild({ account, childId, siteId, sig
       const data = await source.read();
       checkpoint?.();
       const promotions = bindActivitiesToAccountRoute(extractPromotions(data), route);
-      return { promotions, summary: {
+      const summary = buildActivityCatalogSourceSummary({
         source: source.source,
         authoritative: source.authoritative,
-        ok: true,
-        total: promotions.length,
-        seller_campaign_count: sellerCampaignPromotionCount(promotions)
+        route,
+        data,
+        promotions,
+      });
+      return { promotions, summary: {
+        ...summary,
+        seller_campaign_count: sellerCampaignPromotionCount(promotions),
       } };
     } catch (error) {
       if (signal?.aborted
           || String(error?.code || '').startsWith('COMMIT_')
           || String(error?.code || '').startsWith('SUBMISSION_')
           || String(error?.code || '').startsWith('ACTIVITY_ACCOUNT_ROUTE_')) throw error;
-      return { error: {
+      const status = Number(error?.status || error?.httpStatus || 0);
+      const errorClass = status === 401 || status === 403 || String(error?.code || '').toUpperCase().includes('PERMISSION')
+        ? 'permission'
+        : 'transport';
+      return { summary: buildActivityCatalogSourceSummary({
         source: source.source,
         authoritative: source.authoritative,
-        ok: false,
-        error: toChineseError(error)
-      } };
+        route,
+        httpStatus: status || 500,
+        stableCode: error?.code || 'ACTIVITY_DIRECTORY_READ_FAILED',
+        errorClass,
+        error: toChineseError(error),
+      }) };
     }
   }));
   for (const result of sourceResults) {
-    if (result.promotions) promotionGroups.push(result.promotions);
+    if (result.promotions && isCompleteAuthoritativeActivitySource(result.summary)) promotionGroups.push(result.promotions);
     if (result.summary) sourceSummaries.push(result.summary);
     if (result.error) errors.push(result.error);
   }
-  requireAuthoritativeActivityCatalogRead([...sourceSummaries, ...errors]);
-  if (!sourceSummaries.length) {
-    const error = errors[0]?.error || '活动读取失败';
-    throw new Error(error);
+  sourceSummaries.push(buildActivityCatalogSourceSummary({
+    source: 'read_promotions_regular_parent_caller',
+    authoritative: false,
+    route,
+    httpStatus: 0,
+    stableCode: 'NOT_APPLICABLE_MARKETPLACE_ROUTE',
+    errorClass: 'not_applicable',
+    error: 'CBT marketplace child 不调用普通 seller-promotions 目录。',
+  }));
+  try {
+    requireAuthoritativeActivityCatalogRead(sourceSummaries);
+  } catch (error) {
+    error.diagnostics = buildActivityDirectoryDiagnostics(sourceSummaries);
+    throw error;
   }
   const promotions = mergePromotionsByIdentity(...promotionGroups);
   return {
     promotions,
-    sources: [...sourceSummaries, ...errors],
-    errors
+    sources: sourceSummaries,
+    errors,
+    route,
+    status: 'complete',
+    complete: true,
   };
 }
 
 function cachedActivityCatalogForRoute(route) {
   const key = accountRouteKey(route);
-  return listCampaigns(route.account_id)
+  return listCampaigns(route.account_id, {
+    childUserId: route.child_user_id,
+    siteId: route.site_id,
+  })
     .filter((promotion) => String(promotion.status || '').toLowerCase() !== 'catalog_removed')
     .filter((promotion) => accountRouteKey({
       account_id: promotion.account_id,
@@ -8726,7 +8870,13 @@ function cachedActivityCatalogForRoute(route) {
     }) === key);
 }
 
-function persistLiveActivityCatalog({ route, promotions, logisticType = null }) {
+export function persistLiveActivityCatalog({ route, promotions, logisticType = null, complete = true }) {
+  if (complete !== true) {
+    const error = new Error('活动目录读取不完整，本次保留旧缓存且未标记目录移除。');
+    error.code = 'ACTIVITY_DIRECTORY_INCOMPLETE';
+    error.status = 422;
+    throw error;
+  }
   const normalizedRoute = normalizeAccountRoute(route);
   const reconciled = reconcileActivityCatalog({
     route: normalizedRoute,
@@ -8780,6 +8930,65 @@ function sellerCampaignPromotionCount(promotions = []) {
   return promotions.filter((promotion) => String(promotion?.promotion_type || promotion?.type || '').toUpperCase() === 'SELLER_CAMPAIGN').length;
 }
 
+const ACTIVITY_DIRECTORY_DIAGNOSTIC_SOURCES = new Set([
+  'read_promotions_parent_caller',
+  'read_promotions_child_caller',
+  'read_promotions_regular_parent_caller',
+]);
+const ACTIVITY_DIRECTORY_DIAGNOSTIC_ERROR_CLASSES = new Set([
+  'permission',
+  'transport',
+  'incomplete',
+  'not_applicable',
+]);
+
+function safeActivityDiagnosticNumber(value) {
+  if (value === null || value === undefined || typeof value === 'boolean') return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : null;
+}
+
+function safeActivityDiagnosticHttpStatus(value) {
+  const numeric = safeActivityDiagnosticNumber(value);
+  return Number.isInteger(numeric) && numeric >= 100 && numeric <= 599 ? numeric : null;
+}
+
+function safeActivityDiagnosticCode(value) {
+  const code = typeof value === 'string' ? value.trim() : '';
+  return /^[A-Z0-9][A-Z0-9_-]{0,79}$/.test(code) ? code : null;
+}
+
+export function buildActivityDirectoryDiagnostics(rows = []) {
+  return (Array.isArray(rows) ? rows : []).map((row = {}) => {
+    const paging = row?.paging && typeof row.paging === 'object' ? row.paging : {};
+    const source = ACTIVITY_DIRECTORY_DIAGNOSTIC_SOURCES.has(String(row.source || ''))
+      ? String(row.source)
+      : 'unknown';
+    const errorClass = ACTIVITY_DIRECTORY_DIAGNOSTIC_ERROR_CLASSES.has(String(row.error_class || ''))
+      ? String(row.error_class)
+      : null;
+    return {
+      source,
+      authoritative: row.authoritative === true,
+      ok: row.ok === true,
+      http_status: safeActivityDiagnosticHttpStatus(row.http_status),
+      stable_code: safeActivityDiagnosticCode(row.stable_code),
+      results_is_array: typeof row.results_is_array === 'boolean' ? row.results_is_array : null,
+      total: safeActivityDiagnosticNumber(row.total),
+      returned: safeActivityDiagnosticNumber(row.returned),
+      unique: safeActivityDiagnosticNumber(row.unique),
+      paging: {
+        complete: typeof paging.complete === 'boolean' ? paging.complete : null,
+        stalled: typeof paging.stalled === 'boolean' ? paging.stalled : null,
+        total_mismatch: typeof paging.total_mismatch === 'boolean' ? paging.total_mismatch : null,
+      },
+      error_class: errorClass,
+    };
+  });
+}
+
 async function fetchAndSavePromotions(account, {
   readConcurrency = readSettings().readConcurrency,
   siteIds = null,
@@ -8809,6 +9018,7 @@ async function fetchAndSavePromotions(account, {
         const reconciliation = persistLiveActivityCatalog({
           route: { account_id: account.account_id, child_user_id: childId, site_id: child.site_id },
           promotions: readResult.promotions,
+          complete: readResult.complete,
           logisticType: child.logistic_type,
         });
         const promotions = reconciliation.live_promotions;
@@ -8841,21 +9051,42 @@ async function fetchAndSavePromotions(account, {
             || String(error?.code || '').startsWith('SUBMISSION_')
             || String(error?.code || '').startsWith('ACTIVITY_ACCOUNT_ROUTE_')) throw error;
         const errorCn = toChineseError(error);
-        updateMarketplaceSitePromotionStatus({ accountId: account.account_id, childUserId: childId, count: 0, status: 'error', error: errorCn });
+        updateMarketplaceSitePromotionStatus({ accountId: account.account_id, childUserId: childId, count: null, status: 'blocked', error: errorCn });
         recordActivityCatalogCalibration({
           accountId: account.account_id,
           childUserId: childId,
           siteId: child.site_id,
           error: errorCn,
         });
-        return { child_user_id: childId, site_id: child.site_id, logistic_type: child.logistic_type, total: 0, status: 'error', error: errorCn };
+        return {
+          child_user_id: childId,
+          site_id: child.site_id,
+          logistic_type: child.logistic_type,
+          total: 0,
+          status: 'blocked',
+          stable_code: error?.code || 'ACTIVITY_DIRECTORY_INCOMPLETE',
+          error: errorCn,
+          diagnostics: Array.isArray(error?.diagnostics) ? error.diagnostics : [],
+        };
       }
     };
     const children = readScheduler
       ? await Promise.all(selectedUsers.map(childWorker))
       : await mapLimited(selectedUsers, normalizedReadConcurrency, childWorker);
     for (const child of children) total += Number(child?.total || 0);
-    return { total, children, readConcurrency: normalizedReadConcurrency, maxActive: children.maxActive || 0 };
+    const blocked = children.filter((child) => child?.status !== 'ok');
+    const diagnostics = children.flatMap((child) => Array.isArray(child?.diagnostics) ? child.diagnostics : []);
+    const publicChildren = children.map(({ diagnostics: _diagnostics, ...child }) => child);
+    return {
+      total,
+      children: publicChildren,
+      ok: blocked.length === 0,
+      status: blocked.length === 0 ? 'complete' : 'blocked',
+      stable_code: blocked.length === 0 ? null : 'ACTIVITY_DIRECTORY_INCOMPLETE',
+      diagnostics,
+      readConcurrency: normalizedReadConcurrency,
+      maxActive: children.maxActive || 0,
+    };
   }
   const client = new MercadoLibreClient({
     accessToken: account.accessToken, userId: account.account_id, callerId: account.account_id,
@@ -8878,6 +9109,8 @@ async function fetchAndSavePromotions(account, {
     siteId: account.site_id,
   });
   return {
+    ok: true,
+    status: 'complete',
     total: promotions.length,
     seller_campaign_count: sellerCampaignCount,
     catalog_revision: reconciliation.revision,
@@ -9112,10 +9345,10 @@ function buildWriteConcurrencyBenchmarkPlan({ account, input = {} }) {
     status: filters.status || '',
     promotionTypes: filters.promotionTypes || []
   }).filter((promotion) => !['SMART', 'LIGHTNING'].includes(String(promotion.promotion_type || '').toUpperCase()));
-  const promotion = candidatePromotions.find((item) => listItems(account.account_id, item.promotion_id, item.promotion_type, itemStatus).length > 0) || candidatePromotions[0] || null;
+  const promotion = candidatePromotions.find((item) => listItems(account.account_id, item.promotion_id, item.promotion_type, itemStatus, item).length > 0) || candidatePromotions[0] || null;
   const sampleSize = Math.max(1, Math.min(20, Math.floor(Number(input.sampleSize || 3))));
   const sampleItems = promotion
-    ? listItems(account.account_id, promotion.promotion_id, promotion.promotion_type, itemStatus).slice(0, sampleSize).map((item) => ({
+    ? listItems(account.account_id, promotion.promotion_id, promotion.promotion_type, itemStatus, promotion).slice(0, sampleSize).map((item) => ({
       item_id: item.item_id || item.id,
       status: item.status,
       original_price: item.original_price,
@@ -9779,6 +10012,8 @@ function persistWriteBenchmarkLevelCacheEffects({ job, rows = [], items = [] }) 
     if (activity.successful.length && job.action !== 'cancel') {
       applySuccessfulPromotionItemWrites({
         accountId: activity.account.account_id,
+        childUserId: activity.campaign.child_user_id,
+        siteId: activity.campaign.site_id,
         promotionId: activity.campaign.promotion_id,
         promotionType: activity.campaign.promotion_type,
         action: job.action,
@@ -9786,6 +10021,8 @@ function persistWriteBenchmarkLevelCacheEffects({ job, rows = [], items = [] }) 
       });
       reconcilePromotionItemFetchCounts({
         accountId: activity.account.account_id,
+        childUserId: activity.campaign.child_user_id,
+        siteId: activity.campaign.site_id,
         promotionId: activity.campaign.promotion_id,
         promotionType: activity.campaign.promotion_type,
       });
@@ -9795,6 +10032,8 @@ function persistWriteBenchmarkLevelCacheEffects({ job, rows = [], items = [] }) 
     // reading one side cannot make the opposite side look fresh.
     invalidatePromotionItemFetchStates({
       accountId: activity.account.account_id,
+      childUserId: activity.campaign.child_user_id,
+      siteId: activity.campaign.site_id,
       promotionId: activity.campaign.promotion_id,
       promotionType: activity.campaign.promotion_type,
     });
@@ -10043,7 +10282,7 @@ async function collectWriteBenchmarkRows({ accounts, action, itemStatus, input =
       if (!['DEAL', 'SELLER_CAMPAIGN'].includes(promotionType)) continue;
       const remaining = requiredItems - rows.length;
       if (input.useCachedSamplePool !== false) {
-        const cachedItems = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, itemStatus);
+        const cachedItems = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, itemStatus, campaign);
         const selectedFromCache = selectBenchmarkRows({
           items: cachedItems,
           action,
@@ -10346,7 +10585,7 @@ async function resolveWriteBenchmarkPromotion({ account, input = {}, settings })
   await preparePromotionsForExecution({ account, filters: input.filters || settings.defaultFilters || {}, settings, request: { readConcurrency: settings.readConcurrency } });
   const campaigns = listCampaignsFiltered(account.account_id, input.filters || settings.defaultFilters || {})
     .filter((campaign) => ['DEAL', 'SELLER_CAMPAIGN'].includes(String(campaign.promotion_type || '').toUpperCase()));
-  const withCandidates = campaigns.find((campaign) => listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate').length > 0);
+  const withCandidates = campaigns.find((campaign) => listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate', campaign).length > 0);
   const selected = withCandidates || campaigns[0];
   if (!selected) throw new Error('未找到可用于写入并发压测的 DEAL / SELLER_CAMPAIGN 活动。');
   return selected;
@@ -10869,7 +11108,7 @@ async function scanAndSaveInventoryFallbackForCampaign({
     const readStatus = async (status) => {
       const key = operationActivityReadKey(account.account_id, campaign, status);
       if (operationReadCache?.has(key)) {
-        const rows = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, status);
+        const rows = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, status, campaign);
         return { results: rows, total: rows.length, saved: rows.length, detailStatus: 'operation_cache', isFullFetch: true };
       }
       const result = await client.fetchAllPromotionItems({
@@ -10904,7 +11143,7 @@ async function scanAndSaveInventoryFallbackForCampaign({
       replaceStatus: 'pending',
       itemStatus: 'pending'
     });
-    const existingCandidateItems = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate');
+    const existingCandidateItems = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate', campaign);
     const fallback = await buildSellerCampaignInventoryFallback({
       client,
       promotion: campaign,
@@ -10920,7 +11159,7 @@ async function scanAndSaveInventoryFallbackForCampaign({
       accountId: account.account_id,
     });
     checkpoint?.();
-    deleteItemsBySource(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate', INVENTORY_FALLBACK_SOURCE);
+    deleteItemsBySource(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate', INVENTORY_FALLBACK_SOURCE, campaign);
     saveItems(account.account_id, campaign.promotion_id, campaign.promotion_type, fallback.fallback_rows, {
       childUserId: campaign.child_user_id,
       siteId: campaign.site_id,
@@ -10928,8 +11167,8 @@ async function scanAndSaveInventoryFallbackForCampaign({
       itemStatus: 'candidate',
       source: INVENTORY_FALLBACK_SOURCE
     });
-    const candidateAfter = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate');
-    const originalCandidateState = getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate');
+    const candidateAfter = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate', campaign);
+    const originalCandidateState = getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate', campaign);
     const raw = {
       ...fallback.raw,
       scan_total: fallback.scan_total,
@@ -10950,6 +11189,8 @@ async function scanAndSaveInventoryFallbackForCampaign({
     };
     saveItemFetchState({
       accountId: account.account_id,
+      childUserId: campaign.child_user_id,
+      siteId: campaign.site_id,
       promotionId: campaign.promotion_id,
       promotionType: campaign.promotion_type,
       itemStatus: INVENTORY_FALLBACK_ITEM_STATUS,
@@ -10992,6 +11233,8 @@ async function scanAndSaveInventoryFallbackForCampaign({
     const errorCn = toChineseError(error);
     saveItemFetchState({
       accountId: account.account_id,
+      childUserId: campaign.child_user_id,
+      siteId: campaign.site_id,
       promotionId: campaign.promotion_id,
       promotionType: campaign.promotion_type,
       itemStatus: INVENTORY_FALLBACK_ITEM_STATUS,
@@ -11075,6 +11318,7 @@ async function probePromotionItemsForCampaign({
   } catch (error) {
     if (signal?.aborted || String(error?.code || '').startsWith('COMMIT_') || String(error?.code || '').startsWith('SUBMISSION_')) throw error;
     const errorCn = toChineseError(error);
+    const unreadable = String(error?.code || '') === PROMOTION_ITEMS_UNREADABLE_CODE;
     recordActivityItemsCalibration({
       accountId: account.account_id,
       childUserId: campaign.child_user_id,
@@ -11083,7 +11327,22 @@ async function probePromotionItemsForCampaign({
       promotionType: campaign.promotion_type,
       error: errorCn,
     });
-    return { error: errorCn };
+    if (unreadable) {
+      saveItemFetchState({
+        accountId: account.account_id,
+        childUserId: campaign.child_user_id,
+        siteId: campaign.site_id,
+        promotionId: campaign.promotion_id,
+        promotionType: campaign.promotion_type,
+        itemStatus: status,
+        platformTotal: null,
+        savedCount: 0,
+        detailStatus: 'unreadable',
+        warning: errorCn,
+        raw: sanitizeExternalErrorForPersistence(error, { stage: 'promotion_items_probe' }),
+      });
+    }
+    return { error: errorCn, error_code: error?.code || null, unreadable };
   }
 }
 
@@ -11142,7 +11401,7 @@ async function fetchAndSavePromotionItemsForCampaign({
 }) {
   try {
     checkpoint?.();
-    const previousItems = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, status);
+    const previousItems = listItems(account.account_id, campaign.promotion_id, campaign.promotion_type, status, campaign);
     const targetUserId = campaign.child_user_id || account.account_id;
     const client = new MercadoLibreClient({
       accessToken: account.accessToken,
@@ -11168,7 +11427,7 @@ async function fetchAndSavePromotionItemsForCampaign({
       identity_delta: identityDelta,
       identity_summary: buildItemIdentitySummary(result.results, { complete: result.isFullFetch }),
     };
-    const existingState = getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, status);
+    const existingState = getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, status, campaign);
     const preserveExisting = shouldPreserveExistingFetchState({ fetchMode, existingState, nextSaved: result.saved, nextTotal: result.total });
     if (!preserveExisting) {
       saveItems(account.account_id, campaign.promotion_id, campaign.promotion_type, result.results, {
@@ -11180,6 +11439,8 @@ async function fetchAndSavePromotionItemsForCampaign({
       });
       saveItemFetchState({
         accountId: account.account_id,
+        childUserId: campaign.child_user_id,
+        siteId: campaign.site_id,
         promotionId: campaign.promotion_id,
         promotionType: campaign.promotion_type,
         itemStatus: status,
@@ -11245,24 +11506,26 @@ async function fetchAndSavePromotionItemsForCampaign({
     });
     saveItemFetchState({
       accountId: account.account_id,
+      childUserId: campaign.child_user_id,
+      siteId: campaign.site_id,
       promotionId: campaign.promotion_id,
       promotionType: campaign.promotion_type,
       itemStatus: status,
-      platformTotal: 0,
+      platformTotal: null,
       savedCount: 0,
-      detailStatus: 'error',
+      detailStatus: String(error?.code || '') === PROMOTION_ITEMS_UNREADABLE_CODE ? 'unreadable' : 'error',
       warning: errorCn,
       raw: sanitizeExternalErrorForPersistence(error, { stage: 'promotion_items' })
     });
     return batchFetchRow(campaign, status, {
-      total: 0,
+      total: null,
       saved: 0,
-      platform_total: 0,
+      platform_total: null,
       saved_count: 0,
       is_full_fetch: false,
       sample_only: fetchMode !== 'full',
       fetch_mode: fetchMode,
-      detail_status: 'error',
+      detail_status: String(error?.code || '') === PROMOTION_ITEMS_UNREADABLE_CODE ? 'unreadable' : 'error',
       blocked: true,
       note: errorCn,
       error: errorCn
@@ -11309,6 +11572,89 @@ function fetchStatsFromRaw(raw = {}) {
   };
 }
 
+export function buildPromotionItemsIncompleteResponse(result = {}, fetchMode = 'sample') {
+  if (fetchMode !== 'full') return null;
+  const total = numberOrNull(result.total);
+  const saved = numberOrNull(result.saved);
+  const complete = result.isFullFetch === true
+    && result.sampleOnly === false
+    && total !== null
+    && saved !== null
+    && saved === total;
+  if (complete) return null;
+  const detailStatus = SAFE_PROMOTION_ITEMS_DETAIL_STATUSES.has(result.detailStatus)
+    ? result.detailStatus
+    : 'incomplete';
+  return {
+    status: 422,
+    body: {
+      ok: false,
+      code: PROMOTION_ITEMS_INCOMPLETE_CODE,
+      status: 'blocked',
+      fetchMode: 'full',
+      total,
+      saved,
+      detail_status: detailStatus,
+      is_full_fetch: Boolean(result.isFullFetch),
+      sample_only: Boolean(result.sampleOnly),
+      blocked: true,
+      fetch_stats: fetchStatsFromRaw(result.rawSummary),
+    },
+  };
+}
+
+const SAFE_PROMOTION_ITEMS_DIAGNOSTIC_ENDPOINTS = new Set(['marketplace', 'regular', 'unknown']);
+const SAFE_PROMOTION_ITEMS_DIAGNOSTIC_KINDS = new Set(['object', 'array', 'string', 'number', 'bool', 'null', 'unknown']);
+const SAFE_PROMOTION_ITEMS_DIAGNOSTIC_KEYS = new Set([
+  'results', 'paging', 'total', 'offset', 'limit', 'search_after', 'errors', 'code', 'message', 'status'
+]);
+const SAFE_PROMOTION_ITEMS_DIAGNOSTIC_ERROR_CLASSES = new Set(['unreadable_items', 'transport', 'permission', 'incomplete', null]);
+
+function sanitizeDiagnosticKind(value) {
+  return SAFE_PROMOTION_ITEMS_DIAGNOSTIC_KINDS.has(value) ? value : 'unknown';
+}
+
+function sanitizeDiagnosticStatus(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 100 && number <= 599 ? number : null;
+}
+
+function sanitizeDiagnosticTotal(value) {
+  if (value === null || value === undefined || (typeof value === 'string' && !value.trim())) return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+export function sanitizePromotionItemsUnreadableDiagnostics(entries = []) {
+  if (!Array.isArray(entries)) return [];
+  return entries.slice(0, 3).map((entry) => {
+    const source = entry && typeof entry === 'object' ? entry : {};
+    const keys = Array.isArray(source.top_level_keys)
+      ? [...new Set(source.top_level_keys.filter((key) => SAFE_PROMOTION_ITEMS_DIAGNOSTIC_KEYS.has(key)))].sort()
+      : [];
+    const endpointFamily = SAFE_PROMOTION_ITEMS_DIAGNOSTIC_ENDPOINTS.has(source.endpoint_family)
+      ? source.endpoint_family
+      : 'unknown';
+    const stableCode = source.stable_code === PROMOTION_ITEMS_UNREADABLE_CODE
+      ? PROMOTION_ITEMS_UNREADABLE_CODE
+      : null;
+    const errorClass = SAFE_PROMOTION_ITEMS_DIAGNOSTIC_ERROR_CLASSES.has(source.error_class)
+      ? source.error_class
+      : null;
+    return {
+      endpoint_family: endpointFamily,
+      http_status: sanitizeDiagnosticStatus(source.http_status),
+      response_kind: sanitizeDiagnosticKind(source.response_kind),
+      top_level_keys: keys,
+      results_kind: sanitizeDiagnosticKind(source.results_kind),
+      paging_kind: sanitizeDiagnosticKind(source.paging_kind),
+      total: sanitizeDiagnosticTotal(source.total),
+      stable_code: stableCode,
+      error_class: errorClass,
+    };
+  });
+}
+
 async function ensureUsableAccount(accountId) {
   const standalone = getStandaloneSecrets();
   if (standalone && String(standalone.account_id) === String(accountId)) {
@@ -11352,7 +11698,9 @@ function isInvalidTokenError(error) {
 async function ensureFreshAccount(accountId, { force = false } = {}) {
   const account = getAccountSecrets(accountId);
   if (!account) throw new Error('未找到授权账号');
-  if (!force && (!account.expires_at || new Date(account.expires_at).getTime() > Date.now() + 5 * 60 * 1000)) {
+  const expiryText = String(account.expires_at || '').trim();
+  const expiryMs = /(?:Z|[+-]\d{2}:\d{2})$/i.test(expiryText) ? Date.parse(expiryText) : NaN;
+  if (!force && Number.isFinite(expiryMs) && expiryMs > Date.now() + 5 * 60 * 1000) {
     return account;
   }
   if (!account.refreshToken) throw new Error('token 已过期且没有 refresh token，请重新授权');

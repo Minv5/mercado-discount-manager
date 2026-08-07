@@ -156,11 +156,100 @@ export function selectMarketplaceUsersForCatalogRoutes({ accountId, marketplaceU
 
 export function requireAuthoritativeActivityCatalogRead(results = []) {
   const rows = Array.isArray(results) ? results : [];
-  if (rows.some((row) => row?.ok === true && row?.authoritative === true)) return true;
+  const authoritative = rows.filter((row) => row?.authoritative === true);
+  const complete = authoritative.filter((row) => isCompleteAuthoritativeActivitySource(row));
+  const nonFatal = new Set(['permission', 'not_applicable']);
+  if (complete.length
+    && authoritative
+      .filter((row) => !isCompleteAuthoritativeActivitySource(row))
+      .every((row) => nonFatal.has(String(row?.error_class || row?.stable_code || '').toLowerCase()))) {
+    return true;
+  }
   const error = new Error('平台活动目录暂时无法确认，本次已阻断该店铺站点且未使用旧目录。');
   error.code = 'ACTIVITY_DIRECTORY_UNREADABLE';
   error.status = 422;
   throw error;
+}
+
+export function isCompleteAuthoritativeActivitySource(source = {}) {
+  if (source?.authoritative !== true || source?.ok !== true) return false;
+  if (source?.results_is_array !== true) return false;
+  const paging = source?.paging && typeof source.paging === 'object' ? source.paging : source;
+  if (paging.complete !== true) return false;
+  const total = finiteNonNegativePagingNumber(paging.total);
+  const returned = finiteNonNegativePagingNumber(paging.returned);
+  const unique = finiteNonNegativePagingNumber(paging.unique);
+  if (total === null || returned === null || unique === null) return false;
+  if (returned < total || unique < total) return false;
+  if (paging.stalled === true || paging.total_mismatch === true) return false;
+  return true;
+}
+
+function finiteNonNegativePagingNumber(value) {
+  if (value === null || value === undefined || typeof value === 'boolean') return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : null;
+}
+
+export function buildActivityCatalogSourceSummary({
+  source,
+  authoritative = false,
+  route = {},
+  data = null,
+  promotions = [],
+  httpStatus = 200,
+  stableCode = null,
+  errorClass = null,
+  error = null,
+} = {}) {
+  const rawResults = data && typeof data === 'object' ? data.results : undefined;
+  const paging = data?.paging && typeof data.paging === 'object' ? data.paging : {};
+  const resultsIsArray = paging.results_is_array === false
+    ? false
+    : Array.isArray(rawResults);
+  const returned = Number.isFinite(Number(paging.returned))
+    ? Number(paging.returned)
+    : (Array.isArray(promotions) ? promotions.length : 0);
+  const unique = Number.isFinite(Number(paging.unique))
+    ? Number(paging.unique)
+    : (Array.isArray(promotions) ? promotions.length : 0);
+  const summary = {
+    source: String(source || ''),
+    authoritative: Boolean(authoritative),
+    ok: error == null && Number(httpStatus) >= 200 && Number(httpStatus) < 300,
+    http_status: Number.isFinite(Number(httpStatus)) ? Number(httpStatus) : null,
+    stable_code: stableCode || null,
+    results_is_array: resultsIsArray,
+    total: paging.total ?? null,
+    returned,
+    unique,
+    paging: {
+      total: paging.total ?? null,
+      returned,
+      unique,
+      fetched_rows: paging.fetched_rows ?? null,
+      limit: paging.limit ?? null,
+      offset: paging.offset ?? null,
+      search_after: paging.searchAfter ?? paging.search_after ?? null,
+      complete: paging.complete === true,
+      stalled: paging.stalled === true,
+      total_mismatch: paging.total_mismatch === true,
+    },
+    route: {
+      account_id: String(route.account_id || ''),
+      child_user_id: String(route.child_user_id || ''),
+      site_id: String(route.site_id || '').toUpperCase(),
+    },
+    error_class: errorClass || null,
+    error: error ? String(error) : null,
+  };
+  if (summary.authoritative && summary.ok && summary.results_is_array && summary.paging.complete !== true) {
+    summary.error_class = summary.error_class || 'incomplete';
+    summary.stable_code = summary.stable_code || 'ACTIVITY_DIRECTORY_INCOMPLETE';
+  }
+  return summary;
 }
 
 export function sellerCampaignWriteThroughPromotion({

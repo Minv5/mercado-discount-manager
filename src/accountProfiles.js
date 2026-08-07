@@ -34,3 +34,33 @@ export function accountProfileRecord({ accountId, provider, profile, source = 'u
     source: String(source || 'users_me')
   };
 }
+
+const ACCOUNT_IDENTITY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+
+function normalizeOAuthIdentity(value) {
+  const normalized = String(value ?? '').trim();
+  return ACCOUNT_IDENTITY_PATTERN.test(normalized) ? normalized : '';
+}
+
+function accountIdentityMismatchError() {
+  const error = new Error('OAuth 账号身份校验失败，授权未保存。');
+  error.code = 'ACCOUNT_IDENTITY_MISMATCH';
+  error.status = 422;
+  return error;
+}
+
+export function requireOAuthTargetAccountId(value) {
+  const target = normalizeOAuthIdentity(value);
+  if (!target) throw accountIdentityMismatchError();
+  return target;
+}
+
+export function assertOAuthIdentityMatch({ targetAccountId, profileId, tokenUserId } = {}) {
+  const target = normalizeOAuthIdentity(targetAccountId);
+  const profile = normalizeOAuthIdentity(profileId);
+  const token = normalizeOAuthIdentity(tokenUserId);
+  if (!target || !profile || !token || target !== profile || target !== token) {
+    throw accountIdentityMismatchError();
+  }
+  return target;
+}
