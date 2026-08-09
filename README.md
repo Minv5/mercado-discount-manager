@@ -47,7 +47,7 @@ http://127.0.0.1:28758
 `standalone/` WinForms 源码和旧安装版仅作为回退保留，不再承担正式产品功能对齐、日常 Quick/RealWrite 验证或默认发布。只有明确维护回退版本时才使用：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode Release -AllowPackageMutation -PackageTarget Legacy
+& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoLogo -NoProfile -NonInteractive -File scripts/validate.ps1 -Mode Release -AllowPackageMutation -PackageTarget Legacy
 ```
 
 正式产品、默认验证和发布目标均为 PySide。
@@ -56,13 +56,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode R
 
 ```powershell
 # 日常验证：语法和 JS/PySide 测试；服务未运行时 health 记为 SKIP
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode Quick
+& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoLogo -NoProfile -NonInteractive -File scripts/validate.ps1 -Mode Quick
 
 # 真实写入前验证：所有 required 检查强制执行，health 必须通过；不会调用 Mercado 写接口
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode RealWrite
+& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoLogo -NoProfile -NonInteractive -File scripts/validate.ps1 -Mode RealWrite
 
 # 发布验证会生成 PySide 候选包并执行隔离安装/回滚测试，必须显式允许产物变更
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -Mode Release -AllowPackageMutation -PackageTarget PySide
+& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoLogo -NoProfile -NonInteractive -File scripts/validate.ps1 -Mode Release -AllowPackageMutation -PackageTarget PySide
 ```
 
 验证结果只在控制台显示 `PASS`、`FAIL`、`SKIP` 摘要。完整输出保存在
@@ -72,7 +72,7 @@ Quick 模式可安全跳过已经成功的检查。Release 和 RealWrite 模式�
 失败时只展开指定检查的末尾 120 行：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 -ShowFailure <run_id> -Check npm-test -Tail 120
+& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoLogo -NoProfile -NonInteractive -File scripts/validate.ps1 -ShowFailure <run_id> -Check npm-test -Tail 120
 ```
 
 只有明确需要完整原始输出时才追加 `-Full`。Quick 默认不打包、不启动或停止服务，所有模式都不会调用

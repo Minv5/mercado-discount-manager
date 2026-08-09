@@ -1,3 +1,6 @@
+#requires -Version 7.6
+#requires -PSEdition Core
+
 $ErrorActionPreference = 'Stop'
 
 $StandaloneDir = Split-Path -Parent $MyInvocation.MyCommand.Path

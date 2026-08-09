@@ -1,3 +1,6 @@
+#requires -Version 7.6
+#requires -PSEdition Core
+
 [CmdletBinding(DefaultParameterSetName = 'Run')]
 param(
   [Parameter(ParameterSetName = 'Run')]
@@ -83,6 +86,11 @@ function Get-StringHash([string]$Value) {
   finally { $algorithm.Dispose() }
 }
 
+$Pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+if (-not (Test-Path -LiteralPath $Pwsh -PathType Leaf)) {
+  throw "Required PowerShell 7 runtime is missing: $Pwsh"
+}
+$Node = (Get-Command node -ErrorAction Stop).Source
 $Python = (Get-Command python -ErrorAction Stop).Source
 $ExpectedServiceName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x7BA1,0x5BB6))
 $ExpectedProduct = 'mercado-discount-manager'
@@ -91,7 +99,7 @@ $Environment = [ordered]@{
   os = [Environment]::OSVersion.VersionString
   architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
   powershell = $PSVersionTable.PSVersion.ToString()
-  node = Get-ToolOutput 'node' @('--version')
+  node = Get-ToolOutput $Node @('--version')
   dotnet = Get-ToolOutput 'dotnet' @('--version')
   python_executable = $Python
   python = Get-ToolOutput $Python @('--version')
@@ -114,10 +122,8 @@ function Get-InputFingerprint([string[]]$Patterns) {
   Get-StringHash $input
 }
 
-$jsSyntaxCommand = "`$files=Get-ChildItem -LiteralPath 'src','public','tests' -Recurse -File -Filter *.js; foreach(`$f in `$files){ node --check `$f.FullName; if(`$LASTEXITCODE -ne 0){exit `$LASTEXITCODE}}"
-$jsSyntaxEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($jsSyntaxCommand))
 $Checks = @(
-  @{ id='js-syntax'; required=$true; cacheable=$true; patterns=@('src\*.js','public\*.js','tests\*.js','package.json'); file='powershell'; args=@('-NoProfile','-EncodedCommand',$jsSyntaxEncoded) },
+  @{ id='js-syntax'; required=$true; cacheable=$true; patterns=@('src\*.js','public\*.js','tests\*.js','package.json'); js_syntax=$true },
   @{ id='npm-test'; required=$true; cacheable=$true; patterns=@('src\*.js','public\*.js','tests\*.js','package.json'); file='npm.cmd'; args=@('test') },
   @{ id='pyside-tests'; required=$true; cacheable=$true; patterns=@('desktop-pyside\*.py','desktop-pyside\*.spec','desktop-pyside\*.ps1','desktop-pyside\*.json','desktop-pyside\assets\*'); file=$Python; args=@('-m','unittest','discover','-s','desktop-pyside\tests','-v'); environment=@{QT_QPA_PLATFORM='offscreen'} },
   @{ id='health'; required=($Mode -eq 'RealWrite'); cacheable=$false; patterns=@('src\*.js','package.json'); health=$true }
@@ -129,11 +135,11 @@ if ($PackageTarget -in @('Legacy','Both')) {
 
 if ($Mode -eq 'Release') {
   if ($PackageTarget -in @('Legacy','Both')) {
-    $Checks += @{ id='package-legacy'; required=$true; cacheable=$false; package=$true; patterns=@('src\*.js','public\*','standalone\*','package.json','README.md'); file='powershell'; args=@('-NoProfile','-ExecutionPolicy','Bypass','-File','standalone\build-full-exe.ps1') }
+    $Checks += @{ id='package-legacy'; required=$true; cacheable=$false; package=$true; patterns=@('src\*.js','public\*','standalone\*','package.json','README.md'); file=$Pwsh; args=@('-NoLogo','-NoProfile','-NonInteractive','-File','standalone\build-full-exe.ps1') }
   }
   if ($PackageTarget -in @('PySide','Both')) {
-    $Checks += @{ id='package-pyside'; required=$true; cacheable=$false; package=$true; patterns=@('src\*.js','public\*','desktop-pyside\*','package.json','README.md'); file='powershell'; args=@('-NoProfile','-ExecutionPolicy','Bypass','-File','desktop-pyside\build-release.ps1') }
-    $Checks += @{ id='install-pyside-isolated'; required=$true; cacheable=$false; package=$true; patterns=@('desktop-pyside\install-release.ps1','desktop-pyside\test-install-release.ps1','desktop-pyside\build-release.ps1'); file='powershell'; args=@('-NoProfile','-ExecutionPolicy','Bypass','-File','desktop-pyside\test-install-release.ps1') }
+    $Checks += @{ id='package-pyside'; required=$true; cacheable=$false; package=$true; patterns=@('src\*.js','public\*','desktop-pyside\*','package.json','README.md'); file=$Pwsh; args=@('-NoLogo','-NoProfile','-NonInteractive','-File','desktop-pyside\build-release.ps1') }
+    $Checks += @{ id='install-pyside-isolated'; required=$true; cacheable=$false; package=$true; patterns=@('desktop-pyside\install-release.ps1','desktop-pyside\test-install-release.ps1','desktop-pyside\build-release.ps1'); file=$Pwsh; args=@('-NoLogo','-NoProfile','-NonInteractive','-File','desktop-pyside\test-install-release.ps1') }
   }
 }
 
@@ -188,7 +194,24 @@ foreach ($definition in $Checks) {
     }
   }
   if ($status -eq 'PASS' -and $reason -eq 'completed') {
-    if ($definition['health']) {
+    if ($definition['js_syntax']) {
+      try {
+        '' | Set-Content -LiteralPath $stdoutPath -Encoding UTF8
+        '' | Set-Content -LiteralPath $stderrPath -Encoding UTF8
+        $jsFiles = Get-ChildItem -LiteralPath (Join-Path $ProjectRoot 'src'), (Join-Path $ProjectRoot 'public'), (Join-Path $ProjectRoot 'tests') -Recurse -File -Filter '*.js'
+        foreach ($file in $jsFiles) {
+          & $Node '--check' $file.FullName 1>> $stdoutPath 2>> $stderrPath
+          if ($LASTEXITCODE -ne 0) {
+            $exitCode = $LASTEXITCODE
+            $status = 'FAIL'; $reason = 'command_failed'
+            break
+          }
+        }
+      } catch {
+        $_ | Out-String | Set-Content -LiteralPath $stderrPath -Encoding UTF8
+        $status='FAIL'; $reason='command_start_failed'; $exitCode=1
+      }
+    } elseif ($definition['health']) {
       try {
         $response = Invoke-RestMethod -Uri 'http://127.0.0.1:28758/api/health' -TimeoutSec 10
         $response | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $stdoutPath -Encoding UTF8
@@ -204,13 +227,12 @@ foreach ($definition in $Checks) {
         foreach ($entry in $definition['environment'].GetEnumerator()) { $saved[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key); [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value) }
       }
       try {
-        # Invoke directly: some managed hosts expose Path/PATH aliases that
-        # Windows PowerShell Start-Process rejects before the child can start.
+        # Invoke directly so the selected executable and native exit code remain authoritative.
         Push-Location $ProjectRoot
         $savedErrorActionPreference = $ErrorActionPreference
         try {
           # unittest writes normal progress to stderr; do not turn that stream
-          # into a PowerShell terminating NativeCommandError.
+          # into a terminating NativeCommandError.
           $ErrorActionPreference = 'Continue'
           & $definition['file'] @($definition['args']) 1> $stdoutPath 2> $stderrPath
           $exitCode = $LASTEXITCODE

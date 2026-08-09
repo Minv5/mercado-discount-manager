@@ -6,6 +6,7 @@ import { STANDALONE_AUTH_DIR } from './config.js';
 const TOKEN_PATH = path.join(STANDALONE_AUTH_DIR, 'mercado_oauth_token.json');
 const CONFIG_PATH = path.join(STANDALONE_AUTH_DIR, 'mercado_oauth_config.json');
 const REFRESH_SCRIPT = path.join(STANDALONE_AUTH_DIR, 'refresh_now.ps1');
+const POWERSHELL_EXE = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe';
 
 export function hasStandaloneAuth() {
   return fs.existsSync(TOKEN_PATH) && fs.existsSync(CONFIG_PATH);
@@ -59,15 +60,18 @@ export function refreshStandaloneToken({ force = false } = {}) {
   if (!fs.existsSync(REFRESH_SCRIPT)) {
     throw new Error('缺少 standalone Mercado refresh 脚本');
   }
+  if (!fs.existsSync(POWERSHELL_EXE)) {
+    throw new Error('缺少 PowerShell 7.6 Core 运行时');
+  }
   const args = [
+    '-NoLogo',
     '-NoProfile',
-    '-ExecutionPolicy',
-    'Bypass',
+    '-NonInteractive',
     '-File',
     REFRESH_SCRIPT
   ];
   if (force) args.push('-Force');
-  const output = execFileSync('powershell.exe', args, {
+  const output = execFileSync(POWERSHELL_EXE, args, {
     cwd: STANDALONE_AUTH_DIR,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
