@@ -1,0 +1,52 @@
+name: Bug report
+description: Report a reproducible problem without including secrets or marketplace data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include access tokens, refresh tokens, client secrets, account IDs, customer data, raw API responses, or sensitive screenshots.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observable behavior and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Safe reproduction steps
+      description: Use a dry run or local fixture where possible. Do not perform a live marketplace write to reproduce the problem.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Application version or commit
+      placeholder: v0.1.0 or a commit SHA
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Context
+      options:
+        - Local test
+        - Dry run
+        - Read-only API operation
+        - Explicitly confirmed live operation
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted evidence
+      description: Include only redacted logs or screenshots. Do not paste raw API responses.
