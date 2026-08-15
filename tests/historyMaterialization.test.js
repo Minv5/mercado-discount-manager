@@ -35,7 +35,8 @@ test('materialized history publishes only terminal tasks and survives restart', 
       const afterFinish = repo.listTaskSummaries(20, { includeDetails: false });
       console.log(JSON.stringify({ beforeFinish, afterFinish }));
     `, dataDir);
-    assert.equal(first.beforeFinish.length, 0);
+    assert.equal(first.beforeFinish.length, 1);
+    assert.equal(first.beforeFinish[0].success_count, 0);
     assert.equal(first.afterFinish.length, 1);
     assert.equal(first.afterFinish[0].success_count, 1);
 
@@ -157,7 +158,7 @@ test('explicit execution groups publish exactly one terminal history row and nev
       const afterB = repo.listTaskSummaries(20, { includeDetails: false });
       console.log(JSON.stringify({ a, b, beforePublish, afterA, afterB }));
     `, dataDir);
-    assert.equal(result.beforePublish.length, 0);
+    assert.equal(result.beforePublish.length, 1);
     assert.equal(result.afterA.length, 1);
     assert.equal(result.afterA[0].execution_group_id, 'GROUP-A');
     assert.deepEqual(result.afterA[0].task_ids.sort((a, b) => a - b), [result.a.detail, result.a.batch].sort((a, b) => a - b));

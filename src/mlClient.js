@@ -456,6 +456,7 @@ export class MercadoLibreClient {
     maxTotalEmptyPages = 120,
     initialPage = null,
     signal = null,
+    pageConcurrency = 4,
   }) {
     const pageLimit = clampPromotionItemLimit(limit, promotionType);
     const maxToCollect = normalizeMaxItems(maxItems);
@@ -473,10 +474,45 @@ export class MercadoLibreClient {
     let duplicateCount = 0;
     let lastSearchAfter = null;
     let stopReason = null;
-    while (collected.length < maxToCollect && pagesRead < maxPages) {
-      const data = normalizePromotionItemsPage(pagesRead === 0 && initialPage
+    const prefetchConcurrency = Math.max(1, Math.min(8, Math.floor(Number(pageConcurrency) || 4)));
+    let prefetched = [];
+    let prefetchCursor = pageLimit;
+    const prefetchEnabled = () => !searchAfter && total !== null && Number(total) > 0 && prefetchConcurrency > 1;
+    const fillPrefetch = () => {
+      if (!prefetchEnabled()) return;
+      const prefetchCeiling = Math.min(maxToCollect, Number(total) || maxToCollect);
+      while (prefetched.length < prefetchConcurrency && prefetchCursor < prefetchCeiling) {
+        const pageOffset = prefetchCursor;
+        prefetchCursor += pageLimit;
+        prefetched.push({
+          offset: pageOffset,
+          promise: this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset: pageOffset, searchAfter: null, signal })
+            .then((data) => normalizePromotionItemsPage(data))
+            .catch((error) => ({ __prefetch_error: error })),
+        });
+      }
+    };
+    const nextPageData = async () => {
+      if (prefetchEnabled() && prefetched.length) {
+        const entry = prefetched.shift();
+        fillPrefetch();
+        const data = await entry.promise;
+        if (data?.__prefetch_error) throw data.__prefetch_error;
+        return data;
+      }
+      if (prefetchEnabled()) {
+        const pageOffset = prefetchCursor;
+        prefetchCursor += pageLimit;
+        return normalizePromotionItemsPage(
+          await this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset: pageOffset, searchAfter: null, signal }),
+        );
+      }
+      return normalizePromotionItemsPage(pagesRead === 0 && initialPage
         ? initialPage
         : await this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset, searchAfter, signal }));
+    };
+    while (collected.length < maxToCollect && pagesRead < maxPages) {
+      const data = await nextPageData();
       pagesRead += 1;
       const shapeError = promotionItemsShapeError(data);
       if (shapeError) throw shapeError;

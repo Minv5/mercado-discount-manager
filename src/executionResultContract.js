@@ -67,9 +67,10 @@ export function buildCancelResultContract({ plannedItemIds = [], outcomes = [], 
         counts.pending_verification_count += 1;
         counts.skipped += 1;
       } else if (remaining.has(itemId)) {
-        finalStatusByItem[itemId] = CANCEL_RESULT_STATUS.liveStillStarted;
+        finalStatusByItem[itemId] = CANCEL_RESULT_STATUS.pendingVerification;
         liveReadClassificationByItem[itemId] = CANCEL_LIVE_READ_CLASSIFICATION.stillStarted;
-        counts.failed += 1;
+        counts.pending_verification_count += 1;
+        counts.skipped += 1;
       } else if (!finalLiveReadIsComplete || explicitlyUnverifiable.has(itemId)) {
         finalStatusByItem[itemId] = CANCEL_RESULT_STATUS.unverifiable;
         liveReadClassificationByItem[itemId] = CANCEL_LIVE_READ_CLASSIFICATION.unverifiable;
@@ -157,6 +158,7 @@ export function countMutuallyExclusiveRelationResults(rows = []) {
 
 export function summarizeResultContractRows(rows = []) {
   const finalByRelation = new Map();
+  const successRowByRelation = new Map();
   const requestSuccess = new Set();
   const activityFailures = [];
   for (const row of rows || []) {
@@ -168,18 +170,27 @@ export function summarizeResultContractRows(rows = []) {
     const key = relationKey(row);
     const status = String(row?.status || '').toLowerCase();
     if (status === CANCEL_RESULT_STATUS.requestSuccess) requestSuccess.add(key);
+    if (status === 'success' || status === CANCEL_RESULT_STATUS.liveVerifiedRemoved) {
+      if (!successRowByRelation.has(key)) successRowByRelation.set(key, row);
+    }
     if (CONTRACT_FINAL_STATUSES.has(status)) finalByRelation.set(key, row);
   }
   const uniqueItems = new Set();
   const counts = stableContractCounts({ relationCount: finalByRelation.size, uniqueItemCount: 0 });
   counts.activity_failure_count = activityFailures.length;
   counts.request_success_count = requestSuccess.size;
+  for (const [key, row] of successRowByRelation) {
+    uniqueItems.add(`${row.account_id || ''}|${row.item_id || ''}`);
+    counts.success += 1;
+    if (String(row.status || '').toLowerCase() === CANCEL_RESULT_STATUS.liveVerifiedRemoved) {
+      counts.live_verified_removed_count += 1;
+    }
+  }
   for (const [key, row] of finalByRelation) {
     uniqueItems.add(`${row.account_id || ''}|${row.item_id || ''}`);
     const status = String(row.status || '').toLowerCase();
     if (status === 'success' || status === CANCEL_RESULT_STATUS.liveVerifiedRemoved) {
-      counts.success += 1;
-      if (status === CANCEL_RESULT_STATUS.liveVerifiedRemoved) counts.live_verified_removed_count += 1;
+      continue;
     } else if (status === CANCEL_RESULT_STATUS.pendingVerification
       && String(row.error_cn || '').startsWith('平台已明确返回 pending（待生效）')) {
       counts.platform_pending_count += 1;

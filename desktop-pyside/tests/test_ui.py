@@ -520,19 +520,21 @@ class QtUiTests(unittest.TestCase):
             },
         ])
         headers = [self.window.records_table.horizontalHeaderItem(index).text() for index in range(self.window.records_table.columnCount())]
-        self.assertEqual(headers, ["时间", "动作", "活动", "类型", "商品 / 处理项", "结果", "失败", "失败原因"])
-        self.assertIn("参加多个活动会生成多条任务", self.window.records_table.horizontalHeaderItem(4).toolTip())
-        self.assertIn("商品×活动", self.window.records_table.horizontalHeaderItem(4).toolTip())
-        self.assertIn("活动失败不计入商品失败", self.window.records_table.horizontalHeaderItem(6).toolTip())
+        self.assertEqual(headers, ["时间", "动作", "折扣", "活动", "类型", "商品 / 处理项", "结果", "失败", "失败原因"])
+        self.assertEqual(self.window.records_table.item(0, 2).text(), "-")
+        self.assertEqual(self.window.records_table.item(1, 2).text(), "自建6% / 官方7%")
+        self.assertIn("参加多个活动会生成多条任务", self.window.records_table.horizontalHeaderItem(5).toolTip())
+        self.assertIn("商品×活动", self.window.records_table.horizontalHeaderItem(5).toolTip())
+        self.assertIn("活动失败不计入商品失败", self.window.records_table.horizontalHeaderItem(7).toolTip())
         self.assertIn("09:02:03", self.window.records_table.item(0, 0).text())
         self.assertIn("2026-07-26T01:02:03.456Z", self.window.records_table.item(0, 0).toolTip())
-        self.assertEqual(self.window.records_table.item(0, 4).text(), "100 件 / 140 项")
-        self.assertEqual(self.window.records_table.item(0, 5).text(), "取消请求 100\n成功取消 80\n待平台确认 20")
-        self.assertEqual(self.window.records_table.item(0, 6).text(), "商品 5 / 活动 2")
-        self.assertEqual(self.window.records_table.item(1, 5).text(), "更新成功 84\n平台待生效 11\n跳过 5")
-        self.assertNotIn("成功取消", self.window.records_table.item(1, 5).text())
-        self.assertEqual(self.window.records_table.item(2, 4).text(), "旧记录未区分 / -")
-        self.assertEqual(self.window.records_table.item(2, 5).text(), "旧记录未区分")
+        self.assertEqual(self.window.records_table.item(0, 5).text(), "100 件 / 140 项")
+        self.assertEqual(self.window.records_table.item(0, 6).text(), "取消请求 100\n成功取消 80\n待平台确认 20")
+        self.assertEqual(self.window.records_table.item(0, 7).text(), "商品 5 / 活动 2")
+        self.assertEqual(self.window.records_table.item(1, 6).text(), "更新成功 84\n平台待生效 11\n跳过 5")
+        self.assertNotIn("成功取消", self.window.records_table.item(1, 6).text())
+        self.assertEqual(self.window.records_table.item(2, 5).text(), "旧记录未区分 / -")
+        self.assertEqual(self.window.records_table.item(2, 6).text(), "旧记录未区分")
 
     def test_execution_record_columns_fit_minimum_window_without_horizontal_scroll(self) -> None:
         self.window.resize(1180, 720)
@@ -543,7 +545,7 @@ class QtUiTests(unittest.TestCase):
         used_width = sum(self.window.records_table.columnWidth(index) for index in range(self.window.records_table.columnCount()))
         self.assertLessEqual(used_width, visible_width + 2)
         header = self.window.records_table.horizontalHeader()
-        for column in (2, 4, 5, 7):
+        for column in (3, 5, 6, 8):
             self.assertEqual(header.sectionResizeMode(column), QHeaderView.ResizeMode.Stretch)
         for column in range(self.window.records_table.columnCount()):
             self.assertGreaterEqual(
@@ -605,6 +607,7 @@ class QtUiTests(unittest.TestCase):
             "/api/today/global-discount": {"discount": {}},
             "/api/execution/groups/active": {"active": False, "group": None},
             "/api/execution/submissions/active": {"active": False, "prepare": None},
+            "/api/startup-refresh/status": {"refresh": {"status": "ok"}},
         }[path]
         self.window._load_initial_bundle()
         self.assertNotIn(("GET", "/api/tasks?limit=20", None), self.api.calls)

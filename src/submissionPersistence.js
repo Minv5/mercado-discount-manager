@@ -837,20 +837,24 @@ export async function commitSubmission({
         throw submissionError('执行动作或活动结构发生实质变化，本次未执行，请重新核对范围。', 'PREPARE_STALE');
       }
       if (checked?.execution_relation_count === 0) {
-        transition('failed', {
-          ...(checked.prepared_patch || {}),
-          revalidation_history: revalidationHistory,
-          error: '最终核对后没有可执行商品，本次未创建执行组。',
-          failure_code: 'NO_CONFIRMED_TARGETS',
-          commit_lease_id: null,
-          commit_lease_owner: null,
-          commit_lease_expires_at: null,
-          progress: {
-            ...(owned.progress || {}), stage: 'failed', percent: 100,
-            message: '最终核对后没有可执行商品',
-          },
-        }, 'confirmed_scope_empty');
-        throw submissionError('最终核对后没有可执行商品，本次未创建执行组。', 'NO_CONFIRMED_TARGETS');
+        const pendingSellerCreateTargets = (owned.seller_input?.selected_targets || [])
+          .filter((target) => String(target.detection_status || '') === 'confirmed_absent');
+        if (pendingSellerCreateTargets.length === 0) {
+          transition('failed', {
+            ...(checked.prepared_patch || {}),
+            revalidation_history: revalidationHistory,
+            error: '最终核对后没有可执行商品，本次未创建执行组。',
+            failure_code: 'NO_CONFIRMED_TARGETS',
+            commit_lease_id: null,
+            commit_lease_owner: null,
+            commit_lease_expires_at: null,
+            progress: {
+              ...(owned.progress || {}), stage: 'failed', percent: 100,
+              message: '最终核对后没有可执行商品',
+            },
+          }, 'confirmed_scope_empty');
+          throw submissionError('最终核对后没有可执行商品，本次未创建执行组。', 'NO_CONFIRMED_TARGETS');
+        }
       }
       if (checked?.prepared_patch || checked?.revalidation_record) {
         persistCommitPatch({
@@ -924,6 +928,7 @@ export async function commitSubmission({
           signal,
           checkpoint: () => ensureOwned(['created']),
           targetKeys: ['__SELLER__'],
+          postSellerCreation: true,
         }),
         signal,
       );
@@ -933,10 +938,14 @@ export async function commitSubmission({
       const requiresReconfirm = checked?.reconfirm_required === true
         || (checked?.reconfirm_required !== false && scopeHashChanged);
       const changedTargetKeys = clone(checked?.changed_target_keys || []);
+      const postCreationRecheck = Array.isArray(owned.seller_input?.selected_targets)
+        && owned.seller_input.selected_targets.length > 0;
       const expectedSellerCreationChange = requiresReconfirm
-        && changedTargetKeys.length > 0
-        && changedTargetKeys.every((key) => String(key) === '__SELLER__')
-        && checked?.prepared_patch?.confirmed_execution_scope;
+        && (postCreationRecheck || (
+          changedTargetKeys.length > 0
+          && changedTargetKeys.every((key) => String(key) === '__SELLER__')
+          && checked?.prepared_patch?.confirmed_execution_scope
+        ));
       if (requiresReconfirm && !expectedSellerCreationChange) {
         transition('failed', {
           revalidation_history: revalidationHistory,
@@ -949,16 +958,20 @@ export async function commitSubmission({
         throw submissionError('新建活动回查结果与已确认目标不一致，本次未执行，请重新核对范围。', 'PREPARE_STALE');
       }
       if (checked?.execution_relation_count === 0) {
-        transition('failed', {
-          ...(checked.prepared_patch || {}),
-          revalidation_history: revalidationHistory,
-          error: '新建活动回查后没有可执行商品，本次未创建执行组。',
-          failure_code: 'NO_CONFIRMED_TARGETS',
-          commit_lease_id: null,
-          commit_lease_owner: null,
-          commit_lease_expires_at: null,
-        }, 'confirmed_scope_empty_after_creation');
-        throw submissionError('新建活动回查后没有可执行商品，本次未创建执行组。', 'NO_CONFIRMED_TARGETS');
+        const pendingSellerCreateTargets = (owned.seller_input?.selected_targets || [])
+          .filter((target) => String(target.detection_status || '') === 'confirmed_absent');
+        if (pendingSellerCreateTargets.length === 0) {
+          transition('failed', {
+            ...(checked.prepared_patch || {}),
+            revalidation_history: revalidationHistory,
+            error: '新建活动回查后没有可执行商品，本次未创建执行组。',
+            failure_code: 'NO_CONFIRMED_TARGETS',
+            commit_lease_id: null,
+            commit_lease_owner: null,
+            commit_lease_expires_at: null,
+          }, 'confirmed_scope_empty_after_creation');
+          throw submissionError('新建活动回查后没有可执行商品，本次未创建执行组。', 'NO_CONFIRMED_TARGETS');
+        }
       }
       if (checked?.prepared_patch || checked?.revalidation_record) {
         const changed = store.compareAndSwap(owned.id, {

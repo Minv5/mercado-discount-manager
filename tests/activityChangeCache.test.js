@@ -12,7 +12,9 @@ import {
   buildItemIdentitySummary,
   candidatePreparationReadDecision,
   candidateTotalProbeDecision,
+  getActivityCallbackAvailability,
   isActivityExpired,
+  setActivityCallbackAvailability,
   inventoryTotalProbeDecision,
   itemIdentityDelta,
   nextNonPeakCalibrationAt,
@@ -22,13 +24,32 @@ import {
 
 const NOW = new Date('2026-07-15T06:00:00.000Z');
 
-test('activity catalog uses a daily calibration and dirty or gap forces only the target scope', () => {
+test('callback unavailability forces direct platform sync for catalog and items', () => {
+  setActivityCallbackAvailability(false);
+  try {
+    const fresh = { catalog_checked_at: new Date(NOW.getTime() - 60_000).toISOString(), dirty: 0, continuity: 'continuous' };
+    assert.deepEqual(activityCatalogDecision(fresh, NOW), { refresh: true, reason: 'callback_unavailable' });
+    const promotion = { finish_date: '2026-07-31' };
+    const cacheState = { items_full_checked_at: new Date(NOW.getTime() - 60_000).toISOString(), dirty: 0, continuity: 'continuous' };
+    const fetchState = { detail_status: 'ok', saved_count: 12, platform_total: 12, updated_at: cacheState.items_full_checked_at };
+    assert.deepEqual(activityItemsDecision({ promotion, cacheState, fetchState, now: NOW }), { refresh: true, reason: 'callback_unavailable' });
+    assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, dirty: 1 }, fetchState, now: NOW }).reason, 'callback_unavailable');
+    assert.equal(activityCatalogDecision(null, NOW).reason, 'callback_unavailable');
+  } finally {
+    setActivityCallbackAvailability(true);
+  }
+  assert.equal(getActivityCallbackAvailability(), true);
   const fresh = { catalog_checked_at: new Date(NOW.getTime() - 60_000).toISOString(), dirty: 0, continuity: 'continuous' };
   assert.equal(activityCatalogDecision(fresh, NOW).refresh, false);
-  assert.equal(activityCatalogDecision(fresh, NOW).reason, 'same_day_cache');
+});
+
+test('activity catalog uses webhook change signals only: clean cache is reused without daily calibration', () => {
+  const fresh = { catalog_checked_at: new Date(NOW.getTime() - 60_000).toISOString(), dirty: 0, continuity: 'continuous' };
+  assert.equal(activityCatalogDecision(fresh, NOW).refresh, false);
+  assert.equal(activityCatalogDecision(fresh, NOW).reason, 'verified_cache');
   assert.equal(activityCatalogDecision({ ...fresh, dirty: 1 }, NOW).reason, 'dirty');
   assert.equal(activityCatalogDecision({ ...fresh, continuity: 'gap' }, NOW).reason, 'event_gap');
-  assert.equal(activityCatalogDecision({ ...fresh, catalog_checked_at: '2026-07-14T06:00:00.000Z' }, NOW).reason, 'daily_due');
+  assert.equal(activityCatalogDecision({ ...fresh, catalog_checked_at: '2026-07-14T06:00:00.000Z' }, NOW).reason, 'verified_cache');
   assert.deepEqual(activityCatalogDecision({
     ...fresh,
     dirty: 1,
@@ -91,7 +112,7 @@ test('activity items reuse verified full cache for three days and never reuse di
   assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, continuity: 'gap' }, fetchState, now: NOW }).reason, 'event_gap');
   assert.equal(activityItemsDecision({ promotion, cacheState, fetchState: { ...fetchState, detail_status: 'error' }, now: NOW }).reason, 'unreadable');
   assert.equal(activityItemsDecision({ promotion, cacheState, fetchState: { ...fetchState, detail_status: 'partial' }, now: NOW }).reason, 'not_full');
-  assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, items_full_checked_at: new Date(NOW.getTime() - ACTIVITY_ITEMS_TTL_MS - 1).toISOString() }, fetchState, now: NOW }).reason, 'three_day_due');
+  assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, items_full_checked_at: new Date(NOW.getTime() - ACTIVITY_ITEMS_TTL_MS - 1).toISOString() }, fetchState, now: NOW }).reason, 'verified_cache');
 });
 
 test('same-day failed or incomplete item reads do not repeat unless a newer event marks the activity dirty', () => {
@@ -207,7 +228,7 @@ test('only a new enrollment probes candidate totals while fixed update and cance
   }), false);
 });
 
-test('same-day clean candidate preparation performs zero probe while a new business day may probe', () => {
+test('clean candidate preparation performs zero probe regardless of business day while dirty scopes probe', () => {
   const sameDayFetchState = {
     detail_status: 'ok',
     updated_at: new Date(NOW.getTime() - 60_000).toISOString(),
@@ -216,6 +237,7 @@ test('same-day clean candidate preparation performs zero probe while a new busin
     { refresh: false, reason: 'same_day_cache' },
     { refresh: false, reason: 'same_day_partial_cache', effective_state: 'partial_api_sparse_marketplace_candidate' },
     { refresh: false, reason: 'verified_composite_cache', effective_state: 'candidate_plus_inventory_fallback' },
+    { refresh: false, reason: 'verified_cache' },
   ]) {
     assert.deepEqual(candidatePreparationReadDecision({
       action: 'enroll',
@@ -225,7 +247,7 @@ test('same-day clean candidate preparation performs zero probe while a new busin
       now: NOW,
     }), {
       probe: false,
-      reason: 'same_day_candidate_cache',
+      reason: 'verified_candidate_cache',
     });
   }
 
@@ -236,8 +258,19 @@ test('same-day clean candidate preparation performs zero probe while a new busin
     fetchState: { ...sameDayFetchState, updated_at: '2026-07-14T06:00:00.000Z' },
     now: NOW,
   }), {
-    probe: true,
-    reason: 'candidate_daily_probe_due',
+    probe: false,
+    reason: 'verified_candidate_cache',
+  });
+
+  assert.deepEqual(candidatePreparationReadDecision({
+    action: 'enroll',
+    itemStatus: 'candidate',
+    cacheDecision: { refresh: true, reason: 'dirty' },
+    fetchState: sameDayFetchState,
+    now: NOW,
+  }), {
+    probe: false,
+    reason: 'dirty',
   });
 });
 

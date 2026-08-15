@@ -177,7 +177,7 @@ test('one dirty activity is the only item range re-read across multiple accounts
   assert.deepEqual(result.reasons_by_identity['A|CH-A|MLM|P-2|DEAL'], ['candidate:dirty', 'started:dirty']);
 });
 
-test('catalog metadata changes, removed activities and unreadable routes remain exact and never reuse stale rows', () => {
+test('catalog metadata changes only review scope and reuse fresh item cache; removed and unreadable stay exact', () => {
   const rows = [
     activity('A', 'CH-A', 'P-1'),
     activity('A', 'CH-A', 'P-2'),
@@ -196,7 +196,7 @@ test('catalog metadata changes, removed activities and unreadable routes remain 
     }],
   });
 
-  assert.deepEqual([...result.item_read_identity_keys], ['A|CH-A|MLM|P-1|DEAL']);
+  assert.deepEqual([...result.item_read_identity_keys], []);
   assert.deepEqual([...result.removed_identity_keys], ['A|CH-A|MLM|P-2|DEAL']);
   assert.deepEqual([...result.blocked_identity_keys], ['B|CH-B|MLM|P-3|DEAL']);
   assert.deepEqual([...result.scope_review_identity_keys], [

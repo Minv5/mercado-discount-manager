@@ -75,7 +75,7 @@ export function writeJsonFileAtomicallySync({
   }
 }
 
-export function isProcessAlive(pid, { processKill = process.kill } = {}) {
+export function isProcessAlive(pid, { processKill = process.kill, execSync = null } = {}) {
   const normalizedPid = Number(pid || 0);
   if (!Number.isInteger(normalizedPid) || normalizedPid <= 0) return false;
   try {
@@ -83,6 +83,20 @@ export function isProcessAlive(pid, { processKill = process.kill } = {}) {
     return true;
   } catch (error) {
     if (String(error?.code || '') === 'ESRCH') return false;
+    if (String(error?.code || '') === 'EPERM') {
+      // 跨权限：无法直接探测。PID 可能已被系统复用给其他程序，
+      // 通过进程名确认是否是本程序（node）相关进程，避免陈旧锁误判。
+      try {
+        if (typeof execSync !== 'function') return false;
+        const output = execSync(
+          `tasklist /FI "PID eq ${normalizedPid}" /FO CSV /NH`,
+          { encoding: 'utf8', windowsHide: true, timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] },
+        );
+        return /node\.exe|electron\.exe/i.test(String(output || ''));
+      } catch {
+        return false;
+      }
+    }
     // EPERM means the process exists but this user cannot signal it.
     return true;
   }

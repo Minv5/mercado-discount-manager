@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -65,7 +66,7 @@ from theme import APP_QSS
 from workers import Worker
 
 
-TASK_HEADERS = ["时间", "动作", "活动", "类型", "商品 / 处理项", "结果", "失败", "失败原因"]
+TASK_HEADERS = ["时间", "动作", "折扣", "活动", "类型", "商品 / 处理项", "结果", "失败", "失败原因"]
 ACTIVITY_HEADERS = ["店铺", "站点", "类型", "活动", "状态", "商品数"]
 RECORD_VIEW_LIMITS = {"recent": 20, "all": 300}
 
@@ -89,6 +90,7 @@ class MainWindow(QMainWindow):
         self.today_execution_groups: list[dict[str, Any]] = []
         self.current_today_completion: dict[str, Any] | None = None
         self.today_completion_ready = False
+        self.refresh_busy = False
         self.today_completion_request_token = 0
         self.operating_rows_cache: list[dict[str, Any]] = []
         self.benchmark_text_cache = "自动并发按实测和接口反馈调整。"
@@ -108,6 +110,7 @@ class MainWindow(QMainWindow):
         self.prepare_poll_busy = False
         self.prepare_poll_failure_count = 0
         self.prepare_progress_key = ""
+        self.prepare_read_key = ""
         self.job_log_seen: dict[str, set[str]] = {}
         self.poll_failure_count = 0
         self.commit_recovery_poll_count = 0
@@ -314,16 +317,16 @@ class MainWindow(QMainWindow):
         self.records_delta_label.setToolTip("需要服务端提供前一日和当日的完整商品身份快照后才能计算，界面不会根据不完整数据推算。")
         layout.addWidget(self.records_delta_label)
         table = make_table(TASK_HEADERS)
-        table.horizontalHeaderItem(4).setToolTip(
+        table.horizontalHeaderItem(5).setToolTip(
             "涉及商品是按商品编号去重后的件数；处理项是商品×活动的组合数，同一商品参加多个活动会生成多条任务。"
         )
-        table.horizontalHeaderItem(5).setToolTip("批量取消显示取消请求成功、成功取消和待平台确认；其它动作显示成功与跳过。")
-        table.horizontalHeaderItem(6).setToolTip("前者是商品失败，后者是活动失败；活动失败不计入商品失败。")
+        table.horizontalHeaderItem(6).setToolTip("批量取消显示取消请求成功、成功取消和待平台确认；其它动作显示成功与跳过。")
+        table.horizontalHeaderItem(7).setToolTip("前者是商品失败，后者是活动失败；活动失败不计入商品失败。")
         header = table.horizontalHeader()
         header.setMinimumSectionSize(54)
-        for column in (0, 1, 3, 6):
+        for column in (0, 1, 2, 4, 7):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        for column in (2, 4, 5, 7):
+        for column in (3, 5, 6, 8):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         table.itemDoubleClicked.connect(lambda _item: self._show_task_details())
@@ -376,7 +379,55 @@ class MainWindow(QMainWindow):
             "discount": self.api.get("/api/today/global-discount").get("discount", {}),
             "execution": self.api.get("/api/execution/groups/active", timeout=10),
             "submission": self.api.get("/api/execution/submissions/active", timeout=10),
+            "refresh": self.api.get("/api/startup-refresh/status").get("refresh", {}),
         }
+
+    def _apply_startup_refresh_status(self, refresh: object) -> None:
+        status = str(dict(refresh or {}).get("status") or "")
+        if status == "failed":
+            self.log(f"启动缓存刷新失败：{dict(refresh or {}).get('error') or '未知原因'}。报活动时会实时读取有变动的活动，可正常执行。")
+            return
+        if status == "ok":
+            self.log("启动缓存刷新完成，数据已更新。")
+            return
+        if status == "running":
+            self.log("正在刷新数据变动的缓存，刷新完成前暂不能开始执行。")
+            self._set_refresh_busy(True)
+            timer = getattr(self, "refresh_poll_timer", None)
+            if timer is None:
+                timer = QTimer(self)
+                timer.setInterval(5000)
+                timer.timeout.connect(self._poll_startup_refresh)
+                self.refresh_poll_timer = timer
+            timer.start()
+
+    def _poll_startup_refresh(self) -> None:
+        try:
+            data = self.api.get("/api/startup-refresh/status")
+            refresh = dict(data.get("refresh") or {})
+            status = str(refresh.get("status") or "")
+            if status == "running":
+                return
+            timer = getattr(self, "refresh_poll_timer", None)
+            if timer is not None:
+                timer.stop()
+            self._set_refresh_busy(False)
+            if status == "failed":
+                self.log(f"启动缓存刷新失败：{refresh.get('error') or '未知原因'}。报活动时会实时读取有变动的活动，可正常执行。")
+            elif status == "ok":
+                self.log("启动缓存刷新完成，数据已更新。")
+        except Exception:
+            pass
+
+    def _set_refresh_busy(self, busy: bool) -> None:
+        self.refresh_busy = busy
+        if busy:
+            return
+        self.execute_button.setText("开始执行")
+        self.execute_button.setEnabled(self._can_start_submission())
+        for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
+            control.setEnabled(True)
+        self._update_discount_state()
 
     def _apply_initial_bundle(self, bundle: object) -> None:
         data = dict(bundle or {})
@@ -387,6 +438,7 @@ class MainWindow(QMainWindow):
         self.global_seller_discount = int(discount.get("seller_discount") or self.settings.get("sellerDefaultDiscount") or 5)
         self.global_official_discount = int(discount.get("official_discount") or self.settings.get("officialDefaultDiscount") or 6)
         self._apply_global_discounts()
+        self._apply_startup_refresh_status(data.get("refresh"))
         self._fill_store_combo()
         self._set_busy(False, "基础数据已加载，正在读取店铺站点...")
         self.log("基础数据已加载，正在读取店铺站点。")
@@ -821,7 +873,8 @@ class MainWindow(QMainWindow):
             values = [
                 time_text,
                 action_label(str(task.get("action") or "")),
-                activity_summary_text(task),
+                record_discount_text(task),
+                record_activity_text(task),
                 "提交" if str(task.get("mode") or "real") == "real" else "预览",
                 record_scope_text(unique_items, relation_count),
                 record_result_text(task),
@@ -873,9 +926,21 @@ class MainWindow(QMainWindow):
             DetailsDialog("批次详情", business_task_text(task), self).exec()
             return
         path = "/api/tasks/details?taskIds=" + ",".join(str(value) for value in ids)
+        items_path = "/api/tasks/items?task_ids=" + ",".join(str(value) for value in ids) + "&limit=200"
+
+        def load() -> dict[str, Any]:
+            return {
+                "details": list(self.api.get(path).get("details", [])),
+                "items": dict(self.api.get(items_path).get("items", {})),
+            }
+
         self._run_worker(
-            lambda: self.api.get(path).get("details", []),
-            lambda details: DetailsDialog("批次详情", business_details_text(task, list(details or [])), self).exec(),
+            load,
+            lambda payload: DetailsDialog(
+                "批次详情",
+                task_detail_text(task, list(payload["details"] or []), dict(payload["items"] or {})),
+                self,
+            ).exec(),
             lambda error: QMessageBox.warning(self, "批次详情", product_error(error)),
         )
 
@@ -938,6 +1003,8 @@ class MainWindow(QMainWindow):
         site_text = self.site_combo.currentText() or "全部站点"
         seller_discount = self.seller_discount.value()
         official_discount = self.official_discount.value()
+        scope_names = "、".join(self._store_for_account(account_id) for account_id in account_ids) or "无"
+        self.log(f"执行范围确认：店铺={scope_names}，站点={site_text}，动作={requested_action}，折扣=自建{seller_discount}%/官方{official_discount}%。")
         store_names = {account_id: self._store_for_account(account_id) for account_id in account_ids}
         read = int(settings.get("readConcurrency") or 2)
         activity = int(settings.get("previewConcurrency") or 2)
@@ -1065,6 +1132,7 @@ class MainWindow(QMainWindow):
         if state == "prepared":
             self.pending_prepare_payload = None
             self._set_prepare_busy(False)
+            self.log("准备完成（100%）。")
             self._submission_prepared({"prepare": prepare})
             return
         if state == "reconfirm_required":
@@ -1108,19 +1176,45 @@ class MainWindow(QMainWindow):
         if not self.prepare_poll_timer.isActive():
             self.prepare_poll_timer.start()
 
+    PREPARE_STAGE_LABELS = {
+        "queued": "排队等待",
+        "accounts": "核对店铺范围",
+        "catalog": "刷新店铺活动",
+        "started": "核对已报名商品",
+        "items": "核对可报名商品",
+        "seller": "核对自建活动",
+        "final_catalog": "提交前复核",
+        "final_targeted": "提交前复核",
+        "finalizing": "整理最终范围",
+    }
+
     def _log_prepare_progress(self, prepare: dict[str, Any]) -> None:
         progress = dict(prepare.get("progress") or {})
         message = str(progress.get("message") or "正在核对执行范围")
+        stage = str(progress.get("stage") or "")
+        stage_label = self.PREPARE_STAGE_LABELS.get(stage, "")
         current = " / ".join(str(progress.get(key) or "") for key in ("current_store", "current_site", "current_activity") if progress.get(key))
         percent = max(0, min(100, int(progress.get("percent") or 0)))
         scheduler_text = self._prepare_scheduler_text(progress)
-        key = f"{message}|{current}|{percent}|{scheduler_text}"
+        read_match = re.match(r"正在读取(已报名|可报名)商品（活动 \d+/(\d+)）", message)
+        if read_match:
+            read_key = f"read-items:{read_match.group(1)}"
+            if read_key == self.prepare_read_key:
+                return
+            self.prepare_read_key = read_key
+            message = f"正在读取{read_match.group(1)}商品（共 {read_match.group(2)} 个活动）"
+            current = ""
+            percent = 0
+            scheduler_text = ""
+        key = f"{stage}|{message}|{current}|{percent}|{scheduler_text}"
         if key == self.prepare_progress_key:
             return
         self.prepare_progress_key = key
         suffix = f"：{current}" if current else ""
         metrics = f" {scheduler_text}" if scheduler_text else ""
-        self.log(f"{message}{suffix}（{percent}%）。{metrics}")
+        prefix = f"[{stage_label}] " if stage_label else ""
+        percent_text = f"（{percent}%）" if percent > 0 else ""
+        self.log(f"{prefix}{message}{suffix}{percent_text}。{metrics}")
 
     @staticmethod
     def _prepare_scheduler_text(progress: dict[str, Any]) -> str:
@@ -1672,6 +1766,7 @@ class MainWindow(QMainWindow):
             self.preparing_submission = {}
             self.pending_prepare_payload = None
             self.prepare_progress_key = ""
+            self.prepare_read_key = ""
             self._set_prepare_busy(False)
             self.log("已停止准备，未创建执行组、未提交商品。")
 
@@ -1860,6 +1955,15 @@ def daily_item_delta_text(delta: dict[str, Any]) -> tuple[str, str]:
     return "较昨日商品变化：暂无可比较快照，数据不足", tooltip
 
 
+def record_activity_text(task: dict[str, Any]) -> str:
+    if str(task.get("promotion_type") or "").upper() == "BATCH" or not task.get("promotion_id"):
+        return "批量汇总"
+    store = task.get("store_name") or "当前店铺"
+    site = task.get("site_name") or site_name(str(task.get("site_id") or ""))
+    activity = task.get("promotion_name") or task.get("activity_name") or "当前活动"
+    return f"{store} / {site} / {activity}"
+
+
 def activity_summary_text(task: dict[str, Any]) -> str:
     parts = []
     seller = str(task.get("seller_activity_text") or "").strip()
@@ -1883,7 +1987,10 @@ def record_result_text(task: dict[str, Any]) -> str:
         lines = [f"{action_success} {success}"]
         if platform_pending is not None:
             lines.append(f"平台待生效 {platform_pending}")
+        category_text = failure_category_text(task.get("failure_reasons"), _failed)
         lines.append(f"跳过 {skipped}")
+        if category_text:
+            lines.append(f"失败 {_failed}（{category_text}）")
         return "\n".join(lines)
     request_success = optional_contract_count(task, "request_success_count")
     verified_removed = optional_contract_count(task, "live_verified_removed_count")
@@ -1895,6 +2002,47 @@ def record_result_text(task: dict[str, Any]) -> str:
         f"成功取消 {count_or_marker(verified_removed)}\n"
         f"待平台确认 {count_or_marker(pending)}"
     )
+
+
+def is_reservation_start(value: object) -> bool:
+    if not value:
+        return False
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        start = datetime.fromisoformat(text)
+        return start > datetime.now(start.tzinfo)
+    except (TypeError, ValueError):
+        return False
+
+
+def failure_category_text(failure_reasons: object, failed_count: int) -> str:
+    reasons = failure_reasons if isinstance(failure_reasons, list) else []
+    if not reasons:
+        # No categorized reasons available (legacy rows or server without
+        # reason breakdown): do not guess "rejected" for every failure.
+        return ""
+    under_review = 0
+    discount = 0
+    for item in reasons:
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("reason") or "")
+        count = int(item.get("count") or 0)
+        if "审核" in reason:
+            under_review += count
+        elif "折扣" in reason or ("价格" in reason and "不认可" in reason):
+            discount += count
+    rejected = max(int(failed_count or 0) - under_review - discount, 0)
+    parts = []
+    if under_review > 0:
+        parts.append(f"审核中 {under_review}")
+    if discount > 0:
+        parts.append(f"折扣不被认可 {discount}")
+    if rejected > 0:
+        parts.append(f"拒绝 {rejected}")
+    return " / ".join(parts) if parts else ""
 
 
 def execution_result_text(result: dict[str, Any], action: str) -> str:
@@ -1927,8 +2075,14 @@ def execution_result_text(result: dict[str, Any], action: str) -> str:
     if platform_pending is not None:
         pending_text = f"，平台已接受待生效 {platform_pending}"
     success_label = {"enroll": "报名成功", "update": "更新成功"}.get(normalized_action, "成功")
+    if is_reservation_start(result.get("promotion_start_date")):
+        success_label = {"enroll": "预约成功", "update": "更新成功"}.get(normalized_action, "成功")
+    failed_text = f"商品失败 {failed}"
+    category_text = failure_category_text(result.get("failure_reasons"), failed)
+    if category_text:
+        failed_text += f"（{category_text}）"
     return (
-        f"{common}，{success_label} {success}{pending_text}，商品失败 {failed}，"
+        f"{common}，{success_label} {success}{pending_text}，{failed_text}，"
         f"活动失败 {count_or_marker(activity_failures)}，跳过 {skipped}"
     )
 
@@ -1975,8 +2129,16 @@ def execution_log_message(value: object) -> str:
         ):
             return ""
         important_markers = ("失败", "异常", "错误", "限流", "冷却", "重试", "恢复", "中断", "停止", "待平台", "完成")
-        low_value_markers = ("正在处理活动", "正在读取", "正在核对", "详情 ", "排队 ", "并发 ", "本地整理", "分页 ")
+        low_value_markers = ("正在处理活动", "正在读取", "正在核对", "详情 ", "排队 ", "本地整理", "分页 ")
+        is_pure_concurrency_line = (
+            text.startswith("并发处理活动任务")
+            or text.startswith("并发读取站点活动")
+            or text.startswith("并发读取活动商品")
+            or text.startswith("并发提交")
+        )
         if any(marker in text for marker in low_value_markers) and not any(marker in text for marker in important_markers):
+            return ""
+        if is_pure_concurrency_line:
             return ""
         return text
     return ""
@@ -2006,16 +2168,66 @@ def execution_job_summary(job: dict[str, Any]) -> tuple[str, dict[str, int]]:
     return action, {"total": total, "success": success, "failed": failed, "skipped": skipped}
 
 
-def business_task_text(task: dict[str, Any]) -> str:
+def record_discount_text(task: dict[str, Any]) -> str:
+    parts = []
+    seller = task.get("seller_activity_text")
+    if not seller and task.get("seller_discount_percent"):
+        seller = f"{task.get('seller_discount_percent')}%"
+    official = task.get("official_activity_text")
+    if not official and task.get("official_discount_percent"):
+        official = f"{task.get('official_discount_percent')}%"
+    if seller:
+        parts.append(f"自建{seller}")
+    if official:
+        parts.append(f"官方{official}")
+    return " / ".join(parts) if parts else "-"
+
+
+def task_detail_text(task: dict[str, Any], details: list[dict[str, Any]], items: dict[str, Any]) -> str:
+    summary_task = dict(task)
+    if items.get("unique_item_count") is not None:
+        summary_task["unique_item_count"] = items.get("unique_item_count")
+    if items.get("relation_count") is not None:
+        summary_task["relation_count"] = items.get("relation_count")
+    if items.get("activity_failure_count") is not None:
+        summary_task["activity_failure_count"] = items.get("activity_failure_count")
+    for field in ("request_success_count", "live_verified_removed_count", "pending_verification_count"):
+        if summary_task.get(field) is None:
+            summary_task[field] = sum(int(row.get(field) or 0) for row in details)
+    base = business_details_text(summary_task, details)
+    failed = list(items.get("failed_items") or [])
+    parts = [base]
+    if failed:
+        seen: dict[str, int] = {}
+        for row in failed:
+            item_id = str(row.get("item_id") or "")
+            seen[item_id] = seen.get(item_id, 0) + 1
+        unique_failed = []
+        for row in failed:
+            item_id = str(row.get("item_id") or "")
+            if item_id and item_id not in {str(existing.get("item_id") or "") for existing in unique_failed}:
+                unique_failed.append(row)
+        total_failed = int(summary_task.get("failed_count") or 0)
+        lines = [f"\n失败商品明细（去重 {len(unique_failed)} 件 / 共 {total_failed} 件失败）："]
+        for row in unique_failed[:100]:
+            reason = str(row.get("reason") or "").strip()
+            lines.append(f"  {row.get('item_id') or '-'} - {reason or '未知原因'}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def business_task_text(task: dict[str, Any], reserved_count: int | None = None) -> str:
     _total, success, failed, skipped = task_display_counts(task)
     unique_items = optional_contract_count(task, "unique_item_count")
     relations = optional_contract_count(task, "relation_count")
     activity_failures = optional_contract_count(task, "activity_failure_count")
+    seller_text = task.get("seller_activity_text") or (f"{task.get('seller_discount_percent')}%" if task.get("seller_discount_percent") else "-")
+    official_text = task.get("official_activity_text") or (f"{task.get('official_discount_percent')}%" if task.get("official_discount_percent") else "-")
     lines = [
         f"时间：{short_date(str(task.get('created_at') or ''))}\n"
         f"动作：{action_label(str(task.get('action') or ''))}\n"
-        f"自建折扣：{task.get('seller_activity_text') or '-'}\n"
-        f"官方折扣：{task.get('official_activity_text') or '-'}",
+        f"自建折扣：{seller_text}\n"
+        f"官方折扣：{official_text}",
         f"涉及商品：{count_or_marker(unique_items, '旧记录未区分')} 件（按商品编号去重）",
         f"需处理项：{count_or_marker(relations, '旧记录未区分')} 项（商品×活动）",
     ]
@@ -2031,26 +2243,44 @@ def business_task_text(task: dict[str, Any]) -> str:
             "enroll": "报名成功",
             "update": "更新成功",
         }.get(str(task.get("action") or "").lower(), "成功")
-        lines.append(f"{success_label}：{success}")
+        if reserved_count is None:
+            lines.append(f"{success_label}：{success}")
+        else:
+            reserved = int(reserved_count)
+            active = max(int(success) - reserved, 0)
+            lines.append(f"{success_label}：{success}（立即生效 {active}，预约成功 {reserved}）")
         platform_pending = optional_contract_count(task, "platform_pending_count")
         if platform_pending:
             lines.append(f"平台已接受待生效：{platform_pending}")
+    failed_line = f"商品失败：{failed}"
+    category_text = failure_category_text(task.get("failure_reasons"), failed)
+    if category_text:
+        failed_line += f"（{category_text}）"
     lines.extend([
-        f"商品失败：{failed}",
+        failed_line,
         f"活动失败：{count_or_marker(activity_failures, '旧记录未区分')}",
         f"跳过：{skipped}",
         f"失败原因：{task.get('failure_reason') or task.get('short_failure_reason') or '-'}",
     ])
     return "\n".join(lines)
 
-
 def business_details_text(task: dict[str, Any], details: list[dict[str, Any]]) -> str:
-    lines = [business_task_text(task), "", "店铺 / 站点 / 活动明细："]
+    reserved_count = sum(
+        int(row.get("success_count") or 0)
+        for row in details
+        if is_reservation_start(row.get("promotion_start_date"))
+    )
+    lines = [business_task_text(task, reserved_count), "", "店铺 / 站点 / 活动明细："]
     for row in details:
+        promotion_type = str(row.get("promotion_type") or "").upper()
+        promotion_id = str(row.get("promotion_id") or "")
+        if promotion_type == "BATCH" or promotion_id.upper() == "__BATCH__":
+            continue
         store = row.get("store_name") or "当前店铺"
         site = row.get("site_name") or site_name(str(row.get("site_id") or ""))
         activity = row.get("promotion_name") or row.get("activity_name") or "当前活动"
-        lines.append(f"- {store} / {site} / {activity}：{execution_result_text(row, str(row.get('action') or task.get('action') or ''))}")
+        stamp = short_date(str(row.get("created_at") or ""))
+        lines.append(f"- {stamp} {store} / {site} / {activity}：{execution_result_text(row, str(row.get('action') or task.get('action') or ''))}")
     return "\n".join(lines)
 
 

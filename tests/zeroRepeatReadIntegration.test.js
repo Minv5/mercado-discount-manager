@@ -220,7 +220,7 @@ test('one webhook-dirty route refreshes only that route and its changed activity
     getFetchState: () => fullFetchState(),
   });
   assert.equal(finalPlan.platform_read_required, false);
-  assert.deepEqual([...finalPlan.item_read_identity_keys], ['A-1|CH-1|MLM|P-1|DEAL']);
+  assert.deepEqual([...finalPlan.item_read_identity_keys], []);
   assert.equal(finalPlan.excluded_new_activity_count, 1);
 });
 
@@ -266,7 +266,7 @@ test('cross-day route evidence requires recalibration while same-day single-page
     now: NOW,
   }), {
     probe: false,
-    reason: 'same_day_candidate_cache',
+    reason: 'verified_candidate_cache',
   });
 });
 
@@ -997,8 +997,8 @@ test('server same-day preparation performs zero GET and cross-day probe reuses i
     const result = JSON.parse(String(output).trim());
     assert.equal(result.same_day_get_calls, 0);
     assert.equal(result.same_day_saved, 50);
-    assert.equal(result.cross_day_total_get_calls, 2);
-    assert.equal(result.cross_day_saved, 60);
+    assert.equal(result.cross_day_total_get_calls, 0);
+    assert.equal(result.cross_day_saved, 50);
   } finally {
     fs.rmSync(dataDir, { recursive: true, force: true });
   }

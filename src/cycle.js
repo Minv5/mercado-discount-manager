@@ -41,19 +41,33 @@ function localDateNumber(value) {
   return date.getFullYear() * 10000 + (date.getMonth() + 1) * 100 + date.getDate();
 }
 
-export function getCycleState(accountId, promotionId, promotionType) {
+export function getCycleState(accountId, promotionId, promotionType, { childUserId = '', siteId = '', activityRevision = '' } = {}) {
   return get(
-    'SELECT * FROM cycle_states WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?',
-    [String(accountId), promotionId, promotionType]
+    `SELECT * FROM cycle_states
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+       AND promotion_id = ? AND promotion_type = ? AND activity_revision = ?`,
+    [String(accountId), String(childUserId || ''), String(siteId || '').toUpperCase(), promotionId, promotionType, String(activityRevision || '')]
   );
 }
 
-export function upsertCycleState({ accountId, promotionId, promotionType, sellerDiscountPercent, officialDiscountPercent, status, raw }) {
+export function upsertCycleState({
+  accountId,
+  childUserId = '',
+  siteId = '',
+  activityRevision = '',
+  promotionId,
+  promotionType,
+  sellerDiscountPercent,
+  officialDiscountPercent,
+  status,
+  raw,
+}) {
   run(
     `INSERT INTO cycle_states
-      (account_id, promotion_id, promotion_type, seller_discount_percent, official_discount_percent, status, raw_json, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(account_id, promotion_id, promotion_type) DO UPDATE SET
+      (account_id, child_user_id, site_id, promotion_id, promotion_type, activity_revision, identity_state,
+       seller_discount_percent, official_discount_percent, status, raw_json, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'route_scoped', ?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, child_user_id, site_id, promotion_id, promotion_type, activity_revision) DO UPDATE SET
         seller_discount_percent = excluded.seller_discount_percent,
         official_discount_percent = excluded.official_discount_percent,
         status = excluded.status,
@@ -61,8 +75,11 @@ export function upsertCycleState({ accountId, promotionId, promotionType, seller
         updated_at = excluded.updated_at`,
     [
       String(accountId),
+      String(childUserId || ''),
+      String(siteId || '').toUpperCase(),
       promotionId,
       promotionType,
+      String(activityRevision || ''),
       sellerDiscountPercent ?? null,
       officialDiscountPercent ?? null,
       status,
@@ -72,12 +89,15 @@ export function upsertCycleState({ accountId, promotionId, promotionType, seller
   );
 }
 
-export function markCycleAfterTask({ accountId, promotionId, promotionType, action, discountPercent, completed }) {
+export function markCycleAfterTask({ accountId, childUserId = '', siteId = '', activityRevision = '', promotionId, promotionType, action, discountPercent, completed }) {
   const kind = classifyPromotionType(promotionType);
-  const existing = getCycleState(accountId, promotionId, promotionType);
+  const existing = getCycleState(accountId, promotionId, promotionType, { childUserId, siteId, activityRevision });
   const status = completed ? (action === 'cancel' ? 'cancelled_complete' : 'completed') : 'partial_or_failed';
   upsertCycleState({
     accountId,
+    childUserId,
+    siteId,
+    activityRevision,
     promotionId,
     promotionType,
     sellerDiscountPercent: kind === 'seller' ? discountPercent : existing?.seller_discount_percent,

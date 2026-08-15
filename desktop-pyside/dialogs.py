@@ -107,6 +107,15 @@ class SellerCampaignCreateDialog(QDialog):
         help_text = QLabel("以下店铺站点已由可验证来源确认不存在自建活动。请勾选本次需要创建的目标；默认全部不勾选。")
         help_text.setWordWrap(True)
         root.addWidget(help_text)
+        select_row = QHBoxLayout()
+        select_all = QPushButton("全选")
+        select_none = QPushButton("全不选")
+        select_all.clicked.connect(lambda: self._set_all_checked(True))
+        select_none.clicked.connect(lambda: self._set_all_checked(False))
+        select_row.addWidget(select_all)
+        select_row.addWidget(select_none)
+        select_row.addStretch(1)
+        root.addLayout(select_row)
         self.scope_list = QListWidget()
         self.scope_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         for target in targets:
@@ -132,12 +141,12 @@ class SellerCampaignCreateDialog(QDialog):
         form.addRow("开始日期", self.start_edit)
         form.addRow("结束日期", self.finish_edit)
         root.addLayout(form)
-        note = QLabel("只创建 SELLER_CAMPAIGN 自建活动；所选目标会合并到唯一的最终执行摘要中确认。")
+        note = QLabel("只创建 SELLER_CAMPAIGN 自建活动；确认后创建所选目标，并继续进入最终执行确认。")
         note.setObjectName("muted")
         note.setWordWrap(True)
         root.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("加入最终摘要")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认创建并继续")
         buttons.button(QDialogButtonBox.StandardButton.Ok).setObjectName("primary")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self._validate)
@@ -150,6 +159,11 @@ class SellerCampaignCreateDialog(QDialog):
         self.finish_edit.setMinimumDate(value)
         self.finish_edit.setMaximumDate(maximum)
         self.finish_edit.setDate(maximum)
+
+    def _set_all_checked(self, checked: bool) -> None:
+        for index in range(self.scope_list.count()):
+            item = self.scope_list.item(index)
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
 
     def _validate(self) -> None:
         if not self.name_edit.text().strip():
@@ -420,12 +434,27 @@ class SettingsDialog(QDialog):
         self.oauth_redirect_uri = QLineEdit(str(self.settings.get("oauthRedirectUri") or ""))
         self.webhook_callback_url = QLineEdit(str(self.settings.get("webhookCallbackUrl") or ""))
         self.webhook_callback_url.setPlaceholderText("请输入独立回调服务的公网通知地址")
+        self.activity_callback_enabled = QCheckBox("启用活动变化回调接收")
+        self.activity_callback_enabled.setChecked(bool(self.settings.get("activityCallbackEnabled")))
+        self.activity_callback_application_id = QLineEdit(str(self.settings.get("activityCallbackApplicationId") or ""))
+        self.activity_callback_application_id.setPlaceholderText("Mercado 应用 Client ID")
+        self.activity_callback_secret_file = QLineEdit(str(self.settings.get("activityCallbackSecretFile") or ""))
+        self.activity_callback_secret_file.setPlaceholderText("消费密钥文件路径（discount-webhook-consumer.secret）")
+        self.activity_callback_claim_url = QLineEdit(str(self.settings.get("activityCallbackClaimUrl") or "https://xingtupro1020.com/meli-callback/consumer/claim"))
+        self.activity_callback_claim_url.setPlaceholderText("领取通知地址")
+        self.activity_callback_ack_url = QLineEdit(str(self.settings.get("activityCallbackAckUrl") or "https://xingtupro1020.com/meli-callback/consumer/ack"))
+        self.activity_callback_ack_url.setPlaceholderText("确认处理地址")
         form.addRow("美客多应用 Client ID", self.oauth_client_id)
         form.addRow("美客多应用 Client Secret", self.oauth_client_secret)
         form.addRow("OAuth 回调地址", self.oauth_redirect_uri)
         form.addRow("Webhook 通知地址", self.webhook_callback_url)
+        form.addRow("活动回调", self.activity_callback_enabled)
+        form.addRow("回调应用标识", self.activity_callback_application_id)
+        form.addRow("回调共享密钥文件", self.activity_callback_secret_file)
+        form.addRow("领取地址", self.activity_callback_claim_url)
+        form.addRow("确认地址", self.activity_callback_ack_url)
         layout.addLayout(form)
-        callback_note = QLabel("Webhook 通知地址仅保存独立回调服务的公网地址。本桌面程序不会修改 Caddy 或外部回调服务配置。")
+        callback_note = QLabel("启用活动变化回调后，桌面程序会每 2 秒从领取地址拉取平台通知并自动处理（重新核对活动/商品缓存），处理成功后确认。Webhook 通知地址仅作记录，不用于接收。")
         callback_note.setObjectName("muted")
         callback_note.setWordWrap(True)
         layout.addWidget(callback_note)
@@ -480,6 +509,11 @@ class SettingsDialog(QDialog):
             "oauthClientId": self.oauth_client_id.text(),
             "oauthRedirectUri": self.oauth_redirect_uri.text(),
             "webhookCallbackUrl": self.webhook_callback_url.text(),
+            "activityCallbackEnabled": self.activity_callback_enabled.isChecked(),
+            "activityCallbackApplicationId": self.activity_callback_application_id.text().strip(),
+            "activityCallbackSecretFile": self.activity_callback_secret_file.text().strip(),
+            "activityCallbackClaimUrl": self.activity_callback_claim_url.text().strip(),
+            "activityCallbackAckUrl": self.activity_callback_ack_url.text().strip(),
         })
         return page
 
@@ -500,8 +534,21 @@ class SettingsDialog(QDialog):
             ("oauthClientId", self.oauth_client_id, str(settings.get("oauthClientId") or "")),
             ("oauthRedirectUri", self.oauth_redirect_uri, str(settings.get("oauthRedirectUri") or "")),
             ("webhookCallbackUrl", self.webhook_callback_url, str(settings.get("webhookCallbackUrl") or "")),
+            ("activityCallbackEnabled", self.activity_callback_enabled, bool(settings.get("activityCallbackEnabled"))),
+            ("activityCallbackApplicationId", self.activity_callback_application_id, str(settings.get("activityCallbackApplicationId") or "")),
+            ("activityCallbackSecretFile", self.activity_callback_secret_file, str(settings.get("activityCallbackSecretFile") or "")),
+            ("activityCallbackClaimUrl", self.activity_callback_claim_url, str(settings.get("activityCallbackClaimUrl") or "https://xingtupro1020.com/meli-callback/consumer/claim")),
+            ("activityCallbackAckUrl", self.activity_callback_ack_url, str(settings.get("activityCallbackAckUrl") or "https://xingtupro1020.com/meli-callback/consumer/ack")),
         )
         for key, field, value in fields:
+            if isinstance(field, QCheckBox):
+                current = field.isChecked()
+                if current != self._initial_field_values.get(key):
+                    continue
+                with QSignalBlocker(field):
+                    field.setChecked(bool(value))
+                self._initial_field_values[key] = value
+                continue
             current = field.value() if isinstance(field, QSpinBox) else field.text()
             if current != self._initial_field_values.get(key):
                 continue
@@ -550,6 +597,11 @@ class SettingsDialog(QDialog):
             "oauthClientSecret": self.oauth_client_secret.text(),
             "oauthRedirectUri": self.oauth_redirect_uri.text().strip(),
             "webhookCallbackUrl": self.webhook_callback_url.text().strip(),
+            "activityCallbackEnabled": self.activity_callback_enabled.isChecked(),
+            "activityCallbackApplicationId": self.activity_callback_application_id.text().strip(),
+            "activityCallbackSecretFile": self.activity_callback_secret_file.text().strip(),
+            "activityCallbackClaimUrl": self.activity_callback_claim_url.text().strip(),
+            "activityCallbackAckUrl": self.activity_callback_ack_url.text().strip(),
             "storeAliases": aliases,
             "operatingSites": operating,
         }

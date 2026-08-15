@@ -8,6 +8,7 @@ export function decideToday({
   promotions,
   cycleStatesByPromotion = new Map(),
   startedCountsByPromotion = new Map(),
+  candidateCountsByPromotion = new Map(),
   globalCycle = null,
   sellerMaxDiscount = 10,
   officialMaxDiscount = 10,
@@ -50,26 +51,49 @@ export function decideToday({
       ? Number(String(promotion.promotion_type || '').toUpperCase() === 'SELLER_CAMPAIGN'
         ? globalCycle.seller_discount : globalCycle.official_discount)
       : activityDiscount;
-    const action = hasGlobalCycle
-      ? globalCancelCycle ? 'cancel' : 'update'
-      : cycleDecision.action === 'cancel' ? 'cancel' : startedCount > 0 ? 'update' : 'enroll';
+    const isSellerCampaign = String(promotion.promotion_type || '').toUpperCase() === 'SELLER_CAMPAIGN';
+    const freshSellerCampaign = isSellerCampaign
+      && startedCount === 0
+      && !globalCancelCycle;
+    const incompleteLastAction = cycleLastAction(state);
+    const incompleteToday = stateIncompleteToday(state, today);
+    const resumeIncompleteCancel = incompleteToday
+      && startedCount > 0
+      && incompleteLastAction === 'cancel';
+    const candidateCount = Number(candidateCountsByPromotion.get(key) || 0);
+    const action = freshSellerCampaign
+      ? 'enroll'
+      : resumeIncompleteCancel
+        ? 'cancel'
+        : startedCount === 0 && !globalCancelCycle
+          ? 'enroll'
+          : hasGlobalCycle
+            ? globalCancelCycle ? 'cancel' : candidateCount > 0 ? 'enroll' : 'update'
+            : cycleDecision.action === 'cancel' ? 'cancel'
+              : candidateCount > 0 ? 'enroll'
+                : startedCount > 0 ? 'update' : 'enroll';
     return {
       promotion,
       state,
       startedCount,
+      candidateCount,
       action,
       discount,
       completedToday: stateCompletedToday(state, today, action),
-      incompleteToday: stateIncompleteToday(state, today),
-      reason: hasGlobalCycle
-        ? globalCancelCycle
-          ? `上一有效真实报名或更新已达到自建${configuredSellerMaximum}%/官方${configuredOfficialMaximum}%，且当前仍有 started 商品，本次应批量取消折扣`
-          : '按上一有效真实报名或更新批次推进，本次应批量更新折扣'
-        : cycleDecision.action === 'cancel'
-        ? '最近完整折扣已到设置上限，本次应批量取消折扣'
-        : startedCount > 0
-          ? '有 started 商品，本次应批量更新折扣'
-          : '新周期: 批量报折扣'
+      incompleteToday,
+      reason: resumeIncompleteCancel
+        ? `今天取消未完成（${state?.status}），本次继续取消剩余商品`
+        : hasGlobalCycle
+          ? globalCancelCycle
+            ? `上一有效真实报名或更新已达到自建${configuredSellerMaximum}%/官方${configuredOfficialMaximum}%，且当前仍有 started 商品，本次应批量取消折扣`
+            : '按上一有效真实报名或更新批次推进，本次应批量更新折扣'
+          : cycleDecision.action === 'cancel'
+            ? '最近完整折扣已到设置上限，本次应批量取消折扣'
+            : candidateCount > 0
+              ? '仍有候选商品未报名，本次应批量报名'
+              : startedCount > 0
+                ? '候选商品已全部报名，本次应批量更新折扣'
+                : '新周期: 批量报折扣'
     };
   });
 
@@ -97,6 +121,7 @@ export function decideToday({
       action: row.action,
       discount: row.discount,
       started_count: row.startedCount,
+      candidate_count: row.candidateCount,
       completed_today: row.completedToday,
       incomplete_today: row.incompleteToday,
       reason: row.reason,
@@ -148,4 +173,26 @@ function summaryReason({ allSelectedCompleted, incompleteRows, priorityAction, m
 function finiteMaximum(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.min(90, Math.max(1, parsed)) : fallback;
+}
+
+function cycleLastAction(state) {
+  if (!state) return '';
+  const raw = state.raw && typeof state.raw === 'object'
+    ? state.raw
+    : typeof state.raw_json === 'string' && state.raw_json
+      ? safeParse(state.raw_json)
+      : null;
+  return String(raw?.last_action || '').toLowerCase();
+}
+
+function safeParse(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function actionDisplayName(action) {
+  return { enroll: '报名', update: '更新', cancel: '取消' }[String(action || '')] || String(action || '');
 }

@@ -97,6 +97,7 @@ class NodeServiceManager:
         env = os.environ.copy()
         env["MDM_DATA_DIR"] = str(self.data_dir)
         env["ML_STANDALONE_AUTH_DIR"] = str(self.auth_dir)
+        self._apply_webhook_env(env)
         self.process = subprocess.Popen(
             [str(node_exe), "src/server.js"],
             cwd=str(app_dir),
@@ -145,6 +146,41 @@ class NodeServiceManager:
         """Release ownership while leaving an active compatible service running."""
         self.process = None
         self._close_log_handles()
+
+    def _apply_webhook_env(self, env: dict[str, str]) -> None:
+        """Inject activity callback (webhook receiver) settings from settings.json."""
+        try:
+            with open(self.data_dir / "settings.json", encoding="utf-8") as handle:
+                settings = json.load(handle)
+        except (OSError, ValueError):
+            return
+        enabled = settings.get("activityCallbackEnabled") is True
+        if not enabled:
+            env.pop("MDM_ACTIVITY_CALLBACK_ENABLED", None)
+            env.pop("MDM_ACTIVITY_CALLBACK_APPLICATION_ID", None)
+            env.pop("MDM_ACTIVITY_CALLBACK_SECRET_FILE", None)
+            env.pop("MDM_ACTIVITY_CLAIM_ENABLED", None)
+            env.pop("MDM_ACTIVITY_CLAIM_APPLICATION_ID", None)
+            env.pop("MDM_ACTIVITY_CLAIM_SECRET_FILE", None)
+            env.pop("MDM_ACTIVITY_CLAIM_URL", None)
+            env.pop("MDM_ACTIVITY_CLAIM_ACK_URL", None)
+            return
+        application_id = str(settings.get("activityCallbackApplicationId") or "").strip()
+        secret_file = str(settings.get("activityCallbackSecretFile") or "").strip()
+        claim_url = str(settings.get("activityCallbackClaimUrl") or "").strip()
+        ack_url = str(settings.get("activityCallbackAckUrl") or "").strip()
+        env["MDM_ACTIVITY_CALLBACK_ENABLED"] = "1"
+        env["MDM_ACTIVITY_CLAIM_ENABLED"] = "1"
+        if application_id:
+            env["MDM_ACTIVITY_CALLBACK_APPLICATION_ID"] = application_id
+            env["MDM_ACTIVITY_CLAIM_APPLICATION_ID"] = application_id
+        if secret_file:
+            env["MDM_ACTIVITY_CALLBACK_SECRET_FILE"] = secret_file
+            env["MDM_ACTIVITY_CLAIM_SECRET_FILE"] = secret_file
+        if claim_url:
+            env["MDM_ACTIVITY_CLAIM_URL"] = claim_url
+        if ack_url:
+            env["MDM_ACTIVITY_CLAIM_ACK_URL"] = ack_url
 
     def _close_log_handles(self) -> None:
         for handle in self._log_handles:
