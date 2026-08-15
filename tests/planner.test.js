@@ -67,6 +67,7 @@ import { buildGlobalTodayDiscount, findLatestEffectiveUpdate } from '../src/glob
 import { createExecutionJobPersistence } from '../src/executionJobPersistence.js';
 import { accountProfileDisplayName, accountProfileRecord, isSyntheticAccountName } from '../src/accountProfiles.js';
 import {
+  CANCEL_LIVE_READ_CLASSIFICATION,
   CANCEL_RESULT_STATUS,
   buildCancelResultContract,
   summarizeResultContractRows,
@@ -188,7 +189,7 @@ test('WinForms settings expose business site scope without technical child ids',
   assert.doesNotMatch(dialogSource, /child_user_id|jobId|JSONL|api\//i);
 });
 
-test('buildPlan enroll calculates discount price and applies boundaries', () => {
+test('buildPlan enroll calculates discount price and applies boundaries for official activities only', () => {
   const plan = buildPlan({
     action: 'enroll',
     promotion: { id: 'P-1', type: 'SELLER_CAMPAIGN', name: '自建活动' },
@@ -200,10 +201,28 @@ test('buildPlan enroll calculates discount price and applies boundaries', () => 
   });
 
   assert.equal(plan.total, 2);
+  assert.equal(plan.planned, 2);
+  assert.equal(plan.skipped, 0);
+  assert.equal(plan.rows[0].deal_price, 95);
+  assert.equal(plan.rows[1].deal_price, 95);
+});
+
+test('buildPlan enroll applies local min/max boundaries for official activities and reports skip reasons', () => {
+  const plan = buildPlan({
+    action: 'enroll',
+    promotion: { id: 'P-1', type: 'DEAL', name: '官方活动' },
+    discountPercent: 6,
+    items: [
+      { id: 'MLB1', status: 'candidate', original_price: 100, price: 100, min_discounted_price: 90, max_discounted_price: 99 },
+      { id: 'MLB2', status: 'candidate', original_price: 100, price: 100, min_discounted_price: 96, max_discounted_price: 99 }
+    ]
+  });
+
+  assert.equal(plan.total, 2);
   assert.equal(plan.planned, 1);
   assert.equal(plan.skipped, 1);
-  assert.equal(plan.rows[0].deal_price, 95);
-  assert.match(plan.rows[1].reason, /低于最低允许价/);
+  assert.equal(plan.rows[0].deal_price, 94);
+  assert.match(plan.rows[1].reason, /低于最低允许价 96/);
 });
 
 test('buildPlan update skips started item when current price already matches target', () => {
@@ -2243,12 +2262,16 @@ test('cancel request success is not final success until live removal is verified
   });
   assert.deepEqual(contract.counts, {
     relation_count: 4, unique_item_count: 4, activity_failure_count: 0,
-    request_success_count: 2, live_verified_removed_count: 1, pending_verification_count: 0,
+    request_success_count: 2, live_verified_removed_count: 1, pending_verification_count: 1,
     platform_pending_count: 0, retryable_pending_count: 0,
-    success: 1, failed: 2, skipped: 1
+    success: 1, failed: 1, skipped: 2
   });
   assert.equal(contract.final_status_by_item.A, CANCEL_RESULT_STATUS.liveVerifiedRemoved);
-  assert.equal(contract.final_status_by_item.B, CANCEL_RESULT_STATUS.liveStillStarted);
+  assert.equal(contract.final_status_by_item.B, CANCEL_RESULT_STATUS.pendingVerification);
+  assert.equal(
+    contract.live_read_classification_by_item.B,
+    CANCEL_LIVE_READ_CLASSIFICATION.stillStarted,
+  );
 
   const noRecheck = buildCancelResultContract({
     plannedItemIds: ['A'], outcomes: [{ item_id: 'A', status: 'request_success' }],
@@ -2308,6 +2331,25 @@ test('result contract separates relation items from activity failures and expose
     platform_pending_count: 0, retryable_pending_count: 1,
     success: 1, failed: 0, skipped: 1
   });
+});
+
+test('result contract counts a relation as success even when a later read-only pending row shadows the write row', () => {
+  const summary = summarizeResultContractRows([
+    {
+      account_id: 'A', promotion_id: 'P-1', promotion_type: 'DEAL', action: 'enroll', item_id: 'I-1',
+      status: 'success', error_cn: '报名申请已提交',
+    },
+    {
+      account_id: 'A', promotion_id: 'P-1', promotion_type: 'DEAL', action: 'enroll', item_id: 'I-1',
+      status: 'pending_verification', error_cn: '平台已明确返回 pending（待生效），本地执行已完成且不会重复提交',
+    },
+  ]);
+  assert.equal(summary.relation_count, 1);
+  assert.equal(summary.success, 1);
+  assert.equal(summary.platform_pending_count, 1);
+  assert.equal(summary.pending_verification_count, 0);
+  assert.equal(summary.retryable_pending_count, 0);
+  assert.equal(summary.skipped, 0);
 });
 
 test('result contract keeps explicit platform pending separate from skipped and retryable work', () => {

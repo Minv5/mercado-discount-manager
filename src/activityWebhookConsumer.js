@@ -140,18 +140,121 @@ export function createActivityWebhookConsumer({
   createResourceClient,
   markDirty,
   invalidateCatalog,
+  onItemMissing = null,
+  updateItemPrice = null,
+  resolveItemOwner = null,
 } = {}) {
   return async (input, { signal = null } = {}) => {
     const event = normalizeActivityWebhookEvent(input);
-    const route = resolveActivityWebhookRoute({
-      event,
-      marketplaceSites: await listMarketplaceSites(),
-      accounts: await listAccounts(),
-    });
+    const marketplaceSites = await listMarketplaceSites();
+    const accounts = await listAccounts();
+    let route;
+    try {
+      route = resolveActivityWebhookRoute({ event, marketplaceSites, accounts });
+    } catch (error) {
+      if (String(error?.code || '') === 'ACTIVITY_CALLBACK_ROUTE_AMBIGUOUS' && typeof resolveItemOwner === 'function') {
+        const itemId = String(event.resource || '')
+          .replace(/^\/marketplace\/items\//, '')
+          .replace(/^\/items\//, '')
+          .split(/[?#]/)[0];
+        const resourceSiteId = siteIdFromText(event.resource);
+        const registeredRoute = (candidate) => marketplaceSites.some((site) => (
+          String(site.account_id || '') === candidate.account_id
+          && String(site.child_user_id || '') === candidate.child_user_id
+          && String(site.site_id || '').toUpperCase() === candidate.site_id
+        ));
+        const matchesSite = (candidate) => !resourceSiteId || String(candidate.site_id || '').toUpperCase() === resourceSiteId;
+        const localOwners = itemId ? await resolveItemOwner(itemId) : [];
+        const localMatch = localOwners.filter(registeredRoute).filter(matchesSite);
+        if (localMatch.length === 1) {
+          route = localMatch[0];
+        } else {
+          let platformOwner = null;
+          try {
+            const item = await createResourceClient({ account_id: event.remote_user_id, child_user_id: '', site_id: '' })
+              .then((client) => client.getMarketplaceItem(itemId, { signal }));
+            const ownerId = String(item?.seller_id || item?.owner_id || '');
+            if (ownerId) {
+              const platformCandidates = marketplaceSites.filter((site) => (
+                String(site.account_id || '') === event.remote_user_id
+                && String(site.child_user_id || '') === ownerId
+                && matchesSite(site)
+              ));
+              if (platformCandidates.length === 1) platformOwner = platformCandidates[0];
+            }
+          } catch {}
+          if (platformOwner) {
+            route = platformOwner;
+          } else {
+            throw error;
+          }
+        }
+      } else {
+        throw error;
+      }
+    }
     const client = await createResourceClient(route);
     const resourcePath = buildNotificationResourcePath(event);
-    const resourceData = await client.getNotificationResource(resourcePath, { signal });
+    let resourceData;
+    try {
+      resourceData = await client.getNotificationResource(resourcePath, { signal });
+    } catch (error) {
+      const status = Number(error?.status || error?.httpStatus || 0);
+      // Only definitive 404/410 responses prove the resource is gone. Text
+      // matching across all 4xx/5xx statuses is too broad: auth failures
+      // (401/403) or gateway errors (5xx) whose body happens to contain
+      // "not found" would wrongly delete cached candidate rows.
+      const notFound = status === 404 || status === 410;
+      const itemId = String(event.resource || '')
+        .replace(/^\/marketplace\/items\//, '')
+        .replace(/^\/items\//, '')
+        .split(/[?#]/)[0];
+      if (notFound && itemId) {
+        try {
+          await onItemMissing?.({ ...route, item_id: itemId });
+        } catch {}
+        return {
+          account_id: route.account_id,
+          child_user_id: route.child_user_id,
+          site_id: route.site_id,
+          promotion_id: '',
+          promotion_type: '',
+          outcome: 'item_missing_cleaned',
+          resource_status: 'missing',
+        };
+      }
+      throw error;
+    }
     const classified = classifyActivityWebhookResource({ event, route, resourceData });
+    if ((event.topic === 'marketplace_items' || event.topic === 'items') && typeof updateItemPrice === 'function') {
+      try {
+        const itemId = String(resourceData?.id || resourceData?.item_id || '').trim();
+        const parsePrice = (value) => {
+          if (value === null || value === undefined) return null;
+          const text = String(value).trim();
+          if (!text) return null;
+          const parsed = Number(text);
+          return Number.isFinite(parsed) ? parsed : null;
+        };
+        const price = parsePrice(resourceData?.price);
+        // Only an explicitly provided original_price may update the cached
+        // original price. Falling back to the current price would overwrite
+        // the true pre-discount baseline and corrupt discount calculations.
+        const originalPrice = parsePrice(resourceData?.original_price);
+        if (itemId) {
+          await updateItemPrice({
+            accountId: route.account_id,
+            childUserId: route.child_user_id,
+            siteId: route.site_id,
+            itemId,
+            price,
+            originalPrice,
+            status: String(resourceData?.status || ''),
+            raw: resourceData,
+          });
+        }
+      } catch {}
+    }
     for (const activity of classified.dirty_activities) {
       await markDirty({
         accountId: activity.account_id,

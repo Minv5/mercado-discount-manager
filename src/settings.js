@@ -21,6 +21,7 @@ export const DEFAULT_SETTINGS = {
   sellerMaxDiscount: null,
   officialMaxDiscount: null,
   cancelMaxRounds: 5,
+  pendingVerificationGraceMinutes: 120,
   maxItemsPerPromotion: 50,
   readConcurrency: DEFAULT_READ_CONCURRENCY,
   previewConcurrency: DEFAULT_ACTIVITY_CONCURRENCY,
@@ -29,6 +30,11 @@ export const DEFAULT_SETTINGS = {
   oauthClientId: '',
   oauthRedirectUri: '',
   webhookCallbackUrl: '',
+  activityCallbackEnabled: false,
+  activityCallbackApplicationId: '',
+  activityCallbackSecretFile: '',
+  activityCallbackClaimUrl: '',
+  activityCallbackAckUrl: '',
   storeAliases: {},
   operatingSites: {},
   defaultFilters: {
@@ -113,6 +119,7 @@ export function normalizeSettings(input) {
     sellerMaxDiscount: optionalBoundedNumber(input.sellerMaxDiscount, 1, 90),
     officialMaxDiscount: optionalBoundedNumber(input.officialMaxDiscount, 1, 90),
     cancelMaxRounds: Math.max(1, Math.floor(Number(input.cancelMaxRounds || 5))),
+    pendingVerificationGraceMinutes: Math.max(1, Math.floor(Number(input.pendingVerificationGraceMinutes ?? 120))),
     maxItemsPerPromotion: Math.max(1, Math.floor(Number(input.maxItemsPerPromotion || 50))),
     readConcurrency: normalizeConcurrency(input.readConcurrency, DEFAULT_SETTINGS.readConcurrency),
     previewConcurrency: normalizeActivityConcurrency(input.previewConcurrency, DEFAULT_SETTINGS.previewConcurrency),
@@ -121,6 +128,11 @@ export function normalizeSettings(input) {
     oauthClientId: text(input.oauthClientId).slice(0, 160),
     oauthRedirectUri: normalizeUrl(input.oauthRedirectUri),
     webhookCallbackUrl: normalizeUrl(input.webhookCallbackUrl),
+    activityCallbackEnabled: /^(?:1|true|yes)$/i.test(String(input.activityCallbackEnabled ?? '')),
+    activityCallbackApplicationId: text(input.activityCallbackApplicationId).slice(0, 160),
+    activityCallbackSecretFile: text(input.activityCallbackSecretFile).slice(0, 1000),
+    activityCallbackClaimUrl: normalizeSecureUrl(input.activityCallbackClaimUrl),
+    activityCallbackAckUrl: normalizeSecureUrl(input.activityCallbackAckUrl),
     oauthClientSecretConfigured: Boolean(String(input.oauthClientSecretCipher || '')),
     storeAliases: normalizeStoreAliases(input.storeAliases || {}),
     operatingSites: normalizeOperatingSites(input.operatingSites || {}),
@@ -238,4 +250,12 @@ function normalizeUrl(value) {
   } catch {
     return '';
   }
+}
+
+function normalizeSecureUrl(value) {
+  // Claim/ack endpoints receive an Authorization: Bearer secret; plaintext
+  // transport would leak it. Reject non-https configuration outright.
+  const normalized = normalizeUrl(value);
+  if (!normalized) return '';
+  return normalized.startsWith('https://') ? normalized : '';
 }

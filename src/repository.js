@@ -1081,8 +1081,17 @@ export function listCycleStatesForPromotions(accountId, promotions) {
   const map = new Map();
   for (const promo of promotions) {
     const state = get(
-      `SELECT * FROM cycle_states WHERE account_id = ? AND promotion_id = ? AND promotion_type = ?`,
-      [String(accountId), promo.promotion_id, promo.promotion_type]
+      `SELECT * FROM cycle_states
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ? AND activity_revision = ?`,
+      [
+        String(accountId),
+        String(promo.child_user_id || ''),
+        String(promo.site_id || '').toUpperCase(),
+        promo.promotion_id,
+        promo.promotion_type,
+        ''
+      ]
     );
     if (state) map.set(promotionKey(promo), state);
   }
@@ -1222,11 +1231,13 @@ export function applySuccessfulPromotionItemWrites({ accountId, promotionId, pro
   transaction((database) => {
     if (normalizedAction === 'cancel') {
       const statement = database.prepare(
-        `DELETE FROM promo_items
+        `UPDATE promo_items
+         SET status = 'candidate', price = original_price, updated_at = ?
          WHERE account_id = ? AND child_user_id = ? AND site_id = ?
            AND promotion_id = ? AND promotion_type = ? AND item_id = ?`,
       );
-      for (const row of rows) statement.run(...identity, row.itemId);
+      const updatedAt = nowIso();
+      for (const row of rows) statement.run(updatedAt, ...identity, row.itemId);
       return;
     }
     if (!['enroll', 'update'].includes(normalizedAction)) return;
@@ -1419,8 +1430,7 @@ export function saveActivityCacheState({
   return getActivityCacheState(identity);
 }
 
-export function markActivityCacheDirty({
-  accountId,
+export function markActivityCacheDirty({  accountId,
   childUserId = '',
   siteId = '',
   promotionId = '',
@@ -1452,6 +1462,170 @@ export function markActivityCacheDirty({
     });
   }
   return activityState;
+}
+
+export function removeGhostPromotionItem({ accountId, childUserId = '', siteId = '', itemId = '', promotionId = '', promotionType = '' } = {}) {
+  if (!accountId || !itemId) return { removed: 0 };
+  const route = resolveRouteForIdentity({ accountId, promotionId, promotionType, route: { childUserId, siteId } });
+  const promotionFilter = String(promotionId || '').trim() ? String(promotionId) : '';
+  const result = run(
+    `DELETE FROM promo_items
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+       AND item_id = ?
+       AND (status = 'candidate' OR status IS NULL OR status = '')
+       AND (promotion_id = ? OR ? = '')`,
+    [String(accountId), route.childUserId, route.siteId, String(itemId), promotionFilter, promotionFilter],
+  );
+  return { removed: Number(result?.changes || 0) };
+}
+
+export function updateItemPriceByWebhook({ accountId, childUserId = '', siteId = '', itemId = '', price = null, originalPrice = null, status = '' } = {}) {
+  if (!accountId || !itemId) return { updated: 0 };
+  const current = get(
+    `SELECT id FROM promo_items WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND item_id = ?`,
+    [String(accountId), String(childUserId || ''), String(siteId || '').toUpperCase(), String(itemId)],
+  );
+  if (!current) return { updated: 0 };
+  const nextPrice = price !== null && Number.isFinite(Number(price)) ? Number(price) : null;
+  // Never derive original_price from the current price: a missing original
+  // price must preserve the existing baseline (COALESCE keeps the old value),
+  // otherwise discount calculations would use the discounted price as base.
+  const nextOriginal = originalPrice !== null && Number.isFinite(Number(originalPrice)) ? Number(originalPrice) : null;
+  const result = run(
+    `UPDATE promo_items SET
+       price = COALESCE(?, price),
+       original_price = COALESCE(?, original_price),
+       updated_at = ?
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND item_id = ?`,
+    [nextPrice, nextOriginal, nowIso(), String(accountId), String(childUserId || ''), String(siteId || '').toUpperCase(), String(itemId)],
+  );
+  return { updated: Number(result?.changes || 0) };
+}
+
+export function upsertItemPriceCache({ accountId, childUserId = '', siteId = '', itemId = '', price = null, originalPrice = null, currencyId = '', status = '', raw = null } = {}) {
+  if (!accountId || !itemId) return { updated: 0 };
+  const nextPrice = price !== null && Number.isFinite(Number(price)) ? Number(price) : null;
+  const nextOriginal = originalPrice !== null && Number.isFinite(Number(originalPrice)) ? Number(originalPrice) : null;
+  const result = run(
+    `INSERT INTO item_price_cache
+      (account_id, child_user_id, site_id, item_id, price, original_price, currency_id, status, raw_json, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(account_id, child_user_id, site_id, item_id) DO UPDATE SET
+       price = COALESCE(excluded.price, item_price_cache.price),
+       original_price = COALESCE(excluded.original_price, item_price_cache.original_price),
+       currency_id = COALESCE(excluded.currency_id, item_price_cache.currency_id),
+       status = COALESCE(excluded.status, item_price_cache.status),
+       raw_json = COALESCE(excluded.raw_json, item_price_cache.raw_json),
+       updated_at = excluded.updated_at`,
+    [
+      String(accountId),
+      String(childUserId || ''),
+      String(siteId || '').toUpperCase(),
+      String(itemId),
+      nextPrice,
+      nextOriginal,
+      currencyId ? String(currencyId) : null,
+      status ? String(status) : null,
+      raw ? JSON.stringify(raw) : null,
+      nowIso(),
+    ],
+  );
+  return { updated: Number(result?.changes || 0) };
+}
+
+export function getItemPriceCache({ accountId, childUserId = '', siteId = '', itemId = '' } = {}) {
+  if (!accountId || !itemId) return null;
+  return get(
+    `SELECT * FROM item_price_cache
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND item_id = ?`,
+    [String(accountId), String(childUserId || ''), String(siteId || '').toUpperCase(), String(itemId)],
+  );
+}
+
+export function deletePromotionItemData({ accountId, childUserId = '', siteId = '', promotionId = '', promotionType = '' } = {}) {
+  if (!accountId || !promotionId) return { removed: 0 };
+  const route = resolveRouteForIdentity({ accountId, promotionId, promotionType, route: { childUserId, siteId } });
+  transaction((database) => {
+    database.prepare(
+      `DELETE FROM promo_items
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ?`,
+    ).run(String(accountId), route.childUserId, route.siteId, promotionId, String(promotionType || ''));
+    database.prepare(
+      `DELETE FROM promo_item_fetch_states
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ?`,
+    ).run(String(accountId), route.childUserId, route.siteId, promotionId, String(promotionType || ''));
+    database.prepare(
+      `DELETE FROM activity_cache_states
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ?`,
+    ).run(String(accountId), route.childUserId, route.siteId, promotionId, String(promotionType || ''));
+  });
+  return { removed: 1 };
+}
+
+export function cleanupRemovedCampaignItemData() {
+  const campaigns = all(
+    `SELECT account_id, child_user_id, site_id, promotion_id, promotion_type
+     FROM promo_campaigns
+     WHERE status = 'catalog_removed'`,
+  );
+  let removedRows = 0;
+  for (const campaign of campaigns) {
+    const result = run(
+      `DELETE FROM promo_items
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ?`,
+      [
+        String(campaign.account_id || ''),
+        String(campaign.child_user_id || ''),
+        String(campaign.site_id || '').toUpperCase(),
+        campaign.promotion_id,
+        campaign.promotion_type,
+      ],
+    );
+    removedRows += Number(result?.changes || 0);
+    run(
+      `DELETE FROM promo_item_fetch_states
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ?`,
+      [
+        String(campaign.account_id || ''),
+        String(campaign.child_user_id || ''),
+        String(campaign.site_id || '').toUpperCase(),
+        campaign.promotion_id,
+        campaign.promotion_type,
+      ],
+    );
+    run(
+      `DELETE FROM activity_cache_states
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+         AND promotion_id = ? AND promotion_type = ?`,
+      [
+        String(campaign.account_id || ''),
+        String(campaign.child_user_id || ''),
+        String(campaign.site_id || '').toUpperCase(),
+        campaign.promotion_id,
+        campaign.promotion_type,
+      ],
+    );
+  }
+  return { cleaned_campaigns: campaigns.length, removed_item_rows: removedRows };
+}
+
+export function listItemRouteOwners(itemId) {
+  const rows = all(
+    `SELECT DISTINCT account_id, child_user_id, site_id
+     FROM promo_items
+     WHERE item_id = ?`,
+    [String(itemId || '')],
+  );
+  return (rows || []).map((row) => ({
+    account_id: String(row.account_id || ''),
+    child_user_id: String(row.child_user_id || ''),
+    site_id: String(row.site_id || '').toUpperCase(),
+  }));
 }
 
 export function hasActivityCallbackEvent(eventId) {
@@ -1609,17 +1783,22 @@ export function finalizeActivityCallbackEvent({
 }
 
 export function saveActivityCallbackEvent(event) {
+  const value = (field) => (field === undefined ? null : field);
+  const accountId = String(event.account_id || event.remote_user_id || '');
+  const childUserId = String(event.child_user_id || '');
+  const siteMatch = String(event.site_id || event.resource || '').toUpperCase().match(/(?:^|[^A-Z0-9])(ML[A-Z])(?=[A-Z0-9])/);
+  const siteId = siteMatch ? siteMatch[1] : String(event.site_id || '');
   return run(
     `INSERT OR IGNORE INTO activity_callback_events
       (event_id, schema_version, account_id, site_id, promotion_id, promotion_type, cursor, previous_cursor, gap, received_at,
        topic, resource, remote_user_id, child_user_id, application_id, outcome, resource_status, raw_json,
        processing_state, completed_at, attempt_count)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, 1)`,
-    [event.event_id, event.schema_version, event.account_id, event.site_id, event.promotion_id || '',
-      event.promotion_type || '', event.cursor || null, event.previous_cursor || null, Number(Boolean(event.gap)), event.received_at || nowIso(),
-      event.topic || null, event.resource || null, event.remote_user_id || null, event.child_user_id || null,
-      event.application_id || null, event.outcome || null, event.resource_status || null, event.raw_json || null,
-      event.received_at || nowIso()]
+    [value(event.event_id), value(event.schema_version), accountId, siteId, String(event.promotion_id || ''),
+      String(event.promotion_type || ''), value(event.cursor), value(event.previous_cursor), Number(Boolean(event.gap)), value(event.received_at) || nowIso(),
+      value(event.topic), value(event.resource), value(event.remote_user_id), childUserId,
+      value(event.application_id), value(event.outcome), value(event.resource_status), value(event.raw_json),
+      value(event.received_at) || nowIso()]
   );
 }
 
@@ -1719,7 +1898,40 @@ export function listItems(accountId, promotionId, promotionType, status, route =
     params.push(status);
   }
   sql += ' ORDER BY item_id';
-  return all(sql, params);
+  const rows = all(sql, params);
+  return mergeFreshOriginalPrice(rows, String(accountId));
+}
+
+function mergeFreshOriginalPrice(rows = [], accountId = '') {
+  if (!rows.length) return rows;
+  const itemIds = [...new Set(rows.map((row) => String(row.item_id || '')).filter(Boolean))];
+  if (!itemIds.length) return rows;
+  const cachedRows = all(
+    `SELECT item_id, child_user_id, site_id, original_price, updated_at
+     FROM item_price_cache
+     WHERE account_id = ? AND item_id IN (${itemIds.map(() => '?').join(',')})`,
+    [accountId, ...itemIds],
+  );
+  if (!cachedRows.length) return rows;
+  const byKey = new Map(cachedRows.map((row) => [
+    `${String(row.item_id || '')}|${String(row.child_user_id || '')}|${String(row.site_id || '').toUpperCase()}`,
+    row,
+  ]));
+  return rows.map((row) => {
+    const key = `${String(row.item_id || '')}|${String(row.child_user_id || '')}|${String(row.site_id || '').toUpperCase()}`;
+    const cached = byKey.get(key);
+    if (!cached) return row;
+    const cachedPrice = Number(cached.original_price);
+    if (!Number.isFinite(cachedPrice)) return row;
+    const cachedAt = String(cached.updated_at || '');
+    const localAt = String(row.updated_at || '');
+    if (localAt && cachedAt && cachedAt <= localAt) return row;
+    const merged = { ...row, original_price: cachedPrice };
+    if (String(row.status || '') !== 'started' && row.price !== null && Number(row.price) === Number(row.original_price)) {
+      merged.price = cachedPrice;
+    }
+    return merged;
+  });
 }
 
 export function listItemsForPromotions(accountId, promotions, status) {
@@ -1847,6 +2059,97 @@ export function finishTask(taskId, counts, status = 'completed', completed = tru
   });
 }
 
+export function listNonTerminalResultsByJob(executionJobId) {
+  const rows = all(
+    `SELECT r.task_id, r.account_id, r.promotion_id, r.promotion_type, r.item_id, r.action, r.deal_price
+     FROM promo_action_results r
+     JOIN promo_tasks t ON t.id = r.task_id
+     WHERE t.execution_job_id = ?
+       AND r.status IN ('pendingVerification', 'requestSuccess', 'liveStillStarted', 'unverifiable')
+     GROUP BY r.account_id, r.promotion_id, r.promotion_type, r.item_id, r.action`,
+    [String(executionJobId || '')],
+  );
+  return (rows || []).map((row) => {
+    const route = resolveRouteForIdentity({
+      accountId: row.account_id,
+      promotionId: row.promotion_id,
+      promotionType: row.promotion_type,
+    });
+    return {
+      ...row,
+      child_user_id: route.childUserId,
+      site_id: route.siteId,
+    };
+  });
+}
+
+export function recountTaskResultCounts(taskIds = []) {
+  const ids = [...new Set(taskIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
+  const updated = [];
+  const groupIds = new Set();
+  transaction(() => {
+    for (const id of ids) {
+      const task = get('SELECT id, action, summary_json, execution_group_id FROM promo_tasks WHERE id = ?', [id]);
+      if (!task) continue;
+      const summary = summarizeResultContractForTaskIds([id]);
+      if (!summary) continue;
+      const prev = parseSummary(task.summary_json);
+      const counts = {
+        ...prev,
+        relation_count: summary.relation_count,
+        unique_item_count: summary.unique_item_count,
+        activity_failure_count: summary.activity_failure_count,
+        request_success_count: summary.request_success_count,
+        live_verified_removed_count: summary.live_verified_removed_count,
+        pending_verification_count: summary.pending_verification_count,
+        platform_pending_count: summary.platform_pending_count,
+        retryable_pending_count: summary.retryable_pending_count,
+        success: summary.success,
+        failed: summary.failed,
+        skipped: summary.skipped,
+        total: summary.relation_count,
+        result_contract_version: RESULT_CONTRACT_VERSION,
+        recounted_from_results: true,
+      };
+      run(
+        `UPDATE promo_tasks SET
+           total_count = ?, success_count = ?, failed_count = ?, skipped_count = ?,
+           summary_json = ?, updated_at = ?
+         WHERE id = ?`,
+        [
+          summary.relation_count,
+          summary.success,
+          summary.failed,
+          summary.skipped,
+          JSON.stringify(counts),
+          nowIso(),
+          id
+        ]
+      );
+      updated.push({
+        id,
+        action: task.action,
+        success: summary.success,
+        failed: summary.failed,
+        skipped: summary.skipped,
+        pending_verification_count: summary.pending_verification_count,
+        platform_pending_count: summary.platform_pending_count,
+        relation_count: summary.relation_count,
+      });
+      if (task.execution_group_id) groupIds.add(String(task.execution_group_id));
+    }
+  });
+  if (!updated.length) return { updated: [] };
+  const state = get('SELECT schema_version, status FROM history_summary_state WHERE id = 1');
+  const materializationReady = Number(state?.schema_version || 0) === HISTORY_SUMMARY_SCHEMA_VERSION
+    && String(state?.status || '') === 'complete';
+  if (materializationReady) {
+    for (const groupId of groupIds) publishHistorySummaryForExecutionGroup(groupId);
+    for (const entry of updated) publishHistorySummaryForTask(entry.id);
+  }
+  return { updated };
+}
+
 export function deleteTasks(taskIds = []) {
   const ids = [...new Set(taskIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
   if (!ids.length) return { deleted: 0 };
@@ -1888,9 +2191,10 @@ export function listLatestWriteRepeatGuards({ accountId, action, sameDayStartIso
      SELECT promotion_id, promotion_type, item_id, action, status, deal_price, error_cn, created_at
      FROM ranked
      WHERE rn = 1
+       AND created_at >= ?
        AND (
          status = 'pending_verification'
-         OR (status IN ('failed', 'live_still_started') AND created_at >= ?)
+         OR status IN ('failed', 'live_still_started')
        )`,
     [String(accountId || ''), String(action || ''), String(sameDayStartIso || '')],
   );
@@ -1908,8 +2212,113 @@ export function listTaskSummaries(limit = 300, options = {}) {
      LIMIT ?`,
     [HISTORY_SUMMARY_SCHEMA_VERSION, requested]
   ).map((row) => JSON.parse(row.data_json));
-  if (!includeDetails) return summaries;
-  return summaries.map((summary) => ({
+  const materializedIds = new Set(summaries
+    .flatMap((summary) => (Array.isArray(summary.task_ids) ? summary.task_ids : [Number(summary.id || 0)]))
+    .map(Number));
+  const liveRows = fetchTaskSummaryRows(Math.max(requested, 50), readSettings())
+    .filter((row) => !materializedIds.has(Number(row.id)));
+  const groupMap = new Map();
+  for (const row of liveRows) {
+    const groupKey = String(row.execution_group_id || '');
+    const key = groupKey || `task:${row.id}`;
+    if (!groupMap.has(key)) {
+      groupMap.set(key, {
+        ids: [],
+        group_id: groupKey || null,
+        account_id: row.account_id,
+        action: row.action,
+        mode: row.mode,
+        status: row.status,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        store_name: row.store_name,
+        promotion_name: groupKey ? '批量汇总' : row.promotion_name,
+        promotion_id: groupKey ? null : row.promotion_id,
+        promotion_type: groupKey ? 'BATCH' : row.promotion_type,
+        success: 0,
+        failed: 0,
+        skipped: 0,
+        total: 0,
+        activity_count: 0,
+        finished: 0,
+        seller_discount: 0,
+        official_discount: 0,
+        failure_reasons: [],
+        request_success_count: 0,
+        live_verified_removed_count: 0,
+        pending_verification_count: 0,
+        platform_pending_count: 0,
+        activity_failure_count: 0,
+      });
+    }
+    const g = groupMap.get(key);
+    g.ids.push(Number(row.id));
+    g.success += Number(row.success_count || 0);
+    g.failed += Number(row.failed_count || 0);
+    g.skipped += Number(row.skipped_count || 0);
+    g.total += Number(row.total_count || 0);
+    g.activity_count += 1;
+    const rowSummary = parseSummary(row.summary_json);
+    if (Array.isArray(rowSummary.failure_reasons)) {
+      for (const reason of rowSummary.failure_reasons) {
+        const reasonText = String(reason?.reason || '');
+        if (!reasonText) continue;
+        const existing = g.failure_reasons.find((item) => item.reason === reasonText);
+        if (existing) existing.count += Number(reason?.count || 1);
+        else g.failure_reasons.push({ reason: reasonText, count: Number(reason?.count || 1) });
+      }
+    }
+    for (const field of ['request_success_count', 'live_verified_removed_count', 'pending_verification_count', 'platform_pending_count', 'activity_failure_count']) {
+      const value = rowSummary[field];
+      if (Number.isFinite(Number(value))) g[field] += Number(value);
+    }
+    if (String(row.promotion_type || '').toUpperCase() === 'SELLER_CAMPAIGN') {
+      g.seller_discount = Math.max(g.seller_discount, Number(row.discount_percent || 0));
+    } else {
+      g.official_discount = Math.max(g.official_discount, Number(row.discount_percent || 0));
+    }
+    if (String(row.status || '') === 'running') g.status = 'running';
+    else if (String(row.status || '') === 'partial_or_failed' && g.status !== 'running') g.status = 'partial_or_failed';
+    if (String(row.created_at || '') > String(g.created_at || '')) g.created_at = row.created_at;
+    if (String(row.updated_at || '') > String(g.updated_at || '')) g.updated_at = row.updated_at;
+  }
+  const liveSummaries = [...groupMap.values()].map((g) => ({
+    id: g.ids[0],
+    task_ids: g.ids,
+    execution_group_id: g.group_id,
+    account_id: g.account_id,
+    action: g.action,
+    status: g.status,
+    mode: g.mode,
+    created_at: g.created_at,
+    updated_at: g.updated_at,
+    store_name: g.store_name,
+    promotion_id: g.promotion_id,
+    promotion_type: g.promotion_type,
+    promotion_name: g.promotion_name,
+    site_id: null,
+    site_name: null,
+    success_count: g.success,
+    failed_count: g.failed,
+    skipped_count: g.skipped,
+    total_count: g.total,
+    activity_count: g.activity_count,
+    seller_discount_percent: g.seller_discount || null,
+    official_discount_percent: g.official_discount || null,
+    failure_reasons: g.failure_reasons.length ? g.failure_reasons : null,
+    request_success_count: g.request_success_count || null,
+    live_verified_removed_count: g.live_verified_removed_count || null,
+    pending_verification_count: g.pending_verification_count || null,
+    platform_pending_count: g.platform_pending_count || null,
+    activity_failure_count: g.activity_failure_count || null,
+    summary: null,
+  }));
+  const merged = [...liveSummaries, ...summaries]
+    .sort((a, b) => dateMs(b.created_at) - dateMs(a.created_at)
+      || Math.max(...(b.task_ids || [b.id]).map(Number)) - Math.max(...(a.task_ids || [a.id]).map(Number)))
+    .slice(0, requested);
+  if (!includeDetails) return merged;
+  return merged.map((summary) => ({
     ...summary,
     details: listTaskDetails(summary.task_ids || [summary.id])
   }));
@@ -2137,6 +2546,7 @@ function fetchTaskSummaryRows(fetchLimit, settings, filters = {}) {
        p.name AS promotion_name,
        p.site_id AS site_id,
        p.logistic_type AS logistic_type,
+       p.start_date AS promotion_start_date,
        COALESCE(json_extract(t.summary_json, '$.planned'), 0) AS planned_count,
        COALESCE(json_extract(t.summary_json, '$.blocked'), 0) AS blocked_count,
        COALESCE(json_extract(t.summary_json, '$.promotions_total'), 0) AS promotions_total
@@ -2229,15 +2639,30 @@ function buildExecutionGroupSummaryRow(groupId, rows, options = {}) {
   const batchRows = rows.filter(isBatchTaskRow);
   const details = rows.filter((row) => !isBatchTaskRow(row));
   if (!batchRows.length) {
-    const first = [...details].sort((a, b) => Number(b.id || 0) - Number(a.id || 0))[0] || {};
-    return { ...decorateTaskSummaryRow(first, options), execution_group_id: groupId };
+    if (!details.length) {
+      return { ...decorateTaskSummaryRow({}, options), execution_group_id: groupId };
+    }
+    const first = [...details].sort((a, b) => Number(b.id || 0) - Number(a.id || 0))[0];
+    const times = details.map((row) => dateMs(row.created_at)).filter(Number.isFinite);
+    const window = {
+      batch: first,
+      details,
+      startMs: times.length ? Math.min(...times) : dateMs(first.created_at),
+      endMs: times.length ? Math.max(...times) : dateMs(first.created_at),
+    };
+    const summary = buildBatchSummaryRow({
+      windows: [window],
+      startMs: window.startMs,
+      endMs: window.endMs,
+    }, options);
+    return { ...summary, execution_group_id: groupId };
   }
   const windows = batchRows.map((batch) => {
-    const accountDetails = details.filter((row) => String(row.account_id || '') === String(batch.account_id || ''));
-    const times = [batch, ...accountDetails].map((row) => dateMs(row.created_at)).filter(Number.isFinite);
+    const uniqueDetails = [...new Map(details.map((row) => [Number(row.id || 0), row])).values()];
+    const times = [batch, ...uniqueDetails].map((row) => dateMs(row.created_at)).filter(Number.isFinite);
     return {
       batch,
-      details: accountDetails,
+      details: uniqueDetails,
       startMs: times.length ? Math.min(...times) : dateMs(batch.created_at),
       endMs: times.length ? Math.max(...times) : dateMs(batch.created_at),
     };
@@ -2258,6 +2683,41 @@ function groupTaskIds(group) {
   ].map((row) => Number(row?.id || 0)).filter(Boolean))];
 }
 
+export function listTaskItemResults(taskIds = [], { limit = 100 } = {}) {
+  const ids = [...new Set((Array.isArray(taskIds) ? taskIds : [])
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id) && id > 0))];
+  if (!ids.length) return { failed_items: [], unique_item_count: 0, relation_count: 0, activity_failure_count: 0 };
+  const placeholders = ids.map(() => '?').join(',');
+  const failedItems = all(
+    `SELECT r.item_id, r.promotion_id, r.promotion_type, r.error_cn
+     FROM promo_action_results r
+     WHERE r.task_id IN (${placeholders}) AND r.status = 'failed'
+     ORDER BY r.id DESC LIMIT ?`,
+    [...ids, Math.max(1, Number(limit) || 100)],
+  ).map((row) => ({
+    item_id: String(row.item_id || ''),
+    promotion_id: String(row.promotion_id || ''),
+    promotion_type: String(row.promotion_type || ''),
+    reason: String(row.error_cn || '').slice(0, 200),
+  }));
+  const uniqueItems = Number(all(
+    `SELECT COUNT(DISTINCT r.item_id) AS n FROM promo_action_results r WHERE r.task_id IN (${placeholders})`,
+    ids,
+  )[0]?.n || 0);
+  const relationCount = Number(all(
+    `SELECT SUM(total_count) AS n FROM promo_tasks WHERE id IN (${placeholders})`,
+    ids,
+  )[0]?.n || 0);
+  const activityFailures = Number(all(
+    `SELECT COUNT(DISTINCT r.promotion_id) AS n
+     FROM promo_action_results r
+     WHERE r.task_id IN (${placeholders}) AND r.status = 'activity_failed'`,
+    ids,
+  )[0]?.n || 0);
+  return { failed_items: failedItems, unique_item_count: uniqueItems, relation_count: relationCount, activity_failure_count: activityFailures };
+}
+
 export function listTaskDetails(taskIds = []) {
   const ids = [...new Set((Array.isArray(taskIds) ? taskIds : [])
     .map((id) => Number(id))
@@ -2265,13 +2725,14 @@ export function listTaskDetails(taskIds = []) {
   if (!ids.length) return [];
   const settings = readSettings();
   const placeholders = ids.map(() => '?').join(',');
-  return all(
+  const rows = all(
     `SELECT
        t.*,
        o.display_name AS account_display_name,
        p.name AS promotion_name,
        p.site_id AS site_id,
-       p.logistic_type AS logistic_type
+       p.logistic_type AS logistic_type,
+       p.start_date AS promotion_start_date
      FROM promo_tasks t
      LEFT JOIN promo_campaigns p
        ON p.account_id = t.account_id
@@ -2282,11 +2743,32 @@ export function listTaskDetails(taskIds = []) {
      WHERE t.id IN (${placeholders})
      ORDER BY t.id ASC`,
     ids
-  ).map((row) => taskDetail({
-    ...row,
-    store_name: storeNameForAccount({ accountId: row.account_id, rawDisplayName: row.account_display_name, storeAliases: settings.storeAliases }),
-    site_name: siteDisplayName(row.site_id)
-  }));
+  );
+  const reasonRows = all(
+    `SELECT task_id, error_cn, error_raw, response_json, COUNT(*) AS count
+     FROM promo_action_results
+     WHERE task_id IN (${placeholders}) AND status = 'failed'
+     GROUP BY task_id, error_cn, error_raw, response_json`,
+    ids
+  );
+  const reasonsByTask = new Map();
+  for (const row of reasonRows) {
+    const taskId = Number(row.task_id);
+    const classified = classifyFailureReason(row.error_raw || row.response_json || row.error_cn);
+    const bucket = reasonsByTask.get(taskId) || [];
+    bucket.push({ ...classified, count: Number(row.count || 1) });
+    reasonsByTask.set(taskId, bucket);
+  }
+  return rows.map((row) => {
+    const detail = taskDetail({
+      ...row,
+      store_name: storeNameForAccount({ accountId: row.account_id, rawDisplayName: row.account_display_name, storeAliases: settings.storeAliases }),
+      site_name: siteDisplayName(row.site_id)
+    });
+    const reasons = reasonsByTask.get(Number(row.id));
+    if (reasons?.length) detail.failure_reasons = mergeFailureReasons(reasons, 10);
+    return detail;
+  });
 }
 
 function isBatchTaskRow(row) {
@@ -2548,6 +3030,9 @@ function taskDetail(row) {
     promotion_id: row.promotion_id,
     promotion_type: row.promotion_type,
     promotion_name: row.promotion_name,
+    promotion_start_date: row.promotion_start_date || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
     relation_count: summary.relation_count ?? null,
     unique_item_count: summary.unique_item_count ?? null,
     activity_failure_count: summary.activity_failure_count ?? null,
@@ -2562,6 +3047,8 @@ function taskDetail(row) {
     success_count: success,
     failed_count: failed,
     skipped_count: skipped,
+    failure_reasons: Array.isArray(summary.failure_reasons) ? summary.failure_reasons : null,
+    skipped_reasons: Array.isArray(summary.skipped_reasons) ? summary.skipped_reasons : null,
     status: row.status,
     summary_json: row.summary_json
   };

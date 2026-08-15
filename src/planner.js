@@ -129,13 +129,21 @@ export function calculateDealPrice(item, options) {
   return quantizeToMinorUnit(exactDiscountedPrice, moneyRuleForItem(item), 'floor');
 }
 
-export function validateDealPrice(item, dealPrice) {
+export function validateDealPrice(item, dealPrice, promotionType = '') {
   if (!Number.isFinite(dealPrice) || dealPrice <= 0) return '活动价必须大于 0';
-  if (item.min_discounted_price !== null && dealPrice < item.min_discounted_price) {
-    return `活动价 ${dealPrice} 低于最低允许价 ${item.min_discounted_price}`;
-  }
-  if (item.max_discounted_price !== null && dealPrice > item.max_discounted_price) {
-    return `活动价 ${dealPrice} 高于最高允许价 ${item.max_discounted_price}`;
+  // Official activities (DEAL) carry platform-enforced price boundaries: locally
+  // rejecting out-of-range prices avoids submitting requests that the platform
+  // will certainly reject. Seller campaigns define their own boundaries, so
+  // only the basic positivity check applies there.
+  if (promotionBucket(promotionType) !== PROMOTION_BUCKETS.seller) {
+    const minPrice = numberOrNull(item.min_discounted_price);
+    const maxPrice = numberOrNull(item.max_discounted_price);
+    if (minPrice !== null && dealPrice < minPrice) {
+      return `活动价 ${dealPrice} 低于最低允许价 ${minPrice}`;
+    }
+    if (maxPrice !== null && dealPrice > maxPrice) {
+      return `活动价 ${dealPrice} 高于最高允许价 ${maxPrice}`;
+    }
   }
   return null;
 }
@@ -161,7 +169,7 @@ export function buildPlan({ action, promotion, items, priceMode = 'discount', di
     }
 
     const dealPrice = calculateDealPrice(item, { priceMode, discountPercent: effectiveDiscount, directPrice });
-    const priceError = validateDealPrice(item, dealPrice);
+    const priceError = validateDealPrice(item, dealPrice, normalizedPromotion.promotion_type);
     if (priceError) return planSkip(item, priceError);
     if (action === 'update' && skipSamePrice && item.price !== null && roundMoney(item.price) === dealPrice) {
       return planSkip(item, '当前活动价已等于目标价');

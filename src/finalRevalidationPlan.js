@@ -336,12 +336,14 @@ export function assessFinalVerificationEvidence({
   if (source === 'prepared_route_snapshot'
       && evidence?.production === true
       && evidence?.business_date === shanghaiBusinessDate(now)
+      && fresh
+      && afterPrepared
       && hasEvidenceId) {
     return {
       source,
       allows_local_zero_read: true,
       reason: 'prepared_route_snapshot_compared',
-      verified_at: Number.isFinite(verifiedAt) ? new Date(verifiedAt).toISOString() : null,
+      verified_at: new Date(verifiedAt).toISOString(),
       evidence_id: String(evidence.evidence_id),
       verified_route_keys: orderedSet(evidence.verified_route_keys || []),
       attempted_route_keys: orderedSet(evidence.attempted_route_keys || []),
@@ -464,7 +466,10 @@ export function buildFinalRevalidationPlan({
       markRemoved(key, 'catalog:removed');
       continue;
     }
-    for (const reason of changed.get(key) || []) markRead(key, `catalog:${reason}`);
+    for (const reason of changed.get(key) || []) {
+      scopeReview.add(key);
+      addReason(reasons, key, `catalog:${reason}`);
+    }
     for (const status of targetStatuses(action || confirmedScope.action)) {
       const decision = activityItemsDecision({
         promotion: current,
