@@ -13,6 +13,7 @@ import {
 } from '../src/adaptiveWriteScheduler.js';
 import { executePlannedRowsWithConcurrency } from '../src/executor.js';
 import { createPendingWriteQueue, pendingRelationKey } from '../src/pendingWriteQueue.js';
+import { buildPlan } from '../src/planner.js';
 import { isTransientOfferLockError, shouldInvalidateWriteCache } from '../src/writeFailurePolicy.js';
 import { applyWriteRepeatGuards, shanghaiDayStartIso } from '../src/writeRepeatGuard.js';
 
@@ -59,6 +60,73 @@ test('same-day repeat guard skips pending writes and permanent cancel leftovers 
   assert.equal(cancel.rows[0].status, 'skipped');
   assert.match(cancel.rows[0].reason, /不重复提交/);
   assert.equal(shanghaiDayStartIso(new Date('2026-07-22T03:00:00.000Z')), '2026-07-21T16:00:00.000Z');
+});
+
+test('repeat guard keys off the real buildPlan output shape, not synthetic top-level fields', () => {
+  // buildPlan() returns promotion nested under plan.promotion; the guard must
+  // resolve promotion_id/promotion_type from there to protect real executions.
+  const plan = buildPlan({
+    action: 'update',
+    promotion: { promotion_id: 'P-REAL', promotion_type: 'DEAL', account_id: 'acc-1' },
+    items: [
+      { item_id: 'I-1', status: 'started', price: 100, original_price: 100, currency_id: 'BRL' },
+      { item_id: 'I-2', status: 'started', price: 100, original_price: 100, currency_id: 'BRL' },
+    ],
+    priceMode: 'discount',
+    discountPercent: 5,
+  });
+  assert.ok(plan.promotion, 'buildPlan output must carry promotion object');
+  assert.equal(plan.promotionId, undefined, 'buildPlan must not add synthetic top-level promotionId');
+  const guarded = applyWriteRepeatGuards(plan, [
+    { promotion_id: 'P-REAL', promotion_type: 'DEAL', item_id: 'I-1', status: 'pending_verification', deal_price: 95 },
+  ], 'update');
+  assert.equal(guarded.repeat_guard_skipped, 1, 'real plan rows must be matched by promotion nested identity');
+  assert.equal(guarded.rows[0].status, 'skipped');
+  assert.equal(guarded.rows[1].status, 'planned');
+});
+
+test('successful platform write whose result persistence fails stays success and never retries', async () => {
+  const plan = buildPlan({
+    action: 'update',
+    promotion: { promotion_id: 'P-STORAGE', promotion_type: 'DEAL', account_id: 'acc-1' },
+    items: [
+      { item_id: 'I-1', status: 'started', price: 100, original_price: 100, currency_id: 'BRL' },
+      { item_id: 'I-2', status: 'started', price: 100, original_price: 100, currency_id: 'BRL' },
+    ],
+    priceMode: 'discount',
+    discountPercent: 5,
+  });
+  const writeCalls = [];
+  let saveCalls = 0;
+  const events = [];
+  const execution = await executePlannedRowsWithConcurrency({
+    plan,
+    action: 'update',
+    promotionId: 'P-STORAGE',
+    promotionType: 'DEAL',
+    accountId: 'acc-1',
+    taskId: 'task-1',
+    mode: 'real',
+    writeConcurrency: 2,
+    executeOne: async () => {
+      writeCalls.push('write');
+      return { ok: true };
+    },
+    saveResult: async () => {
+      saveCalls += 1;
+      if (saveCalls === 1) throw new Error('disk full');
+      return undefined;
+    },
+    onItemEvent: (event) => events.push(event),
+  });
+  // Both rows were written to the platform exactly once and reported success.
+  assert.equal(writeCalls.length, 2);
+  assert.equal(execution.counts.success, 2);
+  assert.equal(execution.counts.failed, 0);
+  // The failed persistence is surfaced as a distinct storage event, not a business failure.
+  assert.ok(events.some((event) => event.type === 'item_storage_error' && event.status === 'success'));
+  // No second write happens for the row whose persistence failed.
+  assert.equal(writeCalls.filter(() => true).length, 2);
 });
 
 test('server routes transient offer locks to pending recovery in normal and benchmark writes', () => {

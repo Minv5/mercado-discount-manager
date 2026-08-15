@@ -4,6 +4,22 @@ export const ACTIVITY_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 export const ACTIVITY_ITEMS_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 export const ACTIVITY_PARTIAL_ITEMS_TTL_MS = 24 * 60 * 60 * 1000;
 
+// Default trusts the cached catalog: in webhook-only deployments there is no
+// local poll loop to flip this flag, and flipping it off would force a full
+// platform re-read on every decision. Claim-consumer mode is the exception:
+// server startup explicitly sets this to false and the first successful poll
+// turns it back on, so a broken event link cannot silently keep the cache
+// stale before the failure threshold is reached.
+let activityCallbackAvailable = true;
+
+export function setActivityCallbackAvailability(value) {
+  activityCallbackAvailable = Boolean(value);
+}
+
+export function getActivityCallbackAvailability() {
+  return activityCallbackAvailable;
+}
+
 export function activityCacheKey(value = {}) {
   const accountId = String(value.account_id || value.accountId || '');
   const childUserId = String(value.child_user_id || value.childUserId || '');
@@ -26,14 +42,14 @@ export function isActivityExpired(promotion = {}, now = new Date()) {
 }
 
 export function activityCatalogDecision(state = null, now = new Date()) {
+  if (!getActivityCallbackAvailability()) return { refresh: true, reason: 'callback_unavailable' };
   if (!state) return { refresh: true, reason: 'unverified' };
   if (state.last_error && isSameShanghaiDay(state.updated_at, now)) {
     return { refresh: false, blocked: true, reason: 'same_day_failed' };
   }
   if (Number(state.dirty || 0) === 1) return { refresh: true, reason: 'dirty' };
   if (String(state.continuity || 'continuous') !== 'continuous') return { refresh: true, reason: 'event_gap' };
-  if (isSameShanghaiDay(state.catalog_checked_at, now)) return { refresh: false, reason: 'same_day_cache' };
-  return { refresh: true, reason: 'daily_due' };
+  return { refresh: false, reason: 'verified_cache' };
 }
 
 export function planActivityCatalogRoutes(routes = [], getState = () => null, now = new Date()) {
@@ -69,6 +85,7 @@ export function activityItemsDecision({
 } = {}) {
   const normalizedStatus = String(itemStatus || 'candidate').toLowerCase();
   if (isActivityExpired(promotion, now)) return { refresh: false, blocked: true, reason: 'expired' };
+  if (!getActivityCallbackAvailability()) return { refresh: true, reason: 'callback_unavailable' };
   if (!cacheState) return { refresh: true, reason: 'unverified' };
   const attemptedToday = isSameShanghaiDay(fetchState?.updated_at, now);
   const cacheChangedAfterAttempt = isNewer(cacheState?.updated_at, fetchState?.updated_at);
@@ -90,9 +107,6 @@ export function activityItemsDecision({
     }
     if (!isFullFetchState(fetchState)) {
       return { refresh: false, blocked: true, reason: 'same_day_incomplete' };
-    }
-    if (Number(cacheState.dirty || 0) === 1 || String(cacheState.continuity || 'continuous') !== 'continuous') {
-      return { refresh: false, reason: 'same_day_cache' };
     }
   }
   if (Number(cacheState.dirty || 0) === 1) return { refresh: true, reason: 'dirty' };
@@ -124,7 +138,6 @@ export function activityItemsDecision({
   if (isSameShanghaiDay(cacheState.items_full_checked_at, now)) {
     return { refresh: false, reason: 'same_day_cache' };
   }
-  if (!isFresh(cacheState.items_full_checked_at, ACTIVITY_ITEMS_TTL_MS, now)) return { refresh: true, reason: 'three_day_due' };
   return { refresh: false, reason: 'verified_cache' };
 }
 
@@ -165,12 +178,7 @@ export function candidatePreparationReadDecision({
   if (cacheDecision.refresh || cacheDecision.blocked) {
     return { probe: false, reason: String(cacheDecision.reason || 'candidate_cache_not_reusable') };
   }
-  const sameDayCache = isSameShanghaiDay(fetchState?.updated_at, now)
-    || ['same_day_cache', 'same_day_partial_cache'].includes(String(cacheDecision.reason || ''));
-  if (sameDayCache) {
-    return { probe: false, reason: 'same_day_candidate_cache' };
-  }
-  return { probe: true, reason: 'candidate_daily_probe_due' };
+  return { probe: false, reason: 'verified_candidate_cache' };
 }
 
 export function candidateTotalProbeDecision({

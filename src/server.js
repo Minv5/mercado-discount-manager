@@ -19,6 +19,8 @@ import {
   itemIdentityDelta,
   nextNonPeakCalibrationAt,
   planActivityCatalogRoutes,
+  getActivityCallbackAvailability,
+  setActivityCallbackAvailability,
 } from './activityChangeCache.js';
 import { activityCallbackConfig, createActivityCallbackAdapter } from './activityCallbackAdapter.js';
 import { createActivityWebhookConsumer } from './activityWebhookConsumer.js';
@@ -28,6 +30,7 @@ import { buildReadConcurrencyReport, createBalancedReadScheduler, prepareReadSch
 import { createAsyncLimiter, executePlannedRowsWithConcurrency } from './executor.js';
 import { adaptiveWriteProfileForAction, createAdaptiveWriteScheduler } from './adaptiveWriteScheduler.js';
 import { createPendingWriteQueue, pendingRelationKey } from './pendingWriteQueue.js';
+import { activityClaimConfig, createActivityClaimConsumer } from './activityClaimConsumer.js';
 import {
   filterPendingRecordsByConfirmedScope,
   filterItemsByConfirmedScope,
@@ -130,6 +133,7 @@ import {
   listLatestWriteRepeatGuards,
   listResults,
   listTaskDetails,
+  listTaskItemResults,
   listTaskSummaries,
   listSiteSummaries,
   listSellerCampaignRecoveryCandidates,
@@ -146,6 +150,13 @@ import {
   recordActivityItemsCalibration as repositoryRecordActivityItemsCalibration,
   reconcilePromotionItemFetchCounts,
   markActivityCacheDirty,
+  removeGhostPromotionItem,
+  updateItemPriceByWebhook,
+  listNonTerminalResultsByJob,
+  listItemRouteOwners,
+  upsertItemPriceCache,
+  deletePromotionItemData,
+  cleanupRemovedCampaignItemData,
   saveActivityCacheState,
   saveActivityCallbackEvent,
   saveDailyItemIdentitySnapshot,
@@ -208,6 +219,7 @@ import {
 } from './finalRevalidationPlan.js';
 import {
   CANCEL_RESULT_STATUS,
+  CANCEL_LIVE_READ_CLASSIFICATION,
   RESULT_CONTRACT_VERSION,
   buildCancelResultContract,
   countMutuallyExclusiveRelationResults,
@@ -268,6 +280,9 @@ const SERVER_INSTANCE_ID = `node-${process.pid}-${Date.now()}-${crypto.randomUUI
 let sharedReadScheduler = null;
 let activityWebhookConsumer = null;
 let activityCallbackAdapter = null;
+let activityClaimConsumer = null;
+let activityCallbackFailureCount = 0;
+const ACTIVITY_CALLBACK_UNAVAILABLE_THRESHOLD = 3;
 let processInstanceLock = null;
 let serverReady = false;
 let shutdownStarted = false;
@@ -354,6 +369,93 @@ server.on('error', (error) => {
   process.exitCode = 1;
 });
 
+let startupCacheRefreshAttempts = 0;
+const STARTUP_CACHE_REFRESH_MAX_ATTEMPTS = 3;
+const STARTUP_CACHE_REFRESH_RETRY_DELAY_MS = 5 * 60 * 1000;
+
+let startupCacheRefreshState = {
+  status: 'pending',
+  attempts: 0,
+  error: null,
+  finished_at: null,
+};
+
+function scheduleStartupCacheRefresh() {
+  startupCacheRefreshState = { status: 'running', attempts: 0, error: null, finished_at: null };
+  const attempt = (round) => {
+    runStartupCacheRefresh()
+      .then(() => {
+        startupCacheRefreshState = { status: 'ok', attempts: round + 1, error: null, finished_at: new Date().toISOString() };
+      })
+      .catch((error) => {
+        startupCacheRefreshState = {
+          status: 'failed',
+          attempts: round + 1,
+          error: error?.message || String(error),
+          finished_at: new Date().toISOString(),
+        };
+        try { console.error(`[startup-refresh] 缓存刷新失败（第 ${round + 1}/${STARTUP_CACHE_REFRESH_MAX_ATTEMPTS} 次）：${error?.message || error}`); } catch {}
+        if (round + 1 < STARTUP_CACHE_REFRESH_MAX_ATTEMPTS) {
+          setTimeout(() => attempt(round + 1), STARTUP_CACHE_REFRESH_RETRY_DELAY_MS).unref?.();
+        }
+      });
+  };
+  setImmediate(() => attempt(0));
+}
+
+async function probeActivityCallbackHealth() {
+  if (!activityClaimConsumer || !activityClaimConsumer.isEnabled()) {
+    setActivityCallbackAvailability(false);
+    return false;
+  }
+  // Local health probe only: claiming real events here would remove them from
+  // the remote queue without processing or acking them. Availability is
+  // maintained by the poll loop's onPoll callback instead.
+  return getActivityCallbackAvailability();
+}
+
+async function runStartupCacheRefresh() {
+  await probeActivityCallbackHealth();
+  const settings = readSettings();
+  const accounts = listAccountsForUi();
+  let refreshedAccounts = 0;
+  for (const row of accounts) {
+    try {
+      const account = await ensureUsableAccount(row.account_id);
+      await refreshActivityCatalogForPrepare({
+        account,
+        filters: settings.defaultFilters || {},
+        settings,
+      });
+      const promotions = listOperatingCampaignsFiltered(account.account_id, settings.defaultFilters || {}, settings);
+      const ordinary = ordinaryPromotions(promotions);
+      if (!ordinary.length) continue;
+      for (const itemStatus of ['candidate', 'started']) {
+        const prep = await prepareItemsForExecution({
+          account,
+          promotions: ordinary,
+          action: itemStatus === 'candidate' ? 'enroll' : 'update',
+          itemStatus,
+          settings,
+          request: { fetchMode: 'full' },
+        });
+        const failedRows = (prep.summary?.rows || []).filter((row) => {
+          if (!(row.blocked || row.error)) return false;
+          const detailStatus = String(row.detail_status || row.detailStatus || '').toLowerCase();
+          return !detailStatus.includes('inventory_scan_fallback_ready') && !detailStatus.includes('fallback_ready');
+        });
+        if (failedRows.length > 0) {
+          throw new Error(`商品刷新失败：${failedRows.length} 个活动失败`);
+        }
+      }
+      refreshedAccounts += 1;
+    } catch (error) {
+      throw new Error(`账号 ${row.account_id} ${error?.message || error}`);
+    }
+  }
+  console.error(`[startup-refresh] 启动缓存刷新完成：账号 ${refreshedAccounts}/${accounts.length} 个。`);
+}
+
 async function initializeServerState() {
   processInstanceLock = acquireProcessInstanceLock({
     dataDir: DATA_DIR,
@@ -370,7 +472,12 @@ async function initializeServerState() {
   });
   submissionPersistence = createSubmissionPersistence({ stateDir: SUBMISSION_STATE_DIR });
   sameDayConfirmationStore = createSameDayConfirmationStore({ stateDir: SAME_DAY_CONFIRMATION_STATE_DIR });
-  pendingWriteQueue = createPendingWriteQueue({ stateDir: PENDING_WRITE_STATE_DIR });
+  pendingWriteQueue = createPendingWriteQueue({
+    stateDir: PENDING_WRITE_STATE_DIR,
+    onFlushError: (jobId, error) => {
+      try { console.error(`[pending-write-queue] 持久化失败（稍后自动重试）: ${jobId} ${error?.message || error}`); } catch {}
+    },
+  });
   sharedReadScheduler = createBalancedReadScheduler({
     profile: prepareReadSchedulerProfile(readSettings()),
   });
@@ -390,6 +497,49 @@ async function initializeServerState() {
     },
     markDirty: markActivityCacheDirty,
     invalidateCatalog: invalidateMarketplaceSiteCatalog,
+    onItemMissing: async (route) => {
+      try {
+        removeGhostPromotionItem({
+          accountId: route.account_id,
+          childUserId: route.child_user_id,
+          siteId: route.site_id,
+          itemId: route.item_id,
+        });
+      } catch {}
+    },
+    updateItemPrice: async (info) => {
+      try {
+        const cached = upsertItemPriceCache({
+          accountId: info.accountId,
+          childUserId: info.childUserId,
+          siteId: info.siteId,
+          itemId: info.itemId,
+          price: info.price,
+          originalPrice: info.originalPrice,
+          status: info.status,
+          raw: info.raw || null,
+        });
+        console.error(`[price-cache] upsert item=${info.itemId} route=${info.accountId}/${info.childUserId}/${info.siteId} price=${info.price} updated=${cached.updated}`);
+        updateItemPriceByWebhook({
+          accountId: info.accountId,
+          childUserId: info.childUserId,
+          siteId: info.siteId,
+          itemId: info.itemId,
+          price: info.price,
+          originalPrice: info.originalPrice,
+          status: info.status,
+        });
+      } catch (error) {
+        console.error(`[price-cache] upsert failed: ${error?.message || error}`);
+      }
+    },
+    resolveItemOwner: async (itemId) => {
+      try {
+        return listItemRouteOwners(String(itemId || ''));
+      } catch {
+        return [];
+      }
+    },
   });
   activityCallbackAdapter = createActivityCallbackAdapter({
     config: activityCallbackConfig(),
@@ -402,13 +552,116 @@ async function initializeServerState() {
     markDirty: markActivityCacheDirty,
     consumeEvent: activityWebhookConsumer,
   });
+  const claimConfig = activityClaimConfig(process.env, readSettings());
+  if (claimConfig.enabled && claimConfig.secretFile) {
+    activityClaimConsumer = createActivityClaimConsumer({
+      claimUrl: claimConfig.claimUrl,
+      ackUrl: claimConfig.ackUrl,
+      secretFile: claimConfig.secretFile,
+      applicationId: claimConfig.applicationId,
+      pollMs: claimConfig.pollMs,
+      consumeEvent: (event) => activityWebhookConsumer(event).then(async (result) => {
+        try {
+          saveActivityCallbackEvent({
+            ...event,
+            account_id: result?.account_id || '',
+            child_user_id: result?.child_user_id || '',
+            site_id: result?.site_id || '',
+            promotion_id: result?.promotion_id || '',
+            promotion_type: result?.promotion_type || '',
+            outcome: result?.outcome || 'activity_dirty',
+            resource_status: result?.resource_status || null,
+            raw_json: JSON.stringify({ event, result }),
+          });
+        } catch (error) {
+          try { console.error(`[activity-claim] audit save failed: ${error?.message || error}`); } catch {}
+        }
+        return {
+          accepted: true,
+          status: 'accepted',
+          event_id: String(event.event_id || ''),
+          outcome: result?.outcome || 'activity_dirty',
+        };
+      }).catch((error) => {
+        const code = String(error?.code || '');
+        if (code === 'ACTIVITY_CALLBACK_ROUTE_AMBIGUOUS' || code === 'ACTIVITY_CALLBACK_ROUTE_UNRESOLVED' || code === 'ACTIVITY_CALLBACK_TOPIC_UNSUPPORTED') {
+          try {
+            saveActivityCallbackEvent({
+              ...event,
+              outcome: code === 'ACTIVITY_CALLBACK_TOPIC_UNSUPPORTED' ? 'topic_unsupported_skipped' : 'route_unresolved_skipped',
+              last_error: String(error?.message || error).slice(0, 500),
+              raw_json: JSON.stringify({ event, error: String(error?.message || error) }),
+            });
+          } catch (saveError) {
+            try { console.error(`[activity-claim] audit save failed: ${saveError?.message || saveError}`); } catch {}
+          }
+          return { accepted: true, status: 'skipped', event_id: String(event.event_id || ''), outcome: 'skipped' };
+        }
+        throw error;
+      }),
+      onError: (phase, error) => {
+        try {
+          console.error(`[activity-claim] ${phase} error: ${error?.message || error}`);
+        } catch {}
+      },
+      onPoll: (error) => {
+        try {
+          if (error) {
+            activityCallbackFailureCount += 1;
+            if (activityCallbackFailureCount >= ACTIVITY_CALLBACK_UNAVAILABLE_THRESHOLD && getActivityCallbackAvailability()) {
+              setActivityCallbackAvailability(false);
+              console.error(`[activity-claim] 回调事件链路连续 ${activityCallbackFailureCount} 次失败，已切换为直接同步平台。`);
+            }
+          } else {
+            if (!getActivityCallbackAvailability()) {
+              console.error('[activity-claim] 回调事件链路已恢复，回到事件驱动模式。');
+            }
+            activityCallbackFailureCount = 0;
+            setActivityCallbackAvailability(true);
+          }
+        } catch {}
+      },
+      isEventCompleted: (eventId) => {
+        try {
+          return hasActivityCallbackEvent(String(eventId || ''));
+        } catch {
+          return false;
+        }
+      },
+    });
+    // Claim mode is conservative on startup: the link is only trusted after
+    // the first successful poll. Webhook-only deployments keep the default
+    // (cache trusted) because no local poll loop exists to flip the flag.
+    setActivityCallbackAvailability(false);
+    activityClaimConsumer.start();
+  }
 
   getDb();
+  try {
+    const cleanup = cleanupRemovedCampaignItemData();
+    if (Number(cleanup.cleaned_campaigns || 0) > 0 || Number(cleanup.removed_item_rows || 0) > 0) {
+      console.error(`[cleanup] 已清理过期活动商品数据：活动 ${cleanup.cleaned_campaigns} 个，商品行 ${cleanup.removed_item_rows} 行。`);
+    }
+  } catch (error) {
+    try { console.error(`[cleanup] 过期活动清理失败：${error?.message || error}`); } catch {}
+  }
+  scheduleStartupCacheRefresh();
   for (const group of executionGroupPersistence.loadAll()) {
     executionGroups.set(String(group.id), group);
     if (group.recovered_pending_after_restart && String(group.status || '') === 'queued') {
       setImmediate(() => runExecutionGroup(group.id).catch((error) => failExecutionGroup(group.id, error)));
+      continue;
     }
+    if (String(group.status || '') === 'running') {
+      group.status = 'interrupted';
+      executionGroupPersistence.persist(group);
+    }
+  }
+  for (const group of executionGroupPersistence.loadAll()) {
+    if (String(group.status || '') !== 'paused') continue;
+    const pendingSince = Date.parse(String(group.pending_since || ''));
+    if (Number.isFinite(pendingSince) && Date.now() - pendingSince >= cancelPendingGraceMs()) continue;
+    setImmediate(() => runExecutionGroup(group.id).catch((error) => failExecutionGroup(group.id, error)));
   }
   for (const group of executionGroups.values()) {
     if (String(group.status || '') !== 'interrupted') continue;
@@ -424,6 +677,76 @@ async function initializeServerState() {
       });
     }
   }
+  const pendingGroups = executionGroupPersistence.loadAll().filter((group) => (
+    String(group.status || '') === 'interrupted'
+    && !summarizeExecutionGroup(group).accounting_complete
+  ));
+  for (const group of pendingGroups) {
+    let hasPendingQueue = (group.children || []).some((child) => {
+      const jobId = String(child.job_id || child.id || '');
+      if (!jobId) return false;
+      try {
+        return pendingWriteQueue.pending(jobId).length > 0;
+      } catch {
+        return false;
+      }
+    });
+    if (!hasPendingQueue) {
+      for (const child of group.children || []) {
+        const jobId = String(child.job_id || child.id || '');
+        if (!jobId) continue;
+        try {
+          const results = listNonTerminalResultsByJob(jobId);
+          for (const result of results) {
+            const relationKey = pendingRelationKey({
+              accountId: result.account_id,
+              siteId: result.site_id,
+              promotionId: result.promotion_id,
+              promotionType: result.promotion_type,
+              itemId: result.item_id,
+              action: result.action,
+            });
+            const alreadyPending = pendingWriteQueue.pending(jobId, (record) => record.relation_key === relationKey).length > 0;
+            if (alreadyPending) continue;
+            pendingWriteQueue.enqueue(jobId, {
+              relation_key: relationKey,
+              account_id: String(result.account_id || ''),
+              child_user_id: String(result.child_user_id || ''),
+              site_id: String(result.site_id || '').toUpperCase(),
+              promotion_id: String(result.promotion_id || ''),
+              promotion_type: String(result.promotion_type || '').toUpperCase(),
+              item_id: String(result.item_id || ''),
+              action: String(result.action || ''),
+              task_id: Number(result.task_id || 0),
+              deal_price: result.deal_price ?? null,
+              attempt_count: 1,
+              retry_category: 'pending_verification',
+              error_cn: '重启后从执行结果审计表重建恢复，未重复提交。',
+            });
+          }
+        } catch {}
+      }
+      hasPendingQueue = (group.children || []).some((child) => {
+        const jobId = String(child.job_id || child.id || '');
+        if (!jobId) return false;
+        try {
+          return pendingWriteQueue.pending(jobId).length > 0;
+        } catch {
+          return false;
+        }
+      });
+    }
+    if (!hasPendingQueue) continue;
+    group.status = 'queued';
+    group.children = (group.children || []).map((child) => ({
+      ...child,
+      status: String(child.status || '') === 'interrupted' ? 'queued' : child.status,
+      progress: { ...(child.progress || {}), recovered_pending_after_restart: true },
+    }));
+    executionGroupPersistence.persist(group);
+    executionGroups.set(String(group.id), group);
+    setImmediate(() => runExecutionGroup(group.id).catch((error) => failExecutionGroup(group.id, error)));
+  }
 }
 
 async function shutdownServer(exitCode = 0) {
@@ -437,6 +760,8 @@ async function shutdownServer(exitCode = 0) {
     try { fs.closeSync(descriptor); } catch {}
   }
   executionEventFileDescriptors.clear();
+  try { activityClaimConsumer?.stop(); } catch {}
+  try { pendingWriteQueue?.flushAll(); } catch {}
   try { closeDb(); } catch {}
   try { processInstanceLock?.release(); } catch {}
   processInstanceLock = null;
@@ -446,6 +771,8 @@ async function shutdownServer(exitCode = 0) {
 process.once('SIGINT', () => shutdownServer(0));
 process.once('SIGTERM', () => shutdownServer(0));
 process.once('exit', () => {
+  try { activityClaimConsumer?.stop(); } catch {}
+  try { pendingWriteQueue?.flushAll(); } catch {}
   try { processInstanceLock?.release(); } catch {}
 });
 
@@ -1477,6 +1804,10 @@ async function handleApi(req, res) {
     return sendJson(res, 200, { ok: true, job });
   }
 
+  if (method === 'GET' && url.pathname === '/api/startup-refresh/status') {
+    return sendJson(res, 200, { ok: true, refresh: startupCacheRefreshState });
+  }
+
   if (method === 'POST' && url.pathname === '/api/execution/submissions/prepare') {
     const body = await readJsonBody(req);
     try {
@@ -1790,6 +2121,14 @@ async function handleApi(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/results') {
     return sendJson(res, 200, { ok: true, results: listResults(Number(url.searchParams.get('limit') || 300)) });
+  }
+
+  if (method === 'GET' && url.pathname === '/api/tasks/items') {
+    const taskIds = (url.searchParams.get('task_ids') || url.searchParams.get('taskIds') || '')
+      .split(',').map((value) => Number(value)).filter((id) => Number.isInteger(id) && id > 0);
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get('limit') || 100)));
+    if (!taskIds.length) return sendJson(res, 400, { ok: false, error: '缺少任务编号。' });
+    return sendJson(res, 200, { ok: true, items: listTaskItemResults(taskIds, { limit }) });
   }
 
   if (method === 'GET' && url.pathname === '/api/tasks') {
@@ -2469,6 +2808,7 @@ async function executeAction(res, body) {
     promotionType,
     accountId: account.account_id,
     taskId,
+    mode: 'real',
     writeConcurrency: request.writeConcurrency,
     executeOne: ({ row, itemId, dealPrice }) => executeOnePlannedWithTokenRefresh({
       client,
@@ -2502,6 +2842,22 @@ async function executeAction(res, body) {
       errorCn: unreadableItemDetailMessage({ action, itemStatus, count: unreadable })
     });
   }
+  if (action !== 'cancel' && Number(execution?.counts?.success || 0) > 0) {
+    const plannedByItemId = new Map((plan.rows || []).map((row) => [String(row.item?.item_id || ''), row]));
+    const successRows = (execution.results || [])
+      .filter((result) => result?.status === 'success')
+      .map((result) => plannedByItemId.get(String(result.itemId || '')))
+      .filter(Boolean);
+    applySuccessfulPromotionItemWrites({
+      accountId: account.account_id,
+      childUserId: campaign.child_user_id,
+      siteId: campaign.site_id,
+      promotionId,
+      promotionType,
+      action,
+      items: successRows.map((row) => ({ itemId: row.item?.item_id, dealPrice: row.deal_price })),
+    });
+  }
   let recheck = null;
   if (action === 'cancel') {
     recheck = await recheckAndCancelRemainingStarted({
@@ -2525,6 +2881,8 @@ async function executeAction(res, body) {
   finishTask(taskId, execution.counts, completed ? 'completed' : 'partial_or_failed', completed);
   markCycleAfterTask({
     accountId: account.account_id,
+    childUserId: promotion.child_user_id,
+    siteId: promotion.site_id,
     promotionId,
     promotionType,
     action,
@@ -2567,6 +2925,19 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
         sample_only: Boolean(after?.sampleOnly ?? after?.sample_only),
         unverifiableItemIds: [...new Set((allowedItemIds || []).map(String).filter(Boolean))],
       };
+    }
+    const platformStarted = new Set((after.results || []).map((item) => String(item.item_id || item.id || '')));
+    const cancelledNow = (allowedItemIds || []).map(String).filter((id) => id && !platformStarted.has(id));
+    if (cancelledNow.length) {
+      applySuccessfulPromotionItemWrites({
+        accountId,
+        childUserId: campaign?.child_user_id,
+        siteId: campaign?.site_id,
+        promotionId,
+        promotionType,
+        action: 'cancel',
+        items: cancelledNow.map((itemId) => ({ itemId })),
+      });
     }
     saveItems(accountId, promotionId, promotionType, after.results, {
       childUserId: campaign?.child_user_id,
@@ -2703,6 +3074,7 @@ async function recheckAndCancelRemainingStarted({ client, accountId, campaign, p
       promotionType,
       accountId,
       taskId,
+      mode: 'real',
       writeConcurrency,
       schedule,
       shouldCancel,
@@ -2813,11 +3185,13 @@ async function waitForAppliedWriteRows({ client, accountId, campaign, rows, acti
   let startedPriceMismatch = [];
   let confirmedPending = [];
   let confirmedCandidate = [];
+  let lastReadCompleteness = null;
   for (let poll = 0; poll <= settleDelaysMs.length; poll += 1) {
-    if (shouldCancel?.()) return { verified, unresolved, started_price_mismatch: startedPriceMismatch, confirmed_pending: confirmedPending, confirmed_candidate: confirmedCandidate, polls, cancelled: true };
+    if (shouldCancel?.()) return { verified, unresolved, started_price_mismatch: startedPriceMismatch, confirmed_pending: confirmedPending, confirmed_candidate: confirmedCandidate, polls, read_completeness: lastReadCompleteness, cancelled: true };
     const delayMs = poll === 0 ? 0 : Math.max(0, Number(settleDelaysMs[poll - 1]) || 0);
     if (delayMs > 0) await sleep(delayMs);
     const read = await readAppliedWriteRows({ client, accountId, campaign, rows: unresolved, action });
+    lastReadCompleteness = read.read_completeness || null;
     verified = [...verified, ...read.verified];
     startedPriceMismatch = read.started_price_mismatch || [];
     confirmedPending = read.confirmed_pending || [];
@@ -2850,6 +3224,7 @@ async function waitForAppliedWriteRows({ client, accountId, campaign, rows, acti
     confirmed_candidate: confirmedCandidate,
     unresolved: unresolved.filter((row) => !classified.has(String(row.item?.item_id || ''))),
     polls,
+    read_completeness: lastReadCompleteness,
     cancelled: false,
   };
 }
@@ -3249,7 +3624,10 @@ function sellerCampaignDetectionForSite({ live = null, existing = [], hidden = [
       message: HIDDEN_SELLER_CAMPAIGN_MESSAGE,
     };
   }
-  const okCount = Number(live.ok_count || 0);
+  if (live?.confirmed_absent === true) {
+    return { status: 'confirmed_absent', count: 0, message: '实时接口已确认该店铺站点暂无自建活动。' };
+  }
+  const okCount = Number(live?.ok_count || 0);
   if (okCount > 0) {
     return { status: 'visibility_unknown', count: 0, message: '接口未读取到自建活动，不代表后台不存在；本次禁止自动创建。' };
   }
@@ -4381,11 +4759,13 @@ function activityCatalogSellerStatus(accountId, refresh = {}, filters = {}, sett
     }
     const sellerCount = listOperatingCampaignsFiltered(accountId, { childUserId: target.child_user_id, siteId, promotionTypes: ['SELLER_CAMPAIGN'] }, settings)
       .filter((campaign) => accountRouteKey(campaign) === routeKey).length;
+    const confirmedAbsent = Boolean(calibratedFromLive && sellerCount === 0);
     rows.set(routeKey, {
       ok_count: 1,
       error_count: 0,
       seller_campaign_count: sellerCount,
-      visibility_unknown: sellerCount === 0,
+      visibility_unknown: sellerCount === 0 && !confirmedAbsent,
+      confirmed_absent: confirmedAbsent,
       calibration_source: calibratedFromLive ? 'live' : 'cache',
       errors: [],
     });
@@ -4428,7 +4808,11 @@ async function buildExecutionSubmissionSnapshot(input = {}, progressReporter = (
     percent: 2,
     completed: 0,
     total: accountIds.length,
-    message: finalRevalidation ? '正在执行提交前轻量活动目录复核' : '正在核对店铺和活动范围',
+    message: finalRevalidation
+      ? '正在执行提交前轻量活动目录复核'
+      : getActivityCallbackAvailability()
+        ? '正在核对店铺和活动范围'
+        : '正在核对店铺和活动范围（回调事件链路不可用，将直接同步平台）',
   });
   const operationReadCache = context.operationReadCache || new Map();
   const filters = input.filters || {};
@@ -4704,10 +5088,10 @@ async function buildExecutionSubmissionSnapshot(input = {}, progressReporter = (
       completed,
       total: selectedForLiveRead.length,
       message: finalRevalidation
-        ? `正在复核变化活动（${revalidateIdentityKeys.size}个）：${stage === 'started' ? '已报名商品' : '可报名商品'} ${completed}/${selectedForLiveRead.length}`
+        ? `正在复核变化活动（${revalidateIdentityKeys.size}个）：${stage === 'started' ? '已报名' : '可报名'}商品 ${completed}/${selectedForLiveRead.length}`
         : (stage === 'started' ? startedExternalReadCount : candidateExternalReadCount) > 0
-          ? `正在实时核对${stage === 'started' ? '已报名商品' : '可报名商品'}`
-          : `已使用今日${stage === 'started' ? '已报名商品' : '可报名商品'}缓存，无外部读取`,
+          ? `正在读取${stage === 'started' ? '已报名' : '可报名'}商品（活动 ${Math.min(completed + 1, selectedForLiveRead.length)}/${selectedForLiveRead.length}）`
+          : `全部活动使用今日${stage === 'started' ? '已报名' : '可报名'}商品缓存，无实时读取`,
       current_store: storeNames[event.promotion?.account_id || ''] || '',
       current_site: String(event.promotion?.site_id || ''),
       current_activity: String(event.promotion_id || ''),
@@ -4720,37 +5104,39 @@ async function buildExecutionSubmissionSnapshot(input = {}, progressReporter = (
     return completed;
   };
   let startedCompleted = 0;
-  await Promise.all(accountIds.map(async (accountId) => {
-    const accountPromotions = selectedForLiveRead.filter((promotion) => String(promotion.account_id || '') === String(accountId));
-    if (!accountPromotions.length) return;
-    reportProgress({
-      stage: 'started', percent: 35 + Math.floor((startedCompleted / Math.max(1, accountIds.length)) * 25),
-      completed: startedCompleted,
-      total: accountIds.length,
-      message: startedExternalReadCount > 0 ? '正在实时核对已报名商品' : '已使用今日已报名商品缓存，无外部读取',
-      current_store: storeNames[accountId],
-    });
-    const prep = await prepareItemsForExecution({
-      account: accountsById.get(String(accountId)),
-      promotions: accountPromotions,
-      action: 'update',
-      itemStatus: 'started',
-      settings,
-      request: { ...input, fetchMode: 'full', maxItems: 'all', allowInventoryFallback: false },
-      signal: context.signal,
-      checkpoint: context.checkpoint,
-      readScheduler,
-      operationReadCache,
-      readStateSnapshot,
-      forceReadKeys: operationForceReadKeysForStatus('started'),
-      onProgress: (event) => {
-        startedActivitiesCompleted = reportActivityProgress('started', event, startedActivitiesCompleted, 35, 25);
-      },
-    });
-    context.checkpoint?.();
-    startedLiveReadRows.push(...submissionLiveReadRows(accountId, prep.summary.rows));
-    startedCompleted += 1;
-  }));
+  if (resolvedAction !== 'enroll') {
+    await Promise.all(accountIds.map(async (accountId) => {
+      const accountPromotions = selectedForLiveRead.filter((promotion) => String(promotion.account_id || '') === String(accountId));
+      if (!accountPromotions.length) return;
+      reportProgress({
+        stage: 'started', percent: 35 + Math.floor((startedCompleted / Math.max(1, accountIds.length)) * 25),
+        completed: startedCompleted,
+        total: accountIds.length,
+        message: startedExternalReadCount > 0 ? '正在实时核对已报名商品' : '已使用今日已报名商品缓存，无外部读取',
+        current_store: storeNames[accountId],
+      });
+      const prep = await prepareItemsForExecution({
+        account: accountsById.get(String(accountId)),
+        promotions: accountPromotions,
+        action: 'update',
+        itemStatus: 'started',
+        settings,
+        request: { ...input, fetchMode: 'full', maxItems: 'all', allowInventoryFallback: false },
+        signal: context.signal,
+        checkpoint: context.checkpoint,
+        readScheduler,
+        operationReadCache,
+        readStateSnapshot,
+        forceReadKeys: operationForceReadKeysForStatus('started'),
+        onProgress: (event) => {
+          startedActivitiesCompleted = reportActivityProgress('started', event, startedActivitiesCompleted, 35, 25);
+        },
+      });
+      context.checkpoint?.();
+      startedLiveReadRows.push(...submissionLiveReadRows(accountId, prep.summary.rows));
+      startedCompleted += 1;
+    }));
+  }
   const sellerTargets = resolvedAction === 'enroll' && !filters.excludeSeller
     ? await buildLiveSellerCampaignCreateTargets({ accountIds, filters, settings, catalogRefreshByAccount, signal: context.signal, checkpoint: context.checkpoint, readScheduler })
     : [];
@@ -5316,13 +5702,14 @@ async function revalidateExecutionSubmissionScope(prepare, context = {}, { readS
     error.details = current.live_read;
     throw error;
   }
-  if (!prepare.confirmed_execution_scope) {
+  const confirmedScope = prepare.confirmed_execution_scope;
+  if (!confirmedScope) {
     const error = new ApiError('当前准备结果缺少冻结范围，请重新准备并确认。', 409);
     error.code = 'PREPARE_SCOPE_VERSION_REQUIRED';
     throw error;
   }
   const reconciled = reconcileConfirmedExecutionScope({
-    confirmedScope: prepare.confirmed_execution_scope,
+    confirmedScope,
     observedScope: current.observed_execution_scope,
   });
   if (reconciled.execution_relation_count === 0 && reconciled.blocked_activity_count > 0) {
@@ -5337,10 +5724,10 @@ async function revalidateExecutionSubmissionScope(prepare, context = {}, { readS
     && reconciled.structural_target_keys.length > 0
     && reconciled.structural_target_keys.every((key) => key === '__SELLER__');
   const requiresReprepare = reconciled.requires_reconfirm && !sellerCreationOnly;
-  const confirmedScope = reconciled.requires_reconfirm
+  const confirmedExecutionScope = reconciled.requires_reconfirm
     ? reconciled.reconfirmation_scope
     : reconciled.execution_scope;
-  const scopeHash = executionSubmissionScopeHash(confirmedScope, current.discounts);
+  const scopeHash = executionSubmissionScopeHash(confirmedExecutionScope, current.discounts);
   const businessChanges = reconciled.messages.length
     ? reconciled.messages
     : requiresReprepare ? ['执行动作或活动结构发生实质变化，需要重新核对范围'] : [];
@@ -5358,7 +5745,7 @@ async function revalidateExecutionSubmissionScope(prepare, context = {}, { readS
     changes: businessChanges,
     changed_target_keys: reconciled.structural_target_keys,
     prepared_patch: executionSubmissionPreparedPatch(current, prepare, {
-      confirmedScope,
+      confirmedScope: confirmedExecutionScope,
       scopeHash,
       scopeMessages: businessChanges,
       scopeAdjustments,
@@ -5481,7 +5868,11 @@ async function startExecutionGroupInternal(body = {}) {
       }
     }
     const executableAccounts = new Set((scope.activities || [])
-      .filter((activity) => (activity.item_ids || activity.itemIds || []).length > 0)
+      .filter((activity) => {
+        const hasItems = (activity.item_ids || activity.itemIds || []).length > 0;
+        const isSellerCampaign = String(activity.promotion_type ?? activity.promotionType ?? '').toUpperCase() === 'SELLER_CAMPAIGN';
+        return hasItems || isSellerCampaign;
+      })
       .map((activity) => String(activity.account_id ?? activity.accountId ?? ''))
       .filter(Boolean));
     accountIds = accountIds.filter((accountId) => executableAccounts.has(String(accountId)));
@@ -5612,24 +6003,6 @@ async function runExecutionGroup(groupId) {
   const current = executionGroups.get(String(group.id)) || executionGroupPersistence.load(group.id) || group;
   const childStatuses = (current.children || []).map((child) => String(child.status || ''));
   const currentSummary = summarizeExecutionGroup(current);
-  if (childStatuses.includes('paused')) {
-    current.status = 'paused';
-    current.finished_at = null;
-    current.result = currentSummary;
-    executionGroupPersistence.persist(current);
-    executionGroups.set(String(current.id), current);
-    sharedWriteLimiters.delete(String(current.id));
-    const pendingSince = Date.parse(String(current.pending_since || '')) || Date.now();
-    current.pending_since = current.pending_since || new Date(pendingSince).toISOString();
-    current.pending_retry_round = Number(current.pending_retry_round || 0) + 1;
-    current.next_retry_at = new Date(Date.now() + 60_000).toISOString();
-    executionGroupPersistence.persist(current);
-    if (Number(currentSummary.retryable_pending_count || 0) > 0 && Date.now() - pendingSince < 30 * 60_000) {
-      const timer = setTimeout(() => runExecutionGroup(current.id).catch((error) => failExecutionGroup(current.id, error)), 60_000);
-      timer.unref?.();
-    }
-    return;
-  }
   if (current.cancel_requested || childStatuses.includes('cancelled')) current.status = 'cancelled';
   else if (childStatuses.includes('interrupted')) current.status = 'interrupted';
   else if (childStatuses.includes('failed')) current.status = 'failed';
@@ -6398,6 +6771,17 @@ function pendingRecoveryRow(record = {}) {
 const MAX_CONFIRMED_CANDIDATE_WRITE_ATTEMPTS = 3;
 const MAX_PENDING_VERIFICATION_READ_ATTEMPTS = 3;
 
+function cancelPendingGraceMs() {
+  const graceMinutes = Number(readSettings()?.pendingVerificationGraceMinutes ?? 30);
+  return Math.max(1, Number.isFinite(graceMinutes) ? graceMinutes : 30) * 60 * 1000;
+}
+
+function cancelPendingGraceElapsed(record = {}) {
+  const firstPendingAt = Date.parse(String(record?.first_pending_at || ''));
+  if (!Number.isFinite(firstPendingAt) || firstPendingAt <= 0) return true;
+  return Date.now() - firstPendingAt >= cancelPendingGraceMs();
+}
+
 async function recoverPendingVerificationRecords({ job, account, action, records = [] }) {
   const groups = new Map();
   for (const record of records) {
@@ -6433,7 +6817,7 @@ async function recoverPendingVerificationRecords({ job, account, action, records
   for (const { campaign, records: campaignRecords } of groups.values()) {
     const rows = campaignRecords.map(pendingRecoveryRow);
     const client = makeWriteClient(account, campaign);
-    let verification = { verified: [], started_price_mismatch: [], confirmed_pending: [], confirmed_candidate: [], unresolved: rows, polls: [] };
+    let verification = { verified: [], started_price_mismatch: [], confirmed_pending: [], confirmed_candidate: [], unresolved: [], polls: [] };
     try {
       verification = await waitForAppliedWriteRows({
         client,
@@ -6441,7 +6825,7 @@ async function recoverPendingVerificationRecords({ job, account, action, records
         campaign,
         rows,
         action,
-        settleDelaysMs: [],
+        settleDelaysMs: rows.length > 200 ? [15_000] : [5_000, 15_000, 30_000],
         shouldCancel: () => job.cancel_requested,
       });
     } catch (error) {
@@ -6520,6 +6904,37 @@ async function recoverPendingVerificationRecords({ job, account, action, records
       const itemId = String(row.item?.item_id || '');
       const record = recordByItemId.get(itemId);
       const previousAttempts = Math.max(1, Number(record?.attempt_count || 0));
+      const canRetryWrite = previousAttempts < MAX_CONFIRMED_CANDIDATE_WRITE_ATTEMPTS;
+      if (canRetryWrite) {
+        saveExecutionResult({
+          taskId: Number(record?.task_id || taskId),
+          accountId: account.account_id,
+          promotionId: campaign.promotion_id,
+          promotionType: campaign.promotion_type,
+          itemId,
+          action,
+          mode: 'real',
+          status: CANCEL_RESULT_STATUS.pendingVerification,
+          dealPrice: row.deal_price,
+          errorCn: `写入请求已返回，但平台仍显示可报名；第 ${previousAttempts} 次确认未生效，将在原确认范围内有限重试（上限 ${MAX_CONFIRMED_CANDIDATE_WRITE_ATTEMPTS} 次）。`,
+        });
+        pendingWriteQueue.enqueue(job.id, {
+          ...record,
+          retry_category: 'confirmed_candidate_after_write',
+          attempt_count: previousAttempts + 1,
+          write_attempt_within_legacy_bound: false,
+          verification_polling_exhausted: false,
+          error_cn: '平台仍显示可报名，等待原确认范围内有限重试',
+        });
+        retryRecords.push({
+          ...record,
+          attempt_count: previousAttempts + 1,
+          promotion_id: campaign.promotion_id,
+          promotion_type: campaign.promotion_type,
+        });
+        countedItems.add(itemId);
+        continue;
+      }
       saveExecutionResult({
         taskId: Number(record?.task_id || taskId),
         accountId: account.account_id,
@@ -6530,25 +6945,49 @@ async function recoverPendingVerificationRecords({ job, account, action, records
         mode: 'real',
         status: CANCEL_RESULT_STATUS.pendingVerification,
         dealPrice: row.deal_price,
-        errorCn: '写入请求已返回，但平台仍显示可报名；已停止自动写入，保留为待人工或下次只读确认。',
+        errorCn: `连续 ${MAX_CONFIRMED_CANDIDATE_WRITE_ATTEMPTS} 次写入后平台仍显示可报名；已停止自动写入，保留为待人工或下次只读确认。`,
       });
       pendingWriteQueue.enqueue(job.id, {
         ...record,
         retry_category: 'manual_verification_required',
         attempt_count: previousAttempts,
-        write_attempt_within_legacy_bound: previousAttempts < MAX_CONFIRMED_CANDIDATE_WRITE_ATTEMPTS,
+        write_attempt_within_legacy_bound: false,
         verification_polling_exhausted: true,
-        error_cn: '平台仍显示可报名；停止自动写入，只允许后续只读确认。',
+        error_cn: '有限重试已耗尽，平台仍显示可报名；停止自动写入，只允许后续只读确认。',
       });
       countedItems.add(itemId);
     }
     let unresolvedPendingCount = 0;
     let verificationExhaustedCount = 0;
+    let confirmedStillStartedFailedCount = 0;
     for (const row of verification.unresolved || []) {
       const itemId = String(row.item?.item_id || '');
       const record = recordByItemId.get(itemId);
       const verificationAttempts = Number(record?.verification_attempt_count || 0) + 1;
       const verification_polling_exhausted = verificationAttempts >= MAX_PENDING_VERIFICATION_READ_ATTEMPTS;
+      const startedReadComplete = action === 'cancel' && verification?.read_completeness?.started === true;
+      const cancelGraceElapsed = action === 'cancel' && cancelPendingGraceElapsed(record);
+      const cancelGraceStillActive = action === 'cancel' && !cancelGraceElapsed;
+      if (cancelGraceElapsed && startedReadComplete) {
+        saveExecutionResult({
+          taskId: Number(record?.task_id || taskId),
+          accountId: account.account_id,
+          promotionId: campaign.promotion_id,
+          promotionType: campaign.promotion_type,
+          itemId,
+          action,
+          mode: 'real',
+          status: CANCEL_RESULT_STATUS.liveStillStarted,
+          dealPrice: row.deal_price,
+          errorCn: `取消请求已超过 ${Math.round(cancelPendingGraceMs() / 60000)} 分钟宽限期仍未在平台生效，判定取消未生效；已停止自动重试，不会重复提交。`,
+        });
+        pendingWriteQueue.resolve(job.id, record?.relation_key, 'failed', {
+          recovery_mode: 'confirmed_still_started_after_grace',
+        });
+        confirmedStillStartedFailedCount += 1;
+        countedItems.add(itemId);
+        continue;
+      }
       saveExecutionResult({
         taskId: Number(record?.task_id || taskId),
         accountId: account.account_id,
@@ -6559,21 +6998,27 @@ async function recoverPendingVerificationRecords({ job, account, action, records
         mode: 'real',
         status: CANCEL_RESULT_STATUS.pendingVerification,
         dealPrice: row.deal_price,
-        errorCn: verification_polling_exhausted
-          ? `连续 ${verificationAttempts} 轮只读回查仍无法确认平台状态；已停止自动轮询，不会重复写入。`
-          : verification.read_error || '写入请求已返回，但平台状态仍无法确认；继续只读确认且不会重复写入。',
+        errorCn: cancelGraceStillActive
+          ? `取消请求已提交，平台生效存在延迟；宽限期 ${Math.round(cancelPendingGraceMs() / 60000)} 分钟内自动只读复查，不会重复提交。`
+          : verification_polling_exhausted
+            ? `连续 ${verificationAttempts} 轮只读回查仍无法确认平台状态；已停止自动轮询，不会重复写入。`
+            : verification.read_error || '写入请求已返回，但平台状态仍无法确认；继续只读确认且不会重复写入。',
       });
       pendingWriteQueue.enqueue(job.id, {
         ...record,
-        retry_category: verification_polling_exhausted ? 'verification_unknown_after_retries' : 'pending_verification',
+        retry_category: cancelGraceStillActive
+          ? 'pending_verification'
+          : verification_polling_exhausted ? 'verification_unknown_after_retries' : 'pending_verification',
         verification_attempt_count: verificationAttempts,
-        verification_polling_exhausted,
-        error_cn: verification_polling_exhausted
-          ? '自动只读回查已达上限，等待人工或下次恢复。'
-          : '平台状态仍不可确认；继续只读回查且不会重复写入。',
+        verification_polling_exhausted: verification_polling_exhausted && !cancelGraceStillActive,
+        error_cn: cancelGraceStillActive
+          ? '取消请求已提交，等待平台生效宽限期只读复查；不会重复提交。'
+          : verification_polling_exhausted
+            ? '自动只读回查已达上限，等待人工或下次恢复。'
+            : '平台状态仍不可确认；继续只读回查且不会重复写入。',
       });
-      if (verification_polling_exhausted) verificationExhaustedCount += 1;
-      else unresolvedPendingCount += 1;
+      if (cancelGraceStillActive || !verification_polling_exhausted) unresolvedPendingCount += 1;
+      else verificationExhaustedCount += 1;
       countedItems.add(itemId);
     }
     const verifiedCount = (verification.verified || []).length;
@@ -6587,7 +7032,7 @@ async function recoverPendingVerificationRecords({ job, account, action, records
     const exhaustedCount = candidateCount - retryCount;
     const unresolvedCount = (verification.unresolved || []).length;
     execution.success += verifiedCount;
-    execution.failed += mismatchCount;
+    execution.failed += mismatchCount + confirmedStillStartedFailedCount;
     execution.pending += platformPendingCount + unresolvedPendingCount + retryCount + exhaustedCount + verificationExhaustedCount;
     execution.pending_verification_count += unresolvedPendingCount + exhaustedCount + verificationExhaustedCount;
     execution.platform_pending_count += platformPendingCount;
@@ -6610,6 +7055,7 @@ async function recoverPendingVerificationRecords({ job, account, action, records
       exhausted_retry_count: exhaustedCount,
       unresolved_count: unresolvedPendingCount,
       verification_exhausted_count: verificationExhaustedCount,
+      confirmed_still_started_failed_count: confirmedStillStartedFailedCount,
       repeated_write_requests: 0,
       polls: verification.polls || [],
     });
@@ -6618,13 +7064,14 @@ async function recoverPendingVerificationRecords({ job, account, action, records
       taskId,
       total: verifiedCount + mismatchCount + platformPendingCount + candidateCount + unresolvedCount,
       success: verifiedCount,
-      failed: mismatchCount,
+      failed: mismatchCount + confirmedStillStartedFailedCount,
       skipped: 0,
       pending: platformPendingCount + unresolvedPendingCount + retryCount + exhaustedCount + verificationExhaustedCount,
       pending_verification_count: unresolvedPendingCount + exhaustedCount + verificationExhaustedCount,
       platform_pending_count: platformPendingCount,
       retryable_pending_count: unresolvedPendingCount + retryCount,
       unresolved: exhaustedCount + verificationExhaustedCount,
+      confirmed_still_started_failed_count: confirmedStillStartedFailedCount,
       verification_polling_exhausted: exhaustedCount + verificationExhaustedCount > 0,
       recovery_mode: 'read_only_verification',
       repeated_write_requests: 0,
@@ -6685,16 +7132,14 @@ function finalizeExecutionJob({ job, account, action, itemStatus, decision, prom
   });
   job.batch_task_id = Number(batchTaskId);
   const retryablePendingCount = Number(execution.retryable_pending_count ?? 0);
-  const hasReadOnlyPending = terminal_counts.platform_pending > 0 || terminal_counts.unresolved > 0;
+  const hasReadOnlyPending = terminal_counts.unresolved > 0;
   const hasBusinessFailure = terminal_counts.failed > 0 || Number(execution.activity_failure_count || 0) > 0;
   job.status = execution.cancelled
     ? 'cancelled'
-    : hasReadOnlyPending
-      ? 'paused'
-      : hasBusinessFailure || !accounting_complete
-        ? 'failed'
-        : 'completed';
-  job.request.resumePendingOnly = job.status === 'paused';
+    : hasBusinessFailure || !accounting_complete
+      ? 'failed'
+      : 'completed';
+  job.request.resumePendingOnly = false;
   job.progress.stage = job.status;
   job.progress.pending_relations = Number(execution.pending || 0);
   job.progress.write_queue = execution.write_queue || null;
@@ -6713,16 +7158,12 @@ function finalizeExecutionJob({ job, account, action, itemStatus, decision, prom
     execution,
   };
   const executionDisplayTotal = displayExecutionTotal(execution);
-  appendExecutionJobLog(job, job.status === 'paused'
-    ? `待恢复 ${execution.pending || 0} 条关系；已成功、业务失败和普通跳过项不会重复提交。`
-    : execution.cancelled
-      ? '执行任务已停止。'
-      : `结束：总商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，待平台生效 ${execution.platform_pending_count || 0}，阻断活动 ${execution.blocked}，用时 ${Math.round((Date.now() - jobStartedMs) / 1000)} 秒。`);
-  appendExecutionUserLog(job, job.status === 'paused'
-    ? `${execution.pending || 0} 条关系等待恢复；写请求成功但待生效的关系只读回查，不会重复写入。`
-    : execution.cancelled
-      ? `执行任务已按规则停止：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，已保存结果。`
-      : `${actionDisplayName(action)}完成：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，待平台生效 ${execution.platform_pending_count || 0}，用时 ${formatDuration(Date.now() - jobStartedMs)}。`);
+  appendExecutionJobLog(job, execution.cancelled
+    ? '执行任务已停止。'
+    : `结束：总商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，待平台生效 ${execution.platform_pending_count || 0}，阻断活动 ${execution.blocked}，用时 ${Math.round((Date.now() - jobStartedMs) / 1000)} 秒。`);
+  appendExecutionUserLog(job, execution.cancelled
+    ? `执行任务已按规则停止：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，已保存结果。`
+    : `${actionDisplayName(action)}完成：活动 ${execution.promotions_total} 个，商品 ${executionDisplayTotal}，成功 ${execution.success}，失败 ${execution.failed}，跳过 ${execution.skipped}，待平台生效 ${execution.platform_pending_count || 0}${execution.pending ? `，另有 ${execution.pending} 条写请求已提交待平台确认（不影响本次任务）` : ''}，用时 ${formatDuration(Date.now() - jobStartedMs)}。`);
   persistExecutionJob(job);
 }
 
@@ -7333,10 +7774,12 @@ function buildTodayDecisionForScope(accountIds, promotions) {
   const settings = readSettings();
   const cycleStatesByPromotion = new Map();
   const startedCountsByPromotion = new Map();
+  const candidateCountsByPromotion = new Map();
   for (const accountId of accountIds) {
     const scoped = promotions.filter((promotion) => String(promotion.account_id || '') === String(accountId));
     for (const [key, value] of listCycleStatesForPromotions(accountId, scoped)) cycleStatesByPromotion.set(key, value);
     for (const [key, value] of listItemCountsForPromotions(accountId, scoped, 'started')) startedCountsByPromotion.set(key, value);
+    for (const [key, value] of listItemCountsForPromotions(accountId, scoped, 'candidate')) candidateCountsByPromotion.set(key, value);
   }
   const globalCycle = buildGlobalTodayDiscount({
     tasks: listGlobalDiscountExecutionSummaries(300),
@@ -7358,6 +7801,7 @@ function buildTodayDecisionForScope(accountIds, promotions) {
     promotions,
     cycleStatesByPromotion,
     startedCountsByPromotion,
+    candidateCountsByPromotion,
     globalCycle,
     sellerMaxDiscount: settings.sellerMaxDiscount,
     officialMaxDiscount: settings.officialMaxDiscount,
@@ -7432,6 +7876,9 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
   await mapLimited(indexedPlans, normalizedActivityConcurrency, async ({ entry, index }) => {
     const { promotion, blocked, warning, detail_status: detailStatus } = entry;
     let plan = entry.plan;
+    let execution = null;
+    let taskId = 0;
+    try {
     if (!blocked && writeRepeatGuards.length) {
       plan = applyWriteRepeatGuards(plan, writeRepeatGuards, action);
     }
@@ -7518,7 +7965,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         ))
       : [];
     const resumedTaskId = Number(resumedPendingRecords[0]?.task_id || 0);
-    const taskId = resumedTaskId || createTask({
+    taskId = resumedTaskId || createTask({
         accountId: account.account_id,
         promotionId: promotion.promotion_id,
         promotionType: promotion.promotion_type,
@@ -7670,13 +8117,14 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       }
       return saveExecutionResult(persisted);
     };
-    const execution = await executePlannedRowsWithConcurrency({
+    execution = await executePlannedRowsWithConcurrency({
       plan,
       action,
       promotionId: promotion.promotion_id,
       promotionType: promotion.promotion_type,
       accountId: account.account_id,
       taskId,
+      mode: 'real',
       writeConcurrency: normalizedWriteConcurrency,
       schedule: (runWrite) => globalWriteLimiter.run(runWrite, {
         accountId: account.account_id,
@@ -7793,18 +8241,26 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         .filter((result) => result?.status === 'success')
         .map((result) => plannedByItemId.get(String(result.itemId || '')))
         .filter(Boolean);
-      let verification = { verified: [], unresolved: requestSuccessRows, polls: [] };
-      try {
-        verification = await waitForAppliedWriteRows({
-          client,
-          accountId: account.account_id,
-          campaign: promotion,
-          rows: requestSuccessRows,
-          action,
-          shouldCancel: shouldStop,
-        });
-      } catch (error) {
-        verification = { ...verification, read_error: toChineseError(error) };
+      let verification = { verified: [], unresolved: [], polls: [] };
+      const smallEnoughToReadBack = requestSuccessRows.length > 0
+        && requestSuccessRows.length <= 200
+        && Number(plan.total || 0) <= 200;
+      if (smallEnoughToReadBack) {
+        try {
+          verification = await waitForAppliedWriteRows({
+            client,
+            accountId: account.account_id,
+            campaign: promotion,
+            rows: requestSuccessRows,
+            action,
+            settleDelaysMs: [],
+            shouldCancel: shouldStop,
+          });
+        } catch (error) {
+          verification = { verified: [], unresolved: requestSuccessRows, read_error: toChineseError(error), polls: [] };
+        }
+      } else {
+        verification = { verified: requestSuccessRows, unresolved: [], polls: [] };
       }
       appendExecutionItemAuditEvent(request?.executionJobId, {
         type: 'write_live_verification_round',
@@ -7813,6 +8269,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         taskId,
         action,
         verificationRound: 1,
+        readback: smallEnoughToReadBack ? 'platform_readback' : 'write_response_trusted',
         polls: verification.polls,
         verified_count: verification.verified.length,
         started_price_mismatch_count: verification.started_price_mismatch?.length || 0,
@@ -7928,20 +8385,6 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       execution.counts.pending_verification_count = unresolvedRows.length;
       execution.counts.platform_pending_count = platformPendingRows.length;
       execution.counts.retryable_pending_count = candidateRows.length + unresolvedRows.length;
-      invalidatePromotionItemFetchStates({
-        accountId: account.account_id,
-        childUserId: promotion.child_user_id,
-        siteId: promotion.site_id,
-        promotionId: promotion.promotion_id,
-        promotionType: promotion.promotion_type,
-      });
-      markActivityCacheDirty({
-        accountId: account.account_id,
-        childUserId: promotion.child_user_id,
-        siteId: promotion.site_id,
-        promotionId: promotion.promotion_id,
-        promotionType: promotion.promotion_type,
-      });
     }
     if (Number(execution?.counts?.success || 0) > 0 || Number(execution?.counts?.request_success_count || 0) > 0) {
       reconcilePromotionItemFetchCounts({
@@ -7950,6 +8393,75 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
         siteId: promotion.site_id,
         promotionId: promotion.promotion_id,
         promotionType: promotion.promotion_type,
+      });
+    }
+    if (action === 'enroll' && Number(execution?.counts?.success || 0) > 0) {
+      try {
+        await sleep(30_000);
+        const liveStarted = await client.fetchAllPromotionItems({
+          promotionId: promotion.promotion_id,
+          promotionType: promotion.promotion_type,
+          status: 'started',
+          maxItems: 'all',
+        });
+        if (liveStarted && !liveStarted.blocked && Array.isArray(liveStarted.results)) {
+          const liveStartedIds = new Set(liveStarted.results.map((item) => String(item.item_id || item.id || '')));
+          const plannedByItemId = new Map((plan.rows || []).map((row) => [String(row.item?.item_id || ''), row]));
+          let notActivated = 0;
+          for (const result of execution.results || []) {
+            const itemId = String(result?.itemId || '');
+            if (!itemId || result?.status !== 'success' || liveStartedIds.has(itemId)) continue;
+            notActivated += 1;
+            saveExecutionResult({
+              taskId,
+              accountId: account.account_id,
+              promotionId: promotion.promotion_id,
+              promotionType: promotion.promotion_type,
+              itemId,
+              action,
+              mode: 'real',
+              status: 'failed',
+              dealPrice: plannedByItemId.get(itemId)?.deal_price,
+              errorCn: '报名请求已提交但平台未建立活动报价（折扣可能不在平台接受区间），未生效；已跳过不重复提交',
+            });
+            applySuccessfulPromotionItemWrites({
+              accountId: account.account_id,
+              childUserId: promotion.child_user_id,
+              siteId: promotion.site_id,
+              promotionId: promotion.promotion_id,
+              promotionType: promotion.promotion_type,
+              action: 'cancel',
+              items: [{ itemId }],
+            });
+          }
+          if (notActivated > 0) {
+            execution.counts.success = Math.max(0, Number(execution.counts.success || 0) - notActivated);
+            execution.counts.failed = Number(execution.counts.failed || 0) + notActivated;
+            onProgress?.({
+              type: 'execute_info',
+              index,
+              total: batch.plans.length,
+              promotion_id: promotion.promotion_id,
+              promotion_type: promotion.promotion_type,
+              promotion,
+              message: `${businessScope({ storeName: request?.storeName, promotion })}：回读确认 ${notActivated} 个商品平台未建立报价（未生效），已跳过不计成功。`,
+            });
+          }
+        }
+      } catch {}
+    }
+    if (action === 'enroll' && (Number(execution?.counts?.success || 0) > 0 || Number(execution?.counts?.request_success_count || 0) > 0)) {
+      saveItemFetchState({
+        accountId: account.account_id,
+        childUserId: promotion.child_user_id,
+        siteId: promotion.site_id,
+        promotionId: promotion.promotion_id,
+        promotionType: promotion.promotion_type,
+        itemStatus: 'started',
+        platformTotal: null,
+        savedCount: null,
+        detailStatus: 'ok',
+        warning: '报名执行后本地 started 状态已更新，标记今日已验证；更新/取消直接使用本地缓存。',
       });
     }
     const counts = execution.counts;
@@ -8031,11 +8543,15 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
           itemId,
           action,
         });
-        const liveReason = [CANCEL_RESULT_STATUS.pendingVerification, CANCEL_RESULT_STATUS.unverifiable].includes(status)
-          ? '取消请求状态尚未完成平台实时回查确认。'
-          : status === CANCEL_RESULT_STATUS.liveStillStarted
-            ? '取消请求已提交，但实时回查仍为已报名状态。'
-            : null;
+        const liveReason = status === CANCEL_RESULT_STATUS.pendingVerification
+          ? resultContract.live_read_classification_by_item[itemId] === CANCEL_LIVE_READ_CLASSIFICATION.stillStarted
+            ? '取消请求已提交，但平台生效存在延迟，实时回查仍为已报名状态；已进入待回查确认队列，稍后自动只读复查，不会重复提交。'
+            : '取消请求状态尚未完成平台实时回查确认。'
+          : status === CANCEL_RESULT_STATUS.unverifiable
+            ? '取消请求状态尚未完成平台实时回查确认。'
+            : status === CANCEL_RESULT_STATUS.liveStillStarted
+              ? '取消请求已提交，但实时回查仍为已报名状态。'
+              : null;
         saveExecutionResult({
           taskId,
           accountId: account.account_id,
@@ -8127,6 +8643,8 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
     finishTask(taskId, counts, completed ? 'completed' : 'partial_or_failed', completed, { publishHistory: false });
     markCycleAfterTask({
       accountId: account.account_id,
+      childUserId: promotion.child_user_id,
+      siteId: promotion.site_id,
       promotionId: promotion.promotion_id,
       promotionType: promotion.promotion_type,
       action,
@@ -8198,6 +8716,60 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       globalMaxActive: globalWriteLimiter.maxActive,
       writeConcurrency: execution.writeConcurrency
     });
+    } catch (error) {
+      const counts = execution?.counts || {};
+      const safeSuccess = Math.max(0, Number(counts.success || 0));
+      const safeFailed = Math.max(0, Number(counts.failed || 0));
+      const safeSkipped = Math.max(0, Number(counts.skipped || 0));
+      const safePending = Math.max(0, Number(counts.pending || 0));
+      const safeTotal = Math.max(Number(counts.total || 0), Number(plan?.total || 0), safeSuccess + safeFailed + safeSkipped);
+      summary.total += safeTotal;
+      summary.success += safeSuccess;
+      summary.failed += safeFailed;
+      summary.skipped += safeSkipped;
+      summary.pending += safePending;
+      summary.promotions.push({
+        site_id: promotion.site_id,
+        child_user_id: promotion.child_user_id,
+        promotion_id: promotion.promotion_id,
+        promotion_type: promotion.promotion_type,
+        taskId: Number(taskId) || 0,
+        status: 'execution_error',
+        reason: toChineseError(error),
+        total: safeTotal,
+        success: safeSuccess,
+        failed: safeFailed,
+        skipped: safeSkipped,
+        pending: safePending,
+        completed: false,
+      });
+      onProgress?.({
+        type: 'execute_info',
+        index,
+        total: batch.plans.length,
+        promotion_id: promotion.promotion_id,
+        promotion_type: promotion.promotion_type,
+        promotion,
+        message: `${businessScope({ storeName: request?.storeName, promotion })}：执行中断，已保留已提交结果（成功 ${safeSuccess}，失败 ${safeFailed}，跳过 ${safeSkipped}，待确认 ${safePending}），原因：${toChineseError(error)}`,
+      });
+      onProgress?.({
+        type: 'execute_done',
+        index,
+        total: batch.plans.length,
+        promotion_id: promotion.promotion_id,
+        promotion_type: promotion.promotion_type,
+        promotion,
+        total_items: safeTotal,
+        success: safeSuccess,
+        failed: safeFailed,
+        skipped: safeSkipped,
+        pending: safePending,
+        activityConcurrency: normalizedActivityConcurrency,
+        globalWriteConcurrency: normalizedGlobalWriteConcurrency,
+        globalMaxActive: globalWriteLimiter.maxActive,
+        writeConcurrency: execution?.writeConcurrency || normalizedWriteConcurrency
+      });
+    }
   });
   summary.globalMaxActive = globalWriteLimiter.maxActive;
   summary.write_queue = globalWriteLimiter.snapshot?.() || null;
@@ -8317,7 +8889,7 @@ function validateRequestedSmartCancelItems({ promotions = [], itemsByPromotion =
   }
 }
 
-async function preparePromotionsForExecution({ account, filters = {}, settings = readSettings(), request = {} }) {
+async function preparePromotionsForExecution({ account, filters = {}, settings = readSettings(), request = {}, forceCatalogRefresh = false }) {
   const readConcurrency = normalizeConcurrency(request.readConcurrency ?? settings.readConcurrency);
   const summary = {
     stages: [],
@@ -8331,7 +8903,7 @@ async function preparePromotionsForExecution({ account, filters = {}, settings =
   if (request.executionGroupId || request.submissionPrepareId || request.submission_prepare_id) promotions = ordinaryPromotions(promotions);
   summary.matched_before_fetch = promotions.length;
   const localTotal = listCampaignsAll(account.account_id).length;
-  if (localTotal === 0 || promotions.length === 0) {
+  if (forceCatalogRefresh || localTotal === 0 || promotions.length === 0) {
     const fetched = await fetchAndSavePromotions(account, { readConcurrency });
     summary.fetched = true;
     summary.fetch_result = { total: fetched.total, children: fetched.children };
@@ -8628,7 +9200,11 @@ export async function prepareItemsForExecution({
       && request.allowInventoryFallback !== false
       && isSellerCampaign(campaign)
       && !String(row.probe_reason || '').endsWith('_probe_failed')
-      && (CANDIDATE_INCOMPLETE_STATUSES.has(row.detail_status) || row.detail_status === 'partial_api_sparse_marketplace_candidate' || row.blocked)
+      && (CANDIDATE_INCOMPLETE_STATUSES.has(row.detail_status)
+          || row.detail_status === 'unreadable'
+          || row.detail_status === 'empty'
+          || row.blocked
+          || (row.detail_status === 'partial_api_sparse_marketplace_candidate' && !isNearlyCompleteCandidate(row)))
     ) {
       onProgress?.({
         type: 'inventory_fallback_start',
@@ -8899,6 +9475,17 @@ export function persistLiveActivityCatalog({ route, promotions, logisticType = n
       siteId: normalizedRoute.site_id,
       promotions: reconciled.removed,
     });
+    for (const promotion of reconciled.removed) {
+      try {
+        deletePromotionItemData({
+          accountId: normalizedRoute.account_id,
+          childUserId: normalizedRoute.child_user_id,
+          siteId: normalizedRoute.site_id,
+          promotionId: promotion.promotion_id,
+          promotionType: promotion.promotion_type,
+        });
+      } catch {}
+    }
   }
   for (const change of reconciled.dirty_identities) {
     const promotion = change.promotion;
@@ -11050,6 +11637,13 @@ function createInventoryFallbackJob({ accountId, filters, listingStatus, readCon
   return job;
 }
 
+function isNearlyCompleteCandidate(row = {}) {
+  const saved = Number(row?.saved_count ?? row?.saved ?? 0);
+  const total = Number(row?.platform_total ?? row?.total ?? 0);
+  if (saved <= 0 || total <= 0) return false;
+  return (total - saved) < Math.max(50, Math.ceil(total * 0.01));
+}
+
 async function runInventoryFallbackJob(jobId, { accountId, filters, listingStatus, readConcurrency, detailConcurrency, sellerDiscountPercent, maxScanItems = 'all' }) {
   const job = inventoryFallbackJobs.get(jobId);
   if (!job) return;
@@ -11059,6 +11653,10 @@ async function runInventoryFallbackJob(jobId, { accountId, filters, listingStatu
     const promotions = listOperatingCampaignsFiltered(account.account_id, filters || {}, readSettings()).filter(isSellerCampaign);
     job.progress.total_promotions = promotions.length;
     const rows = await mapLimited(promotions, readConcurrency, async (campaign) => {
+      const fetchState = getItemFetchState(account.account_id, campaign.promotion_id, campaign.promotion_type, 'candidate', campaign);
+      if (fetchState && isNearlyCompleteCandidate(fetchState)) {
+        return { campaign, skipped: true, reason: '接近全量（差异小于1%），跳过扫描兜底' };
+      }
       const row = await scanAndSaveInventoryFallbackForCampaign({
         account,
         campaign,
@@ -11071,8 +11669,7 @@ async function runInventoryFallbackJob(jobId, { accountId, filters, listingStatu
       job.progress.completed_promotions += 1;
       if (row.error || row.blocked) job.progress.failed_promotions += 1;
       return row;
-    });
-    job.rows = rows;
+    });    job.rows = rows;
     job.status = 'completed';
     job.finished_at = new Date().toISOString();
   } catch (error) {

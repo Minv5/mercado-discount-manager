@@ -123,6 +123,21 @@ function migrate(database) {
       UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type, item_id)
     );
 
+    CREATE TABLE IF NOT EXISTS item_price_cache (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT NOT NULL,
+      child_user_id TEXT NOT NULL DEFAULT '',
+      site_id TEXT NOT NULL DEFAULT '',
+      item_id TEXT NOT NULL,
+      price REAL,
+      original_price REAL,
+      currency_id TEXT,
+      status TEXT,
+      raw_json TEXT,
+      updated_at TEXT NOT NULL,
+      UNIQUE(account_id, child_user_id, site_id, item_id)
+    );
+
     CREATE TABLE IF NOT EXISTS promo_tasks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       account_id TEXT NOT NULL,
@@ -300,18 +315,23 @@ function migrate(database) {
     CREATE TABLE IF NOT EXISTS cycle_states (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       account_id TEXT NOT NULL,
+      child_user_id TEXT NOT NULL DEFAULT '',
+      site_id TEXT NOT NULL DEFAULT '',
       promotion_id TEXT NOT NULL,
       promotion_type TEXT NOT NULL,
+      activity_revision TEXT NOT NULL DEFAULT '',
+      identity_state TEXT NOT NULL DEFAULT 'route_scoped',
       seller_discount_percent REAL,
       official_discount_percent REAL,
       status TEXT NOT NULL,
       raw_json TEXT,
       updated_at TEXT NOT NULL,
-      UNIQUE(account_id, promotion_id, promotion_type)
+      UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type, activity_revision)
     );
   `);
   migrateOAuthStateClaimsAndDailySnapshots(database);
   migrateActivityCacheIdentity(database);
+  migrateCycleStatesRouteIdentity(database);
   database.exec(`
     DROP INDEX IF EXISTS idx_activity_cache_due;
     CREATE INDEX idx_activity_cache_due
@@ -646,6 +666,56 @@ function migrateActivityCacheIdentity(database) {
           account_id, child_user_id, site_id, dirty, continuity,
           catalog_checked_at, items_full_checked_at
         );
+    `);
+    database.exec('COMMIT');
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      // Preserve the migration error.
+    }
+    throw error;
+  }
+}
+
+function migrateCycleStatesRouteIdentity(database) {
+  const columns = database.prepare('PRAGMA table_info(cycle_states)').all();
+  const columnNames = new Set(columns.map((row) => String(row.name)));
+  const expectedColumns = ['account_id', 'child_user_id', 'site_id', 'promotion_id', 'promotion_type', 'activity_revision'];
+  const hasAllColumns = expectedColumns.every((name) => columnNames.has(name)) && columnNames.has('identity_state');
+  const hasExpectedUnique = hasUniqueIndex(database, 'cycle_states', expectedColumns);
+  if (hasAllColumns && hasExpectedUnique) return;
+
+  // Legacy cycle_states only keyed by (account_id, promotion_id, promotion_type).
+  // Route-scoped reads (child_user_id + site_id + activity_revision + identity_state)
+  // require a rebuild because the UNIQUE constraint cannot be altered in place.
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec('ALTER TABLE cycle_states RENAME TO cycle_states_legacy_route');
+    database.exec(`
+      CREATE TABLE cycle_states (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id TEXT NOT NULL,
+        child_user_id TEXT NOT NULL DEFAULT '',
+        site_id TEXT NOT NULL DEFAULT '',
+        promotion_id TEXT NOT NULL,
+        promotion_type TEXT NOT NULL,
+        activity_revision TEXT NOT NULL DEFAULT '',
+        identity_state TEXT NOT NULL DEFAULT 'route_scoped',
+        seller_discount_percent REAL,
+        official_discount_percent REAL,
+        status TEXT NOT NULL,
+        raw_json TEXT,
+        updated_at TEXT NOT NULL,
+        UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type, activity_revision)
+      );
+      INSERT INTO cycle_states
+        (account_id, child_user_id, site_id, promotion_id, promotion_type, activity_revision,
+         identity_state, seller_discount_percent, official_discount_percent, status, raw_json, updated_at)
+      SELECT account_id, '', '', promotion_id, promotion_type, '',
+             'route_scoped', seller_discount_percent, official_discount_percent, status, raw_json, updated_at
+      FROM cycle_states_legacy_route;
+      DROP TABLE cycle_states_legacy_route;
     `);
     database.exec('COMMIT');
   } catch (error) {

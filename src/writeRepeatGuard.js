@@ -16,11 +16,12 @@ export function applyWriteRepeatGuards(plan = {}, guards = [], action = '') {
     if (key) guardByRelation.set(key, guard);
   }
   let guarded = 0;
+  const planPromotion = plan.promotion || {};
   const rows = (plan.rows || []).map((row) => {
     if (String(row.status || '') !== 'planned') return row;
     const guard = guardByRelation.get(repeatGuardKey({
-      promotion_id: plan.promotionId || plan.promotion_id,
-      promotion_type: plan.promotionType || plan.promotion_type,
+      promotion_id: planPromotion.promotion_id || planPromotion.promotionId || plan.promotion_id || plan.promotionId,
+      promotion_type: planPromotion.promotion_type || planPromotion.promotionType || plan.promotion_type || plan.promotionType,
       item_id: row.item?.item_id,
     }));
     if (!guard || !guardApplies(guard, row, action)) return row;

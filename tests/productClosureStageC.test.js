@@ -535,6 +535,43 @@ test('seller creation confirmed in the final summary starts one group without a 
   assert.equal(groupCalls, 1);
 });
 
+test('post-creation recheck accepts mixed structural changes when seller creation was the explicit goal', async () => {
+  const store = createSubmissionPersistence({ stateDir: temporaryDirectory(), now: () => '2026-07-16T01:00:00.000Z' });
+  store.create({
+    id: 'prepare-seller-mixed-change', client_submission_id: 'submit-seller-mixed', state: 'prepared',
+    scope_hash: 'before-create', expires_at: '2026-07-17T00:00:00.000Z',
+    seller_input: { selected_targets: [{ account_id: 'A', child_user_id: 'A-CHILD', site_id: 'MLM', detection_status: 'confirmed_absent' }] },
+    confirmed_execution_scope: { action: 'enroll', activities: [], seller_create_target_keys: ['A|MLM'] },
+  });
+  let createCalls = 0;
+  let groupCalls = 0;
+  const result = await commitSubmission({
+    store, prepareId: 'prepare-seller-mixed-change', confirmText: 'REAL_SUBMIT', createConfirmText: 'CREATE_SELLER_CAMPAIGN',
+    revalidate: async () => ({ scope_hash: 'before-create', reconfirm_required: false, execution_relation_count: 1 }),
+    createSellerCampaigns: async () => { createCalls += 1; return { ok: true, created_count: 1 }; },
+    revalidateAfterCreation: async () => ({
+      scope_hash: 'after-create', reconfirm_required: true, execution_relation_count: 0,
+      changes: ['执行动作或活动结构发生实质变化，需要重新核对范围'],
+      changed_target_keys: ['__SELLER__', '__ACTION__'],
+      prepared_patch: {
+        seller_input: { selected_targets: [] },
+        confirmed_execution_scope: {
+          action: 'enroll',
+          activities: [{ account_id: 'A', site_id: 'MLM', promotion_id: 'C-NEW', promotion_type: 'SELLER_CAMPAIGN', item_status: 'candidate', item_ids: [] }],
+          seller_create_target_keys: [],
+        },
+      },
+    }),
+    startGroup: async () => { groupCalls += 1; return { id: 'group-mixed-after-create', status: 'queued' }; },
+    now: () => '2026-07-16T01:00:01.000Z',
+  });
+  assert.equal(result.group.id, 'group-mixed-after-create');
+  assert.equal(createCalls, 1);
+  assert.equal(groupCalls, 1);
+  const saved = store.load('prepare-seller-mixed-change');
+  assert.equal(saved.state, 'executing');
+});
+
 test('commit keeps both gates, creation failure starts no group, and created retry reuses one group', async () => {
   const store = createSubmissionPersistence({ stateDir: temporaryDirectory(), now: () => '2026-07-14T00:00:00.000Z' });
   const base = {
@@ -761,10 +798,13 @@ test('server and PySide expose one prepare/commit product path and retire old or
   assert.doesNotMatch(mainWindow, /batch-precheck|batch-create|\/api\/execution\/groups\/start/);
 });
 
-test('submission prepare and commit retain the full live-read gate before group start', () => {
+test('submission commit reuses the confirmed scope without a second full live-read gate', () => {
   const server = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
   assert.match(server, /prepareItemsForExecution\(\{[\s\S]*fetchMode: 'full'/);
   assert.match(server, /live_read: liveRead\.rows/);
+  // Final revalidation restores a lightweight live catalog check at commit
+  // time (PREPARE_STALE / LIVE_READ_BLOCKED protection), while execution
+  // itself still consumes the frozen intersection without a second full scan.
   assert.match(server, /current\.live_read\?\.all_blocked/);
   assert.match(server, /LIVE_READ_BLOCKED/);
   assert.match(server, /status: 'activity_failed'/);
@@ -780,6 +820,7 @@ test('final execution consumes the frozen intersection without a second full act
   assert.match(server, /filterItemsByConfirmedScope\(\{[\s\S]*?accountId: account\.account_id,[\s\S]*?requiredRecords: request\.resumePendingOnly \? pendingWriteRecords : null/);
   assert.match(server, /revalidateAfterCreation:/);
   assert.match(server, /buildFinalRevalidationPlan\(/);
+  // Commit-time revalidation marks the snapshot rebuild as final revalidation.
   assert.match(server, /finalRevalidation: true/);
   assert.match(server, /selectedForLiveRead = targetedRevalidate \? selected\.filter\(promotionNeedsItemRead\) : selected/);
   assert.match(server, /item_read_activity_count/);

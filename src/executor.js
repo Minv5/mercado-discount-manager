@@ -55,7 +55,7 @@ export async function executePlannedRowsWithConcurrency({
   promotionType,
   accountId,
   taskId,
-  mode = 'real',
+  mode,
   writeConcurrency = 2,
   schedule,
   executeOne,
@@ -150,18 +150,42 @@ export async function executePlannedRowsWithConcurrency({
         });
         const response = schedule ? await schedule(runWrite) : await runWrite();
         const finishedAt = new Date().toISOString();
-        await saveResult?.({
-          taskId,
-          accountId,
-          promotionId,
-          promotionType,
-          itemId: row.item?.item_id || '',
-          action,
-          mode,
-          status: 'success',
-          dealPrice: row.deal_price,
-          response
-        });
+        // The Mercado write already succeeded. Mark the relation as successful
+        // BEFORE local persistence so a storage failure can never cause a
+        // duplicate submission of the same item (repeat guard + same-batch dedupe).
+        successfulItemKeys.add(itemKey);
+        try {
+          await saveResult?.({
+            taskId,
+            accountId,
+            promotionId,
+            promotionType,
+            itemId: row.item?.item_id || '',
+            action,
+            mode,
+            status: 'success',
+            dealPrice: row.deal_price,
+            response
+          });
+        } catch (storageError) {
+          // Interface write succeeded but the local result row could not be
+          // persisted. Do NOT classify this as a business failure: retrying
+          // would re-submit an already-enrolled item. Report it separately.
+          await onItemEvent?.({
+            type: 'item_storage_error',
+            row,
+            status: 'success',
+            startedAt,
+            finishedAt,
+            durationMs: Date.now() - startedMs,
+            error: storageError,
+            errorCn: toErrorText(storageError),
+            attempt,
+            retryCount,
+            finalRetry
+          });
+          return { itemId: row.item?.item_id || '', status: 'success', response, finalRetry, storageError: true };
+        }
         await onItemEvent?.({
           type: 'item_finish',
           row,
@@ -174,7 +198,6 @@ export async function executePlannedRowsWithConcurrency({
           retryCount,
           finalRetry
         });
-        successfulItemKeys.add(itemKey);
         return { itemId: row.item?.item_id || '', status: 'success', response, finalRetry };
       } catch (error) {
         const errorCn = toErrorText(error);
