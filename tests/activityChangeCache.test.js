@@ -49,7 +49,8 @@ test('activity catalog uses webhook change signals only: clean cache is reused w
   assert.equal(activityCatalogDecision(fresh, NOW).reason, 'verified_cache');
   assert.equal(activityCatalogDecision({ ...fresh, dirty: 1 }, NOW).reason, 'dirty');
   assert.equal(activityCatalogDecision({ ...fresh, continuity: 'gap' }, NOW).reason, 'event_gap');
-  assert.equal(activityCatalogDecision({ ...fresh, catalog_checked_at: '2026-07-14T06:00:00.000Z' }, NOW).reason, 'verified_cache');
+  assert.equal(activityCatalogDecision({ ...fresh, catalog_checked_at: '2026-07-14T06:00:00.000Z' }, NOW).reason, 'catalog_ttl_due');
+  assert.equal(activityCatalogDecision({ ...fresh, catalog_checked_at: new Date(NOW.getTime() - ACTIVITY_CATALOG_TTL_MS + 60_000).toISOString() }, NOW).reason, 'verified_cache');
   assert.deepEqual(activityCatalogDecision({
     ...fresh,
     dirty: 1,
@@ -112,7 +113,7 @@ test('activity items reuse verified full cache for three days and never reuse di
   assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, continuity: 'gap' }, fetchState, now: NOW }).reason, 'event_gap');
   assert.equal(activityItemsDecision({ promotion, cacheState, fetchState: { ...fetchState, detail_status: 'error' }, now: NOW }).reason, 'unreadable');
   assert.equal(activityItemsDecision({ promotion, cacheState, fetchState: { ...fetchState, detail_status: 'partial' }, now: NOW }).reason, 'not_full');
-  assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, items_full_checked_at: new Date(NOW.getTime() - ACTIVITY_ITEMS_TTL_MS - 1).toISOString() }, fetchState, now: NOW }).reason, 'verified_cache');
+  assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, items_full_checked_at: new Date(NOW.getTime() - ACTIVITY_ITEMS_TTL_MS - 1).toISOString() }, fetchState, now: NOW }).reason, 'items_ttl_due');
 });
 
 test('same-day failed or incomplete item reads do not repeat unless a newer event marks the activity dirty', () => {

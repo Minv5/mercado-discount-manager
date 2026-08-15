@@ -49,6 +49,11 @@ export function activityCatalogDecision(state = null, now = new Date()) {
   }
   if (Number(state.dirty || 0) === 1) return { refresh: true, reason: 'dirty' };
   if (String(state.continuity || 'continuous') !== 'continuous') return { refresh: true, reason: 'event_gap' };
+  // Conservative TTL fallback: a clean cache with no events for a long time
+  // may be silently stale (missed/dropped webhook). Refresh once per TTL even
+  // when no change signal arrived, so the event-driven path stays fast without
+  // trusting the catalog indefinitely.
+  if (isStale(state.catalog_checked_at, ACTIVITY_CATALOG_TTL_MS, now)) return { refresh: true, reason: 'catalog_ttl_due' };
   return { refresh: false, reason: 'verified_cache' };
 }
 
@@ -137,6 +142,12 @@ export function activityItemsDecision({
   }
   if (isSameShanghaiDay(cacheState.items_full_checked_at, now)) {
     return { refresh: false, reason: 'same_day_cache' };
+  }
+  // Conservative TTL fallback mirroring the catalog: full item cache older
+  // than ACTIVITY_ITEMS_TTL_MS is refreshed even without a change signal, so
+  // missed events cannot keep a stale item list in use indefinitely.
+  if (isStale(cacheState.items_full_checked_at, ACTIVITY_ITEMS_TTL_MS, now)) {
+    return { refresh: true, reason: 'items_ttl_due' };
   }
   return { refresh: false, reason: 'verified_cache' };
 }
@@ -354,6 +365,15 @@ export function nextNonPeakCalibrationAt(now = new Date(), hour = 2, minute = 30
 function isFresh(value, ttlMs, now) {
   const timestamp = Date.parse(String(value || ''));
   return Number.isFinite(timestamp) && now.getTime() - timestamp >= 0 && now.getTime() - timestamp < ttlMs;
+}
+
+function isStale(value, ttlMs, now) {
+  // Stale means "older than the TTL window". Missing timestamps are NOT
+  // considered stale here: the caller's earlier checks (unverified / dirty /
+  // gap) already decide those cases, and treating a missing timestamp as
+  // stale would force refreshes for rows that never recorded a check time.
+  const timestamp = Date.parse(String(value || ''));
+  return Number.isFinite(timestamp) && now.getTime() - timestamp >= ttlMs;
 }
 
 function isFullFetchState(state = {}) {
