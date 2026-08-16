@@ -158,7 +158,8 @@ export function createActivityWebhookConsumer({
     try {
       route = resolveActivityWebhookRoute({ event, marketplaceSites, accounts });
     } catch (error) {
-      if (String(error?.code || '') === 'ACTIVITY_CALLBACK_ROUTE_AMBIGUOUS' && typeof resolveItemOwner === 'function') {
+      const code = String(error?.code || '');
+      if ((code === 'ACTIVITY_CALLBACK_ROUTE_AMBIGUOUS' || code === 'ACTIVITY_CALLBACK_ROUTE_UNRESOLVED') && typeof resolveItemOwner === 'function') {
         const itemId = String(event.resource || '')
           .replace(/^\/marketplace\/items\//, '')
           .replace(/^\/items\//, '')

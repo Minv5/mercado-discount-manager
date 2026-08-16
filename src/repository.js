@@ -1476,7 +1476,18 @@ export function removeGhostPromotionItem({ accountId, childUserId = '', siteId =
        AND (promotion_id = ? OR ? = '')`,
     [String(accountId), route.childUserId, route.siteId, String(itemId), promotionFilter, promotionFilter],
   );
-  return { removed: Number(result?.changes || 0) };
+  // A removed item must also leave the item price pool, otherwise the local
+  // pool keeps a ghost entry that the platform no longer lists.
+  let poolRemoved = 0;
+  if (!String(promotionId || '').trim()) {
+    const pool = run(
+      `DELETE FROM item_price_cache
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND item_id = ?`,
+      [String(accountId), route.childUserId, route.siteId, String(itemId)],
+    );
+    poolRemoved = Number(pool?.changes || 0);
+  }
+  return { removed: Number(result?.changes || 0), pool_removed: poolRemoved };
 }
 
 export function updateItemPriceByWebhook({ accountId, childUserId = '', siteId = '', itemId = '', price = null, originalPrice = null, status = '' } = {}) {
