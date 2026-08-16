@@ -2181,6 +2181,8 @@ def execution_job_summary(job: dict[str, Any]) -> tuple[str, dict[str, int]]:
 
 
 def record_discount_text(task: dict[str, Any]) -> str:
+    if str(task.get("action") or "").lower() == "cancel":
+        return "-"
     parts = []
     seller = task.get("seller_activity_text")
     if not seller and task.get("seller_discount_percent"):
