@@ -1949,12 +1949,20 @@ function mergeFreshOriginalPrice(rows = [], accountId = '') {
   if (!rows.length) return rows;
   const itemIds = [...new Set(rows.map((row) => String(row.item_id || '')).filter(Boolean))];
   if (!itemIds.length) return rows;
-  const cachedRows = all(
-    `SELECT item_id, child_user_id, site_id, original_price, updated_at
-     FROM item_price_cache
-     WHERE account_id = ? AND item_id IN (${itemIds.map(() => '?').join(',')})`,
-    [accountId, ...itemIds],
-  );
+  // Query in bounded batches: a single IN(...) with tens of thousands of
+  // placeholders is pathologically slow (and can exceed SQLite limits), which
+  // made every candidate list read crawl on large catalogs.
+  const BATCH = 500;
+  const cachedRows = [];
+  for (let start = 0; start < itemIds.length; start += BATCH) {
+    const slice = itemIds.slice(start, start + BATCH);
+    cachedRows.push(...all(
+      `SELECT item_id, child_user_id, site_id, original_price, updated_at
+       FROM item_price_cache
+       WHERE account_id = ? AND item_id IN (${slice.map(() => '?').join(',')})`,
+      [accountId, ...slice],
+    ));
+  }
   if (!cachedRows.length) return rows;
   const byKey = new Map(cachedRows.map((row) => [
     `${String(row.item_id || '')}|${String(row.child_user_id || '')}|${String(row.site_id || '').toUpperCase()}`,
