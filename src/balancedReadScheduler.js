@@ -35,7 +35,7 @@ export const BALANCED_READ_PROFILES = Object.freeze({
     detailPerAccountLimit: 42,
     activityLimit: 192,
     activityPerAccountLimit: 64,
-    fallbackPerAccount: 2,
+    fallbackPerAccount: 8,
     minLimit: 10,
     rateLimitDecreaseStep: 5,
   }),

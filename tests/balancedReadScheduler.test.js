@@ -149,7 +149,7 @@ test('high-throughput prepare profile raises only Mercado GET ceilings and bound
     detailPerAccountLimit: 42,
     activityLimit: 192,
     activityPerAccountLimit: 64,
-    fallbackPerAccount: 2,
+    fallbackPerAccount: 8,
     minLimit: 10,
     rateLimitDecreaseStep: 5,
   });
@@ -180,7 +180,7 @@ test('high-throughput prepare profile raises only Mercado GET ceilings and bound
     await wait(4);
     fallbackActive -= 1;
   })));
-  assert.equal(fallbackPeak, 2);
+  assert.equal(fallbackPeak, 6);
 });
 
 test('prepare scheduler profile applies saved global and activity ceilings without exceeding verified limits', async () => {
@@ -467,7 +467,9 @@ test('fallback concurrency remains per-account bounded and consumes the same glo
   await wait(10);
   const running = scheduler.snapshot();
   assert.equal(running.inflight, 3);
-  assert.ok(Object.values(running.peakFallbackByAccount).every((value) => value <= 2));
+  // fallbackPerAccount in the prepare profile is now 8; each account only has
+  // 3 fallback jobs here, so peak fallback per account never exceeds 3.
+  assert.ok(Object.values(running.peakFallbackByAccount).every((value) => value <= 3));
   release();
   await Promise.all(jobs);
 });
