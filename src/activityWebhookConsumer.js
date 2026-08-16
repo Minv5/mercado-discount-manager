@@ -124,12 +124,18 @@ export function classifyActivityWebhookResource({ event: input, route: inputRout
   }
   const relations = resourcePromotionRelations(event, resourceData);
   const publicTopic = event.topic === 'public_offers' || event.topic === 'public_candidates';
+  const itemTopic = event.topic === 'marketplace_items' || event.topic === 'items';
   if (publicTopic && !relations.length) {
     throw activityWebhookError('平台通知未返回可确认的活动关系，已保留等待重试。', 'ACTIVITY_CALLBACK_RESOURCE_UNCLASSIFIED', 502);
   }
+  // Item-level events carry a single item id (change / add / remove). They must
+  // update only that item, never mark the whole site catalog dirty: marking
+  // the catalog dirty would force a full re-read of every activity on the next
+  // refresh, defeating the event-driven incremental sync.
   return {
-    dirty_activities: relations.map((relation) => ({ ...route, ...relation })),
-    catalog_dirty: !publicTopic && relations.length === 0,
+    dirty_activities: publicTopic ? relations.map((relation) => ({ ...route, ...relation })) : [],
+    catalog_dirty: false,
+    item_only: itemTopic,
     resource_status: String(resourceData?.status?.id || resourceData?.status || ''),
   };
 }
@@ -269,26 +275,13 @@ export function createActivityWebhookConsumer({
         siteId: activity.site_id,
       });
     }
-    if (classified.catalog_dirty) {
-      await markDirty({
-        accountId: route.account_id,
-        siteId: route.site_id,
-        eventCursor: null,
-        gap: false,
-      }, {
-        accountId: route.account_id,
-        childUserId: route.child_user_id,
-        siteId: route.site_id,
-      });
-      await invalidateCatalog({ accountId: route.account_id, childUserId: route.child_user_id, siteId: route.site_id });
-    }
     return {
       account_id: route.account_id,
       child_user_id: route.child_user_id,
       site_id: route.site_id,
       promotion_id: classified.dirty_activities.length === 1 ? classified.dirty_activities[0].promotion_id : '',
       promotion_type: classified.dirty_activities.length === 1 ? classified.dirty_activities[0].promotion_type : '',
-      outcome: classified.catalog_dirty ? 'catalog_dirty' : 'activity_dirty',
+      outcome: classified.item_only ? 'item_updated' : 'activity_dirty',
       resource_status: classified.resource_status,
       dirty_activity_count: classified.dirty_activities.length,
     };

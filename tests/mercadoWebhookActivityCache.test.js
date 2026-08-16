@@ -120,7 +120,7 @@ test('public candidate uses the same exact promotion relation contract', () => {
   assert.equal(result.dirty_activities[0].promotion_id, 'C-MLM10');
 });
 
-test('items only mark an exact activity when the GET proves the relation, otherwise they dirty the route catalog', () => {
+test('items only update the single item and never dirty the route catalog', () => {
   const itemEvent = normalizeActivityWebhookEvent({
     ...EVENT, event_id: 'evt-item-1', topic: 'items', resource: '/items/MLM123', remote_user_id: '3333531550',
   });
@@ -129,10 +129,13 @@ test('items only mark an exact activity when the GET proves the relation, otherw
     resourceData: { id: 'MLM123', promotions: [{ id: 'C-MLM8', type: 'SELLER_CAMPAIGN' }] },
   });
   assert.equal(exact.catalog_dirty, false);
-  assert.equal(exact.dirty_activities[0].promotion_id, 'C-MLM8');
+  assert.deepEqual(exact.dirty_activities, []);
 
+  // Even without a proved activity relation, an item-level event must not
+  // dirty the whole site catalog: it updates only that item.
   const fallback = classifyActivityWebhookResource({ event: itemEvent, route: ROUTES[1], resourceData: { id: 'MLM123', status: 'active' } });
-  assert.equal(fallback.catalog_dirty, true);
+  assert.equal(fallback.catalog_dirty, false);
+  assert.equal(fallback.item_only, true);
   assert.deepEqual(fallback.dirty_activities, []);
 });
 
@@ -162,20 +165,24 @@ test('consumer performs one read-only resource GET and marks only the resolved c
   assert.equal(invalidated.length, 0);
 });
 
-test('item notification without a proved activity relation dirties only the resolved site catalog', async () => {
+test('item notification without a proved activity relation updates only that item, never the catalog', async () => {
   const marked = [];
   const invalidated = [];
+  const updated = [];
   const consumer = createActivityWebhookConsumer({
     listMarketplaceSites: () => ROUTES,
     listAccounts: () => [],
-    createResourceClient: async () => ({ getNotificationResource: async () => ({ id: 'MLM123', status: 'active' }) }),
+    createResourceClient: async () => ({ getNotificationResource: async () => ({ id: 'MLM123', status: 'active', price: 12.34 }) }),
     markDirty: (value) => marked.push(value),
     invalidateCatalog: (value) => invalidated.push(value),
+    updateItemPrice: (value) => updated.push(value),
   });
   const result = await consumer({ ...EVENT, event_id: 'evt-item-catalog', topic: 'items', resource: '/items/MLM123' });
-  assert.equal(result.outcome, 'catalog_dirty');
-  assert.deepEqual(marked, [{ accountId: '3332096437', siteId: 'MLM', eventCursor: null, gap: false }]);
-  assert.deepEqual(invalidated, [{ accountId: '3332096437', childUserId: '3333531550', siteId: 'MLM' }]);
+  assert.equal(result.outcome, 'item_updated');
+  assert.deepEqual(marked, []);
+  assert.deepEqual(invalidated, []);
+  assert.equal(updated.length, 1);
+  assert.equal(updated[0].itemId, 'MLM123');
 });
 
 test('resource GET failures remain retryable and do not dirty any cache state', async () => {
