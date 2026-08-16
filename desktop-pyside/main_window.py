@@ -422,6 +422,7 @@ class MainWindow(QMainWindow):
     def _set_refresh_busy(self, busy: bool) -> None:
         self.refresh_busy = busy
         if busy:
+            self.execute_button.setText("刷新缓存中…")
             return
         self.execute_button.setText("开始执行")
         self.execute_button.setEnabled(self._can_start_submission())
