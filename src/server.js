@@ -379,10 +379,38 @@ let startupCacheRefreshState = {
   attempts: 0,
   error: null,
   finished_at: null,
+  stage: '',
+  stage_label: '',
+  account: '',
+  account_index: 0,
+  account_total: 0,
+  message: '',
+  percent: 0,
 };
 
+const STARTUP_REFRESH_STAGE_LABELS = {
+  probe: '检测回调链路',
+  catalog: '刷新活动目录',
+  candidate: '刷新可报名商品',
+  started: '刷新已报名商品',
+};
+
+function reportStartupRefreshProgress(progress = {}) {
+  startupCacheRefreshState = {
+    ...startupCacheRefreshState,
+    status: 'running',
+    stage: progress.stage || startupCacheRefreshState.stage,
+    stage_label: STARTUP_REFRESH_STAGE_LABELS[progress.stage] || startupCacheRefreshState.stage_label,
+    account: progress.account ?? startupCacheRefreshState.account,
+    account_index: progress.account_index ?? startupCacheRefreshState.account_index,
+    account_total: progress.account_total ?? startupCacheRefreshState.account_total,
+    message: progress.message ?? startupCacheRefreshState.message,
+    percent: progress.percent ?? startupCacheRefreshState.percent,
+  };
+}
+
 function scheduleStartupCacheRefresh() {
-  startupCacheRefreshState = { status: 'running', attempts: 0, error: null, finished_at: null };
+  startupCacheRefreshState = { status: 'running', attempts: 0, error: null, finished_at: null, stage: '', stage_label: '', account: '', account_index: 0, account_total: 0, message: '', percent: 0 };
   const attempt = (round) => {
     runStartupCacheRefresh()
       .then(() => {
@@ -416,13 +444,26 @@ async function probeActivityCallbackHealth() {
 }
 
 async function runStartupCacheRefresh() {
+  reportStartupRefreshProgress({ stage: 'probe', message: '正在检测回调事件链路', percent: 2 });
   await probeActivityCallbackHealth();
   const settings = readSettings();
   const accounts = listAccountsForUi();
+  const accountTotal = accounts.length;
   let refreshedAccounts = 0;
-  for (const row of accounts) {
+  for (let accountIndex = 0; accountIndex < accounts.length; accountIndex += 1) {
+    const row = accounts[accountIndex];
+    const accountLabel = storeIdentityForAccount(row.account_id, row, settings).store_name;
+    const basePercent = Math.floor((accountIndex / Math.max(1, accountTotal)) * 100);
     try {
       const account = await ensureUsableAccount(row.account_id);
+      reportStartupRefreshProgress({
+        stage: 'catalog',
+        account: accountLabel,
+        account_index: accountIndex + 1,
+        account_total: accountTotal,
+        message: `正在刷新活动目录`,
+        percent: Math.min(99, basePercent + 2),
+      });
       await refreshActivityCatalogForPrepare({
         account,
         filters: settings.defaultFilters || {},
@@ -432,6 +473,14 @@ async function runStartupCacheRefresh() {
       const ordinary = ordinaryPromotions(promotions);
       if (!ordinary.length) continue;
       for (const itemStatus of ['candidate', 'started']) {
+        reportStartupRefreshProgress({
+          stage: itemStatus,
+          account: accountLabel,
+          account_index: accountIndex + 1,
+          account_total: accountTotal,
+          message: itemStatus === 'candidate' ? '正在刷新可报名商品' : '正在刷新已报名商品',
+          percent: Math.min(99, basePercent + (itemStatus === 'candidate' ? 4 : 6)),
+        });
         const prep = await prepareItemsForExecution({
           account,
           promotions: ordinary,
@@ -458,6 +507,14 @@ async function runStartupCacheRefresh() {
         }
       }
       refreshedAccounts += 1;
+      reportStartupRefreshProgress({
+        stage: 'started',
+        account: accountLabel,
+        account_index: accountIndex + 1,
+        account_total: accountTotal,
+        message: '店铺刷新完成',
+        percent: Math.min(99, basePercent + 8),
+      });
     } catch (error) {
       throw new Error(`账号 ${row.account_id} ${error?.message || error}`);
     }

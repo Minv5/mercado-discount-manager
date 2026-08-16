@@ -394,6 +394,7 @@ class MainWindow(QMainWindow):
         if status == "running":
             self.log("正在刷新数据变动的缓存，刷新完成前暂不能开始执行。")
             self._set_refresh_busy(True)
+            self._log_startup_refresh_progress(refresh)
             timer = getattr(self, "refresh_poll_timer", None)
             if timer is None:
                 timer = QTimer(self)
@@ -402,12 +403,27 @@ class MainWindow(QMainWindow):
                 self.refresh_poll_timer = timer
             timer.start()
 
+    def _log_startup_refresh_progress(self, refresh: object) -> None:
+        data = dict(refresh or {})
+        stage_label = str(data.get("stage_label") or "")
+        account = str(data.get("account") or "")
+        account_index = int(data.get("account_index") or 0)
+        account_total = int(data.get("account_total") or 0)
+        percent = int(data.get("percent") or 0)
+        if not stage_label:
+            return
+        position = f"{account_index}/{account_total}" if account_total else ""
+        store = f" {account}" if account else ""
+        percent_text = f"（{percent}%）" if percent > 0 else ""
+        self.log(f"[{stage_label}]{store} {position}{percent_text}")
+
     def _poll_startup_refresh(self) -> None:
         try:
             data = self.api.get("/api/startup-refresh/status")
             refresh = dict(data.get("refresh") or {})
             status = str(refresh.get("status") or "")
             if status == "running":
+                self._log_startup_refresh_progress(refresh)
                 return
             timer = getattr(self, "refresh_poll_timer", None)
             if timer is not None:
