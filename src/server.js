@@ -9321,11 +9321,17 @@ export async function prepareItemsForExecution({
     }
     operationReadCache?.set(operationKey, row);
     checkpoint?.();
+    // Skip inventory fallback when a verified composite cache already covers
+    // this activity: re-scanning the whole store on every prepare is exactly
+    // the "always full read" the cache is meant to avoid.
+    const fallbackAlreadyReady = cacheDecision.reason === 'verified_composite_cache'
+      && String(fallbackState?.detail_status || '').toLowerCase() === 'inventory_scan_fallback_ready';
     if (
       action === 'enroll'
       && itemStatus === 'candidate'
       && request.allowInventoryFallback !== false
       && isSellerCampaign(campaign)
+      && !fallbackAlreadyReady
       && !String(row.probe_reason || '').endsWith('_probe_failed')
       && (CANDIDATE_INCOMPLETE_STATUSES.has(row.detail_status)
           || row.detail_status === 'unreadable'
