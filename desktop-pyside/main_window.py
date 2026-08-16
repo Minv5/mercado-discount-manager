@@ -15,6 +15,7 @@ from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -209,6 +210,11 @@ class MainWindow(QMainWindow):
         self.settings_button.setFixedHeight(36)
         self.settings_button.clicked.connect(self._open_settings)
         layout.addWidget(self.settings_button)
+        self.auto_shutdown_check = QCheckBox("执行完自动关机")
+        self.auto_shutdown_check.setObjectName("muted")
+        self.auto_shutdown_check.setChecked(bool(self.settings.get("autoShutdownAfterExecution")))
+        self.auto_shutdown_check.stateChanged.connect(self._on_auto_shutdown_toggled)
+        layout.addWidget(self.auto_shutdown_check)
         self.nav_buttons[0].setChecked(True)
         return header
 
@@ -1602,6 +1608,16 @@ class MainWindow(QMainWindow):
             lambda: self.api.post(f"/api/execution/groups/{group_id}/cancel", {}),
             lambda _result: self.log("已请求停止执行任务，正在等待已开始的商品收口。"),
             lambda error: self.log("停止任务请求失败：" + product_error(error)),
+        )
+
+    def _on_auto_shutdown_toggled(self) -> None:
+        enabled = self.auto_shutdown_check.isChecked()
+        def save() -> dict[str, Any]:
+            return self.api.post("/api/settings", {"autoShutdownAfterExecution": enabled}).get("settings", {})
+        self._run_worker(
+            save,
+            lambda settings: self.log("已开启自动关机，执行完成后 60 秒关机。" if enabled else "已关闭自动关机。"),
+            lambda error: self.log("自动关机设置保存失败：" + product_error(error)),
         )
 
     def _open_settings(self) -> None:
