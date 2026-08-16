@@ -444,6 +444,8 @@ class SettingsDialog(QDialog):
         self.activity_callback_claim_url.setPlaceholderText("领取通知地址")
         self.activity_callback_ack_url = QLineEdit(str(self.settings.get("activityCallbackAckUrl") or "https://xingtupro1020.com/meli-callback/consumer/ack"))
         self.activity_callback_ack_url.setPlaceholderText("确认处理地址")
+        self.auto_shutdown = QCheckBox("活动执行完成后自动关机")
+        self.auto_shutdown.setChecked(bool(self.settings.get("autoShutdownAfterExecution")))
         form.addRow("美客多应用 Client ID", self.oauth_client_id)
         form.addRow("美客多应用 Client Secret", self.oauth_client_secret)
         form.addRow("OAuth 回调地址", self.oauth_redirect_uri)
@@ -453,6 +455,7 @@ class SettingsDialog(QDialog):
         form.addRow("回调共享密钥文件", self.activity_callback_secret_file)
         form.addRow("领取地址", self.activity_callback_claim_url)
         form.addRow("确认地址", self.activity_callback_ack_url)
+        form.addRow("自动关机", self.auto_shutdown)
         layout.addLayout(form)
         callback_note = QLabel("启用活动变化回调后，桌面程序会每 2 秒从领取地址拉取平台通知并自动处理（重新核对活动/商品缓存），处理成功后确认。Webhook 通知地址仅作记录，不用于接收。")
         callback_note.setObjectName("muted")
@@ -514,6 +517,7 @@ class SettingsDialog(QDialog):
             "activityCallbackSecretFile": self.activity_callback_secret_file.text().strip(),
             "activityCallbackClaimUrl": self.activity_callback_claim_url.text().strip(),
             "activityCallbackAckUrl": self.activity_callback_ack_url.text().strip(),
+            "autoShutdownAfterExecution": self.auto_shutdown.isChecked(),
         })
         return page
 
@@ -539,6 +543,7 @@ class SettingsDialog(QDialog):
             ("activityCallbackSecretFile", self.activity_callback_secret_file, str(settings.get("activityCallbackSecretFile") or "")),
             ("activityCallbackClaimUrl", self.activity_callback_claim_url, str(settings.get("activityCallbackClaimUrl") or "https://xingtupro1020.com/meli-callback/consumer/claim")),
             ("activityCallbackAckUrl", self.activity_callback_ack_url, str(settings.get("activityCallbackAckUrl") or "https://xingtupro1020.com/meli-callback/consumer/ack")),
+            ("autoShutdownAfterExecution", self.auto_shutdown, bool(settings.get("autoShutdownAfterExecution"))),
         )
         for key, field, value in fields:
             if isinstance(field, QCheckBox):
@@ -602,6 +607,7 @@ class SettingsDialog(QDialog):
             "activityCallbackSecretFile": self.activity_callback_secret_file.text().strip(),
             "activityCallbackClaimUrl": self.activity_callback_claim_url.text().strip(),
             "activityCallbackAckUrl": self.activity_callback_ack_url.text().strip(),
+            "autoShutdownAfterExecution": self.auto_shutdown.isChecked(),
             "storeAliases": aliases,
             "operatingSites": operating,
         }

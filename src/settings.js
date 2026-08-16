@@ -35,6 +35,7 @@ export const DEFAULT_SETTINGS = {
   activityCallbackSecretFile: '',
   activityCallbackClaimUrl: '',
   activityCallbackAckUrl: '',
+  autoShutdownAfterExecution: false,
   storeAliases: {},
   operatingSites: {},
   defaultFilters: {
@@ -133,6 +134,7 @@ export function normalizeSettings(input) {
     activityCallbackSecretFile: text(input.activityCallbackSecretFile).slice(0, 1000),
     activityCallbackClaimUrl: normalizeSecureUrl(input.activityCallbackClaimUrl),
     activityCallbackAckUrl: normalizeSecureUrl(input.activityCallbackAckUrl),
+    autoShutdownAfterExecution: /^(?:1|true|yes)$/i.test(String(input.autoShutdownAfterExecution ?? '')),
     oauthClientSecretConfigured: Boolean(String(input.oauthClientSecretCipher || '')),
     storeAliases: normalizeStoreAliases(input.storeAliases || {}),
     operatingSites: normalizeOperatingSites(input.operatingSites || {}),

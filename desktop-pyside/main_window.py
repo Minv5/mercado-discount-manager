@@ -112,6 +112,7 @@ class MainWindow(QMainWindow):
         self.prepare_progress_key = ""
         self.prepare_read_key = ""
         self.prepare_stage_seen = ""
+        self.refresh_progress_key = ""
         self.job_log_seen: dict[str, set[str]] = {}
         self.poll_failure_count = 0
         self.commit_recovery_poll_count = 0
@@ -415,6 +416,10 @@ class MainWindow(QMainWindow):
         position = f"{account_index}/{account_total}" if account_total else ""
         store = f" {account}" if account else ""
         percent_text = f"（{percent}%）" if percent > 0 else ""
+        key = f"{stage_label}|{account}|{account_index}|{account_total}|{percent}"
+        if key == self.refresh_progress_key:
+            return
+        self.refresh_progress_key = key
         self.log(f"[{stage_label}]{store} {position}{percent_text}")
 
     def _poll_startup_refresh(self) -> None:

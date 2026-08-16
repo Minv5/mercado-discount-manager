@@ -2,6 +2,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { HOST, PORT, DEFAULT_AUTH_DOMAIN, DATA_DIR } from './config.js';
 import { buildBatchConfirmationPackage, buildConfirmationPackage } from './confirmationPackage.js';
@@ -450,19 +451,20 @@ async function runStartupCacheRefresh() {
   const accounts = listAccountsForUi();
   const accountTotal = accounts.length;
   let refreshedAccounts = 0;
-  for (let accountIndex = 0; accountIndex < accounts.length; accountIndex += 1) {
-    const row = accounts[accountIndex];
+  const activeAccounts = new Set();
+
+  const refreshOneAccount = async (accountIndex, row) => {
     const accountLabel = storeIdentityForAccount(row.account_id, row, settings).store_name;
-    const basePercent = Math.floor((accountIndex / Math.max(1, accountTotal)) * 100);
+    activeAccounts.add(accountLabel);
     try {
       const account = await ensureUsableAccount(row.account_id);
       reportStartupRefreshProgress({
         stage: 'catalog',
-        account: accountLabel,
-        account_index: accountIndex + 1,
+        account: [...activeAccounts].join('、'),
+        account_index: refreshedAccounts + 1,
         account_total: accountTotal,
-        message: `正在刷新活动目录`,
-        percent: Math.min(99, basePercent + 2),
+        message: '正在刷新活动目录',
+        percent: Math.min(99, Math.floor((refreshedAccounts / Math.max(1, accountTotal)) * 100) + 2),
       });
       await refreshActivityCatalogForPrepare({
         account,
@@ -471,15 +473,18 @@ async function runStartupCacheRefresh() {
       });
       const promotions = listOperatingCampaignsFiltered(account.account_id, settings.defaultFilters || {}, settings);
       const ordinary = ordinaryPromotions(promotions);
-      if (!ordinary.length) continue;
+      if (!ordinary.length) {
+        activeAccounts.delete(accountLabel);
+        return;
+      }
       for (const itemStatus of ['candidate', 'started']) {
         reportStartupRefreshProgress({
           stage: itemStatus,
-          account: accountLabel,
-          account_index: accountIndex + 1,
+          account: [...activeAccounts].join('、'),
+          account_index: refreshedAccounts + 1,
           account_total: accountTotal,
           message: itemStatus === 'candidate' ? '正在刷新可报名商品' : '正在刷新已报名商品',
-          percent: Math.min(99, basePercent + (itemStatus === 'candidate' ? 4 : 6)),
+          percent: Math.min(99, Math.floor((refreshedAccounts / Math.max(1, accountTotal)) * 100) + (itemStatus === 'candidate' ? 4 : 6)),
         });
         const prep = await prepareItemsForExecution({
           account,
@@ -507,19 +512,33 @@ async function runStartupCacheRefresh() {
         }
       }
       refreshedAccounts += 1;
+      activeAccounts.delete(accountLabel);
       reportStartupRefreshProgress({
         stage: 'started',
-        account: accountLabel,
-        account_index: accountIndex + 1,
+        account: [...activeAccounts].join('、'),
+        account_index: refreshedAccounts,
         account_total: accountTotal,
         message: '店铺刷新完成',
-        percent: Math.min(99, basePercent + 8),
+        percent: Math.min(99, Math.floor((refreshedAccounts / Math.max(1, accountTotal)) * 100) + 8),
       });
     } catch (error) {
+      activeAccounts.delete(accountLabel);
       throw new Error(`账号 ${row.account_id} ${error?.message || error}`);
     }
-  }
+  };
+
+  // Accounts refresh concurrently (like prepare does), sharing the read
+  // scheduler. Progress reports aggregate across the concurrently-running
+  // accounts.
+  const results = await Promise.allSettled(
+    accounts.map((row, index) => refreshOneAccount(index, row)),
+  );
+  const failures = results.filter((result) => result.status === 'rejected');
   console.error(`[startup-refresh] 启动缓存刷新完成：账号 ${refreshedAccounts}/${accounts.length} 个。`);
+  if (failures.length > 0) {
+    const firstFailure = failures[0].reason;
+    throw new Error(`${failures.length} 个账号刷新失败：${firstFailure?.message || firstFailure}`);
+  }
 }
 
 async function initializeServerState() {
@@ -6129,6 +6148,26 @@ async function runExecutionGroup(groupId) {
   if (current.result.accounting_complete) publishHistorySummaryForExecutionGroup(current.id);
   const submission = submissionPersistence.findBySubmissionId(current.client_submission_id);
   if (submission) submissionPersistence.update(submission.id, { state: 'terminal', group_id: current.id, group: publicExecutionGroup(current) });
+  if (current.status === 'completed') maybeAutoShutdownAfterExecution();
+}
+
+function maybeAutoShutdownAfterExecution() {
+  try {
+    const settings = readSettings();
+    if (settings.autoShutdownAfterExecution !== true) return;
+    // Delay 60s so the desktop can show a final message and the user can abort
+    // if needed (shutdown /a).
+    const child = spawn('shutdown', ['/s', '/t', '60'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.on('error', (error) => {
+      try { console.error(`[auto-shutdown] 触发自动关机失败：${error?.message || error}`); } catch {}
+    });
+    try { console.error('[auto-shutdown] 活动执行完成，60 秒后自动关机（shutdown /a 可取消）。'); } catch {}
+  } catch (error) {
+    try { console.error(`[auto-shutdown] 自动关机设置读取失败：${error?.message || error}`); } catch {}
+  }
 }
 
 function failExecutionGroup(groupId, error) {
