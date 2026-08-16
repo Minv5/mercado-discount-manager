@@ -41,6 +41,12 @@ export function isActivityExpired(promotion = {}, now = new Date()) {
   return finish < shanghaiDate(now);
 }
 
+export function isActivityNotStarted(promotion = {}, now = new Date()) {
+  const start = String(promotion.start_date || promotion.startDate || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) return false;
+  return start > shanghaiDate(now);
+}
+
 export function activityCatalogDecision(state = null, now = new Date()) {
   if (!getActivityCallbackAvailability()) return { refresh: true, reason: 'callback_unavailable' };
   if (!state) return { refresh: true, reason: 'unverified' };
@@ -90,6 +96,7 @@ export function activityItemsDecision({
 } = {}) {
   const normalizedStatus = String(itemStatus || 'candidate').toLowerCase();
   if (isActivityExpired(promotion, now)) return { refresh: false, blocked: true, reason: 'expired' };
+  if (isActivityNotStarted(promotion, now)) return { refresh: false, blocked: true, reason: 'not_started' };
   if (!getActivityCallbackAvailability()) return { refresh: true, reason: 'callback_unavailable' };
   if (!cacheState) return { refresh: true, reason: 'unverified' };
   const attemptedToday = isSameShanghaiDay(fetchState?.updated_at, now);

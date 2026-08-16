@@ -14,6 +14,7 @@ import {
   candidateTotalProbeDecision,
   getActivityCallbackAvailability,
   isActivityExpired,
+  isActivityNotStarted,
   setActivityCallbackAvailability,
   inventoryTotalProbeDecision,
   itemIdentityDelta,
@@ -395,6 +396,26 @@ test('finish date expires locally after the Shanghai business day without a netw
   assert.equal(isActivityExpired({ finish_date: '2026-07-14' }, NOW), true);
   assert.equal(isActivityExpired({ finish_date: '2026-07-15' }, NOW), false);
   assert.equal(isActivityExpired({ finish_date: '2026-07-16' }, NOW), false);
+});
+
+test('start date in the future marks the activity not started without a network read', () => {
+  assert.equal(isActivityNotStarted({ start_date: '2026-07-16' }, NOW), true);
+  assert.equal(isActivityNotStarted({ start_date: '2026-07-15' }, NOW), false);
+  assert.equal(isActivityNotStarted({ start_date: '2026-07-14' }, NOW), false);
+  assert.equal(isActivityNotStarted({}, NOW), false);
+});
+
+test('not-started activities are blocked as not_started and never treated as a refresh failure', () => {
+  const promotion = { start_date: '2026-07-16', finish_date: '2026-08-01' };
+  const decision = activityItemsDecision({
+    promotion,
+    cacheState: { items_full_checked_at: new Date(NOW.getTime() - 60_000).toISOString(), dirty: 0, continuity: 'continuous' },
+    fetchState: { detail_status: 'ok', saved_count: 12, platform_total: 12, updated_at: new Date(NOW.getTime() - 60_000).toISOString() },
+    now: NOW,
+  });
+  assert.equal(decision.refresh, false);
+  assert.equal(decision.blocked, true);
+  assert.equal(decision.reason, 'not_started');
 });
 
 test('low frequency calibration schedules once at the next non-peak window', () => {
