@@ -1611,7 +1611,39 @@ export function cleanupRemovedCampaignItemData() {
       ],
     );
   }
-  return { cleaned_campaigns: campaigns.length, removed_item_rows: removedRows };
+  // Remove orphaned activity-level cache states: rows whose activity no longer
+  // exists in the catalog (deleted) or whose activity has already finished.
+  // Without this, stale dirty flags from removed/finished activities keep
+  // triggering "re-check changed activities" on every execution forever.
+  const orphaned = run(
+    `DELETE FROM activity_cache_states
+     WHERE promotion_id <> ''
+       AND NOT EXISTS (
+         SELECT 1 FROM promo_campaigns c
+         WHERE c.account_id = activity_cache_states.account_id
+           AND c.promotion_id = activity_cache_states.promotion_id
+           AND c.promotion_type = activity_cache_states.promotion_type
+       )`,
+  );
+  const finished = run(
+    `DELETE FROM activity_cache_states
+     WHERE promotion_id <> ''
+       AND EXISTS (
+         SELECT 1 FROM promo_campaigns c
+         WHERE c.account_id = activity_cache_states.account_id
+           AND c.promotion_id = activity_cache_states.promotion_id
+           AND c.promotion_type = activity_cache_states.promotion_type
+           AND c.finish_date IS NOT NULL
+           AND c.finish_date <> ''
+           AND substr(c.finish_date, 1, 10) < date('now')
+       )`,
+  );
+  return {
+    cleaned_campaigns: campaigns.length,
+    removed_item_rows: removedRows,
+    removed_orphaned_cache_states: Number(orphaned?.changes || 0),
+    removed_finished_cache_states: Number(finished?.changes || 0),
+  };
 }
 
 export function listItemRouteOwners(itemId) {
@@ -2216,7 +2248,10 @@ export function listTaskSummaries(limit = 300, options = {}) {
     .flatMap((summary) => (Array.isArray(summary.task_ids) ? summary.task_ids : [Number(summary.id || 0)]))
     .map(Number));
   const liveRows = fetchTaskSummaryRows(Math.max(requested, 50), readSettings())
-    .filter((row) => !materializedIds.has(Number(row.id)));
+    .filter((row) => !materializedIds.has(Number(row.id)))
+    // BATCH rows aggregate their per-activity children, which are also present
+    // in the same execution group. Summing both would double every count.
+    .filter((row) => !isBatchTaskRow(row));
   const groupMap = new Map();
   for (const row of liveRows) {
     const groupKey = String(row.execution_group_id || '');

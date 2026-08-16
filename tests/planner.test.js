@@ -5168,6 +5168,13 @@ test('history task summaries read the indexed materialized store for every limit
   assert.doesNotMatch(route, /history_task_summary_cache|buildLegacyTaskSummaries|promo_action_results/);
 });
 
+test('listTaskSummaries excludes BATCH rows so group totals never double count children', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'src', 'repository.js'), 'utf8');
+  const route = source.slice(source.indexOf('export function listTaskSummaries'), source.indexOf('export function buildLegacyHistoryBaseline'));
+  // BATCH rows aggregate per-activity children; the live group sum must skip them.
+  assert.match(route, /\.filter\(\(row\) => !isBatchTaskRow\(row\)\)/);
+});
+
 test('lightweight update summaries keep cross-store discounts and the latest completion time', () => {
   const rows = [
     { id: 1, account_id: 'A', promotion_id: 'C-A', promotion_type: 'SELLER_CAMPAIGN', action: 'update', mode: 'real', status: 'completed', discount_percent: 7, created_at: '2026-07-12T14:00:00Z', updated_at: '2026-07-12T14:00:10Z' },

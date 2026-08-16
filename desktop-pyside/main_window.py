@@ -111,6 +111,7 @@ class MainWindow(QMainWindow):
         self.prepare_poll_failure_count = 0
         self.prepare_progress_key = ""
         self.prepare_read_key = ""
+        self.prepare_stage_seen = ""
         self.job_log_seen: dict[str, set[str]] = {}
         self.poll_failure_count = 0
         self.commit_recovery_poll_count = 0
@@ -1130,6 +1131,7 @@ class MainWindow(QMainWindow):
         self.prepare_poll_timer.stop()
         self.preparing_submission = {}
         self.prepare_progress_key = ""
+        self.prepare_stage_seen = ""
         if state == "prepared":
             self.pending_prepare_payload = None
             self._set_prepare_busy(False)
@@ -1207,6 +1209,13 @@ class MainWindow(QMainWindow):
             current = ""
             percent = 0
             scheduler_text = ""
+        # Stage anchor: emit an explicit "stage started" line once per stage so
+        # the progress is anchored (0% -> stage transitions) instead of jumping
+        # straight to a mid-stage percent.
+        if stage_label and stage != self.prepare_stage_seen:
+            self.prepare_stage_seen = stage
+            self.prepare_progress_key = ""
+            self.log(f"[{stage_label}] 开始。")
         key = f"{stage}|{message}|{current}|{percent}|{scheduler_text}"
         if key == self.prepare_progress_key:
             return
@@ -1768,6 +1777,7 @@ class MainWindow(QMainWindow):
             self.pending_prepare_payload = None
             self.prepare_progress_key = ""
             self.prepare_read_key = ""
+            self.prepare_stage_seen = ""
             self._set_prepare_busy(False)
             self.log("已停止准备，未创建执行组、未提交商品。")
 
@@ -2066,9 +2076,10 @@ def execution_result_text(result: dict[str, Any], action: str) -> str:
             f"成功取消 {count_or_marker(verified_removed, '旧记录未区分')}，"
             f"取消请求已提交，待平台回查确认 {count_or_marker(pending, '旧记录未区分')}"
         )
+        # skipped for cancel duplicates pending_verification; do not repeat it.
         return (
             f"{common}，{cancellation}，商品失败 {failed}，"
-            f"活动失败 {count_or_marker(activity_failures)}，跳过 {skipped}"
+            f"活动失败 {count_or_marker(activity_failures)}"
         )
     success = int(result.get("success") or result.get("success_count") or 0)
     platform_pending = optional_contract_count(result, "platform_pending_count")
@@ -2222,17 +2233,23 @@ def business_task_text(task: dict[str, Any], reserved_count: int | None = None) 
     unique_items = optional_contract_count(task, "unique_item_count")
     relations = optional_contract_count(task, "relation_count")
     activity_failures = optional_contract_count(task, "activity_failure_count")
-    seller_text = task.get("seller_activity_text") or (f"{task.get('seller_discount_percent')}%" if task.get("seller_discount_percent") else "-")
-    official_text = task.get("official_activity_text") or (f"{task.get('official_discount_percent')}%" if task.get("official_discount_percent") else "-")
+    action = str(task.get("action") or "").lower()
     lines = [
         f"时间：{short_date(str(task.get('created_at') or ''))}\n"
-        f"动作：{action_label(str(task.get('action') or ''))}\n"
-        f"自建折扣：{seller_text}\n"
-        f"官方折扣：{official_text}",
+        f"动作：{action_label(str(task.get('action') or ''))}",
+    ]
+    # Discounts only apply to enroll/update. Cancel shows no discount: the
+    # persisted seller/official_discount_percent is the enroll/update value and
+    # would mislead a cancel summary.
+    if action != "cancel":
+        seller_text = task.get("seller_activity_text") or (f"{task.get('seller_discount_percent')}%" if task.get("seller_discount_percent") else "-")
+        official_text = task.get("official_activity_text") or (f"{task.get('official_discount_percent')}%" if task.get("official_discount_percent") else "-")
+        lines.append(f"自建折扣：{seller_text}\n官方折扣：{official_text}")
+    lines.extend([
         f"涉及商品：{count_or_marker(unique_items, '旧记录未区分')} 件（按商品编号去重）",
         f"需处理项：{count_or_marker(relations, '旧记录未区分')} 项（商品×活动）",
-    ]
-    if str(task.get("action") or "").lower() == "cancel":
+    ])
+    if action == "cancel":
         lines.extend([
             f"取消请求成功：{count_or_marker(optional_contract_count(task, 'request_success_count'), '旧记录未区分')}",
             f"成功取消：{count_or_marker(optional_contract_count(task, 'live_verified_removed_count'), '旧记录未区分')}",
@@ -2243,7 +2260,7 @@ def business_task_text(task: dict[str, Any], reserved_count: int | None = None) 
         success_label = {
             "enroll": "报名成功",
             "update": "更新成功",
-        }.get(str(task.get("action") or "").lower(), "成功")
+        }.get(action, "成功")
         if reserved_count is None:
             lines.append(f"{success_label}：{success}")
         else:
@@ -2257,10 +2274,14 @@ def business_task_text(task: dict[str, Any], reserved_count: int | None = None) 
     category_text = failure_category_text(task.get("failure_reasons"), failed)
     if category_text:
         failed_line += f"（{category_text}）"
+    # For cancel, "skipped" rows are actually pending platform verification
+    # (same set as pending_verification_count); label them accordingly instead
+    # of showing a duplicate "skipped" number.
+    skip_label = "待平台回查" if action == "cancel" else "跳过"
     lines.extend([
         failed_line,
         f"活动失败：{count_or_marker(activity_failures, '旧记录未区分')}",
-        f"跳过：{skipped}",
+        f"{skip_label}：{skipped}",
         f"失败原因：{task.get('failure_reason') or task.get('short_failure_reason') or '-'}",
     ])
     return "\n".join(lines)

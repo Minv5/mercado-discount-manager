@@ -4550,7 +4550,11 @@ function publicExecutionSubmission(prepare = {}) {
     local_work_concurrency: Number(schedulerProgress.local_work_concurrency || 1),
     local_db_batch_queries: Number(schedulerProgress.local_db_batch_queries || 0),
     per_account: Object.entries(schedulerProgress.per_account || {}).map(([accountId, inflight]) => ({
-      store_name: String(prepare.storeNames?.[accountId] || '店铺'),
+      store_name: String(
+        prepare.storeNames?.[accountId]
+        || prepare.group_request?.storeNames?.[accountId]
+        || '店铺',
+      ),
       inflight: Math.max(0, Number(inflight || 0)),
     })).filter((row) => row.inflight > 0),
   } : null;
