@@ -346,7 +346,7 @@ test('successful writes are classified before any bounded semantic retry', () =>
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
   assert.match(serverSource, /retry_category:\s*'pending_verification'/);
   assert.match(serverSource, /recoverPendingVerificationRecords\(/);
-  assert.match(serverSource, /pendingVerificationRecords[\s\S]*?waitForAppliedWriteRows/);
+  assert.match(serverSource, /pendingVerificationRecords[\s\S]*?confirmAppliedWrites/);
   assert.match(serverSource, /status:\s*'candidate'/);
   assert.match(serverSource, /status:\s*'pending'/);
   assert.match(serverSource, /platform_pending/);
@@ -358,6 +358,26 @@ test('successful writes are classified before any bounded semantic retry', () =>
     .split('function finalizeExecutionJob')[0];
   assert.doesNotMatch(recoveryBody, /executeOnePlannedWithTokenRefresh|client\.enrollItem|client\.updateItem|client\.cancelItem/);
   assert.match(recoveryBody, /repeated_write_requests:\s*0/);
+});
+
+test('write confirmation has a complete-read hard gate and never guesses a verdict from partial reads', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  // The unified confirmAppliedWrites entry point exists and gates on complete reads.
+  assert.match(serverSource, /async function confirmAppliedWrites/);
+  assert.match(serverSource, /const completeRead = Boolean\(startedComplete && candidateComplete && pendingComplete\)/);
+  // Incomplete reads return read_incomplete rows and clear every verdict category.
+  assert.match(serverSource, /verdict: 'read_incomplete'/);
+  assert.match(serverSource, /read_incomplete: rows \|\| \[\]/);
+  assert.match(serverSource, /verified: \[\],\s*started_price_mismatch: \[\],\s*confirmed_pending: \[\],\s*confirmed_candidate: \[\],\s*unresolved: \[\]/);
+  // All three call sites go through the unified entry point.
+  const confirmCalls = (serverSource.match(/confirmAppliedWrites\(\{/g) || []).length;
+  assert.ok(confirmCalls >= 3, `expected >=3 confirmAppliedWrites call sites, got ${confirmCalls}`);
+  // read_incomplete rows are enqueued as pending, never failed.
+  assert.match(serverSource, /retry_category: 'read_incomplete'/);
+  assert.match(serverSource, /平台回读不完整[\s\S]*?不会重复写入/);
+  // The sync read-back no longer has a 200-row skip.
+  assert.doesNotMatch(serverSource, /smallEnoughToReadBack/);
+  assert.doesNotMatch(serverSource, /write_response_trusted/);
 });
 
 test('pending recovery closes empty queues idempotently and preserves terminalized accounting', () => {
