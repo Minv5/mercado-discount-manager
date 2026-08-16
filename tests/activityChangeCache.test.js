@@ -44,14 +44,14 @@ test('callback unavailability forces direct platform sync for catalog and items'
   assert.equal(activityCatalogDecision(fresh, NOW).refresh, false);
 });
 
-test('activity catalog uses webhook change signals only: clean cache is reused without daily calibration', () => {
+test('activity catalog uses webhook change signals only: clean cache is reused without any time-based refresh', () => {
   const fresh = { catalog_checked_at: new Date(NOW.getTime() - 60_000).toISOString(), dirty: 0, continuity: 'continuous' };
   assert.equal(activityCatalogDecision(fresh, NOW).refresh, false);
   assert.equal(activityCatalogDecision(fresh, NOW).reason, 'verified_cache');
   assert.equal(activityCatalogDecision({ ...fresh, dirty: 1 }, NOW).reason, 'dirty');
   assert.equal(activityCatalogDecision({ ...fresh, continuity: 'gap' }, NOW).reason, 'event_gap');
-  assert.equal(activityCatalogDecision({ ...fresh, catalog_checked_at: '2026-07-14T06:00:00.000Z' }, NOW).reason, 'catalog_ttl_due');
-  assert.equal(activityCatalogDecision({ ...fresh, catalog_checked_at: new Date(NOW.getTime() - ACTIVITY_CATALOG_TTL_MS + 60_000).toISOString() }, NOW).reason, 'verified_cache');
+  // No time-based forced refresh: even a very old clean cache stays trusted.
+  assert.equal(activityCatalogDecision({ ...fresh, catalog_checked_at: '2026-07-14T06:00:00.000Z' }, NOW).reason, 'verified_cache');
   assert.deepEqual(activityCatalogDecision({
     ...fresh,
     dirty: 1,
@@ -100,7 +100,7 @@ test('catalog route plan blocks a failed route for the rest of the Shanghai day'
   assert.equal(plan.reasons['A|C1|MLM'], 'same_day_failed');
 });
 
-test('activity items reuse verified full cache for three days and never reuse dirty gap error or partial cache', () => {
+test('activity items reuse verified cache indefinitely and only refresh on dirty gap error or non-sparse partial', () => {
   const promotion = { finish_date: '2026-07-31' };
   const cacheState = { items_full_checked_at: new Date(NOW.getTime() - ACTIVITY_ITEMS_TTL_MS + 1_000).toISOString(), dirty: 0, continuity: 'continuous' };
   const fetchState = { detail_status: 'ok', saved_count: 12, platform_total: 12, updated_at: cacheState.items_full_checked_at };
@@ -114,7 +114,8 @@ test('activity items reuse verified full cache for three days and never reuse di
   assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, continuity: 'gap' }, fetchState, now: NOW }).reason, 'event_gap');
   assert.equal(activityItemsDecision({ promotion, cacheState, fetchState: { ...fetchState, detail_status: 'error' }, now: NOW }).reason, 'unreadable');
   assert.equal(activityItemsDecision({ promotion, cacheState, fetchState: { ...fetchState, detail_status: 'partial' }, now: NOW }).reason, 'not_full');
-  assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, items_full_checked_at: new Date(NOW.getTime() - ACTIVITY_ITEMS_TTL_MS - 1).toISOString() }, fetchState, now: NOW }).reason, 'items_ttl_due');
+  // No time-based forced refresh: even a full cache far older than the old TTL stays trusted.
+  assert.equal(activityItemsDecision({ promotion, cacheState: { ...cacheState, items_full_checked_at: new Date(NOW.getTime() - ACTIVITY_ITEMS_TTL_MS - 1).toISOString() }, fetchState, now: NOW }).reason, 'verified_cache');
 });
 
 test('same-day failed or incomplete item reads do not repeat unless a newer event marks the activity dirty', () => {
@@ -142,7 +143,7 @@ test('same-day failed or incomplete item reads do not repeat unless a newer even
   assert.equal(newerEvent.reason, 'dirty');
 });
 
-test('partial candidate plus fresh inventory fallback is a reusable complete verification state', () => {
+test('partial candidate plus inventory fallback is a reusable complete verification state', () => {
   const checkedAt = new Date(NOW.getTime() - 60_000).toISOString();
   const decision = activityItemsDecision({
     promotion: { finish_date: '2026-07-31' },
@@ -155,6 +156,7 @@ test('partial candidate plus fresh inventory fallback is a reusable complete ver
   assert.equal(decision.reason, 'verified_composite_cache');
   assert.equal(decision.effective_state, 'candidate_plus_inventory_fallback');
 
+  // Even an old fallback stays a reusable composite state; no time-based refresh.
   const staleFallback = activityItemsDecision({
     promotion: { finish_date: '2026-07-31' },
     cacheState: { items_full_checked_at: checkedAt, dirty: 0, continuity: 'continuous' },
@@ -163,11 +165,11 @@ test('partial candidate plus fresh inventory fallback is a reusable complete ver
     now: NOW,
   });
   assert.equal(staleFallback.refresh, false);
-  assert.equal(staleFallback.blocked, true);
-  assert.equal(staleFallback.reason, 'same_day_incomplete');
+  assert.equal(staleFallback.reason, 'verified_composite_cache');
+  assert.equal(staleFallback.effective_state, 'candidate_plus_inventory_fallback');
 });
 
-test('audited sparse candidate responses use a bounded low-frequency window instead of refreshing every prepare', () => {
+test('audited sparse candidate responses reuse the partial cache indefinitely, never refreshing by time', () => {
   const checkedAt = new Date(NOW.getTime() - ACTIVITY_PARTIAL_ITEMS_TTL_MS + 1).toISOString();
   const reusable = activityItemsDecision({
     promotion: { finish_date: '2026-07-31' },
@@ -182,9 +184,11 @@ test('audited sparse candidate responses use a bounded low-frequency window inst
   });
   assert.deepEqual(reusable, {
     refresh: false,
-    reason: 'verified_sparse_window',
+    reason: 'verified_sparse_cache',
     effective_state: 'partial_api_sparse_marketplace_candidate',
   });
+  // Even far past the old 24h window, the sparse partial result is still the
+  // complete cache and is trusted (no time-based refresh).
   const stale = activityItemsDecision({
     promotion: { finish_date: '2026-07-31' },
     cacheState: { dirty: 0, continuity: 'continuous' },
@@ -196,8 +200,8 @@ test('audited sparse candidate responses use a bounded low-frequency window inst
     },
     now: NOW,
   });
-  assert.equal(stale.refresh, true);
-  assert.equal(stale.reason, 'not_full');
+  assert.equal(stale.refresh, false);
+  assert.equal(stale.reason, 'verified_sparse_cache');
 });
 
 test('started activities never reuse sparse candidate window', () => {

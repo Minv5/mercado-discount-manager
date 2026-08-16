@@ -55,11 +55,10 @@ export function activityCatalogDecision(state = null, now = new Date()) {
   }
   if (Number(state.dirty || 0) === 1) return { refresh: true, reason: 'dirty' };
   if (String(state.continuity || 'continuous') !== 'continuous') return { refresh: true, reason: 'event_gap' };
-  // Conservative TTL fallback: a clean cache with no events for a long time
-  // may be silently stale (missed/dropped webhook). Refresh once per TTL even
-  // when no change signal arrived, so the event-driven path stays fast without
-  // trusting the catalog indefinitely.
-  if (isStale(state.catalog_checked_at, ACTIVITY_CATALOG_TTL_MS, now)) return { refresh: true, reason: 'catalog_ttl_due' };
+  // Cache is trusted until an anomaly signal (dirty / event gap / callback
+  // unavailable / read failure) says otherwise. There is no time-based forced
+  // refresh: webhook-driven single-item corrections keep it in sync, and a
+  // full re-read only happens when the cache is provably untrustworthy.
   return { refresh: false, reason: 'verified_cache' };
 }
 
@@ -106,8 +105,7 @@ export function activityItemsDecision({
     return { refresh: false, blocked: true, reason: 'same_day_failed' };
   }
   if (attemptedToday && !cacheChangedAfterAttempt) {
-    if (isCompositeCandidateState(fetchState, fallbackState)
-        && isFresh(fallbackState.updated_at, ACTIVITY_ITEMS_TTL_MS, now)) {
+    if (isCompositeCandidateState(fetchState, fallbackState)) {
       return { refresh: false, reason: 'verified_composite_cache', effective_state: 'candidate_plus_inventory_fallback' };
     }
     if (normalizedStatus === 'candidate' && detailStatus === 'partial_api_sparse_marketplace_candidate') {
@@ -125,20 +123,19 @@ export function activityItemsDecision({
   if (String(cacheState.continuity || 'continuous') !== 'continuous') return { refresh: true, reason: 'event_gap' };
   if (!fetchState || String(fetchState.detail_status || '').toLowerCase() === 'error') return { refresh: true, reason: 'unreadable' };
   if (!isFullFetchState(fetchState)) {
-    if (isCompositeCandidateState(fetchState, fallbackState)
-        && isFresh(fetchState.updated_at, ACTIVITY_ITEMS_TTL_MS, now)
-        && isFresh(fallbackState.updated_at, ACTIVITY_ITEMS_TTL_MS, now)
-        && isFresh(cacheState.items_full_checked_at, ACTIVITY_ITEMS_TTL_MS, now)) {
+    if (isCompositeCandidateState(fetchState, fallbackState)) {
       return { refresh: false, reason: 'verified_composite_cache', effective_state: 'candidate_plus_inventory_fallback' };
     }
     if (
       normalizedStatus === 'candidate'
       && String(fetchState.detail_status || '').toLowerCase() === 'partial_api_sparse_marketplace_candidate'
-      && isFresh(fetchState.updated_at, ACTIVITY_PARTIAL_ITEMS_TTL_MS, now)
     ) {
+      // Sparse marketplace candidates are how the platform returns these
+      // activities; the partial result IS the complete cache. Trust it until
+      // an anomaly (dirty / gap / callback) says otherwise, never time-based.
       return {
         refresh: false,
-        reason: 'verified_sparse_window',
+        reason: 'verified_sparse_cache',
         effective_state: 'partial_api_sparse_marketplace_candidate',
       };
     }
@@ -150,12 +147,8 @@ export function activityItemsDecision({
   if (isSameShanghaiDay(cacheState.items_full_checked_at, now)) {
     return { refresh: false, reason: 'same_day_cache' };
   }
-  // Conservative TTL fallback mirroring the catalog: full item cache older
-  // than ACTIVITY_ITEMS_TTL_MS is refreshed even without a change signal, so
-  // missed events cannot keep a stale item list in use indefinitely.
-  if (isStale(cacheState.items_full_checked_at, ACTIVITY_ITEMS_TTL_MS, now)) {
-    return { refresh: true, reason: 'items_ttl_due' };
-  }
+  // Cache is trusted until an anomaly signal says otherwise; no time-based
+  // forced refresh (see activityCatalogDecision).
   return { refresh: false, reason: 'verified_cache' };
 }
 
@@ -367,20 +360,6 @@ export function nextNonPeakCalibrationAt(now = new Date(), hour = 2, minute = 30
   target.setHours(hour, minute, 0, 0);
   if (target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
   return target;
-}
-
-function isFresh(value, ttlMs, now) {
-  const timestamp = Date.parse(String(value || ''));
-  return Number.isFinite(timestamp) && now.getTime() - timestamp >= 0 && now.getTime() - timestamp < ttlMs;
-}
-
-function isStale(value, ttlMs, now) {
-  // Stale means "older than the TTL window". Missing timestamps are NOT
-  // considered stale here: the caller's earlier checks (unverified / dirty /
-  // gap) already decide those cases, and treating a missing timestamp as
-  // stale would force refreshes for rows that never recorded a check time.
-  const timestamp = Date.parse(String(value || ''));
-  return Number.isFinite(timestamp) && now.getTime() - timestamp >= ttlMs;
 }
 
 function isFullFetchState(state = {}) {
