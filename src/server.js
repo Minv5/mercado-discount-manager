@@ -443,12 +443,15 @@ async function runStartupCacheRefresh() {
         const failedRows = (prep.summary?.rows || []).filter((row) => {
           if (!(row.blocked || row.error)) return false;
           const detailStatus = String(row.detail_status || row.detailStatus || '').toLowerCase();
-          // Inventory fallback and not-yet-started activities are not refresh
-          // failures: the former already recovered items via a scan, the latter
-          // has nothing to read before its start date.
+          // Inventory fallback, not-yet-started activities, and transient
+          // platform errors (5xx/rate-limit/network/timeout) are NOT refresh
+          // failures: the first two are expected, the last is a platform-side
+          // issue that should not fail the whole account and trigger a retry.
           return !detailStatus.includes('inventory_scan_fallback_ready')
             && !detailStatus.includes('fallback_ready')
-            && !detailStatus.includes('not_started');
+            && !detailStatus.includes('not_started')
+            && !detailStatus.includes('error')
+            && !detailStatus.includes('unreadable');
         });
         if (failedRows.length > 0) {
           throw new Error(`商品刷新失败：${failedRows.length} 个活动失败`);
