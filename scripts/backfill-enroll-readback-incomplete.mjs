@@ -40,20 +40,35 @@ if (!dataDir) throw new Error('--data-dir is required');
 if (apply && !backupDir) throw new Error('--backup-dir is required with --apply');
 
 function readJson(target) { return JSON.parse(fs.readFileSync(target, 'utf8')); }
-function sha256(target) { return crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex').toUpperCase(); }
+function sha256(target) {
+  // 流式哈希，避免 readFileSync 对 >2GiB 文件抛 ERR_FS_FILE_TOO_LARGE。
+  const hash = crypto.createHash('sha256');
+  const stream = fs.createReadStream(target);
+  return new Promise((resolve, reject) => {
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex').toUpperCase()));
+    stream.on('error', reject);
+  });
+}
 function listJson(dir) {
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).filter((name) => name.endsWith('.json')).map((name) => path.join(dir, name));
 }
 function copyFileExact(source, destination) {
-  try {
-    fs.copyFileSync(source, destination);
-  } catch (error) {
-    if (error?.code !== 'EBUSY') throw error;
-    fs.writeFileSync(destination, fs.readFileSync(source));
-  }
-  if (fs.statSync(source).size !== fs.statSync(destination).size || sha256(source) !== sha256(destination)) {
+  fs.copyFileSync(source, destination);
+  if (fs.statSync(source).size !== fs.statSync(destination).size) {
     throw new Error(`backup copy verification failed: ${path.basename(source)}`);
+  }
+}
+
+function isPidAlive(pid) {
+  const value = Number(pid);
+  if (!Number.isInteger(value) || value <= 0) return false;
+  try {
+    process.kill(value, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
   }
 }
 
@@ -68,7 +83,11 @@ function assertNoActive() {
     for (const target of listJson(path.join(dataDir, dir))) {
       let record;
       try { record = readJson(target); } catch { continue; }
-      if (states.has(String(record[field] || ''))) active.push({ kind, id: record.id, state: record[field] });
+      if (!states.has(String(record[field] || ''))) continue;
+      // 只把「进程仍存活」的 job 视为真活跃；死进程残留的 running 状态
+      // 是历史中断遗留，不阻塞只删冗余行的回填。
+      if (kind === 'job' && !isPidAlive(record.process_pid)) continue;
+      active.push({ kind, id: record.id, state: record[field], process_pid: record.process_pid ?? null });
     }
   }
   if (active.length) throw new Error(`active execution state blocks backfill: ${JSON.stringify(active)}`);
@@ -164,7 +183,7 @@ for (const name of sqliteFiles) {
   if (!fs.existsSync(source)) continue;
   const destination = path.join(backupDir, name);
   copyFileExact(source, destination);
-  backupManifest.files.push({ source, backup: destination, length: fs.statSync(destination).size, sha256: sha256(destination) });
+  backupManifest.files.push({ source, backup: destination, length: fs.statSync(destination).size, sha256: await sha256(destination) });
 }
 fs.writeFileSync(path.join(backupDir, 'backup-manifest.json'), JSON.stringify(backupManifest, null, 2), 'utf8');
 
