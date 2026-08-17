@@ -6148,7 +6148,9 @@ async function runExecutionGroup(groupId) {
   if (current.result.accounting_complete) publishHistorySummaryForExecutionGroup(current.id);
   const submission = submissionPersistence.findBySubmissionId(current.client_submission_id);
   if (submission) submissionPersistence.update(submission.id, { state: 'terminal', group_id: current.id, group: publicExecutionGroup(current) });
-  if (current.status === 'completed') maybeAutoShutdownAfterExecution();
+  // Auto-shutdown once execution reaches a terminal state, regardless of
+  // success/failure — only user-cancelled or interrupted runs are excluded.
+  if (current.status !== 'cancelled' && current.status !== 'interrupted') maybeAutoShutdownAfterExecution();
 }
 
 function maybeAutoShutdownAfterExecution() {
@@ -8464,9 +8466,10 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       const platformPendingRows = verification.confirmed_pending || [];
       const candidateRows = verification.confirmed_candidate || [];
       const unresolvedRows = verification.unresolved || [];
-      // Incomplete platform read: these rows are NOT settled (no verdict), they
-      // go straight to the pending queue for read-only confirmation.
-      const readIncompleteRows = verification.read_incomplete || [];
+      // Incomplete platform read is NOT a downgrade signal for enroll/update:
+      // the write request already succeeded, so those rows keep their `success`
+      // status. Only the 30s second confirmation round may reclassify a genuine
+      // non-activation as failed (on a COMPLETE read).
       applySuccessfulPromotionItemWrites({
         accountId: account.account_id,
         childUserId: promotion.child_user_id,
@@ -8519,7 +8522,6 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
       for (const [category, rows] of [
         ['confirmed_candidate_after_write', candidateRows],
         ['pending_verification', unresolvedRows],
-        ['read_incomplete', readIncompleteRows],
       ]) {
         for (const row of rows) {
         const relationKey = pendingRelationKey({
@@ -8542,9 +8544,7 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
           dealPrice: row.deal_price,
           errorCn: category === 'confirmed_candidate_after_write'
             ? '写入请求已成功，但平台仍明确返回可报名；将在原确认范围内有限重试'
-            : category === 'read_incomplete'
-              ? '写入请求已成功，但平台回读不完整，未判定生效状态；继续只读确认且不会盲目重写'
-              : verification.read_error || '写入请求已成功，但平台未返回已报名或可报名状态；继续只读确认且不会盲目重写',
+            : verification.read_error || '写入请求已成功，但平台未返回已报名或可报名状态；继续只读确认且不会盲目重写',
         });
         pendingWriteQueue.enqueue(request?.executionJobId, {
           relation_key: relationKey,
@@ -8561,19 +8561,21 @@ async function executeBatchPlans({ account, action, itemStatus, batch, request, 
           retry_category: category,
           error_cn: category === 'confirmed_candidate_after_write'
             ? '平台仍明确返回可报名，等待有限重试'
-            : category === 'read_incomplete'
-              ? '平台回读不完整，等待只读确认；不会重复写入'
-              : verification.read_error || '写入请求已成功，等待平台实时状态只读确认',
+            : verification.read_error || '写入请求已成功，等待平台实时状态只读确认',
         });
         }
       }
-      const nonVerifiedCount = mismatchRows.length + platformPendingRows.length + candidateRows.length + unresolvedRows.length + readIncompleteRows.length;
+      // Read-incomplete rows stay success (write already succeeded). They are NOT
+      // subtracted from success, NOT re-saved as pending, and NOT enqueued for
+      // rewrite. The 30s second round below re-reads them and only a COMPLETE read
+      // that proves non-activation may reclassify them as failed.
+      const nonVerifiedCount = mismatchRows.length + platformPendingRows.length + candidateRows.length + unresolvedRows.length;
       execution.counts.success = Math.max(0, Number(execution.counts.success || 0) - nonVerifiedCount);
       execution.counts.failed = Number(execution.counts.failed || 0) + mismatchRows.length;
-      execution.counts.pending = Number(execution.counts.pending || 0) + platformPendingRows.length + candidateRows.length + unresolvedRows.length + readIncompleteRows.length;
-      execution.counts.pending_verification_count = unresolvedRows.length + readIncompleteRows.length;
+      execution.counts.pending = Number(execution.counts.pending || 0) + platformPendingRows.length + candidateRows.length + unresolvedRows.length;
+      execution.counts.pending_verification_count = unresolvedRows.length;
       execution.counts.platform_pending_count = platformPendingRows.length;
-      execution.counts.retryable_pending_count = candidateRows.length + unresolvedRows.length + readIncompleteRows.length;
+      execution.counts.retryable_pending_count = candidateRows.length + unresolvedRows.length;
     }
     if (Number(execution?.counts?.success || 0) > 0 || Number(execution?.counts?.request_success_count || 0) > 0) {
       reconcilePromotionItemFetchCounts({
