@@ -72,11 +72,39 @@ test('empty OAuth settings retain standalone compatibility without exposing a se
     console.log(JSON.stringify({ settings: readSettings(), effective }));
   `);
   assert.equal(payload.settings.oauthClientSecretConfigured, false);
-  assert.equal(payload.settings.webhookCallbackUrl, '');
+  assert.equal(payload.settings.webhookCallbackUrl, 'https://webhook.xingtupro1020.com/webhook/mercado-libre/');
+  assert.equal(payload.settings.activityCallbackClaimUrl, 'https://webhook.xingtupro1020.com/meli-callback/consumer/claim');
+  assert.equal(payload.settings.activityCallbackAckUrl, 'https://webhook.xingtupro1020.com/meli-callback/consumer/ack');
   assert.equal(payload.effective.client_id, 'legacy-id');
   assert.equal(payload.effective.client_secret, 'legacy-secret');
   assert.equal(payload.effective.redirect_uri, 'https://legacy.test/callback');
   assert.equal(payload.effective.config_source, 'standalone-auth-dir');
+});
+
+test('legacy callback endpoints migrate to the dedicated webhook subdomain while custom endpoints remain', () => {
+  const { payload } = runIsolated(`
+    import fs from 'node:fs';
+    import { readSettings, saveSettings } from './src/settings.js';
+    fs.mkdirSync(process.env.MDM_DATA_DIR, { recursive: true });
+    fs.writeFileSync(process.env.MDM_DATA_DIR + '/settings.json', JSON.stringify({
+      webhookCallbackUrl: 'https://xingtupro1020.com/webhook/mercado-libre/',
+      activityCallbackClaimUrl: 'https://xingtupro1020.com/meli-callback/consumer/claim',
+      activityCallbackAckUrl: 'https://xingtupro1020.com/meli-callback/consumer/ack',
+    }));
+    const migrated = readSettings();
+    const custom = saveSettings({
+      webhookCallbackUrl: 'https://callback.example.test/webhook',
+      activityCallbackClaimUrl: 'https://callback.example.test/claim',
+      activityCallbackAckUrl: 'https://callback.example.test/ack',
+    });
+    console.log(JSON.stringify({ migrated, custom }));
+  `);
+  assert.equal(payload.migrated.webhookCallbackUrl, 'https://webhook.xingtupro1020.com/webhook/mercado-libre/');
+  assert.equal(payload.migrated.activityCallbackClaimUrl, 'https://webhook.xingtupro1020.com/meli-callback/consumer/claim');
+  assert.equal(payload.migrated.activityCallbackAckUrl, 'https://webhook.xingtupro1020.com/meli-callback/consumer/ack');
+  assert.equal(payload.custom.webhookCallbackUrl, 'https://callback.example.test/webhook');
+  assert.equal(payload.custom.activityCallbackClaimUrl, 'https://callback.example.test/claim');
+  assert.equal(payload.custom.activityCallbackAckUrl, 'https://callback.example.test/ack');
 });
 
 test('legacy 42 and 24 scheduler defaults migrate to the real tested ceilings', () => {

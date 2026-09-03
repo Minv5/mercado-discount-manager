@@ -4,12 +4,37 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QObject, QRunnable, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, Qt, Signal, Slot
+
+
+class GuiDispatcher(QObject):
+    """Queue arbitrary callbacks onto the GUI thread.
+
+    ``QRunnable`` result signals may be emitted from a pool thread.  A plain
+    Python lambda does not provide a reliable Qt receiver context, so every
+    callback that can touch widgets is routed through this QObject with an
+    explicit queued connection.
+    """
+
+    _invoke = Signal(object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._invoke.connect(self._run, Qt.ConnectionType.QueuedConnection)
+
+    @Slot(object)
+    def _run(self, callback: object) -> None:
+        if callable(callback):
+            callback()
+
+    def dispatch(self, callback: object) -> None:
+        self._invoke.emit(callback)
 
 
 class WorkerSignals(QObject):
     result = Signal(object)
     error = Signal(object)
+    progress = Signal(object)
     finished = Signal()
 
 
@@ -33,3 +58,6 @@ class Worker(QRunnable):
             self.signals.result.emit(result)
         finally:
             self.signals.finished.emit()
+
+    def report_progress(self, value: object) -> None:
+        self.signals.progress.emit(value)

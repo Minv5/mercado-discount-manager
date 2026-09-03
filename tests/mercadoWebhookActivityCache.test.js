@@ -165,6 +165,34 @@ test('consumer performs one read-only resource GET and marks only the resolved c
   assert.equal(invalidated.length, 0);
 });
 
+test('configured webhook applies only the changed activity detail and leaves the route clean', async () => {
+  const applied = [];
+  const marked = [];
+  const consumer = createActivityWebhookConsumer({
+    listMarketplaceSites: () => ROUTES,
+    listAccounts: () => [],
+    createResourceClient: async () => ({
+      getNotificationResource: async () => ({ item_id: 'MLM123', promotion_id: 'P-MLM9', type: 'DEAL' }),
+      getPromotionDetail: async (input) => ({
+        id: input.promotionId,
+        type: input.promotionType,
+        name: '9.9',
+        status: 'started',
+      }),
+    }),
+    markDirty: (value) => marked.push(value),
+    applyActivityChange: (value) => applied.push(value),
+  });
+  const result = await consumer(EVENT);
+  assert.equal(result.outcome, 'activity_updated');
+  assert.equal(result.applied_activity_count, 1);
+  assert.equal(marked.length, 0);
+  assert.equal(applied.length, 1);
+  assert.equal(applied[0].promotion_id, 'P-MLM9');
+  assert.equal(applied[0].detail.name, '9.9');
+  assert.equal(applied[0].removed, false);
+});
+
 test('item notification without a proved activity relation updates only that item, never the catalog', async () => {
   const marked = [];
   const invalidated = [];
@@ -183,6 +211,114 @@ test('item notification without a proved activity relation updates only that ite
   assert.deepEqual(invalidated, []);
   assert.equal(updated.length, 1);
   assert.equal(updated[0].itemId, 'MLM123');
+});
+
+test('item notification retries a resource revision behind the webhook and applies only the fresh price', async () => {
+  const updated = [];
+  const responses = [
+    { id: 'MLM123', status: 'active', price: 12.34, original_price: 20, last_updated: '2026-07-16T09:59:59Z' },
+    { id: 'MLM123', status: 'active', price: 12.34, original_price: 20, last_updated: '2026-07-16T09:59:59Z' },
+    { id: 'MLM123', status: 'active', price: 18, original_price: 22, last_updated: '2026-07-16T10:00:01Z' },
+  ];
+  const consumer = createActivityWebhookConsumer({
+    listMarketplaceSites: () => ROUTES,
+    listAccounts: () => [],
+    createResourceClient: async () => ({ getNotificationResource: async () => responses.shift() }),
+    updateItemPrice: (value) => updated.push(value),
+    itemSyncRetryDelaysMs: [0, 0, 0],
+    sleepFn: async () => {},
+  });
+  const result = await consumer({ ...EVENT, event_id: 'evt-item-fresh-after-retry', topic: 'items', resource: '/items/MLM123' });
+  assert.equal(result.outcome, 'item_updated');
+  assert.equal(updated.length, 1);
+  assert.equal(updated[0].originalPrice, 22);
+  assert.equal(updated[0].confirmed, true);
+});
+
+test('notification delivery time is only a retry hint and the newest successful GET is applied', async () => {
+  const updated = [];
+  const unconfirmed = [];
+  const relations = [];
+  let calls = 0;
+  const consumer = createActivityWebhookConsumer({
+    listMarketplaceSites: () => ROUTES,
+    listAccounts: () => [],
+    createResourceClient: async () => ({
+      getNotificationResource: async () => {
+        calls += 1;
+        return {
+          id: 'MLM123', status: 'active', price: 12.34, original_price: 20,
+          last_updated: '2026-07-16T09:59:59Z',
+          promotions: [{ id: 'P-MLM9', type: 'DEAL', status: 'candidate' }],
+        };
+      },
+    }),
+    updateItemPrice: (value) => updated.push(value),
+    markItemUnconfirmed: (value) => unconfirmed.push(value),
+    updateItemRelations: (value) => relations.push(value),
+    itemSyncRetryDelaysMs: [0, 0, 0],
+    sleepFn: async () => {},
+  });
+  const result = await consumer({ ...EVENT, event_id: 'evt-item-still-stale', topic: 'items', resource: '/items/MLM123' });
+  assert.equal(calls, 4);
+  assert.equal(result.outcome, 'item_updated');
+  assert.equal(result.item_sync_attempts, 4);
+  assert.equal(updated.length, 1);
+  assert.equal(updated[0].confirmed, true);
+  assert.equal(unconfirmed.length, 0);
+  assert.equal(relations.length, 1);
+  assert.equal(relations[0].itemId, 'MLM123');
+});
+
+test('item notification exposes exact promotion relations for incremental cache upsert', async () => {
+  const relations = [];
+  const consumer = createActivityWebhookConsumer({
+    listMarketplaceSites: () => ROUTES,
+    listAccounts: () => [],
+    createResourceClient: async () => ({
+      getNotificationResource: async () => ({
+        id: 'MLM123',
+        status: 'active',
+        price: 12.34,
+        promotions: [{ id: 'P-MLM9', type: 'DEAL', status: 'candidate' }],
+      }),
+    }),
+    markDirty: () => assert.fail('known item relation must not dirty the catalog'),
+    updateItemPrice: () => {},
+    updateItemRelations: (value) => relations.push(value),
+  });
+  const result = await consumer({ ...EVENT, event_id: 'evt-item-relation', topic: 'items', resource: '/items/MLM123' });
+  assert.equal(result.outcome, 'item_updated');
+  assert.equal(relations.length, 1);
+  assert.equal(relations[0].itemId, 'MLM123');
+  assert.deepEqual(relations[0].relations, [{
+    promotion_id: 'P-MLM9',
+    promotion_type: 'DEAL',
+    status: 'candidate',
+    raw: { id: 'P-MLM9', type: 'DEAL', status: 'candidate' },
+  }]);
+});
+
+test('item notification with an explicit empty promotions array reconciles relation removals', async () => {
+  const relations = [];
+  const consumer = createActivityWebhookConsumer({
+    listMarketplaceSites: () => ROUTES,
+    listAccounts: () => [],
+    createResourceClient: async () => ({
+      getNotificationResource: async () => ({
+        id: 'MLM123',
+        status: 'active',
+        price: 12.34,
+        promotions: [],
+      }),
+    }),
+    updateItemPrice: () => {},
+    updateItemRelations: (value) => relations.push(value),
+  });
+  await consumer({ ...EVENT, event_id: 'evt-item-empty-relations', topic: 'items', resource: '/items/MLM123' });
+  assert.equal(relations.length, 1);
+  assert.deepEqual(relations[0].relations, []);
+  assert.equal(relations[0].relationsComplete, true);
 });
 
 test('resource GET failures remain retryable and do not dirty any cache state', async () => {

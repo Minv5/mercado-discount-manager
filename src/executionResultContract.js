@@ -24,6 +24,15 @@ export const CANCEL_LIVE_READ_CLASSIFICATION = Object.freeze({
   unverifiable: 'unverifiable',
 });
 
+export function cancellationReadbackApplied({
+  startedComplete = false,
+  pendingComplete = false,
+  inStarted = false,
+  inPending = false,
+} = {}) {
+  return Boolean(startedComplete && pendingComplete && !inStarted && !inPending);
+}
+
 const CONTRACT_FINAL_STATUSES = new Set([
   'success',
   'failed',

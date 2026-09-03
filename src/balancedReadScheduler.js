@@ -169,7 +169,7 @@ export class BalancedReadScheduler {
     return () => this.snapshotListeners.delete(listener);
   }
 
-  schedule({ accountId = '', key = '', kind = 'read', signal = null } = {}, task) {
+  schedule({ accountId = '', key = '', kind = 'read', signal = null, retry = true } = {}, task) {
     if (typeof task !== 'function') return Promise.reject(new TypeError('read task is required'));
     if (signal?.aborted) return Promise.reject(abortError());
     const account = String(accountId || '__global__');
@@ -188,6 +188,7 @@ export class BalancedReadScheduler {
       kind: String(kind || 'read'),
       signal,
       task,
+      retry: retry !== false,
       resolve: resolvePromise,
       reject: rejectPromise,
       abortListener: null,
@@ -493,7 +494,7 @@ export class BalancedReadScheduler {
       if (kind === 'network') this.metricNetworkErrors += 1;
       if (kind === 'service') this.metricServiceErrors += 1;
       if (kind === 'timeout') this.metricTimeoutErrors += 1;
-      if (!kind || job.attempt >= TRANSIENT_RETRY_DELAYS_MS.length) {
+      if (job.retry !== true || !kind || job.attempt >= TRANSIENT_RETRY_DELAYS_MS.length) {
         this.#release(job, true, attemptGeneration);
         this.#settle(job, null, error);
         return;

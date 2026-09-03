@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 import uuid
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 from PySide6.QtCore import QSignalBlocker, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon
@@ -56,20 +59,34 @@ from core import (
     normalize_activity_name,
     promotion_bucket,
     promotion_display_name,
+    targeted_cancel_filters,
     resolve_global_action,
     site_name,
     task_display_counts,
 )
-from dialogs import DetailsDialog, SellerCampaignCreateDialog, SettingsDialog
+from dialogs import DetailsDialog, ItemQueryDialog, SellerCampaignCreateDialog, SettingsDialog, TargetedCancelDialog
 from diagnostics import diagnostic_event
+from reason_text import (
+    business_reason_text,
+    completeness_notice as _completeness_notice,
+    has_readback_incomplete_reason as _has_readback_incomplete_reason,
+    reason_matches as _reason_matches,
+)
 from service_manager import NodeServiceManager, ServiceError
 from theme import APP_QSS
-from workers import Worker
+from workers import GuiDispatcher, Worker
 
 
 TASK_HEADERS = ["时间", "动作", "折扣", "活动", "类型", "商品 / 处理项", "结果", "失败", "失败原因"]
 ACTIVITY_HEADERS = ["店铺", "站点", "类型", "活动", "状态", "商品数"]
 RECORD_VIEW_LIMITS = {"recent": 20, "all": 300}
+STARTUP_PHASE_LABELS = {
+    "service_connect": "程序组件连接",
+    "initial_bundle": "基础数据",
+    "scope_bundle": "店铺与活动范围",
+    "records_bundle": "今日执行记录",
+    "startup_readiness": "启动缓存",
+}
 
 
 class MainWindow(QMainWindow):
@@ -80,8 +97,10 @@ class MainWindow(QMainWindow):
         self.api = api
         self.service = service
         self.thread_pool = QThreadPool.globalInstance()
+        self.gui_dispatcher = GuiDispatcher(self)
         self.workers: set[Worker] = set()
         self.settings: dict[str, Any] = {}
+        self.auto_shutdown_session_initialized = False
         self.accounts: list[Account] = []
         self.store_map: dict[str, list[str]] = {}
         self.promotions: list[dict[str, Any]] = []
@@ -91,7 +110,15 @@ class MainWindow(QMainWindow):
         self.today_execution_groups: list[dict[str, Any]] = []
         self.current_today_completion: dict[str, Any] | None = None
         self.today_completion_ready = False
+        self.startup_ready = False
+        self.startup_refresh_status = "pending"
+        self.startup_readiness: dict[str, Any] = {}
+        self.startup_account_audits: list[dict[str, Any]] = []
         self.refresh_busy = False
+        self.refresh_poll_busy = False
+        self.refresh_poll_token = 0
+        self.refresh_poll_inflight_token: int | None = None
+        self.startup_attempt_token = 0
         self.today_completion_request_token = 0
         self.operating_rows_cache: list[dict[str, Any]] = []
         self.benchmark_text_cache = "自动并发按实测和接口反馈调整。"
@@ -99,6 +126,7 @@ class MainWindow(QMainWindow):
         self.global_official_discount = 6
         self.auto_action = ""
         self.scope_refresh_token = 0
+        self.scope_inputs_ready = False
         self.site_discovery_attempted: set[str] = set()
         self.initial_site_discovery_consumed = False
         self.initial_site_discovery_pending = False
@@ -114,17 +142,36 @@ class MainWindow(QMainWindow):
         self.prepare_read_key = ""
         self.prepare_stage_seen = ""
         self.refresh_progress_key = ""
+        self.account_progress_key = ""
+        self.startup_final_log_key = ""
+        self.background_group_log_key = ""
+        self.background_group_poll_busy = False
+        self.initial_bundle_retry_count = 0
+        self.initial_bundle_retry_token = 0
+        self.startup_status_finalized = False
+        self.startup_refresh_start_requested = False
         self.job_log_seen: dict[str, set[str]] = {}
         self.poll_failure_count = 0
         self.commit_recovery_poll_count = 0
         self.poll_busy = False
         self.records_request_token = 0
         self.ui_busy = False
+        self._startup_phase_started_at: dict[str, float] = {}
+        self._service_progress_key = ""
         self._closing = False
         self._build_ui()
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(900)
         self.poll_timer.timeout.connect(self._poll_group)
+        self.refresh_poll_timer = QTimer(self)
+        self.refresh_poll_timer.setInterval(5000)
+        self.refresh_poll_timer.timeout.connect(self._poll_startup_refresh)
+        self.background_group_timer = QTimer(self)
+        self.background_group_timer.setInterval(15000)
+        self.background_group_timer.timeout.connect(self._poll_background_execution_groups)
+        self.initial_bundle_retry_timer = QTimer(self)
+        self.initial_bundle_retry_timer.setSingleShot(True)
+        self.initial_bundle_retry_timer.timeout.connect(self._retry_initial_bundle)
         self.prepare_poll_timer = QTimer(self)
         self.prepare_poll_timer.setInterval(1000)
         self.prepare_poll_timer.timeout.connect(self._poll_prepare)
@@ -165,7 +212,14 @@ class MainWindow(QMainWindow):
         workspace.setSizes([330, 1050])
         root.addWidget(workspace, 1)
         self.setCentralWidget(central)
-        self.statusBar().showMessage("正在准备工作台...")
+        self.statusBar().clearMessage()
+        self.version_label = QLabel(f"版本 {product_version()}")
+        self.version_label.setObjectName("muted")
+        self.version_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.version_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        self.version_label.setMinimumWidth(self.version_label.fontMetrics().horizontalAdvance(self.version_label.text()) + 12)
+        self.version_label.setToolTip("当前安装版本")
+        self.statusBar().addPermanentWidget(self.version_label)
 
     def _surface(self) -> QFrame:
         frame = QFrame()
@@ -210,6 +264,16 @@ class MainWindow(QMainWindow):
         self.settings_button.setFixedHeight(36)
         self.settings_button.clicked.connect(self._open_settings)
         layout.addWidget(self.settings_button)
+        self.query_button = QPushButton("查询")
+        self.query_button.setObjectName("nav")
+        self.query_button.setFixedHeight(36)
+        self.query_button.clicked.connect(self._open_query)
+        layout.addWidget(self.query_button)
+        self.targeted_cancel_button = QPushButton("按ID操作")
+        self.targeted_cancel_button.setObjectName("nav")
+        self.targeted_cancel_button.setFixedHeight(36)
+        self.targeted_cancel_button.clicked.connect(self._open_targeted_cancel)
+        layout.addWidget(self.targeted_cancel_button)
         self.auto_shutdown_check = QCheckBox("执行完自动关机")
         self.auto_shutdown_check.setObjectName("muted")
         self.auto_shutdown_check.setChecked(bool(self.settings.get("autoShutdownAfterExecution")))
@@ -368,17 +432,124 @@ class MainWindow(QMainWindow):
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.document().setMaximumBlockCount(1000)
+        self.log_box.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layout.addWidget(self.log_box, 1)
         return surface
 
     def startup(self) -> None:
+        self.startup_attempt_token += 1
+        token = self.startup_attempt_token
+        self.initial_bundle_retry_count = 0
+        self.initial_bundle_retry_token = token
+        self.initial_bundle_retry_timer.stop()
+        self.scope_inputs_ready = False
+        self.scope_ready = False
+        self.scope_refresh_token += 1
+        self.startup_final_log_key = ""
+        self.startup_status_finalized = False
+        self.startup_refresh_start_requested = False
         self._set_busy(True, "正在启动程序组件...")
-        self._run_worker(self.service.ensure_started, self._service_ready, self._startup_failed)
+        self._run_worker(
+            lambda: self._ensure_service_started(token),
+            lambda started: self._service_ready(started, token),
+            lambda error: self._startup_failed(error, token),
+            phase="service_connect",
+        )
 
-    def _service_ready(self, started: object) -> None:
+    def _ensure_service_started(self, token: int | None = None) -> bool:
+        return self.service.ensure_started(
+            progress_callback=lambda progress: self._service_progress_from_worker(progress, token)
+        )
+
+    def _service_progress_from_worker(self, progress: dict[str, object], token: int | None = None) -> None:
+        # ServiceManager runs in a worker.  Only enqueue a data-only callback;
+        # widget access remains on the GUI thread.
+        self.gui_dispatcher.dispatch(
+            lambda data=dict(progress): self._apply_service_progress(data, token)
+        )
+
+    def _apply_service_progress(self, progress: dict[str, object], token: int | None = None) -> None:
+        if token is not None and token != self.startup_attempt_token:
+            return
+        state = str(progress.get("state") or "")
+        elapsed_ms = int(progress.get("elapsed_ms") or 0)
+        if state in {"reused", "ready"}:
+            return
+        key = f"{state}|{elapsed_ms // 1000}|{progress.get('cause_code') or ''}"
+        if key == self._service_progress_key:
+            return
+        self._service_progress_key = key
+        seconds = max(0, elapsed_ms // 1000)
+        if state == "soft_timeout":
+            message = f"程序组件仍在启动（已耗时 {seconds} 秒），继续等待本地服务响应..."
+        elif state == "failed":
+            message = "程序组件启动未完成，正在整理失败原因..."
+        else:
+            message = f"程序组件启动中（已耗时 {seconds} 秒）..."
+        if not self.startup_status_finalized:
+            self._show_status(message)
+        diagnostic_event(
+            "service_start_progress",
+            phase="service_connect",
+            state=state,
+            elapsed_ms=elapsed_ms,
+            cause_code=str(progress.get("cause_code") or ""),
+            callback_thread=threading.get_ident(),
+        )
+
+    def _service_ready(self, started: object, token: int | None = None) -> None:
+        if token is not None and token != self.startup_attempt_token:
+            return
         self.component_label.setText("程序组件已连接")
-        self.log("程序组件已连接。" if started else "已连接现有程序组件。")
-        self._run_worker(self._load_initial_bundle, self._apply_initial_bundle, self._startup_failed)
+        elapsed_ms = self._phase_elapsed_ms("service_connect")
+        self.log(
+            ("程序组件已连接。" if started else "已连接现有程序组件。")
+            + f"（耗时 {elapsed_ms / 1000:.1f} 秒）"
+        )
+        # Startup readiness is independent from the heavier initial bundle.
+        # Poll as soon as the local service is connected so a slow settings,
+        # account, history, or scope endpoint cannot hide the backend terminal
+        # state or leave the UI showing only the component-connected line.
+        if not self.refresh_poll_timer.isActive():
+            self.refresh_poll_timer.start()
+        self._request_initial_bundle(token)
+
+    def _request_initial_bundle(self, token: int) -> None:
+        if token != self.startup_attempt_token:
+            return
+        self._run_worker(
+            self._load_initial_bundle,
+            lambda bundle: self._initial_bundle_ready(bundle, token),
+            lambda error: self._initial_bundle_failed(error, token),
+            phase="initial_bundle",
+            soft_error=True,
+        )
+
+    def _initial_bundle_ready(self, bundle: object, token: int) -> None:
+        if token != self.startup_attempt_token:
+            return
+        self.initial_bundle_retry_timer.stop()
+        self.initial_bundle_retry_count = 0
+        self._apply_initial_bundle(dict(bundle or {}), token)
+
+    def _initial_bundle_failed(self, error: object, token: int) -> None:
+        if token != self.startup_attempt_token:
+            return
+        self.initial_bundle_retry_count += 1
+        service_alive = self.service.owns_process or self.service.is_healthy(timeout=3.0)
+        if self.initial_bundle_retry_count <= 3 and service_alive:
+            self.initial_bundle_retry_token = token
+            self.log(
+                f"基础数据读取较慢，程序组件仍正常；5 秒后自动重试"
+                f"（{self.initial_bundle_retry_count}/3），不会重复启动服务。"
+            )
+            self.initial_bundle_retry_timer.start(5000)
+            return
+        self._startup_phase_failed("initial_bundle", error)
+        self._startup_failed(product_error(error), token)
+
+    def _retry_initial_bundle(self) -> None:
+        self._request_initial_bundle(self.initial_bundle_retry_token)
 
     def _load_initial_bundle(self) -> dict[str, Any]:
         return {
@@ -387,90 +558,375 @@ class MainWindow(QMainWindow):
             "discount": self.api.get("/api/today/global-discount").get("discount", {}),
             "execution": self.api.get("/api/execution/groups/active", timeout=10),
             "submission": self.api.get("/api/execution/submissions/active", timeout=10),
-            "refresh": self.api.get("/api/startup-refresh/status").get("refresh", {}),
         }
 
     def _apply_startup_refresh_status(self, refresh: object) -> None:
-        status = str(dict(refresh or {}).get("status") or "")
+        data = dict(refresh or {})
+        status = str(data.get("status") or "")
+        self.startup_refresh_status = status
+        self.startup_readiness = dict(data.get("readiness") or {})
+        self.startup_account_audits = [dict(row) for row in data.get("account_audits") or [] if isinstance(row, dict)]
+        self.startup_ready = status == "ok" and self.startup_readiness.get("ready") is True
         if status == "failed":
-            self.log(f"启动缓存刷新失败：{dict(refresh or {}).get('error') or '未知原因'}。报活动时会实时读取有变动的活动，可正常执行。")
+            self._log_startup_refresh_progress(data)
+            message = startup_refresh_blocked_text(data)
+            self.startup_status_finalized = True
+            self._append_startup_final_log(status, message)
+            self._show_status("缓存同步被阻断，详情见运行日志", message)
             return
-        if status == "ok":
-            self.log("启动缓存刷新完成，数据已更新。")
+        if status in {"ok", "blocked", "degraded"}:
+            self._log_startup_refresh_progress(data)
+            message = startup_refresh_success_text(data) if self.startup_ready else startup_refresh_blocked_text(data)
+            self.startup_status_finalized = True
+            self._append_startup_final_log(status, message)
+            self._show_status("缓存同步完成" if self.startup_ready else "缓存同步被阻断，详情见运行日志", message)
             return
-        if status == "running":
-            self.log("正在刷新数据变动的缓存，刷新完成前暂不能开始执行。")
+        if status in {"pending", "running"}:
+            self.startup_ready = False
+            self.startup_final_log_key = ""
+            self.startup_status_finalized = False
+            if status == "running":
+                self.refresh_progress_key = ""
+                self.account_progress_key = ""
+                self.log("正在刷新数据变动的缓存，刷新完成前暂不能开始执行。")
             self._set_refresh_busy(True)
-            self._log_startup_refresh_progress(refresh)
-            timer = getattr(self, "refresh_poll_timer", None)
-            if timer is None:
-                timer = QTimer(self)
-                timer.setInterval(5000)
-                timer.timeout.connect(self._poll_startup_refresh)
-                self.refresh_poll_timer = timer
-            timer.start()
+            if status == "running":
+                self._log_startup_refresh_progress(refresh)
+            self.refresh_poll_timer.start()
 
     def _log_startup_refresh_progress(self, refresh: object) -> None:
         data = dict(refresh or {})
         stage_label = str(data.get("stage_label") or "")
-        account = str(data.get("account") or "")
-        account_index = int(data.get("account_index") or 0)
-        account_total = int(data.get("account_total") or 0)
-        percent = int(data.get("percent") or 0)
-        if not stage_label:
+        account_progress = dict(data.get("account_progress") or {})
+        replay_progress = dict(data.get("replay_progress") or {})
+        if account_progress:
+            final_line = str(account_progress.get("final_line") or "").strip()
+            if final_line and final_line != self.account_progress_key:
+                self.account_progress_key = final_line
+                self.log(final_line)
+            elif not final_line:
+                try:
+                    completed = int(account_progress.get("completed") or 0)
+                    total = int(account_progress.get("total") or 0)
+                except (TypeError, ValueError):
+                    completed, total = 0, 0
+                active_store = str(account_progress.get("active_store") or "").strip()
+                account_text = (
+                    f"活动缓存：已完成 {completed}/{total} 家"
+                    + (f"｜正在处理 {active_store} 家" if active_store else "")
+                )
+                if account_text != self.account_progress_key:
+                    self.account_progress_key = account_text
+                    self.log(account_text)
+
+        replay = replay_progress or dict(data.get("cbt_replay") or {})
+        is_replay = bool(replay) or stage_label == "补偿最近48小时商品通知"
+        if is_replay:
+            status = str(replay.get("status") or "running")
+            try:
+                attempted = int(replay.get("attempted") or 0)
+            except (TypeError, ValueError):
+                attempted = 0
+            total_value = replay.get("total", replay.get("progress_total"))
+            total_known = replay.get("total_known") is True or (
+                total_value is not None and str(total_value).strip() != ""
+            )
+            try:
+                total = int(total_value) if total_known else 0
+            except (TypeError, ValueError):
+                total_known, total = False, 0
+            if status == "counting" and not total_known:
+                replay_text = "商品通知补偿：正在统计最近48小时待处理数据…"
+            elif status in {"ready", "completed"}:
+                unique_resources = int(replay.get("remaining_resources") or replay.get("remaining_unique_resources") or 0)
+                replay_text = f"CBT父商品通知：{total if total_known else 0}条已完成本地分类"
+                if unique_resources:
+                    replay_text += f"｜{unique_resources}个无可操作站点子商品已隔离"
+                replay_text += "｜需平台补查0个｜可处理剩余0条"
+            else:
+                wave = int(replay.get("wave") or 0)
+                page = int(replay.get("page") or replay.get("pages") or 0)
+                if status == "cooldown":
+                    prefix = f"商品补偿第{wave}波完成，等待 {int(replay.get('cooldown_ms') or 0)}ms 后继续"
+                else:
+                    prefix = f"商品补偿第{wave}波第{page}页" if wave or page else "商品通知补偿"
+                processed = f"{attempted}/{total}条通知" if total_known else f"{attempted}条通知"
+                replay_text = (
+                    f"{prefix}：已处理{processed}"
+                    f"｜CBT {int(replay.get('unique_cbt') or replay.get('unique_cbt_resource_attempted') or 0)} 个"
+                    f"｜匹配子商品 {int(replay.get('route_targets') or replay.get('route_target_matched') or replay.get('route_target_attempted') or 0)} 个"
+                    f"｜缓存更新 {int(replay.get('cache_updated') or replay.get('cache_updated_count') or 0)} 个"
+                    f"｜GET {int(replay.get('physical_get_used') or 0)}/{int(replay.get('physical_budget') or 0)}"
+                )
+                if int(replay.get("targeted_fallback_planned") or 0):
+                    replay_text += f"｜待定向补查 {int(replay.get('targeted_fallback_planned') or 0)} 个"
+                remaining = replay.get("remaining_events", replay.get("remaining_eligible_events"))
+                if remaining is not None:
+                    replay_text += f"｜剩余 {int(remaining or 0)} 条通知"
+            key = f"replay|{replay_text}"
+            if key != self.refresh_progress_key:
+                self.refresh_progress_key = key
+                self.log(replay_text)
+            self._show_status("")
             return
-        position = f"{account_index}/{account_total}" if account_total else ""
-        store = f" {account}" if account else ""
-        percent_text = f"（{percent}%）" if percent > 0 else ""
-        key = f"{stage_label}|{account}|{account_index}|{account_total}|{percent}"
-        if key == self.refresh_progress_key:
-            return
-        self.refresh_progress_key = key
-        self.log(f"[{stage_label}]{store} {position}{percent_text}")
+
+        if stage_label:
+            message = str(data.get("message") or stage_label).strip()
+            key = f"account|{message}|{account_progress.get('completed')}|{account_progress.get('active_store')}"
+            if key != self.refresh_progress_key:
+                self.refresh_progress_key = key
+                self.log(message)
+            self._show_status("")
+
+    def _record_startup_poll_diagnostic(
+        self,
+        branch: str,
+        request_token: int,
+        *,
+        current_token: int | None = None,
+        status: str = "",
+        percent: int | None = None,
+        elapsed_ms: int = 0,
+        error: object | None = None,
+    ) -> None:
+        diagnostic_event(
+            "startup_refresh_poll",
+            phase="startup_readiness",
+            branch=branch,
+            request_token=request_token,
+            current_token=self.refresh_poll_token if current_token is None else current_token,
+            status=status,
+            percent=percent if percent is not None else -1,
+            elapsed_ms=max(0, int(elapsed_ms)),
+            error_kind=type(error).__name__ if error is not None else "",
+            cause_code=str(getattr(error, "code", "") or getattr(error, "cause_code", "") or ""),
+        )
+
+    def _refresh_poll_response_summary(self, data: object) -> tuple[dict[str, Any], str, int | None]:
+        payload = dict(data or {})
+        refresh = {
+            **dict(payload.get("refresh") or {}),
+            "cbt_callback": payload.get("cbt_callback"),
+            "daily_item_delta": payload.get("daily_item_delta"),
+            "webhook_item_summary": payload.get("webhook_item_summary"),
+            "readiness": payload.get("readiness") or dict(payload.get("refresh") or {}).get("readiness") or {},
+            "account_progress": payload.get("account_progress") or dict(payload.get("refresh") or {}).get("account_progress"),
+            "replay_progress": payload.get("replay_progress") or dict(payload.get("refresh") or {}).get("replay_progress"),
+        }
+        raw_percent = refresh.get("percent")
+        try:
+            percent = int(raw_percent) if raw_percent is not None else None
+        except (TypeError, ValueError):
+            percent = None
+        return refresh, str(refresh.get("status") or ""), percent
 
     def _poll_startup_refresh(self) -> None:
+        if self.refresh_poll_busy:
+            return
+        self.refresh_poll_token += 1
+        request_token = self.refresh_poll_token
+        self.refresh_poll_inflight_token = request_token
+        self.refresh_poll_busy = True
+        started_at = time.perf_counter()
+        self._record_startup_poll_diagnostic("requested", request_token)
+        self._run_worker(
+            lambda: self.api.get("/api/startup-refresh/status"),
+            lambda data: self._finalize_startup_refresh_poll(request_token, started_at, data=data),
+            lambda error: self._finalize_startup_refresh_poll(request_token, started_at, error=error),
+            phase="startup_readiness",
+            soft_error=True,
+        )
+
+    def _finalize_startup_refresh_poll(
+        self,
+        request_token: int,
+        started_at: float,
+        *,
+        data: object | None = None,
+        error: object | None = None,
+    ) -> None:
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        refresh: dict[str, Any] = {}
+        status = ""
+        percent: int | None = None
+        stale_result = False
         try:
-            data = self.api.get("/api/startup-refresh/status")
-            refresh = dict(data.get("refresh") or {})
-            status = str(refresh.get("status") or "")
-            if status == "running":
-                self._log_startup_refresh_progress(refresh)
+            if error is not None:
+                if request_token != self.refresh_poll_token:
+                    stale_result = True
+                    self._record_startup_poll_diagnostic(
+                        "stale",
+                        request_token,
+                        status=status,
+                        percent=percent,
+                        elapsed_ms=elapsed_ms,
+                        error=error,
+                    )
+                    return
+                self._record_startup_poll_diagnostic(
+                    "error",
+                    request_token,
+                    status=status,
+                    percent=percent,
+                    elapsed_ms=elapsed_ms,
+                    error=error,
+                )
+                self.startup_ready = False
+                self._set_refresh_busy(False)
+                self.log("启动缓存状态暂未同步，继续等待本地服务响应：" + product_error(error))
+                self._show_status("缓存同步被阻断，详情见运行日志", "启动缓存状态暂未同步，继续等待本地服务响应：" + product_error(error))
+                self.refresh_poll_timer.start()
                 return
-            timer = getattr(self, "refresh_poll_timer", None)
-            if timer is not None:
-                timer.stop()
+
+            refresh, status, percent = self._refresh_poll_response_summary(data)
+            if request_token != self.refresh_poll_token:
+                stale_result = True
+                self._record_startup_poll_diagnostic(
+                    "stale",
+                    request_token,
+                    status=status,
+                    percent=percent,
+                    elapsed_ms=elapsed_ms,
+                )
+                return
+
+            self._record_startup_poll_diagnostic(
+                "completed",
+                request_token,
+                status=status,
+                percent=percent,
+                elapsed_ms=elapsed_ms,
+            )
+            if status == "running":
+                self._set_refresh_busy(True)
+                self._log_startup_refresh_progress(refresh)
+                self.refresh_poll_timer.start()
+                return
+
+            self.refresh_poll_timer.stop()
+            self._apply_startup_refresh_status(refresh)
             self._set_refresh_busy(False)
-            if status == "failed":
-                self.log(f"启动缓存刷新失败：{refresh.get('error') or '未知原因'}。报活动时会实时读取有变动的活动，可正常执行。")
-            elif status == "ok":
-                self.log("启动缓存刷新完成，数据已更新。")
-        except Exception:
-            pass
+        except Exception as callback_error:
+            if request_token == self.refresh_poll_token:
+                self._record_startup_poll_diagnostic(
+                    "error",
+                    request_token,
+                    status=status,
+                    percent=percent,
+                    elapsed_ms=elapsed_ms,
+                    error=callback_error,
+                )
+                self.startup_ready = False
+                self._set_refresh_busy(False)
+                self.log("加载启动缓存阶段失败：" + product_error(callback_error))
+                self._show_status("缓存同步被阻断，详情见运行日志", "加载启动缓存阶段失败：" + product_error(callback_error))
+                self.refresh_poll_timer.start()
+            else:
+                stale_result = True
+                self._record_startup_poll_diagnostic(
+                    "stale",
+                    request_token,
+                    status=status,
+                    percent=percent,
+                    elapsed_ms=elapsed_ms,
+                    error=callback_error,
+                )
+        finally:
+            if self.refresh_poll_inflight_token == request_token:
+                self.refresh_poll_inflight_token = None
+                self.refresh_poll_busy = False
+                if stale_result and not self.refresh_poll_timer.isActive():
+                    self.refresh_poll_timer.start()
+                self._record_startup_poll_diagnostic(
+                    "finalized",
+                    request_token,
+                    status=status,
+                    percent=percent,
+                    elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                )
+
+    def _apply_startup_refresh_poll(self, token: int, data: object) -> None:
+        """Compatibility wrapper for frozen callers and focused tests."""
+        started_at = time.perf_counter()
+        self._finalize_startup_refresh_poll(token, started_at, data=data)
+
+    def _startup_refresh_poll_failed(self, token: int, error: object) -> None:
+        """Compatibility wrapper for frozen callers and focused tests."""
+        started_at = time.perf_counter()
+        self._finalize_startup_refresh_poll(token, started_at, error=error)
 
     def _set_refresh_busy(self, busy: bool) -> None:
         self.refresh_busy = busy
         if busy:
+            self.startup_ready = False
             self.execute_button.setText("刷新缓存中…")
+            self.execute_button.setEnabled(True)
+            self.targeted_cancel_button.setEnabled(self._can_open_targeted_cancel())
             return
         self.execute_button.setText("开始执行")
         self.execute_button.setEnabled(self._can_start_submission())
+        self.targeted_cancel_button.setEnabled(self._can_open_targeted_cancel())
         for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
             control.setEnabled(True)
         self._update_discount_state()
 
-    def _apply_initial_bundle(self, bundle: object) -> None:
+    def _stop_startup_refresh(self) -> None:
+        self.execute_button.setEnabled(False)
+        self.execute_button.setText("正在停止缓存补偿…")
+        self.log("正在请求停止缓存补偿，已完成的本地缓存更新会保留。")
+
+        def failed(error: object) -> None:
+            self.log("停止缓存补偿请求未确认：" + product_error(error))
+            if self.refresh_busy:
+                self.execute_button.setText("刷新缓存中…")
+                self.execute_button.setEnabled(True)
+
+        self._run_worker(
+            lambda: self.api.post("/api/startup-refresh/stop", {}),
+            lambda _result: self.log("已请求停止缓存补偿，正在等待当前读取安全收口。"),
+            failed,
+            phase="startup_readiness",
+        )
+
+    def _apply_initial_bundle(self, bundle: object, token: int | None = None) -> None:
+        if token is not None and token != self.startup_attempt_token:
+            return
         data = dict(bundle or {})
         self.settings = dict(data.get("settings") or {})
+        first_session_load = not self.auto_shutdown_session_initialized
+        if first_session_load:
+            self.auto_shutdown_session_initialized = True
+            self.settings["autoShutdownAfterExecution"] = False
+        blocker = QSignalBlocker(self.auto_shutdown_check)
+        self.auto_shutdown_check.setChecked(bool(self.settings.get("autoShutdownAfterExecution")))
+        del blocker
+        if first_session_load:
+            self._run_worker(
+                lambda: self.api.post("/api/settings", {"autoShutdownAfterExecution": False}).get("settings", {}),
+                lambda settings: self.settings.update(dict(settings or {})),
+                lambda error: self.log("自动关机默认关闭状态保存失败：" + product_error(error)),
+            )
         self.accounts = [account_from_json(row) for row in data.get("accounts") or []]
         self.accounts = [account for account in self.accounts if account.account_id]
         discount = dict(data.get("discount") or {})
         self.global_seller_discount = int(discount.get("seller_discount") or self.settings.get("sellerDefaultDiscount") or 5)
         self.global_official_discount = int(discount.get("official_discount") or self.settings.get("officialDefaultDiscount") or 6)
         self._apply_global_discounts()
-        self._apply_startup_refresh_status(data.get("refresh"))
+        # Compatibility for explicit/focused callers that pass a refresh
+        # snapshot. The real startup path uses the independent poll timer,
+        # avoiding a stale snapshot captured before the initial bundle ends.
+        if data.get("refresh") is not None:
+            refresh = dict(data.get("refresh") or {})
+            refresh_context = dict(data.get("refresh_diagnostics") or {})
+            refresh.update({
+                "cbt_callback": refresh_context.get("cbt_callback"),
+                "daily_item_delta": refresh_context.get("daily_item_delta"),
+            })
+            self._apply_startup_refresh_status(refresh)
         self._fill_store_combo()
-        self._set_busy(False, "基础数据已加载，正在读取店铺站点...")
-        self.log("基础数据已加载，正在读取店铺站点。")
+        elapsed_ms = self._phase_elapsed_ms("initial_bundle")
+        self._set_busy(False, f"基础数据已加载（耗时 {elapsed_ms / 1000:.1f} 秒），正在读取店铺站点...")
+        self.log(f"基础数据已加载（耗时 {elapsed_ms / 1000:.1f} 秒），正在读取店铺站点。")
         active_group = dict(dict(data.get("execution") or {}).get("group") or {})
         if active_group:
             self.log("检测到未完成执行，正在恢复进度。")
@@ -492,11 +948,14 @@ class MainWindow(QMainWindow):
         if not self.initial_site_discovery_consumed:
             self.initial_site_discovery_pending = True
             self.initial_site_discovery_consumed = True
+        self.scope_inputs_ready = True
         self.refresh_scope()
         self.ready.emit()
         QTimer.singleShot(0, self.refresh_records)
 
-    def _startup_failed(self, message: str) -> None:
+    def _startup_failed(self, message: str, token: int | None = None) -> None:
+        if token is not None and token != self.startup_attempt_token:
+            return
         self._set_busy(False, "工作台未准备好")
         self.component_label.setText("程序组件未连接")
         self.log("工作台准备失败：" + product_error(message))
@@ -533,6 +992,8 @@ class MainWindow(QMainWindow):
         )
 
     def refresh_scope(self) -> None:
+        if not self.scope_inputs_ready:
+            return
         account_ids = self.selected_account_ids()
         if not account_ids:
             self.scope_ready = False
@@ -542,6 +1003,7 @@ class MainWindow(QMainWindow):
         self._set_busy(True, "正在读取店铺站点...")
         self.scope_refresh_token += 1
         token = self.scope_refresh_token
+        startup_token = self.startup_attempt_token
         selected_site = self.selected_site_id()
         discover_missing_sites = self.initial_site_discovery_pending
         self.initial_site_discovery_pending = False
@@ -550,13 +1012,15 @@ class MainWindow(QMainWindow):
                 account_ids,
                 selected_site,
                 discover_missing_sites=discover_missing_sites,
+                startup_token=startup_token,
             ),
-            lambda result: self._apply_scope_bundle(token, result),
-            lambda error: self._scope_load_failed(token, error),
+            lambda result: self._apply_scope_bundle(token, result, startup_token),
+            lambda error: self._scope_load_failed(token, error, startup_token),
+            phase="scope_bundle",
         )
 
-    def _scope_load_failed(self, token: int, error: str) -> None:
-        if token != self.scope_refresh_token:
+    def _scope_load_failed(self, token: int, error: str, startup_token: int | None = None) -> None:
+        if token != self.scope_refresh_token or (startup_token is not None and startup_token != self.startup_attempt_token):
             return
         self.scope_ready = False
         self._set_busy(False, "店铺站点未准备好")
@@ -568,10 +1032,15 @@ class MainWindow(QMainWindow):
         selected_site: str,
         *,
         discover_missing_sites: bool = False,
+        startup_token: int | None = None,
     ) -> dict[str, Any]:
+        if startup_token is not None and startup_token != self.startup_attempt_token:
+            return {"stale": True, "selected_site": selected_site}
         sites: list[dict[str, Any]] = []
         promotions: list[dict[str, Any]] = []
         for account_id in account_ids:
+            if startup_token is not None and startup_token != self.startup_attempt_token:
+                return {"stale": True, "selected_site": selected_site}
             account_sites = list(
                 self.api.get(f"/api/accounts/{account_id}/sites").get("sites", [])
             )
@@ -581,6 +1050,8 @@ class MainWindow(QMainWindow):
                 and account_id not in self.site_discovery_attempted
             ):
                 self.site_discovery_attempted.add(account_id)
+                if startup_token is not None and startup_token != self.startup_attempt_token:
+                    return {"stale": True, "selected_site": selected_site}
                 account_sites = list(
                     self.api.get(
                         f"/api/accounts/{account_id}/sites?refresh=1",
@@ -590,14 +1061,18 @@ class MainWindow(QMainWindow):
             for row in account_sites:
                 sites.append({**row, "account_id": account_id})
             path = ApiClient.query(f"/api/accounts/{account_id}/promotions", siteId=selected_site)
+            if startup_token is not None and startup_token != self.startup_attempt_token:
+                return {"stale": True, "selected_site": selected_site}
             for row in self.api.get(path).get("promotions", []):
                 promotions.append({**row, "account_id": account_id})
         return {"sites": sites, "promotions": promotions, "selected_site": selected_site}
 
-    def _apply_scope_bundle(self, token: int, result: object) -> None:
-        if token != self.scope_refresh_token:
+    def _apply_scope_bundle(self, token: int, result: object, startup_token: int | None = None) -> None:
+        if token != self.scope_refresh_token or (startup_token is not None and startup_token != self.startup_attempt_token):
             return
         data = dict(result or {})
+        if data.get("stale"):
+            return
         selected_site = str(data.get("selected_site") or "")
         sites = list(data.get("sites") or [])
         account_names = {account.account_id: account.store_name for account in self.accounts}
@@ -629,9 +1104,29 @@ class MainWindow(QMainWindow):
         self._fill_activity_combos()
         self._populate_activities()
         self.scope_ready = True
-        self._set_busy(False, "工作台已就绪")
-        self.log("店铺站点与活动范围已加载。")
+        elapsed_ms = self._phase_elapsed_ms("scope_bundle")
+        self._set_busy(False, f"工作台已就绪（范围耗时 {elapsed_ms / 1000:.1f} 秒）")
+        self.log(f"店铺站点与活动范围已加载（耗时 {elapsed_ms / 1000:.1f} 秒）。")
+        self._request_startup_refresh_after_scope()
         self._refresh_auto_decision()
+
+    def _request_startup_refresh_after_scope(self) -> None:
+        if self.startup_refresh_start_requested or self.startup_status_finalized:
+            return
+        self.startup_refresh_start_requested = True
+        self._set_refresh_busy(True)
+
+        def failed(error: object) -> None:
+            self.startup_refresh_start_requested = False
+            self.log("启动缓存触发暂未确认，后台定时器会继续兜底：" + product_error(error))
+
+        self._run_worker(
+            lambda: self.api.post("/api/startup-refresh/start", {}, timeout=10),
+            lambda _result: self.refresh_poll_timer.start(),
+            failed,
+            phase="startup_readiness",
+            soft_error=True,
+        )
 
     def _fill_activity_combos(self) -> None:
         for combo, prefix in ((self.seller_combo, "自建"), (self.official_combo, "官方")):
@@ -659,12 +1154,16 @@ class MainWindow(QMainWindow):
         self._refresh_auto_decision()
 
     def _scope_changed(self, _index: int = -1) -> None:
+        if not self.scope_inputs_ready:
+            return
         if self.sender() is self.store_combo:
             self.refresh_scope()
         else:
             self._refresh_auto_decision()
 
     def _site_changed(self, _index: int = -1) -> None:
+        if not self.scope_inputs_ready:
+            return
         self.refresh_scope()
 
     def _apply_global_discounts(self) -> None:
@@ -791,6 +1290,7 @@ class MainWindow(QMainWindow):
             load,
             lambda payload: self._records_loaded(dict(payload or {}), token),
             lambda error: self._records_load_failed(error, requested, token),
+            phase="records_bundle",
         )
 
     def _records_loaded(self, payload: dict[str, list[dict[str, Any]]], token: int) -> None:
@@ -802,6 +1302,12 @@ class MainWindow(QMainWindow):
         current = self.records_cache.get(self.records_view)
         if current is not None:
             self._apply_current_records(current)
+        elapsed_ms = self._phase_elapsed_ms("records_bundle")
+        if not self.startup_status_finalized:
+            self._show_status(
+                "正在核对今日执行记录",
+                f"今日执行记录已返回（耗时 {elapsed_ms / 1000:.1f} 秒），正在核对今日状态...",
+            )
         completion_rows = payload.get("recent")
         if completion_rows is None and "recent" not in self.records_cache:
             completion_rows = payload.get("all")
@@ -856,10 +1362,86 @@ class MainWindow(QMainWindow):
         if token is not None and token != self.today_completion_request_token:
             return
         self.today_execution_groups = [dict(group) for group in groups]
+        self._append_background_group_summary(self.today_execution_groups)
+        if any(self._group_needs_background_poll(group) for group in self.today_execution_groups):
+            if not self.background_group_timer.isActive():
+                self.background_group_timer.start()
+        else:
+            self.background_group_timer.stop()
         self.today_completion_ready = True
         self.current_today_completion = self._completion_for_current_scope()
         self._refresh_auto_decision()
         self._sync_submit_availability()
+
+    @staticmethod
+    def _group_needs_background_poll(group: dict[str, Any]) -> bool:
+        if str(group.get("status") or "").lower() not in {"completed", "partial_or_failed", "failed", "cancelled", "interrupted"}:
+            return False
+        result = dict(group.get("result") or {})
+        return result.get("accounting_complete") is not True or int(result.get("pending") or 0) > 0
+
+    def _poll_background_execution_groups(self) -> None:
+        if self.background_group_poll_busy:
+            return
+        group_ids = [str(group.get("id") or "") for group in self.today_execution_groups if str(group.get("id") or "")]
+        if not group_ids:
+            self.background_group_timer.stop()
+            return
+        self.background_group_poll_busy = True
+
+        def load() -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+            for group_id in group_ids:
+                payload = self.api.get(f"/api/execution/groups/{group_id}?compact=1", timeout=10)
+                group = dict(payload.get("group") or {})
+                if group:
+                    rows.append(group)
+            return rows
+
+        def success(groups: object) -> None:
+            self.background_group_poll_busy = False
+            rows = [dict(group) for group in list(groups or [])]
+            self.today_execution_groups = rows
+            self._append_background_group_summary(rows)
+            self.current_today_completion = self._completion_for_current_scope()
+            self._refresh_auto_decision()
+            self._sync_submit_availability()
+            if not any(self._group_needs_background_poll(group) for group in rows):
+                self.background_group_timer.stop()
+
+        def failure(_error: object) -> None:
+            self.background_group_poll_busy = False
+
+        self._run_worker(load, success, failure)
+
+    def _append_background_group_summary(self, groups: list[dict[str, Any]]) -> None:
+        terminal = [
+            dict(group)
+            for group in groups
+            if str(group.get("status") or "").lower() in {"completed", "partial_or_failed", "failed", "cancelled", "interrupted"}
+        ]
+        if not terminal:
+            return
+        group = max(terminal, key=lambda row: str(row.get("updated_at") or row.get("finished_at") or ""))
+        result = dict(group.get("result") or {})
+        success = int(result.get("success") or 0)
+        failed = int(result.get("failed") or 0)
+        skipped = int(result.get("skipped") or 0)
+        pending = int(result.get("pending") or result.get("pending_verification_count") or 0)
+        if not any((success, failed, skipped, pending)):
+            return
+        if str(group.get("status") or "").lower() == "completed" and pending == 0:
+            return
+        action = str(result.get("action") or group.get("action") or "")
+        key = f"{group.get('id')}|{success}|{failed}|{skipped}|{pending}"
+        if key == self.background_group_log_key:
+            return
+        self.background_group_log_key = key
+        suffix = "；当前结果尚未全部确认。" if pending > 0 or result.get("accounting_complete") is not True else "。"
+        self.log(
+            f"后台{action_label(action)}结果已更新：成功 {success}，失败 {failed}，跳过 {skipped}，"
+            f"待平台确认 {pending}{suffix}"
+        )
 
     def _today_execution_groups_failed(self, error: object, token: int) -> None:
         if token != self.today_completion_request_token:
@@ -908,7 +1490,7 @@ class MainWindow(QMainWindow):
                 record_scope_text(unique_items, relation_count),
                 record_result_text(task),
                 f"商品 {failed} / 活动 {count_or_marker(activity_failures)}",
-                str(task.get("short_failure_reason") or task.get("failure_reason") or ""),
+                business_reason_text(task.get("short_failure_reason") or task.get("failure_reason") or ""),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -980,7 +1562,7 @@ class MainWindow(QMainWindow):
         task = dict(self.records_table.item(row, 0).data(Qt.ItemDataRole.UserRole) or {})
         reason = str(task.get("failure_reason") or task.get("short_failure_reason") or "")
         if reason:
-            self.log("所选批次失败原因：" + reason)
+            self.log("所选批次失败原因：" + business_reason_text(reason))
 
     def _reload_live_promotions(self) -> None:
         account_ids = self.selected_account_ids()
@@ -1002,6 +1584,9 @@ class MainWindow(QMainWindow):
         self._run_worker(reload, done, lambda error: self._operation_error("活动读取", error))
 
     def _on_execute_clicked(self) -> None:
+        if self.refresh_busy:
+            self._stop_startup_refresh()
+            return
         if self.preparing_submission:
             if str(self.preparing_submission.get("state") or "") == "stopping":
                 self.log("正在停止准备，请稍候。")
@@ -1215,6 +1800,8 @@ class MainWindow(QMainWindow):
         "seller": "核对自建活动",
         "final_catalog": "提交前复核",
         "final_targeted": "提交前复核",
+        "targeted_lookup": "定位指定商品",
+        "targeted_verify": "核对命中活动",
         "finalizing": "整理最终范围",
     }
 
@@ -1321,6 +1908,30 @@ class MainWindow(QMainWindow):
                 lambda error: self._operation_error("保存创建范围", error, execution=True),
             )
             return
+        targeted = dict(prepare.get("targeted_item_action") or prepare.get("targeted_cancel") or {})
+        if targeted.get("enabled") is True:
+            action = str(targeted.get("action") or prepare.get("resolved_action") or "cancel")
+            action_text = "取消" if action == "cancel" else "报名"
+            unmatched_ids = [str(value) for value in targeted.get("unmatched_item_ids") or [] if str(value)]
+            unmatched_count = int(targeted.get("unmatched_item_count") or len(unmatched_ids))
+            deferred_activity_count = int(targeted.get("deferred_activity_count") or 0)
+            deferred_route_count = int(targeted.get("deferred_route_relation_count") or 0)
+            account_lines: list[str] = []
+            for row in list(targeted.get("accounts") or []):
+                account_lines.append(
+                    f"{row.get('store_name') or '店铺'}：商品 {int(row.get('unique_item_count') or 0)} 个，"
+                    f"活动 {int(row.get('activity_count') or 0)} 个，关系 {int(row.get('relation_count') or 0)} 条"
+                )
+            self.log(
+                f"指定商品{action_text}核对完成：匹配商品 {int(targeted.get('matched_item_count') or 0)} 个，"
+                f"活动 {int(targeted.get('activity_count') or 0)} 个，"
+                f"商品×活动关系 {int(targeted.get('relation_count') or 0)} 条；"
+                f"未找到 {unmatched_count} 个留待重查或人工核实；"
+                f"读取未完成活动 {deferred_activity_count} 个，路由不完整关系 {deferred_route_count} 条。"
+            )
+            for line in account_lines:
+                self.log(f"指定{action_text}范围：" + line + "。")
+            self.log(f"按商品 ID {action_text}采用单次确认，正在提交上述精确活动关系。")
         self._submit_prepared_submission(prepare)
 
     def _submission_input_saved(self, response: object) -> None:
@@ -1445,7 +2056,7 @@ class MainWindow(QMainWindow):
         if payload.get("prepare"):
             self._commit_submission_polled(dict(payload.get("prepare") or {}))
             return
-        terminal = {"completed", "failed", "cancelled", "interrupted"}
+        terminal = {"completed", "partial_or_failed", "failed", "cancelled", "interrupted"}
         group = dict(payload.get("group") or response or {})
         if not group.get("id"):
             self._poll_group_failed(ApiError("未读取到执行组状态。", kind="unknown", retryable=True))
@@ -1486,6 +2097,7 @@ class MainWindow(QMainWindow):
                 site = str(store_result.get("site_name") or self.site_combo.currentText() or "全部站点")
                 ending = {
                     "completed": "完成",
+                    "partial_or_failed": "部分完成",
                     "failed": "未完整完成",
                     "cancelled": "已停止",
                     "interrupted": "意外中断",
@@ -1501,6 +2113,10 @@ class MainWindow(QMainWindow):
             self.poll_failure_count = 0
             self._set_execution_busy(False)
             self._refresh_records_after_group()
+            # The activity table is a separate cached scope from task history.
+            # Refresh it after every terminal execution so cancelled items do
+            # not remain visible until the next manual scope refresh.
+            self.refresh_scope()
 
     def _commit_submission_polled(self, prepare: dict[str, Any]) -> None:
         state = str(prepare.get("state") or "").lower()
@@ -1618,6 +2234,84 @@ class MainWindow(QMainWindow):
             save,
             lambda settings: self.log("已开启自动关机，执行完成后 60 秒关机。" if enabled else "已关闭自动关机。"),
             lambda error: self.log("自动关机设置保存失败：" + product_error(error)),
+        )
+
+    def _open_query(self) -> None:
+        dialog = ItemQueryDialog(self)
+        dialog.query_requested.connect(lambda item_id: self._run_item_query(dialog, item_id))
+        dialog.exec()
+
+    def _open_targeted_cancel(self) -> None:
+        if self.preparing_submission or self.running_group or self.pending_group_payload:
+            QMessageBox.information(self, "按商品 ID 操作活动", "当前已有准备或执行任务，请等待其结束后再操作。")
+            return
+        account_ids = self.selected_account_ids()
+        if not account_ids:
+            QMessageBox.information(self, "按商品 ID 操作活动", "当前店铺没有可用授权账号。")
+            return
+        store_names = {account_id: self._store_for_account(account_id) for account_id in account_ids}
+        store_text = "、".join(store_names.values())
+        site_text = self.site_combo.currentText() or "全部站点"
+        locked_seller_discount = int(self.seller_discount.value())
+        locked_official_discount = int(self.official_discount.value())
+        dialog = TargetedCancelDialog(
+            f"店铺={store_text}；站点={site_text}；自建活动={self.seller_combo.currentText() or '全部'}；官方活动={self.official_combo.currentText() or '全部'}",
+            self,
+            submission_ready=self._can_start_targeted_cancel,
+            seller_discount=locked_seller_discount,
+            official_discount=locked_official_discount,
+        )
+        if dialog.exec() != QDialogAccepted:
+            return
+        if not self._can_start_targeted_cancel():
+            QMessageBox.information(self, "按商品 ID 操作活动", "缓存补偿或其它任务仍在运行，本次没有提交；请稍后重试。")
+            return
+        item_ids = dialog.item_ids()
+        action = dialog.action()
+        settings = self.settings
+        submission_id = str(uuid.uuid4())
+        payload = execution_group_payload(
+            account_ids=account_ids,
+            action=action,
+            filters=(self.current_filters() if action == "enroll" else targeted_cancel_filters(str(self.site_combo.currentData() or ""))),
+            store_names=store_names,
+            site_name_text=site_text,
+            seller_discount=locked_seller_discount,
+            official_discount=locked_official_discount,
+            read_concurrency=int(settings.get("readConcurrency") or 2),
+            activity_concurrency=int(settings.get("previewConcurrency") or 2),
+            write_concurrency=int(settings.get("writeConcurrency") or 2),
+            client_submission_id=submission_id,
+        )
+        payload.update({
+            "requested_action": action,
+            "targetedItemAction": True,
+            "targetedCancelAllActivities": action == "cancel",
+            "itemIds": item_ids,
+        })
+        self.preparing_submission = {"client_submission_id": submission_id, "state": "starting"}
+        self.pending_prepare_payload = dict(payload)
+        self._set_prepare_busy(True)
+        self.log(f"正在核对 {len(item_ids)} 个指定商品的可{'取消' if action == 'cancel' else '报名'}活动；当前只读取命中范围。")
+        self._run_worker(
+            lambda: self.api.post(
+                "/api/execution/submissions/prepare", payload, timeout=20,
+                timeout_message="指定商品操作范围准备较慢，正在恢复已保存的准备记录。",
+            ),
+            self._prepare_started,
+            self._prepare_start_failed,
+        )
+
+    def _run_item_query(self, dialog: ItemQueryDialog, item_id: str) -> None:
+        safe_id = quote(item_id, safe="")
+        self._run_worker(
+            lambda: self.api.get(
+                "/api/items/{}/status".format(safe_id),
+                timeout=30,
+                timeout_message="商品查询等待时间较长，本地记录仍未返回。",
+            ),
+            lambda payload: dialog.show_result(payload),
+            lambda error: dialog.show_error(product_error(error)),
         )
 
     def _open_settings(self) -> None:
@@ -1748,14 +2442,20 @@ class MainWindow(QMainWindow):
 
     def _set_busy(self, busy: bool, message: str) -> None:
         self.ui_busy = busy
-        self.statusBar().showMessage(message)
+        if busy:
+            self.startup_status_finalized = False
+            self._show_status(message, message)
+        elif not self.startup_status_finalized:
+            self._show_status(message, message)
         if not self.running_group and not self.pending_group_payload and not self.preparing_submission:
             self.execute_button.setEnabled(not busy and self._can_start_submission())
+            self.targeted_cancel_button.setEnabled(self._can_open_targeted_cancel())
         self.records_refresh_button.setEnabled(not busy)
 
     def _set_execution_busy(self, busy: bool) -> None:
         self.execute_button.setEnabled(busy or self._can_start_submission())
         self.execute_button.setText("停止任务" if busy else "开始执行")
+        self.targeted_cancel_button.setEnabled(not busy and self._can_open_targeted_cancel())
         for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
             control.setEnabled(not busy)
         self._update_discount_state()
@@ -1764,6 +2464,7 @@ class MainWindow(QMainWindow):
         if not busy:
             self.execute_button.setText("开始执行")
             self.execute_button.setEnabled(self._can_start_submission())
+            self.targeted_cancel_button.setEnabled(self._can_open_targeted_cancel())
             for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
                 control.setEnabled(True)
             self._update_discount_state()
@@ -1772,12 +2473,13 @@ class MainWindow(QMainWindow):
         has_prepare_id = bool(self.preparing_submission.get("prepare_id"))
         self.execute_button.setText("正在停止" if state == "stopping" else "停止准备" if has_prepare_id else "正在准备")
         self.execute_button.setEnabled(has_prepare_id and state != "stopping")
+        self.targeted_cancel_button.setEnabled(False)
         for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
             control.setEnabled(False)
         self._update_discount_state()
 
     def _can_start_submission(self) -> bool:
-        if self.ui_busy or not self.scope_ready or not self.today_completion_ready:
+        if self.ui_busy or not self._scope_startup_ready() or not self.scope_ready or not self.today_completion_ready:
             return False
         if self.mode_combo.currentText() == "自动判断" and self._completion_for_current_scope():
             return False
@@ -1785,10 +2487,44 @@ class MainWindow(QMainWindow):
             return False
         return True
 
+    def _can_start_targeted_cancel(self) -> bool:
+        return (
+            not self.ui_busy
+            and not self.refresh_busy
+            and not self.preparing_submission
+            and not self.running_group
+            and not self.pending_group_payload
+            and bool(self.selected_account_ids())
+        )
+
+    def _can_open_targeted_cancel(self) -> bool:
+        return (
+            not self.preparing_submission
+            and not self.running_group
+            and not self.pending_group_payload
+            and bool(self.accounts)
+        )
+
+    def _scope_startup_ready(self) -> bool:
+        if self.startup_ready and (self.startup_readiness.get("ready") is True or not self.startup_readiness):
+            return True
+        selected = set(self.selected_account_ids())
+        if not selected or self.startup_refresh_status not in {"ok", "blocked", "degraded"}:
+            return False
+        ready_accounts = set(str(value) for value in self.startup_readiness.get("ready_accounts") or [])
+        blocked_accounts = set(str(value) for value in self.startup_readiness.get("blocked_account_ids") or [])
+        return selected.issubset(ready_accounts) and not selected.intersection(blocked_accounts)
+
     def _sync_submit_availability(self) -> None:
+        if self.refresh_busy:
+            self.execute_button.setText("刷新缓存中…")
+            self.execute_button.setEnabled(True)
+            self.targeted_cancel_button.setEnabled(self._can_open_targeted_cancel())
+            return
         if self.running_group or self.pending_group_payload or self.preparing_submission:
             return
         self.execute_button.setEnabled(self._can_start_submission())
+        self.targeted_cancel_button.setEnabled(self._can_open_targeted_cancel())
 
     def _discard_prepared_submission(self, prepare_id: str) -> None:
         if not prepare_id:
@@ -1834,13 +2570,224 @@ class MainWindow(QMainWindow):
     def log(self, message: str) -> None:
         self.log_box.append(f"[{datetime.now():%H:%M:%S}] {message}")
 
-    def _run_worker(self, function: Callable[[], Any], on_result: Callable[[object], None], on_error: Callable[[object], None]) -> None:
+    def _append_startup_final_log(self, status: str, message: str) -> None:
+        """Append one timestamped terminal startup summary per final state."""
+        key = f"{status}|{message}"
+        if key == self.startup_final_log_key:
+            return
+        self.startup_final_log_key = key
+        self.log(message)
+
+    def _show_status(self, short_text: str, full_text: str | None = None) -> None:
+        """Keep runtime progress out of the bottom border; details live in the log."""
+        status_bar = self.statusBar()
+        status_bar.clearMessage()
+        status_bar.setToolTip("")
+
+    def _phase_label(self, phase: str) -> str:
+        return STARTUP_PHASE_LABELS.get(phase, phase or "后台")
+
+    def _record_worker_stage(
+        self,
+        phase: str,
+        state: str,
+        elapsed_ms: int,
+        *,
+        payload_size: int | None = None,
+        error: object | None = None,
+    ) -> None:
+        error_kind = type(error).__name__ if error is not None else ""
+        cause_code = str(getattr(error, "code", "") or getattr(error, "cause_code", "") or "")
+        diagnostic_event(
+            "ui_worker_stage",
+            phase=phase or "worker",
+            state=state,
+            elapsed_ms=max(0, int(elapsed_ms)),
+            callback_thread=threading.get_ident(),
+            payload_size=payload_size if payload_size is not None else -1,
+            error_kind=error_kind,
+            cause_code=cause_code,
+        )
+
+    def _startup_phase_started(self, phase: str) -> None:
+        if phase not in STARTUP_PHASE_LABELS:
+            return
+        started_at = time.perf_counter()
+        self._startup_phase_started_at[phase] = started_at
+        self._record_worker_stage(phase, "started", 0, payload_size=0)
+        if not self.startup_status_finalized:
+            self._show_status(f"正在{self._phase_label(phase)}...")
+
+    def _phase_elapsed_ms(self, phase: str) -> int:
+        started_at = self._startup_phase_started_at.get(phase)
+        if started_at is None:
+            return 0
+        return max(0, int((time.perf_counter() - started_at) * 1000))
+
+    def _startup_phase_failed(self, phase: str, error: object) -> None:
+        if phase not in STARTUP_PHASE_LABELS:
+            return
+        self.startup_ready = False
+        if phase in {"service_connect", "initial_bundle", "scope_bundle"}:
+            self.scope_ready = False
+        if phase in {"service_connect", "initial_bundle", "records_bundle"}:
+            self.today_completion_ready = False
+        label = self._phase_label(phase)
+        elapsed_ms = self._phase_elapsed_ms(phase)
+        message = f"加载{label}阶段失败：{product_error(error)}（耗时 {elapsed_ms / 1000:.1f} 秒）"
+        if not self.startup_status_finalized:
+            self._show_status(f"加载{label}失败", message)
+        self.log(message)
+        self._set_busy(False, message)
+
+    def _callback_error(self, phase: str, error: object) -> RuntimeError:
+        return RuntimeError(f"加载{self._phase_label(phase)}阶段失败：界面结果应用未完成。")
+
+    def _safe_payload_size(self, value: object) -> int:
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":")).encode("utf-8")
+            return len(encoded)
+        except Exception:
+            return -1
+
+    def _handle_worker_callback_failure(
+        self,
+        phase: str,
+        started_at: float,
+        on_error: Callable[[object], None],
+        error: Exception,
+        payload_size: int,
+    ) -> None:
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        self._record_worker_stage(
+            phase,
+            "callback_failed",
+            elapsed_ms,
+            payload_size=payload_size,
+            error=error,
+        )
+        safe_error = self._callback_error(phase, error)
+        self._startup_phase_failed(phase, safe_error)
+        try:
+            on_error(safe_error)
+        except Exception as callback_error:
+            self._record_worker_stage(
+                phase,
+                "error_callback_failed",
+                elapsed_ms,
+                payload_size=payload_size,
+                error=callback_error,
+            )
+
+    def _run_worker(
+        self,
+        function: Callable[[], Any],
+        on_result: Callable[[object], None],
+        on_error: Callable[[object], None],
+        *,
+        phase: str = "worker",
+        on_progress: Callable[[object], None] | None = None,
+        soft_error: bool = False,
+    ) -> None:
+        started_at = time.perf_counter()
+        self._startup_phase_started(phase)
         worker = Worker(function)
         self.workers.add(worker)
-        worker.signals.result.connect(on_result)
-        worker.signals.error.connect(on_error)
-        worker.signals.finished.connect(lambda current=worker: self.workers.discard(current))
+
+        def queue_result(result: object) -> None:
+            payload_size = self._safe_payload_size(result)
+            self.gui_dispatcher.dispatch(
+                lambda: self._run_gui_result(
+                    phase,
+                    started_at,
+                    on_result,
+                    on_error,
+                    result,
+                    payload_size,
+                )
+            )
+
+        def queue_error(error: object) -> None:
+            self.gui_dispatcher.dispatch(
+                lambda: self._run_gui_error(phase, started_at, on_error, error, soft_error=soft_error)
+            )
+
+        def queue_progress(progress: object) -> None:
+            if on_progress is None:
+                return
+            self.gui_dispatcher.dispatch(
+                lambda: self._run_gui_progress(phase, started_at, on_progress, progress)
+            )
+
+        worker.signals.result.connect(queue_result)
+        worker.signals.error.connect(queue_error)
+        worker.signals.progress.connect(queue_progress)
+        worker.signals.finished.connect(
+            lambda current=worker: self.gui_dispatcher.dispatch(
+                lambda: self.workers.discard(current)
+            )
+        )
         self.thread_pool.start(worker)
+
+    def _run_gui_result(
+        self,
+        phase: str,
+        started_at: float,
+        on_result: Callable[[object], None],
+        on_error: Callable[[object], None],
+        result: object,
+        payload_size: int,
+    ) -> None:
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        if phase in STARTUP_PHASE_LABELS and phase != "startup_readiness" and not self.startup_status_finalized:
+            self._show_status(
+                f"{self._phase_label(phase)}数据已返回",
+                f"{self._phase_label(phase)}数据已返回（耗时 {elapsed_ms / 1000:.1f} 秒），正在更新界面...",
+            )
+        try:
+            on_result(result)
+        except Exception as error:
+            self._handle_worker_callback_failure(phase, started_at, on_error, error, payload_size)
+            return
+        self._record_worker_stage(
+            phase,
+            "completed",
+            elapsed_ms,
+            payload_size=payload_size,
+        )
+
+    def _run_gui_error(
+        self,
+        phase: str,
+        started_at: float,
+        on_error: Callable[[object], None],
+        error: object,
+        *,
+        soft_error: bool = False,
+    ) -> None:
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        self._record_worker_stage(phase, "failed", elapsed_ms, error=error)
+        if not soft_error:
+            self._startup_phase_failed(phase, error)
+        try:
+            on_error(error)
+        except Exception as callback_error:
+            if not soft_error:
+                self._startup_phase_failed(phase, error)
+            self._record_worker_stage(phase, "error_callback_failed", elapsed_ms, error=callback_error)
+
+    def _run_gui_progress(
+        self,
+        phase: str,
+        started_at: float,
+        on_progress: Callable[[object], None],
+        progress: object,
+    ) -> None:
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        try:
+            on_progress(progress)
+        except Exception as error:
+            self._record_worker_stage(phase, "progress_callback_failed", elapsed_ms, error=error)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
         diagnostic_event("main_window_close_event", running_group=bool(self.running_group), already_closing=self._closing)
@@ -1851,6 +2798,9 @@ class MainWindow(QMainWindow):
             diagnostic_event("prepare_detached_on_close", prepare_id=prepare_id, progress=progress)
             self.prepare_poll_timer.stop()
             self.poll_timer.stop()
+            refresh_timer = getattr(self, "refresh_poll_timer", None)
+            if refresh_timer is not None:
+                refresh_timer.stop()
             self.service.detach()
             event.accept()
             return
@@ -1880,6 +2830,9 @@ class MainWindow(QMainWindow):
                 return
         self.poll_timer.stop()
         self.prepare_poll_timer.stop()
+        refresh_timer = getattr(self, "refresh_poll_timer", None)
+        if refresh_timer is not None:
+            refresh_timer.stop()
         self.service.stop()
         event.accept()
 
@@ -1889,6 +2842,24 @@ def resource_path(relative: str) -> Path:
 
     root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return root / relative
+
+
+def product_version() -> str:
+    candidates = [
+        resource_path("app/build-info.json"),
+        resource_path("app/package.json"),
+        resource_path("build-info.json"),
+        Path(__file__).resolve().parents[1] / "package.json",
+    ]
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        value = str(payload.get("version") or payload.get("product_version") or "").strip()
+        if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
+            return value
+    return "0.1.56"
 
 
 def make_table(headers: list[str]) -> QTableWidget:
@@ -1996,11 +2967,195 @@ def daily_item_delta_text(delta: dict[str, Any]) -> tuple[str, str]:
             f"较昨日：新增 {added} 件，减少 {removed} 件",
             f"比较区间：{baseline_date} → {current_date}\n仅使用服务端确认完整的每日商品身份快照。",
         )
-    reason = str(delta.get("reason") or "").strip()
+    reason = str(delta.get("reason_cn") or delta.get("reason") or "").strip()
     tooltip = "需要服务端提供前一日和当日的完整商品身份快照后才能计算，界面不会根据不完整数据推算。"
     if reason:
-        tooltip += "\n数据状态：" + reason
-    return "较昨日商品变化：暂无可比较快照，数据不足", tooltip
+        tooltip += "\n数据状态：" + business_reason_text(reason)
+    insufficient_routes = list(delta.get("insufficient_routes") or [])
+    if insufficient_routes:
+        route_text = "、".join(
+            f"{row.get('account_id') or '-'} / {row.get('child_user_id') or '-'} / {row.get('site_id') or '-'}"
+            for row in insufficient_routes[:20]
+        )
+        tooltip += "\n未完成路由：" + route_text
+    unresolved_count = int(delta.get("route_unresolved_count") or 0)
+    if unresolved_count:
+        tooltip += f"\n路由未确认：{unresolved_count} 条"
+    return "较昨日商品变化：完整快照不足，暂不统计新增/减少", tooltip
+
+
+def _startup_replay_metrics_text(replay: dict[str, Any]) -> str:
+    """Render the terminal CBT replay facts without collapsing categories."""
+    if not replay:
+        return ""
+    item_categories = dict(replay.get("classification_item_counts") or {})
+    categories = dict(replay.get("terminal_categories") or replay.get("classification_counts") or {})
+
+    def category(name: str) -> int:
+        value = item_categories.get(name)
+        if value is None:
+            value = replay.get(f"{name}_count")
+        if value is None:
+            value = categories.get(name, 0)
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    success = replay.get("unique_resource_succeeded")
+    if success is None:
+        success = replay.get("succeeded", replay.get("replayed", 0))
+    cache_updated = replay.get("cache_updated_count")
+    physical_used = replay.get("physical_get_used")
+    physical_budget = replay.get("physical_budget", replay.get("total_budget"))
+    try:
+        success = max(0, int(success or 0))
+    except (TypeError, ValueError):
+        success = 0
+    try:
+        cache_updated = max(0, int(cache_updated or 0))
+    except (TypeError, ValueError):
+        cache_updated = 0
+    parts = [
+        f"CBT成功 {success} 个",
+        f"子缓存更新 {cache_updated} 个",
+        f"字段不足 {category('quarantined_unknown')} 个",
+        f"路线缺失 {category('route_catalog_gap')} 个",
+        f"无关/不可用排除 {category('terminal_irrelevant')} 个",
+        f"跨账号排除 {category('terminal_foreign')} 个",
+        f"待重试 {category('eligible_partial') + category('eligible_budget_remaining') + category('eligible_retryable')} 个",
+    ]
+    if physical_used is not None or physical_budget is not None:
+        try:
+            used_text = str(max(0, int(physical_used or 0)))
+        except (TypeError, ValueError):
+            used_text = "未知"
+        try:
+            budget_text = str(max(0, int(physical_budget or 0))) if physical_budget is not None else "未知"
+        except (TypeError, ValueError):
+            budget_text = "未知"
+        parts.append(f"GET {used_text}/{budget_text}")
+    remaining_events = replay.get("remaining_eligible_events", replay.get("remaining_events"))
+    remaining_items = replay.get("remaining_eligible_resources", replay.get("remaining_unique_resources"))
+    if remaining_events is not None or remaining_items is not None:
+        try:
+            event_text = str(max(0, int(remaining_events or 0)))
+        except (TypeError, ValueError):
+            event_text = "未知"
+        try:
+            item_text = str(max(0, int(remaining_items or 0)))
+        except (TypeError, ValueError):
+            item_text = "未知"
+        parts.append(f"剩余可处理事件 {event_text} / 商品 {item_text}")
+    return "；".join(parts)
+
+
+def startup_refresh_success_text(refresh: dict[str, Any]) -> str:
+    readiness = dict(refresh.get("readiness") or {})
+    parts = ["商品和活动缓存同步完成" if readiness.get("ready") is True else "活动缓存刷新已结束，执行仍被阻断"]
+    audits = [row for row in refresh.get("account_audits") or [] if isinstance(row, dict)]
+    if audits:
+        account_parts = []
+        expired_ids: set[str] = set()
+        for audit in audits:
+            store = str(audit.get("store_name") or "当前店铺")
+            status = str(audit.get("status") or "unknown")
+            label = {"ok": "完成", "failed": "失败", "unknown": "未确认", "running": "进行中"}.get(status, "未确认")
+            account_parts.append(f"{store}：{label}")
+            for stage in audit.get("stages") or []:
+                for skipped in stage.get("expired_skipped") or []:
+                    if isinstance(skipped, dict) and skipped.get("promotion_id"):
+                        expired_ids.add(str(skipped.get("promotion_id")))
+        if account_parts and all(part.endswith("：完成") for part in account_parts):
+            parts.append(f"{len(account_parts)}家店铺均完成")
+        else:
+            parts.append("店铺结果：" + "；".join(account_parts))
+        if expired_ids:
+            parts.append(f"已跳过已结束活动 {len(expired_ids)} 个")
+    webhook_items = dict(refresh.get("webhook_item_summary") or {})
+    refreshed_items = int(webhook_items.get("refreshed_item_count") or 0)
+    changed_items = int(webhook_items.get("changed_item_count") or 0)
+    if refreshed_items:
+        parts.append(f"今日商品快照已更新 {refreshed_items} 个，其中 {changed_items} 个检测到数据变化")
+    callback = dict(refresh.get("cbt_callback") or {})
+    replay_summary = dict(refresh.get("cbt_replay") or callback.get("last_replay") or {})
+    categories = dict(replay_summary.get("classification_item_counts")
+                      or replay_summary.get("terminal_categories")
+                      or replay_summary.get("classification_counts")
+                      or {})
+    if int(categories.get("terminal_irrelevant") or 0):
+        parts.append(f"已安全排除无关或不可用商品 {int(categories.get('terminal_irrelevant') or 0)} 个")
+    if int(categories.get("terminal_no_actionable_global_parent") or 0):
+        parts.append(f"全球父商品 {int(categories.get('terminal_no_actionable_global_parent') or 0)} 个暂无可操作站点子商品，已隔离且不影响活动")
+    if int(categories.get("route_catalog_gap") or 0):
+        parts.append(f"路线缺失 {int(categories.get('route_catalog_gap') or 0)} 个，需先做路线校准")
+    if int(categories.get("quarantined_unknown") or 0):
+        parts.append(f"字段不足或多候选 {int(categories.get('quarantined_unknown') or 0)} 个，已隔离")
+    retryable_events = int(callback.get("retryable_failed_count") or 0)
+    retryable_items = int(callback.get("retryable_failed_item_count") or 0)
+    if retryable_events or retryable_items:
+        parts.append(f"商品通知读取失败 {max(retryable_events, retryable_items)} 个，稍后可重试")
+    replay = replay_summary
+    if replay:
+        remaining_eligible = int(replay.get("remaining_eligible_resources") or 0)
+        retryable = (
+            int(replay.get("eligible_partial_count") or 0)
+            + int(replay.get("eligible_budget_remaining_count") or 0)
+            + int(replay.get("eligible_retryable_count") or 0)
+        )
+        if remaining_eligible or retryable:
+            parts.append(f"仍有 {max(remaining_eligible, retryable)} 个商品待继续处理")
+    delta = dict(refresh.get("daily_item_delta") or {})
+    if str(delta.get("status") or "").lower() == "ready" and delta.get("added_count") is not None:
+        parts.append(f"商品差异缓存新增 {int(delta.get('added_count') or 0)} 件")
+        if delta.get("removed_count") is not None:
+            parts.append(f"减少 {int(delta.get('removed_count') or 0)} 件")
+    return "；".join(parts) + "。"
+
+
+def startup_refresh_blocked_text(refresh: dict[str, Any]) -> str:
+    data = dict(refresh or {})
+    readiness = dict(data.get("readiness") or {})
+    reasons = [
+        str(row.get("reason_cn") or "").strip()
+        for row in readiness.get("reasons") or []
+        if isinstance(row, dict) and str(row.get("reason_cn") or "").strip()
+    ]
+    error = str(data.get("error") or "").strip()
+    if error and not reasons:
+        reasons.append(business_reason_text(error))
+    if not reasons:
+        reasons.append("启动缓存完整性尚未确认。")
+    replay = dict(data.get("cbt_replay") or dict(data.get("cbt_callback") or {}).get("last_replay") or {})
+    categories = dict(replay.get("classification_item_counts")
+                      or replay.get("terminal_categories")
+                      or replay.get("classification_counts")
+                      or {})
+    category_text = []
+    if int(categories.get("terminal_irrelevant") or 0):
+        category_text.append(f"已删除或不可用 {int(categories.get('terminal_irrelevant') or 0)} 个，可排除")
+    if int(categories.get("terminal_foreign") or 0):
+        category_text.append(f"跨账号 {int(categories.get('terminal_foreign') or 0)} 个，保留审计")
+    if int(categories.get("terminal_no_actionable_global_parent") or 0):
+        category_text.append(f"全球父商品 {int(categories.get('terminal_no_actionable_global_parent') or 0)} 个暂无站点子商品，已隔离，不影响当前活动")
+    if int(categories.get("route_catalog_gap") or 0):
+        category_text.append(f"路线缺失 {int(categories.get('route_catalog_gap') or 0)} 个，需路线校准")
+    if int(categories.get("quarantined_unknown") or 0):
+        category_text.append(f"字段不足或多候选 {int(categories.get('quarantined_unknown') or 0)} 个，已隔离")
+    reasons.extend(category_text)
+    audits = [row for row in data.get("account_audits") or [] if isinstance(row, dict)]
+    account_parts = []
+    for audit in audits:
+        store = str(audit.get("store_name") or "当前店铺")
+        status = str(audit.get("status") or "unknown")
+        label = {"ok": "完成", "failed": "失败", "unknown": "未确认", "running": "进行中"}.get(status, "未确认")
+        account_parts.append(f"{store}：{label}")
+    if account_parts:
+        reasons.append("店铺结果：" + "；".join(account_parts))
+    metrics = _startup_replay_metrics_text(replay)
+    if metrics:
+        reasons.append(metrics)
+    return "启动缓存未达到执行条件：" + "；".join(dict.fromkeys(reasons)) + "。"
 
 
 def record_activity_text(task: dict[str, Any]) -> str:
@@ -2039,17 +3194,32 @@ def record_result_text(task: dict[str, Any]) -> str:
         lines.append(f"跳过 {skipped}")
         if category_text:
             lines.append(f"失败 {_failed}（{category_text}）")
+        notice = _completeness_notice(task)
+        if notice:
+            lines.append(notice)
         return "\n".join(lines)
     request_success = optional_contract_count(task, "request_success_count")
     verified_removed = optional_contract_count(task, "live_verified_removed_count")
     pending = optional_contract_count(task, "pending_verification_count")
     if request_success is None and verified_removed is None and pending is None:
         return "旧记录未区分"
-    return (
-        f"取消请求 {count_or_marker(request_success)}\n"
-        f"成功取消 {count_or_marker(verified_removed)}\n"
-        f"待平台确认 {count_or_marker(pending)}"
-    )
+    if request_success is not None and _has_readback_incomplete_reason(task):
+        pending_text = count_or_marker(pending if pending is not None else task.get("failed_count"))
+        lines = [
+            f"取消请求已成功：{count_or_marker(request_success)}",
+            f"部分商品仍待平台确认：{pending_text}",
+            f"成功取消：{count_or_marker(verified_removed)}",
+        ]
+    else:
+        lines = [
+            f"取消请求 {count_or_marker(request_success)}",
+            f"成功取消 {count_or_marker(verified_removed)}",
+            f"待平台确认 {count_or_marker(pending)}",
+        ]
+    notice = _completeness_notice(task)
+    if notice:
+        lines.append(notice)
+    return "\n".join(lines)
 
 
 def is_reservation_start(value: object) -> bool:
@@ -2071,6 +3241,8 @@ def failure_category_text(failure_reasons: object, failed_count: int) -> str:
         # No categorized reasons available (legacy rows or server without
         # reason breakdown): do not guess "rejected" for every failure.
         return ""
+    readback_incomplete = 0
+    pending_relations = 0
     under_review = 0
     discount = 0
     for item in reasons:
@@ -2078,12 +3250,20 @@ def failure_category_text(failure_reasons: object, failed_count: int) -> str:
             continue
         reason = str(item.get("reason") or "")
         count = int(item.get("count") or 0)
-        if "审核" in reason:
+        if _reason_matches(reason, 0):
+            readback_incomplete += count
+        elif _reason_matches(reason, 1):
+            pending_relations += count
+        elif "审核" in reason:
             under_review += count
         elif "折扣" in reason or ("价格" in reason and "不认可" in reason):
             discount += count
     rejected = max(int(failed_count or 0) - under_review - discount, 0)
     parts = []
+    if readback_incomplete > 0:
+        parts.append(f"平台未返回可读取的商品清单 {readback_incomplete}")
+    if pending_relations > 0:
+        parts.append(f"待平台确认 {pending_relations}")
     if under_review > 0:
         parts.append(f"审核中 {under_review}")
     if discount > 0:
@@ -2108,21 +3288,41 @@ def execution_result_text(result: dict[str, Any], action: str) -> str:
         request_success = optional_contract_count(result, "request_success_count")
         verified_removed = optional_contract_count(result, "live_verified_removed_count")
         pending = optional_contract_count(result, "pending_verification_count")
-        cancellation = (
-            f"取消请求成功 {count_or_marker(request_success, '旧记录未区分')}，"
-            f"成功取消 {count_or_marker(verified_removed, '旧记录未区分')}，"
-            f"取消请求已提交，待平台回查确认 {count_or_marker(pending, '旧记录未区分')}"
-        )
+        readback_incomplete = _has_readback_incomplete_reason(result)
+        if request_success is not None and readback_incomplete:
+            pending_count = pending if pending is not None else failed
+            cancellation = (
+                f"取消请求已成功 {count_or_marker(request_success)}，"
+                f"部分商品仍待平台确认 {count_or_marker(pending_count)}，"
+                f"成功取消 {count_or_marker(verified_removed, '旧记录未区分')}"
+            )
+            failed_text = f"部分商品待平台确认 {count_or_marker(pending_count)}"
+        else:
+            cancellation = (
+                f"取消请求成功 {count_or_marker(request_success, '旧记录未区分')}，"
+                f"成功取消 {count_or_marker(verified_removed, '旧记录未区分')}，"
+                f"取消请求已提交，待平台回查确认 {count_or_marker(pending, '旧记录未区分')}"
+            )
+            failed_text = f"商品失败 {failed}"
+        notice = _completeness_notice(result)
+        if notice:
+            cancellation += f"，{notice}"
         # skipped for cancel duplicates pending_verification; do not repeat it.
         return (
-            f"{common}，{cancellation}，商品失败 {failed}，"
+            f"{common}，{cancellation}，{failed_text}，"
             f"活动失败 {count_or_marker(activity_failures)}"
         )
     success = int(result.get("success") or result.get("success_count") or 0)
     platform_pending = optional_contract_count(result, "platform_pending_count")
+    pending_verification = optional_contract_count(result, "pending_verification_count")
+    if pending_verification is None:
+        pending_verification = optional_contract_count(result, "pending")
     pending_text = ""
     if platform_pending is not None:
         pending_text = f"，平台已接受待生效 {platform_pending}"
+    additional_pending = max(int(pending_verification or 0) - int(platform_pending or 0), 0)
+    if additional_pending:
+        pending_text += f"，仍待平台确认 {additional_pending}"
     success_label = {"enroll": "报名成功", "update": "更新成功"}.get(normalized_action, "成功")
     if is_reservation_start(result.get("promotion_start_date")):
         success_label = {"enroll": "预约成功", "update": "更新成功"}.get(normalized_action, "成功")
@@ -2130,6 +3330,9 @@ def execution_result_text(result: dict[str, Any], action: str) -> str:
     category_text = failure_category_text(result.get("failure_reasons"), failed)
     if category_text:
         failed_text += f"（{category_text}）"
+    notice = _completeness_notice(result)
+    if notice:
+        failed_text += f"，{notice}"
     return (
         f"{common}，{success_label} {success}{pending_text}，{failed_text}，"
         f"活动失败 {count_or_marker(activity_failures)}，跳过 {skipped}"
@@ -2151,6 +3354,7 @@ def status_text(value: str) -> str:
         "pending": "待开始",
         "candidate": "可报名",
         "completed": "已完成",
+        "partial_or_failed": "部分完成",
         "failed": "未完整完成",
         "cancelled": "已停止",
         "interrupted": "意外中断",
@@ -2189,7 +3393,7 @@ def execution_log_message(value: object) -> str:
             return ""
         if is_pure_concurrency_line:
             return ""
-        return text
+        return business_reason_text(text)
     return ""
 
 
@@ -2261,7 +3465,7 @@ def task_detail_text(task: dict[str, Any], details: list[dict[str, Any]], items:
         total_failed = int(summary_task.get("failed_count") or 0)
         lines = [f"\n失败商品明细（去重 {len(unique_failed)} 件 / 共 {total_failed} 件失败）："]
         for row in unique_failed[:100]:
-            reason = str(row.get("reason") or "").strip()
+            reason = business_reason_text(row.get("reason"))
             lines.append(f"  {row.get('item_id') or '-'} - {reason or '未知原因'}")
         parts.append("\n".join(lines))
     return "\n\n".join(parts)
@@ -2288,13 +3492,25 @@ def business_task_text(task: dict[str, Any], reserved_count: int | None = None) 
         f"涉及商品：{count_or_marker(unique_items, '旧记录未区分')} 件（按商品编号去重）",
         f"需处理项：{count_or_marker(relations, '旧记录未区分')} 项（商品×活动）",
     ])
+    request_success = None
+    pending = None
     if action == "cancel":
-        lines.extend([
-            f"取消请求成功：{count_or_marker(optional_contract_count(task, 'request_success_count'), '旧记录未区分')}",
-            f"成功取消：{count_or_marker(optional_contract_count(task, 'live_verified_removed_count'), '旧记录未区分')}",
-            "取消请求已提交，待平台回查确认："
-            + count_or_marker(optional_contract_count(task, "pending_verification_count"), "旧记录未区分"),
-        ])
+        request_success = optional_contract_count(task, "request_success_count")
+        pending = optional_contract_count(task, "pending_verification_count")
+        if request_success is not None and _has_readback_incomplete_reason(task):
+            pending_count = pending if pending is not None else failed
+            lines.extend([
+                f"取消请求已成功：{count_or_marker(request_success)}",
+                f"部分商品仍待平台确认：{count_or_marker(pending_count)}",
+                f"成功取消：{count_or_marker(optional_contract_count(task, 'live_verified_removed_count'))}",
+            ])
+        else:
+            lines.extend([
+                f"取消请求成功：{count_or_marker(request_success, '旧记录未区分')}",
+                f"成功取消：{count_or_marker(optional_contract_count(task, 'live_verified_removed_count'), '旧记录未区分')}",
+                "取消请求已提交，待平台回查确认："
+                + count_or_marker(pending, "旧记录未区分"),
+            ])
     else:
         success_label = {
             "enroll": "报名成功",
@@ -2309,10 +3525,18 @@ def business_task_text(task: dict[str, Any], reserved_count: int | None = None) 
         platform_pending = optional_contract_count(task, "platform_pending_count")
         if platform_pending:
             lines.append(f"平台已接受待生效：{platform_pending}")
-    failed_line = f"商品失败：{failed}"
+    readback_incomplete = action == "cancel" and request_success is not None and _has_readback_incomplete_reason(task)
+    failed_line = (
+        f"部分商品待平台确认：{count_or_marker(pending if pending is not None else failed)}"
+        if readback_incomplete
+        else f"商品失败：{failed}"
+    )
     category_text = failure_category_text(task.get("failure_reasons"), failed)
     if category_text:
         failed_line += f"（{category_text}）"
+    notice = _completeness_notice(task)
+    if notice:
+        failed_line += f"，{notice}"
     # For cancel, "skipped" rows are actually pending platform verification
     # (same set as pending_verification_count); label them accordingly instead
     # of showing a duplicate "skipped" number.
@@ -2321,7 +3545,7 @@ def business_task_text(task: dict[str, Any], reserved_count: int | None = None) 
         failed_line,
         f"活动失败：{count_or_marker(activity_failures, '旧记录未区分')}",
         f"{skip_label}：{skipped}",
-        f"失败原因：{task.get('failure_reason') or task.get('short_failure_reason') or '-'}",
+        f"失败原因：{business_reason_text(task.get('failure_reason') or task.get('short_failure_reason') or '-')}",
     ])
     return "\n".join(lines)
 
@@ -2359,6 +3583,9 @@ def product_error(message: str) -> str:
     clean = str(message or "").strip()
     if not clean:
         return "当前操作没有完成，请稍后重试。"
+    readable = business_reason_text(clean)
+    if readable != clean:
+        return readable
     technical = ("requires an element", "target element has type", "JsonElement", "fetch failed", "rate limit")
     if any(value.lower() in clean.lower() for value in technical):
         if "rate limit" in clean.lower():
@@ -2382,7 +3609,7 @@ def prepare_failure_message(prepare: dict[str, Any]) -> str:
     }
     if kind in messages:
         return messages[kind]
-    return str(prepare.get("error") or "执行范围准备未完成。")
+    return business_reason_text(prepare.get("error") or "执行范围准备未完成。")
 
 
 QDialogAccepted = 1

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import json
 from pathlib import Path
 
 
@@ -12,6 +13,14 @@ from core import build_filters, execution_payload  # noqa: E402
 
 
 class ReleaseModeTests(unittest.TestCase):
+    def test_product_version_source_is_0118_and_ui_reads_artifact_metadata(self) -> None:
+        package = json.loads((ROOT.parent / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(package["version"], "0.1.56")
+        window_source = (ROOT / "main_window.py").read_text(encoding="utf-8")
+        self.assertIn('resource_path("app/build-info.json")', window_source)
+        self.assertNotIn('return "0.1.0"', window_source)
+        self.assertIn('return "0.1.56"', window_source)
+
     def test_visible_title_and_package_names_have_no_candidate_wording(self) -> None:
         window_source = (ROOT / "main_window.py").read_text(encoding="utf-8")
         spec_source = (ROOT / "mercado_discount_manager_pyside.spec").read_text(encoding="utf-8")
@@ -56,13 +65,26 @@ class ReleaseModeTests(unittest.TestCase):
         build_source = (ROOT / "build-release.ps1").read_text(encoding="utf-8")
         installer = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
         self.assertIn("release-manifest.json", build_source)
-        for field in ("display_name", "file_count", "total_bytes", "exe_sha256", "protocol_version", "build_fingerprint"):
+        for field in ("display_name", "version", "file_count", "total_bytes", "exe_sha256", "protocol_version", "build_fingerprint"):
             self.assertIn(field, build_source)
+        self.assertIn("ProductVersion", build_source)
+        self.assertIn('version=str(desktop / "version_info.txt")', (ROOT / "mercado_discount_manager_pyside.spec").read_text(encoding="utf-8"))
+        self.assertIn("$ProductVersion", installer)
+        self.assertIn("manifest.version", installer)
         self.assertIn("active", installer.lower())
         self.assertIn("backup", installer.lower())
         self.assertIn("rollback", installer.lower())
         self.assertIn("--keyboard-smoke", installer)
         self.assertIn("--smoke-service", installer)
+
+    def test_release_packages_reason_text_as_a_runtime_resource(self) -> None:
+        spec_source = (ROOT / "mercado_discount_manager_pyside.spec").read_text(encoding="utf-8")
+        build_source = (ROOT / "build-release.ps1").read_text(encoding="utf-8")
+        installer = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
+        self.assertIn('reason_text.py', spec_source)
+        self.assertIn('"app/desktop-pyside"', spec_source)
+        self.assertIn('_internal\\app\\desktop-pyside\\reason_text.py', build_source)
+        self.assertIn('_internal\\app\\desktop-pyside\\reason_text.py', installer)
 
     def test_installer_defaults_to_current_user_start_menu_without_desktop_policy(self) -> None:
         installer = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
@@ -99,6 +121,19 @@ class ReleaseModeTests(unittest.TestCase):
             self.assertIn("src\\productContract.js", source)
             self.assertIn("PROTOCOL_VERSION", source)
             self.assertNotRegex(source, r"\$ProtocolVersion\s*=\s*['\"]\d+['\"]")
+
+    def test_release_filters_workspace_runtime_dlls_and_rejects_unversioned_icu(self) -> None:
+        source = (ROOT / "build-release.ps1").read_text(encoding="utf-8")
+        self.assertIn("codex-runtimes", source)
+        self.assertIn("ForbiddenUnversionedIcu", source)
+        self.assertIn("icuuc.dll", source)
+        self.assertIn("conflicting unversioned ICU runtime", source)
+
+    def test_hidden_smoke_has_a_hard_timeout_and_process_cleanup(self) -> None:
+        source = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
+        self.assertIn("WaitForExit(30000)", source)
+        self.assertIn("smoke timed out after 30 seconds", source)
+        self.assertIn("Stop-Process -Id $process.Id -Force", source)
 
     def test_validation_defaults_to_pyside_and_legacy_is_explicit(self) -> None:
         validate = (ROOT.parent / "scripts" / "validate.ps1").read_text(encoding="utf-8")

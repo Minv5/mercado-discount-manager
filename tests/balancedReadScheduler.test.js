@@ -494,7 +494,7 @@ test('scheduler emits bounded observable snapshots with queue, cooldown and fall
   assert.equal(finalSnapshot.fallbackActiveByAccount.A, 0);
 });
 
-test('prepare integration shares the scheduler and only live-verified writes update cache before exact invalidation', () => {
+test('prepare integration shares the scheduler and acknowledged writes update cache before exact invalidation', () => {
   const server = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
   const repository = fs.readFileSync(new URL('../src/repository.js', import.meta.url), 'utf8');
   const client = fs.readFileSync(new URL('../src/mlClient.js', import.meta.url), 'utf8');
@@ -504,7 +504,7 @@ test('prepare integration shares the scheduler and only live-verified writes upd
   assert.match(server, /readScheduler[\s\S]*operationReadCache/);
   assert.match(server, /await Promise\.all\(accountIds\.map/);
   assert.doesNotMatch(server, /for \(const promotionResult of promotionResults\)[\s\S]*markActivityCacheDirty/);
-  assert.match(server, /applySuccessfulPromotionItemWrites\([\s\S]*items: verifiedRows/);
+  assert.match(server, /applySuccessfulPromotionItemWrites\([\s\S]*items: requestSuccessRows/);
   assert.match(server, /invalidatePromotionItemFetchStates\([\s\S]*markActivityCacheDirty/);
   assert.match(repository, /applySuccessfulPromotionItemWrites[\s\S]*transaction\(\(database\)[\s\S]*for \(const row of rows\)/);
   assert.match(client, /this\.readScheduler\.schedule/);

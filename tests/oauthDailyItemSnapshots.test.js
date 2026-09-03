@@ -462,8 +462,31 @@ test('daily item identity snapshots isolate child routes and reject partial remo
   assert.deepEqual(payload.routeBOld.item_ids, ['OTHER']);
   assert.equal(payload.partialDelta.status, 'insufficient');
   assert.equal(payload.partialDelta.reason, 'current_snapshot_incomplete');
+  assert.equal(payload.partialDelta.reason_cn, '今日商品身份快照未完整读取。');
   assert.equal(payload.partialDelta.added_count, null);
   assert.equal(payload.partialDelta.removed_count, null);
+});
+
+test('daily delta exposes missing route identities and never reports a false zero change', () => {
+  const payload = runIsolated(`
+    const repo = await import('./src/repository.js');
+    const db = await import('./src/db.js');
+    const routeA = { accountId: 'A', childUserId: 'CH-1', siteId: 'MLB' };
+    const routeB = { accountId: 'A', childUserId: 'CH-2', siteId: 'MLM' };
+    repo.saveDailyItemIdentitySnapshot({ businessDate: '2026-08-23', ...routeA, itemIds: ['I-1'], complete: true });
+    repo.saveDailyItemIdentitySnapshot({ businessDate: '2026-08-24', ...routeA, itemIds: ['I-1', 'I-2'], complete: true });
+    const aggregate = repo.summarizeDailyItemIdentityDeltas({ businessDate: '2026-08-24', routes: [routeA, routeB] });
+    console.log(JSON.stringify(aggregate));
+    db.closeDb();
+  `);
+
+  assert.equal(payload.status, 'insufficient');
+  assert.equal(payload.added_count, null);
+  assert.equal(payload.removed_count, null);
+  assert.equal(payload.insufficient_route_count, 1);
+  assert.equal(payload.insufficient_routes[0].site_id, 'MLM');
+  assert.equal(payload.insufficient_routes[0].reason, 'current_snapshot_missing');
+  assert.equal(payload.insufficient_routes[0].reason_cn, '当前经营路由缺少今日商品身份快照。');
 });
 
 test('adjacent complete daily snapshots produce exact added and removed identities', () => {
@@ -512,6 +535,8 @@ test('adjacent complete daily snapshots produce exact added and removed identiti
     ready_route_count: 1,
     insufficient_route_count: 0,
     reason: '',
+    reason_cn: '',
+    insufficient_routes: [],
   });
 });
 

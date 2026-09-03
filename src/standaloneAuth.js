@@ -56,6 +56,40 @@ export function getStandaloneSecrets() {
   };
 }
 
+export function buildStandaloneTokenAccountImport({
+  token = readStandaloneToken(),
+  config = readStandaloneConfig(),
+  profile = null,
+  authDomain = 'https://global-selling.mercadolibre.com',
+} = {}) {
+  if (!token?.user_id || !token?.access_token || !token?.refresh_token) {
+    throw new Error('standalone token 缺少 user_id、access_token 或 refresh_token，未导入本地加密授权。');
+  }
+  if (!config?.client_id || !config?.client_secret) {
+    throw new Error('standalone OAuth 配置缺少 client_id 或 client_secret，未导入本地加密授权。');
+  }
+  const accountId = String(token.user_id);
+  return {
+    token: {
+      user_id: accountId,
+      access_token: String(token.access_token),
+      refresh_token: String(token.refresh_token),
+      token_type: token.token_type || 'Bearer',
+      expires_at: token.expires_at || null,
+      scope: token.scope || null,
+    },
+    profile: {
+      id: accountId,
+      nickname: profile?.display_name || profile?.nickname || `账号 ${accountId}`,
+      site_id: profile?.site_id || token.site_id || null,
+    },
+    clientId: String(config.client_id),
+    clientSecret: String(config.client_secret),
+    redirectUri: String(token.redirect_uri || config.redirect_uri || ''),
+    authDomain: String(config.auth_domain || authDomain),
+  };
+}
+
 export function refreshStandaloneToken({ force = false } = {}) {
   if (!fs.existsSync(REFRESH_SCRIPT)) {
     throw new Error('缺少 standalone Mercado refresh 脚本');

@@ -8,6 +8,7 @@ import {
   ACTIVITY_PARTIAL_ITEMS_TTL_MS,
   activityCatalogDecision,
   activityItemsDecision,
+  activityRouteChildrenComplete,
   applyActivityChangeEvent,
   buildItemIdentitySummary,
   candidatePreparationReadDecision,
@@ -18,9 +19,11 @@ import {
   setActivityCallbackAvailability,
   inventoryTotalProbeDecision,
   itemIdentityDelta,
+  recoveredRelationFetchState,
   nextNonPeakCalibrationAt,
   planActivityCatalogRoutes,
   shouldProbeFreshPreparationItems,
+  targetedRelationCacheDecision,
 } from '../src/activityChangeCache.js';
 
 const NOW = new Date('2026-07-15T06:00:00.000Z');
@@ -68,6 +71,31 @@ test('activity catalog uses webhook change signals only: clean cache is reused w
   assert.equal(states.get('A|MLM|P-1|DEAL').dirty, 0);
   assert.equal(states.get('A|MLM|P-2|DEAL').dirty, 1);
   assert.equal(states.get('A|MLM|P-2|DEAL').event_cursor, '18');
+});
+
+test('targeted item actions reuse webhook cache and refresh only dirty, gapped, or unverified relations', () => {
+  const clean = { dirty: 0, continuity: 'continuous', last_error: null };
+  assert.deepEqual(targetedRelationCacheDecision({ activityState: clean, routeState: clean }), {
+    refresh: false,
+    reason: 'webhook_cache',
+  });
+  assert.equal(targetedRelationCacheDecision({ activityState: { ...clean, dirty: 1 }, routeState: clean }).reason, 'dirty');
+  assert.equal(targetedRelationCacheDecision({ activityState: clean, routeState: { ...clean, continuity: 'gap' } }).reason, 'event_gap');
+  assert.equal(targetedRelationCacheDecision({}).reason, 'unverified');
+  setActivityCallbackAvailability(false);
+  try {
+    assert.equal(targetedRelationCacheDecision({ activityState: clean, routeState: clean }).reason, 'callback_unavailable');
+  } finally {
+    setActivityCallbackAvailability(true);
+  }
+});
+
+test('route aggregate dirty marker does not prevent clean activity children from closing the route', () => {
+  const aggregate = { promotion_id: '', promotion_type: '', dirty: 1, continuity: 'gap' };
+  const cleanChild = { promotion_id: 'P-1', promotion_type: 'DEAL', dirty: 0, continuity: 'continuous' };
+  assert.equal(activityRouteChildrenComplete([aggregate, cleanChild]), true);
+  assert.equal(activityRouteChildrenComplete([aggregate, { ...cleanChild, dirty: 1 }]), false);
+  assert.equal(activityRouteChildrenComplete([aggregate, { ...cleanChild, continuity: 'gap' }]), false);
 });
 
 test('catalog route plan performs zero external reads for clean routes and targets only dirty routes', () => {
@@ -141,6 +169,62 @@ test('same-day failed or incomplete item reads do not repeat unless a newer even
   });
   assert.equal(newerEvent.refresh, true);
   assert.equal(newerEvent.reason, 'dirty');
+});
+
+test('a newer clean full Webhook calibration recovers an older unreadable fetch without a full reread', () => {
+  const fetchUpdatedAt = '2026-07-14T06:00:00.000Z';
+  const recoveredAt = '2026-07-14T06:00:01.000Z';
+  const promotion = { finish_date: '2026-07-31' };
+  const fetchState = {
+    detail_status: 'error',
+    saved_count: 0,
+    platform_total: null,
+    updated_at: fetchUpdatedAt,
+  };
+  const recoveredCache = {
+    dirty: 0,
+    continuity: 'continuous',
+    last_error: null,
+    updated_at: recoveredAt,
+    items_full_checked_at: recoveredAt,
+  };
+  assert.deepEqual(activityItemsDecision({
+    promotion,
+    cacheState: recoveredCache,
+    fetchState,
+    itemStatus: 'started',
+    now: NOW,
+  }), { refresh: false, reason: 'webhook_recovered_cache' });
+  assert.equal(activityItemsDecision({
+    promotion,
+    cacheState: { ...recoveredCache, dirty: 1 },
+    fetchState,
+    itemStatus: 'started',
+    now: NOW,
+  }).reason, 'dirty');
+  assert.equal(activityItemsDecision({
+    promotion,
+    cacheState: { ...recoveredCache, updated_at: fetchUpdatedAt, items_full_checked_at: fetchUpdatedAt },
+    fetchState: { ...fetchState, updated_at: recoveredAt },
+    itemStatus: 'started',
+    now: NOW,
+  }).reason, 'unreadable');
+});
+
+test('recovered relation state replaces stale zero error counts with exact local identities', () => {
+  assert.deepEqual(recoveredRelationFetchState([
+    { item_id: 'MLB1' },
+    { item_id: 'MLB2' },
+    { item_id: 'MLB1' },
+    { item_id: '' },
+  ], { detail_status: 'error' }), {
+    platform_total: 2,
+    saved_count: 2,
+    detail_status: 'full',
+    recovery_source: 'newer_verified_local_relation_cache',
+    previous_detail_status: 'error',
+  });
+  assert.equal(recoveredRelationFetchState([], { detail_status: 'unreadable' }).detail_status, 'empty');
 });
 
 test('partial candidate plus inventory fallback is a reusable complete verification state', () => {

@@ -304,7 +304,7 @@ test('OAuth release failure cannot replace the original callback error or leak d
   }
 });
 
-test('final reads are complete and unverifiable results remain paused', () => {
+test('final reads are complete and unverifiable results stop after bounded read-only attempts', () => {
   const recheck = functionSource('recheckAndCancelRemainingStarted', 'readAppliedWriteRows');
   const applied = functionSource('readAppliedWriteRows', 'waitForAppliedWriteRows');
   const recovery = functionSource('recoverPendingVerificationRecords', 'finalizeExecutionJob');
@@ -314,7 +314,8 @@ test('final reads are complete and unverifiable results remain paused', () => {
   assert.doesNotMatch(applied, /maxItems:\s*5000/);
   assert.match(applied, /maxItems:\s*'all'/);
   assert.match(applied, /unverifiable/);
-  assert.doesNotMatch(recovery, /exhausted\s*\?\s*'failed'/);
+  assert.match(recovery, /exhausted\s*\?\s*'failed'/);
+  assert.match(recovery, /read_incomplete_after_max_attempts/);
   assert.match(recovery, /verification_polling_exhausted/);
   assert.match(recovery, /unresolved/);
 

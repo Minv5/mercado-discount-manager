@@ -50,7 +50,7 @@ http://127.0.0.1:28758
 
 活动变化回调默认关闭。启用时由独立公网回调服务将已验证 Mercado 通知转换为内部 schema v2，并通过本机 HMAC 签名发送到 `/api/integrations/activity-callback`。运行环境需要同时提供 `MDM_ACTIVITY_CALLBACK_ENABLED=1`、指向仓库外共享密钥文件的 `MDM_ACTIVITY_CALLBACK_SECRET_FILE` 和当前 Mercado 应用标识 `MDM_ACTIVITY_CALLBACK_APPLICATION_ID`。明文 `MDM_ACTIVITY_CALLBACK_SECRET` 只保留测试兼容，正式部署不使用。
 
-通知归属只按 `account_id + child_user_id + site_id` 解析，店铺显示名不参与路由。资源 GET 失败或身份无法确认时不会使用旧商品缓存；事件由上游持久队列重试。回调只负责精确标脏或站点目录失效，不替代每日目录、三日商品完整校准及提交前 live 复核。
+通知归属只按 `account_id + child_user_id + site_id` 解析，店铺显示名不参与路由。回调消费成功后会立即把对应活动详情和商品增删/价格差异落入本地缓存；没有未处理差异时，活动准备和任务直接复用本地缓存，不因启动或时间流逝重复全量读取平台；存在差异时只读取对应活动或商品。资源 GET 失败、身份无法确认、事件缺口或回调连续失败时才保留相应活动/路由的直读兜底；事件由上游持久队列重试。正式提交前的独立 live 复核仍按业务安全门执行。
 
 ## Legacy 回退版
 

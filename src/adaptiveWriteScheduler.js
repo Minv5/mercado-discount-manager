@@ -41,6 +41,15 @@ export function adaptiveWriteProfileForLimit(value) {
   return profileForLimit(ADAPTIVE_WRITE_PROFILE, value);
 }
 
+export function allocateWriteLimitForStore(totalLimit, storeCount, storeIndex = 0) {
+  const total = Math.max(1, Math.floor(Number(totalLimit) || 1));
+  const count = Math.max(1, Math.floor(Number(storeCount) || 1));
+  const index = Math.max(0, Math.min(count - 1, Math.floor(Number(storeIndex) || 0)));
+  const base = Math.floor(total / count);
+  const remainder = total % count;
+  return Math.max(1, base + (index < remainder ? 1 : 0));
+}
+
 function profileForLimit(source, value) {
   const requested = Number(value);
   const maxGlobal = Number.isFinite(requested)

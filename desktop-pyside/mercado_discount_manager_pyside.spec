@@ -7,6 +7,7 @@ project = desktop.parent
 datas = [
     (str(desktop / "assets"), "assets"),
     (str(desktop / "runtime-staging" / "app"), "app"),
+    (str(desktop / "reason_text.py"), "app/desktop-pyside"),
     (str(desktop / "runtime-staging" / "node" / "node.exe"), "node"),
 ]
 
@@ -30,6 +31,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="美客多活动管家",
+    version=str(desktop / "version_info.txt"),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

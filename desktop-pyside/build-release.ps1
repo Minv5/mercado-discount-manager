@@ -12,7 +12,9 @@ $Work = Join-Path $DesktopDir 'build-release'
 $Staging = Join-Path $DesktopDir 'runtime-staging'
 $AppStaging = Join-Path $Staging 'app'
 $NodeStaging = Join-Path $Staging 'node\node.exe'
+$VersionInfoPath = Join-Path $DesktopDir 'version_info.txt'
 $NodeLockPath = Join-Path $DesktopDir 'node-runtime.lock.json'
+$PackageJsonPath = Join-Path $ProjectRoot 'package.json'
 $Product = 'mercado-discount-manager'
 $DisplayName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x7BA1,0x5BB6))
 $BuildStarted = Get-Date
@@ -31,6 +33,36 @@ function Get-ProductProtocolVersion([string]$Root) {
 }
 
 $ProtocolVersion = Get-ProductProtocolVersion $ProjectRoot
+$PackageMetadata = Get-Content -LiteralPath $PackageJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$ProductVersion = [string]$PackageMetadata.version
+if ($ProductVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') { throw 'Unable to read a valid product version from package.json.' }
+$BaseVersion = ($ProductVersion -split '[-+]', 2)[0]
+$VersionParts = $BaseVersion.Split('.') | ForEach-Object { [int]$_ }
+if ($VersionParts.Count -ne 3) { throw 'Product version must contain three numeric components.' }
+$VersionTuple = "($($VersionParts[0]), $($VersionParts[1]), $($VersionParts[2]), 0)"
+$VersionInfoText = @"
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=$VersionTuple, prodvers=$VersionTuple,
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable('040904B0', [
+        StringStruct('CompanyName', '美客多活动管家'),
+        StringStruct('FileDescription', '美客多活动管家'),
+        StringStruct('FileVersion', '$ProductVersion'),
+        StringStruct('InternalName', '美客多活动管家'),
+        StringStruct('OriginalFilename', '美客多活动管家.exe'),
+        StringStruct('ProductName', '美客多活动管家'),
+        StringStruct('ProductVersion', '$ProductVersion')
+      ])
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+"@
 
 function Get-TreeFingerprint([string]$Root) {
   $rows = foreach ($file in Get-ChildItem -LiteralPath $Root -Recurse -File | Sort-Object FullName) {
@@ -52,6 +84,7 @@ function Write-ReleaseManifest([string]$ReleaseRoot, [System.IO.FileInfo]$Exe, [
       schema_version = 1
       product = $BuildInfo.product
       display_name = $BuildInfo.display_name
+      version = $BuildInfo.version
       protocol_version = $BuildInfo.protocol_version
       build_fingerprint = $BuildInfo.build_fingerprint
       built_at = $BuildInfo.built_at
@@ -106,6 +139,7 @@ if ((Get-FileHash -LiteralPath $NodeStaging -Algorithm SHA256).Hash -ne $nodeLoc
 $buildInfo = [ordered]@{
   product = $Product
   display_name = $DisplayName
+  version = $ProductVersion
   protocol_version = $ProtocolVersion
   build_fingerprint = Get-TreeFingerprint $AppStaging
   built_at = $BuildStarted.ToUniversalTime().ToString('o')
@@ -114,17 +148,39 @@ $buildInfo = [ordered]@{
 }
 Write-Utf8NoBom (Join-Path $AppStaging 'build-info.json') ($buildInfo | ConvertTo-Json -Depth 4)
 
-& $Python -m PyInstaller --noconfirm --clean --distpath $Dist --workpath $Work $Spec
-if ($LASTEXITCODE -ne 0) { throw 'PyInstaller release build failed.' }
+Write-Utf8NoBom $VersionInfoPath $VersionInfoText
+$OriginalPath = $env:PATH
+$SanitizedPathEntries = @($OriginalPath -split ';' | Where-Object {
+  $_ -and $_ -notmatch '[\\/]\.cache[\\/]codex-runtimes[\\/]'
+})
+if ($SanitizedPathEntries.Count -eq 0) { throw 'Unable to construct a safe PyInstaller PATH.' }
+try {
+  $env:PATH = [string]::Join(';', $SanitizedPathEntries)
+  & $Python -m PyInstaller --noconfirm --clean --distpath $Dist --workpath $Work $Spec
+  if ($LASTEXITCODE -ne 0) { throw 'PyInstaller release build failed.' }
+} finally {
+  $env:PATH = $OriginalPath
+  if (Test-Path -LiteralPath $VersionInfoPath) { Remove-Item -LiteralPath $VersionInfoPath -Force }
+}
 
 $NewExecutables = @(Get-ChildItem -LiteralPath $Dist -Recurse -File -Filter '*.exe' |
   Where-Object { $_.Name -ne 'node.exe' -and $_.LastWriteTime -ge $BuildStarted.AddMinutes(-1) })
 if ($NewExecutables.Count -ne 1) { throw "Expected exactly one newly built release executable, found $($NewExecutables.Count)." }
 $Exe = $NewExecutables[0]
 $ReleaseRoot = $Exe.Directory
+$ForbiddenUnversionedIcu = @('icuuc.dll', 'icuin.dll', 'icudt.dll')
+foreach ($name in $ForbiddenUnversionedIcu) {
+  $forbidden = Join-Path $ReleaseRoot.FullName (Join-Path '_internal' $name)
+  if (Test-Path -LiteralPath $forbidden) {
+    throw "Candidate contains a conflicting unversioned ICU runtime: $name"
+  }
+}
 $Required = @(
   (Join-Path $ReleaseRoot.FullName '_internal\node\node.exe'),
   (Join-Path $ReleaseRoot.FullName '_internal\app\src\server.js'),
+  (Join-Path $ReleaseRoot.FullName '_internal\app\src\activityWebhookReplay.js'),
+  (Join-Path $ReleaseRoot.FullName '_internal\app\src\activityWebhookConsumer.js'),
+  (Join-Path $ReleaseRoot.FullName '_internal\app\desktop-pyside\reason_text.py'),
   (Join-Path $ReleaseRoot.FullName '_internal\app\build-info.json'),
   (Join-Path $ReleaseRoot.FullName '_internal\app\public\index.html'),
   (Join-Path $ReleaseRoot.FullName '_internal\app\public\styles.css'),

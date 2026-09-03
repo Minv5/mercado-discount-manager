@@ -46,6 +46,7 @@ import {
   filterPendingRecordsByConfirmedScope,
   filterPromotionsByConfirmedScope,
   filterItemsByConfirmedScope,
+  filterItemsByPendingReprice,
   filterItemsByRequestedIds,
   hasConfirmedExecutionScope,
   partitionItemsByAllowedIds,
@@ -114,9 +115,9 @@ test('offer item ids containing 401 are not reported as expired authorization', 
     },
   };
   assert.equal(toChineseError(error), '缺少或无效的活动报价信息');
-  const serverSource = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
-  assert.match(serverSource, /invalid_token\|unauthorized\|\\b401\\b/);
-  assert.doesNotMatch(serverSource, /invalid_token\|unauthorized\|401\//);
+  const writePolicySource = fs.readFileSync(new URL('../src/writeFailurePolicy.js', import.meta.url), 'utf8');
+  assert.match(writePolicySource, /invalid_token\|unauthorized\|\\b401\\b/);
+  assert.doesNotMatch(writePolicySource, /invalid_token\|unauthorized\|401\//);
 });
 
 test('account profile refresh stays read-only and serves stale cache while refreshing', () => {
@@ -207,7 +208,7 @@ test('buildPlan enroll calculates discount price and applies boundaries for offi
   assert.equal(plan.rows[1].deal_price, 95);
 });
 
-test('buildPlan enroll applies local min/max boundaries for official activities and reports skip reasons', () => {
+test('buildPlan sends official activity pricing to Mercado even when cached min/max boundaries disagree', () => {
   const plan = buildPlan({
     action: 'enroll',
     promotion: { id: 'P-1', type: 'DEAL', name: '官方活动' },
@@ -219,10 +220,11 @@ test('buildPlan enroll applies local min/max boundaries for official activities 
   });
 
   assert.equal(plan.total, 2);
-  assert.equal(plan.planned, 1);
-  assert.equal(plan.skipped, 1);
+  assert.equal(plan.planned, 2);
+  assert.equal(plan.skipped, 0);
   assert.equal(plan.rows[0].deal_price, 94);
-  assert.match(plan.rows[1].reason, /低于最低允许价 96/);
+  assert.equal(plan.rows[1].deal_price, 94);
+  assert.equal(plan.rows[1].reason, '可执行');
 });
 
 test('buildPlan update skips started item when current price already matches target', () => {
@@ -257,7 +259,7 @@ test('buildPlan enroll does not skip candidate when candidate price equals targe
   assert.equal(plan.rows[0].deal_price, 95);
 });
 
-test('buildPlan cancel only allows started items', () => {
+test('buildPlan cancel allows started and pending activity relations', () => {
   const plan = buildPlan({
     action: 'cancel',
     promotion: { id: 'P-1', type: 'DEAL' },
@@ -267,9 +269,10 @@ test('buildPlan cancel only allows started items', () => {
     ]
   });
 
-  assert.equal(plan.planned, 1);
-  assert.equal(plan.skipped, 1);
+  assert.equal(plan.planned, 2);
+  assert.equal(plan.skipped, 0);
   assert.equal(plan.rows[0].reason, '将取消已开始活动商品');
+  assert.equal(plan.rows[1].reason, '将取消待开始活动商品');
 });
 
 test('inventory fallback builds seller campaign candidate drafts from child inventory scan', async () => {
@@ -307,6 +310,72 @@ test('inventory fallback builds seller campaign candidate drafts from child inve
   assert.equal(result.fallback_rows[0].suggested_discounted_price, 190);
   assert.equal(result.excluded_started_pending, 2);
   assert.equal(result.existing_candidate_count, 1);
+});
+
+test('inventory fallback reuses confirmed local item snapshots and only GETs cache misses', async () => {
+  const requested = [];
+  const client = {
+    userId: '2668031897',
+    scanMarketplaceUserItems: async () => ({
+      ids: ['MLB1', 'MLB2', 'MLB3'],
+      total: 3,
+      saved: 3,
+      isFullFetch: true,
+      sampleOnly: false,
+      rawSummary: { pages_read: 1 },
+    }),
+    getMarketplaceItem: async (itemId) => {
+      requested.push(itemId);
+      return { id: itemId, status: 'active', price: 30, currency_id: 'USD' };
+    },
+  };
+  const result = await buildSellerCampaignInventoryFallback({
+    client,
+    promotion: { promotion_id: 'C-1', promotion_type: 'SELLER_CAMPAIGN', child_user_id: '2668031897' },
+    cachedItemDetails: [
+      { id: 'MLB1', status: 'active', price: 10, currency_id: 'USD' },
+      { id: 'MLB2', status: 'active', price: 20, currency_id: 'USD' },
+    ],
+    discountPercent: 5,
+  });
+
+  assert.deepEqual(requested, ['MLB3']);
+  assert.equal(result.detail_targets, 3);
+  assert.equal(result.detail_cache_hits, 2);
+  assert.equal(result.detail_platform_reads, 1);
+  assert.equal(result.detail_success, 3);
+  assert.equal(result.added_count, 3);
+  assert.match(result.note, /复用本地已确认商品快照 2 个，平台补读 1 个/);
+});
+
+test('inventory fallback reuses a complete daily route identity snapshot without a second full scan', async () => {
+  let scanCalls = 0;
+  let detailCalls = 0;
+  const result = await buildSellerCampaignInventoryFallback({
+    client: {
+      userId: '2668031897',
+      scanMarketplaceUserItems: async () => { scanCalls += 1; throw new Error('should not scan'); },
+      getMarketplaceItem: async () => { detailCalls += 1; throw new Error('should not read cached details'); },
+    },
+    promotion: { promotion_id: 'C-NEW', promotion_type: 'SELLER_CAMPAIGN', child_user_id: '2668031897' },
+    inventorySnapshot: {
+      ids: ['MLB1', 'MLB2'], total: 2, saved: 2,
+      isFullFetch: true, sampleOnly: false,
+      rawSummary: { source: 'complete_daily_identity_plus_webhook_deltas' },
+    },
+    cachedItemDetails: [
+      { id: 'MLB1', status: 'active', price: 10, currency_id: 'USD' },
+      { id: 'MLB2', status: 'active', price: 20, currency_id: 'USD' },
+    ],
+    discountPercent: 5,
+  });
+
+  assert.equal(scanCalls, 0);
+  assert.equal(detailCalls, 0);
+  assert.equal(result.inventory_snapshot_reused, true);
+  assert.equal(result.detail_cache_hits, 2);
+  assert.equal(result.detail_platform_reads, 0);
+  assert.equal(result.added_count, 2);
 });
 
 test('inventory fallback candidate row uses current marketplace price as discount base', () => {
@@ -2291,7 +2360,7 @@ test('cancel live verification waits for propagation and only retries request-su
   assert.match(serverSource, /delay_ms: delayMs/);
 });
 
-test('enroll and update require live target state before the task counts request success', () => {
+test('enroll and update finish on acknowledged writes while later visibility is event driven', () => {
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
   assert.match(serverSource, /async function waitForAppliedWriteRows/);
   assert.match(serverSource, /repeated_write_requests: 0/);
@@ -2308,14 +2377,15 @@ test('enroll and update require live target state before the task counts request
     true,
     'planned writes must preserve sanitized HTTP response evidence',
   );
-  assert.match(serverSource, /write_live_verification_round/);
-  assert.match(serverSource, /confirmed_candidate_after_write/);
-  assert.match(serverSource, /confirmed_pending/);
-  assert.match(serverSource, /retryable_pending_count/);
-  assert.match(serverSource, /started_price_mismatch/);
-  assert.match(serverSource, /平台仍明确返回可报名/);
-  assert.match(serverSource, /MAX_CONFIRMED_CANDIDATE_WRITE_ATTEMPTS = 3/);
-  assert.match(serverSource, /execution\.counts\.pending_verification_count = unresolvedRows\.length/);
+  const acknowledged = serverSource.slice(
+    serverSource.indexOf("if (action !== 'cancel')"),
+    serverSource.indexOf('if (Number(execution?.counts?.success', serverSource.indexOf("if (action !== 'cancel')")),
+  );
+  assert.match(acknowledged, /write_request_acknowledged/);
+  assert.match(acknowledged, /deferred_to_webhook_or_incremental_refresh/);
+  assert.match(acknowledged, /execution\.counts\.request_success_count = requestSuccessRows\.length/);
+  assert.match(acknowledged, /execution\.counts\.platform_pending_count = uncertainCount/);
+  assert.doesNotMatch(acknowledged, /confirmAppliedWrites|pendingWriteQueue\.enqueue|sleep\(30_000\)/);
 });
 
 test('result contract separates relation items from activity failures and exposes stable counts', () => {
@@ -3580,7 +3650,8 @@ test('executePlannedRowsWithConcurrency limits write concurrency and records all
       return { item_id: itemId, ok: true };
     },
     saveResult: (row) => saved.push(row),
-    toErrorText: (error) => `中文失败：${error.message}`
+    toErrorText: (error) => `中文失败：${error.message}`,
+    retryOptions: { finalFailureBackoffMs: [0, 0, 0], finalFailureConcurrency: 1 },
   });
 
   assert.equal(observedMax <= 2, true);
@@ -3655,7 +3726,8 @@ test('single promotion can submit multiple planned rows concurrently without sto
       return { ok: true, item_id: itemId };
     },
     saveResult: (row) => saved.push(row),
-    toErrorText: (error) => `中文失败：${error.message}`
+    toErrorText: (error) => `中文失败：${error.message}`,
+    retryOptions: { finalFailureBackoffMs: [0, 0, 0], finalFailureConcurrency: 1 },
   });
 
   assert.equal(observedMax > 1, true);
@@ -3781,7 +3853,8 @@ test('execution rows do not stop remaining items after business write errors', a
     saveResult: (row) => saved.push(row),
     classifyError: () => ({ interfaceFailure: false, businessFailure: true }),
     onStopRequested: () => { stop = true; },
-    onItemEvent: (event) => events.push(event)
+    onItemEvent: (event) => events.push(event),
+    retryOptions: { finalFailureBackoffMs: [0, 0, 0], finalFailureConcurrency: 1 },
   });
 
   assert.equal(stop, false);
@@ -3790,6 +3863,7 @@ test('execution rows do not stop remaining items after business write errors', a
   assert.equal(result.counts.skipped, 0);
   assert.equal(saved.length, 4);
   assert.equal(calls.filter((itemId) => itemId === 'MLB-BUSINESS-2').length, 1);
+  assert.equal(events.filter((event) => event.type === 'final_failure_retry_start').length, 0);
   assert.equal(events.some((event) => event.type === 'item_cancelled_before_start'), false);
 });
 
@@ -3878,6 +3952,7 @@ test('deferred transient failure becomes auditable pending after the tail retry'
 
 test('execution job item audit resolves run-id event files and counts true write attempts only', () => {
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  const writePolicySource = fs.readFileSync(path.join(process.cwd(), 'src/writeFailurePolicy.js'), 'utf8');
 
   assert.match(serverSource, /function findExecutionJobEventPath/);
   assert.match(serverSource, /name\.startsWith\(`\$\{safeJobId\}-`\)/);
@@ -3887,9 +3962,168 @@ test('execution job item audit resolves run-id event files and counts true write
   assert.match(serverSource, /summary\.planned_unique \+= 1/);
   assert.match(serverSource, /summary\.write_attempt_unique \+= 1/);
   assert.doesNotMatch(serverSource, /\['item_start', 'item_finish', 'item_skipped', 'item_cancelled_before_start'\]\.includes\(eventType\)[\s\S]{0,80}row\.hasWriteEvent = true/);
-  assert.match(serverSource, /businessFailure/);
-  assert.match(serverSource, /缺少或无效/);
-  assert.match(serverSource, /interfaceFailure: !businessFailure/);
+  assert.match(writePolicySource, /businessFailure/);
+  assert.match(writePolicySource, /缺少或无效/);
+  assert.match(writePolicySource, /interfaceFailure: !businessFailure/);
+});
+
+test('pending repricing filter keeps only relations marked by a base-price webhook change', () => {
+  const itemsByPromotion = new Map([
+    ['A|C|MLB|P-1|DEAL', [
+      { item_id: 'MLB1', price_recalc_required: 1 },
+      { item_id: 'MLB2', price_recalc_required: 0 },
+      { item_id: 'MLB3' },
+    ]],
+  ]);
+  const filtered = filterItemsByPendingReprice(itemsByPromotion);
+  assert.equal(filtered.relationCount, 1);
+  assert.deepEqual(filtered.itemsByPromotion.get('A|C|MLB|P-1|DEAL').map((row) => row.item_id), ['MLB1']);
+});
+
+test('same-day price webhook reopens only pending activity repricing at the existing discounts', () => {
+  const today = new Date('2026-08-26T19:00:00+08:00');
+  const promotions = [
+    { account_id: 'A', child_user_id: 'C', site_id: 'MLB', promotion_id: 'C-1', promotion_type: 'SELLER_CAMPAIGN' },
+    { account_id: 'A', child_user_id: 'C', site_id: 'MLB', promotion_id: 'P-1', promotion_type: 'DEAL' },
+  ];
+  const states = new Map([
+    [promotionKey(promotions[0]), { seller_discount_percent: 17, status: 'completed', updated_at: '2026-08-26T10:00:00+08:00' }],
+    [promotionKey(promotions[1]), { official_discount_percent: 18, status: 'completed', updated_at: '2026-08-26T10:00:00+08:00' }],
+  ]);
+  const started = new Map(promotions.map((promotion) => [promotionKey(promotion), 10]));
+  const repricing = new Map(promotions.map((promotion) => [promotionKey(promotion), 1]));
+
+  const decision = decideToday({
+    promotions,
+    cycleStatesByPromotion: states,
+    startedCountsByPromotion: started,
+    repriceCountsByPromotion: repricing,
+    sellerMaxDiscount: 17,
+    officialMaxDiscount: 18,
+    today,
+  });
+
+  assert.equal(decision.action, 'update');
+  assert.equal(decision.already_completed, false);
+  assert.equal(decision.reprice_pending_only, true);
+  assert.equal(decision.reprice_pending_count, 2);
+  assert.equal(decision.seller_discount, 17);
+  assert.equal(decision.official_discount, 18);
+  assert.ok(decision.rows.every((row) => row.reprice_required && row.reprice_pending_count === 1));
+  assert.match(decision.reason, /只更新待重算/);
+});
+
+test('cycle cancellation remains higher priority than pending repricing', () => {
+  const promotion = { account_id: 'A', child_user_id: 'C', site_id: 'MLB', promotion_id: 'C-1', promotion_type: 'SELLER_CAMPAIGN' };
+  const key = promotionKey(promotion);
+  const decision = decideToday({
+    promotions: [promotion],
+    cycleStatesByPromotion: new Map([[key, { seller_discount_percent: 17, status: 'completed', updated_at: '2026-08-25T10:00:00+08:00' }]]),
+    startedCountsByPromotion: new Map([[key, 10]]),
+    repriceCountsByPromotion: new Map([[key, 1]]),
+    sellerMaxDiscount: 17,
+    today: new Date('2026-08-26T10:00:00+08:00'),
+  });
+  assert.equal(decision.action, 'cancel');
+  assert.equal(decision.reprice_pending_only, false);
+});
+
+test('capacity-safe promotion pagination lowers page size, backs off, and resumes the same page', async () => {
+  const client = new MercadoLibreClient();
+  const calls = [];
+  const waits = [];
+  client.getPromotionItems = async ({ offset, limit }) => {
+    calls.push({ offset, limit });
+    if (limit > 10) {
+      const error = new Error('The request could not be completed due to internal capacity constraints.');
+      error.status = 409;
+      error.body = { error: 'internal_capacity_conflict', status: 409 };
+      throw error;
+    }
+    const total = 25;
+    return {
+      paging: { total, offset, limit },
+      results: Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, index) => ({
+        id: `ITEM-${offset + index + 1}`,
+      })),
+    };
+  };
+
+  const result = await client.fetchAllPromotionItems({
+    promotionId: 'C-LARGE',
+    promotionType: 'SELLER_CAMPAIGN',
+    status: 'started',
+    maxItems: 'all',
+    capacitySafe: true,
+    capacityRetryDelaysMs: [10, 20],
+    sleepFn: async (ms) => waits.push(ms),
+  });
+
+  assert.equal(result.isFullFetch, true);
+  assert.equal(result.saved, 25);
+  assert.deepEqual(calls, [
+    { offset: 0, limit: 50 },
+    { offset: 0, limit: 25 },
+    { offset: 0, limit: 10 },
+    { offset: 10, limit: 10 },
+    { offset: 20, limit: 10 },
+  ]);
+  assert.deepEqual(waits, [10, 20]);
+  assert.equal(result.rawSummary.capacity_recovery_used, true);
+  assert.equal(result.rawSummary.capacity_retry_count, 2);
+  assert.equal(result.rawSummary.page_limit_final, 10);
+});
+
+test('capacity-safe pagination does not restart completed pages after a later capacity conflict', async () => {
+  const client = new MercadoLibreClient();
+  const calls = [];
+  client.getPromotionItems = async ({ offset, limit }) => {
+    calls.push({ offset, limit });
+    if (offset === 50 && limit > 25) {
+      const error = new Error('internal_capacity_conflict');
+      error.status = 409;
+      error.body = { error: 'internal_capacity_conflict' };
+      throw error;
+    }
+    const total = 120;
+    return {
+      paging: { total, offset, limit },
+      results: Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, index) => ({ id: `I-${offset + index}` })),
+    };
+  };
+  const result = await client.fetchAllPromotionItems({
+    promotionId: 'C-LARGE-RESUME', promotionType: 'SELLER_CAMPAIGN', status: 'started', maxItems: 'all',
+    capacitySafe: true, capacityRetryDelaysMs: [0], sleepFn: async () => {},
+  });
+  assert.equal(result.saved, 120);
+  assert.equal(calls.filter((call) => call.offset === 0).length, 1);
+  assert.deepEqual(calls.slice(0, 3), [
+    { offset: 0, limit: 50 },
+    { offset: 50, limit: 50 },
+    { offset: 50, limit: 25 },
+  ]);
+});
+
+test('capacity conflicts remain bounded and default reads do not silently retry 409', async () => {
+  for (const capacitySafe of [false, true]) {
+    const client = new MercadoLibreClient();
+    let calls = 0;
+    client.getPromotionItems = async () => {
+      calls += 1;
+      const error = new Error('internal_capacity_conflict');
+      error.status = 409;
+      error.body = { error: 'internal_capacity_conflict' };
+      throw error;
+    };
+    await assert.rejects(
+      client.fetchAllPromotionItems({
+        promotionId: 'C-FAIL', promotionType: 'SELLER_CAMPAIGN', status: 'started', maxItems: 'all',
+        capacitySafe, capacityRetryDelaysMs: [0], sleepFn: async () => {},
+      }),
+      /internal_capacity_conflict/,
+    );
+    assert.equal(calls, capacitySafe ? 6 : 1);
+  }
 });
 
 test('shared write limiter caps global in-flight writes across concurrent activities', async () => {
@@ -3951,8 +4185,9 @@ test('execution job path carries normalized write concurrency into real executio
   assert.equal(serverSource.includes('\u6309\u6d3b\u52a8\u5e76\u53d1 ${event.activityConcurrency || jobActivityConcurrency}\u3001\u5546\u54c1\u5199\u5165\u5e76\u53d1 ${event.writeConcurrency || jobWriteConcurrency}'), true);
   assert.match(serverSource, /writeConcurrency: jobWriteConcurrency/);
   assert.match(serverSource, /activityConcurrency: jobActivityConcurrency/);
-  assert.match(serverSource, /getSharedWriteLimiter\(request\.executionGroupId, action, normalizedGlobalWriteConcurrency/);
+  assert.match(serverSource, /getSharedWriteLimiter\(request\.executionGroupId, account\.account_id, action, normalizedGlobalWriteConcurrency/);
   assert.match(serverSource, /sharedWriteLimiters/);
+  assert.match(serverSource, /sharedWriteGroupGuards/);
   assert.match(serverSource, /const requestedNormalizedWriteConcurrency = normalizeWriteConcurrency\(writeConcurrency, readSettings\(\)\.writeConcurrency\)/);
   assert.match(serverSource, /adaptiveWriteProfileForAction\(action, requestedGlobalWriteConcurrency\)/);
   assert.match(serverSource, /Math\.min\(requestedNormalizedWriteConcurrency, actionWriteProfile\.perRoute\)/);

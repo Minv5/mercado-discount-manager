@@ -112,6 +112,67 @@ export function requestedExecutionItemIds(request = {}) {
   return result;
 }
 
+export function isTargetedCancelAllActivitiesRequest(request = {}) {
+  const enabled = request.targetedCancelAllActivities ?? request.targeted_cancel_all_activities;
+  const action = String(request.action || request.requested_action || request.requestedAction || '').toLowerCase();
+  return (enabled === true || isTargetedItemActionRequest(request)) && action === 'cancel';
+}
+
+export function isTargetedItemActionRequest(request = {}) {
+  const enabled = request.targetedItemAction ?? request.targeted_item_action;
+  const action = String(request.action || request.requested_action || request.requestedAction || '').toLowerCase();
+  return enabled === true && ['enroll', 'cancel'].includes(action);
+}
+
+export function filterExecutionScopeByRequestedItemIds({ scope = {}, request = {} } = {}) {
+  const requestedItemIds = requestedExecutionItemIds(request);
+  const wanted = new Set(requestedItemIds.map(normalizeItemId));
+  const matched = new Set();
+  const activities = [];
+  const accountStats = new Map();
+
+  for (const activity of Array.isArray(scope.activities) ? scope.activities : []) {
+    const selectedItemIds = [];
+    const seenRelations = new Set();
+    for (const itemId of activity.item_ids ?? activity.itemIds ?? []) {
+      const normalized = normalizeItemId(itemId);
+      if (!normalized || !wanted.has(normalized) || seenRelations.has(normalized)) continue;
+      seenRelations.add(normalized);
+      matched.add(normalized);
+      selectedItemIds.push(String(itemId));
+    }
+    if (!selectedItemIds.length) continue;
+    activities.push({ ...activity, item_ids: selectedItemIds });
+    const accountId = String(activity.account_id ?? activity.accountId ?? '');
+    if (!accountStats.has(accountId)) {
+      accountStats.set(accountId, { account_id: accountId, item_ids: new Set(), relation_count: 0, activity_count: 0 });
+    }
+    const stats = accountStats.get(accountId);
+    for (const itemId of selectedItemIds) stats.item_ids.add(normalizeItemId(itemId));
+    stats.relation_count += selectedItemIds.length;
+    stats.activity_count += 1;
+  }
+
+  const matchedItemIds = requestedItemIds.filter((itemId) => matched.has(normalizeItemId(itemId)));
+  const missingItemIds = requestedItemIds.filter((itemId) => !matched.has(normalizeItemId(itemId)));
+  return {
+    hasFilter: requestedItemIds.length > 0,
+    requestedItemIds,
+    matchedItemIds,
+    missingItemIds,
+    relationCount: activities.reduce((sum, activity) => sum + (activity.item_ids || []).length, 0),
+    activityCount: activities.length,
+    accountCount: accountStats.size,
+    accounts: [...accountStats.values()].map((stats) => ({
+      account_id: stats.account_id,
+      unique_item_count: stats.item_ids.size,
+      relation_count: stats.relation_count,
+      activity_count: stats.activity_count,
+    })),
+    scope: { ...scope, activities },
+  };
+}
+
 export function filterItemsByRequestedIds({ promotions = [], itemsByPromotion = new Map(), request = {} } = {}) {
   const requestedItemIds = requestedExecutionItemIds(request);
   if (!requestedItemIds.length) {
@@ -151,6 +212,16 @@ export function filterItemsByRequestedIds({ promotions = [], itemsByPromotion = 
     missingItemIds,
     itemsByPromotion: filtered
   };
+}
+
+export function filterItemsByPendingReprice(itemsByPromotion = new Map()) {
+  let relationCount = 0;
+  const filtered = new Map([...itemsByPromotion.entries()].map(([key, items]) => {
+    const rows = (items || []).filter((item) => Number(item?.price_recalc_required || 0) === 1);
+    relationCount += rows.length;
+    return [key, rows];
+  }));
+  return { itemsByPromotion: filtered, relationCount };
 }
 
 export function filterItemsByConfirmedScope({ accountId = '', promotions = [], itemsByPromotion = new Map(), request = {}, requiredRecords = null } = {}) {

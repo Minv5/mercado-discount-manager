@@ -812,6 +812,15 @@ test('submission commit reuses the confirmed scope without a second full live-re
   assert.match(server, /CANCEL_RESULT_STATUS\.pendingVerification/);
 });
 
+test('healthy event cache skips forced final catalog reads and carries reconciled scope through group start', () => {
+  const server = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
+  assert.match(server, /function eventDrivenCacheReadyForExecution\(routes = \[\]\)/);
+  assert.match(server, /const eventCacheReady = finalRevalidation && eventDrivenCacheReadyForExecution\(confirmedRoutes\)/);
+  assert.match(server, /reason: 'event_driven_cache_verified'/);
+  assert.match(server, /cacheScopeReconciled: true/);
+  assert.match(server, /if \(missingRelations\.length && !cacheScopeReconciled\)/);
+});
+
 test('final execution consumes the frozen intersection without a second full activity or item scan', () => {
   const server = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
   assert.match(server, /const frozenScope = hasConfirmedExecutionScope\(request\)/);

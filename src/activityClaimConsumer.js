@@ -1,8 +1,13 @@
 import { createHmac } from 'node:crypto';
 import fs from 'node:fs';
+import {
+  DEFAULT_ACTIVITY_ACK_URL,
+  DEFAULT_ACTIVITY_CLAIM_URL,
+  LEGACY_ACTIVITY_ACK_URLS,
+  LEGACY_ACTIVITY_CLAIM_URLS,
+  migrateCallbackEndpoint,
+} from './callbackEndpoints.js';
 
-const DEFAULT_CLAIM_URL = 'https://xingtupro1020.com/meli-callback/consumer/claim';
-const DEFAULT_ACK_URL = 'https://xingtupro1020.com/meli-callback/consumer/ack';
 const DEFAULT_POLL_MS = 2000;
 const DEFAULT_LEASE_GRACE_MS = 30000;
 const DEFAULT_MAX_PROCESSING = 20;
@@ -78,8 +83,8 @@ function fetchJson(url, { method = 'POST', headers = {}, body = null, timeoutMs 
 }
 
 export function createActivityClaimConsumer({
-  claimUrl = DEFAULT_CLAIM_URL,
-  ackUrl = DEFAULT_ACK_URL,
+  claimUrl = DEFAULT_ACTIVITY_CLAIM_URL,
+  ackUrl = DEFAULT_ACTIVITY_ACK_URL,
   secretFile = '',
   applicationId = '',
   pollMs = DEFAULT_POLL_MS,
@@ -256,13 +261,21 @@ export function activityClaimConfig(env = process.env, settings = null) {
   const envApplicationId = String(env.MDM_ACTIVITY_CLAIM_APPLICATION_ID || env.MDM_ACTIVITY_CALLBACK_APPLICATION_ID || '').trim();
   const settingsApplicationId = String(settings?.activityCallbackApplicationId || '').trim();
   const envClaimUrl = String(env.MDM_ACTIVITY_CLAIM_URL || '').trim();
-  const settingsClaimUrl = String(settings?.activityCallbackClaimUrl || '').trim();
+  const settingsClaimUrl = migrateCallbackEndpoint(
+    settings?.activityCallbackClaimUrl,
+    DEFAULT_ACTIVITY_CLAIM_URL,
+    LEGACY_ACTIVITY_CLAIM_URLS,
+  );
   const envAckUrl = String(env.MDM_ACTIVITY_CLAIM_ACK_URL || '').trim();
-  const settingsAckUrl = String(settings?.activityCallbackAckUrl || '').trim();
+  const settingsAckUrl = migrateCallbackEndpoint(
+    settings?.activityCallbackAckUrl,
+    DEFAULT_ACTIVITY_ACK_URL,
+    LEGACY_ACTIVITY_ACK_URLS,
+  );
   const secretFile = envSecretFile || settingsSecretFile;
   const applicationId = envApplicationId || settingsApplicationId;
-  const claimUrl = envClaimUrl || settingsClaimUrl || DEFAULT_CLAIM_URL;
-  const ackUrl = envAckUrl || settingsAckUrl || DEFAULT_ACK_URL;
+  const claimUrl = envClaimUrl || settingsClaimUrl || DEFAULT_ACTIVITY_CLAIM_URL;
+  const ackUrl = envAckUrl || settingsAckUrl || DEFAULT_ACTIVITY_ACK_URL;
   const pollMs = Math.max(500, Math.floor(Number(env.MDM_ACTIVITY_CLAIM_POLL_MS) || DEFAULT_POLL_MS));
   return { enabled, secretFile, applicationId, claimUrl, ackUrl, pollMs };
 }

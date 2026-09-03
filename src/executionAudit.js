@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 
-const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+const TERMINAL = new Set(['completed', 'partial_or_failed', 'failed', 'cancelled', 'interrupted']);
 
 export function readAuditText(file) {
   const buffer = fs.readFileSync(file);

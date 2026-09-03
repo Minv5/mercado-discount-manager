@@ -1,4 +1,11 @@
+const TECHNICAL_REASON_MAPPINGS = [
+  [/\bPROMOTION_ITEMS_(?:UNREADABLE|INCOMPLETE)\b|\bresults\s*["']?\s*[:=]\s*null\b|已报名商品明细不完整|已报名明细不完整|平台商品明细不可验证/i, '平台未返回可读取的商品清单，暂无法确认取消结果。'],
+  [/\bpending[_\s-]*relations?[_\s-]*present\b/i, '存在待平台确认的商品关系。'],
+  [/\baccounting[_\s-]*complete\s*["']?\s*[:=]\s*false\b|\baccounting_(?:incomplete|not_proven)\b/i, '本次结果尚未全部确认。'],
+];
+
 const mappings = [
+  ...TECHNICAL_REASON_MAPPINGS,
   [/invalid_token|expired|unauthorized|\b401\b/i, '授权失效或 token 已过期'],
   [/under_review|item status is not allowed/i, '商品正在审核中，平台不允许报名'],
   [/forbidden|permission|\b403\b|not authorized|access denied|caller.*not/i, '账号权限不足或应用权限不足'],
@@ -86,6 +93,29 @@ export function toChineseError(error) {
     if (pattern.test(raw)) return label;
   }
   return raw ? `平台返回未分类错误：${raw.slice(0, 160)}` : '未知错误';
+}
+
+export function businessReasonText(reason = '') {
+  const raw = String(reason || '').trim();
+  if (!raw) return '';
+  let technicalText = raw;
+  let matchedTechnical = false;
+  for (const [pattern, label] of TECHNICAL_REASON_MAPPINGS) {
+    if (!pattern.test(technicalText)) continue;
+    const tokenOnly = /^(?:PROMOTION_ITEMS_(?:UNREADABLE|INCOMPLETE)|pending[_\s-]*relations?[_\s-]*present|accounting[_\s-]*complete\s*["']?\s*[:=]\s*false|accounting_(?:incomplete|not_proven)|results\s*["']?\s*[:=]\s*null|已报名商品明细不完整|已报名明细不完整|平台商品明细不可验证)$/i.test(raw);
+    if (tokenOnly || /^\s*[\[{]/.test(raw)) return label;
+    technicalText = technicalText.replace(pattern, label);
+    matchedTechnical = true;
+  }
+  if (matchedTechnical) return technicalText;
+  const text = (/[\u4e00-\u9fff]/.test(raw) ? raw : toChineseError(raw)).replace(/_/g, ' ');
+  return text
+    .replace(/\bapi incomplete marketplace candidate\b/gi, '商品明细不完整')
+    .replace(/\bpartial api sparse marketplace candidate\b/gi, '平台商品明细读取不完整')
+    .replace(/\bparameters unconfirmed\b/gi, '活动参数未确认')
+    .replace(/\brunning\b/gi, '执行中')
+    .replace(/\bpartial or failed\b/gi, '部分完成/有失败')
+    .replace(/\bempty or failed\b/gi, '未执行/无可处理商品');
 }
 
 export class ApiError extends Error {

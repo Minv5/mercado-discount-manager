@@ -55,24 +55,33 @@ export async function buildSellerCampaignInventoryFallback({
   signal = null,
   readScheduler = null,
   accountId = null,
+  cachedItemDetails = [],
+  inventorySnapshot = null,
 }) {
   if (!isSellerCampaign(promotion)) {
     return skippedFallbackRow(promotion, '仅 SELLER_CAMPAIGN 自建活动支持库存扫描兜底');
   }
   const childUserId = promotion.child_user_id || client.userId;
   const runFallback = async () => {
-  const scan = await client.scanMarketplaceUserItems({
-    userId: childUserId,
-    status: listingStatus || 'all',
-    maxItems: maxScanItems,
-    signal,
-  });
+  const reusableInventorySnapshot = inventorySnapshot?.isFullFetch === true
+    && Array.isArray(inventorySnapshot?.ids);
+  const scan = reusableInventorySnapshot ? inventorySnapshot : await client.scanMarketplaceUserItems({
+      userId: childUserId,
+      status: listingStatus || 'all',
+      maxItems: maxScanItems,
+      signal,
+    });
   const excludedIds = new Set([
     ...startedItems.map(itemIdFromRow),
     ...pendingItems.map(itemIdFromRow)
   ].filter(Boolean));
   const existingCandidateIds = new Set(existingCandidateItems.map(itemIdFromRow).filter(Boolean));
   const detailTargetIds = scan.ids.filter((id) => !excludedIds.has(id) && !existingCandidateIds.has(id));
+  const cachedById = new Map((cachedItemDetails || [])
+    .map((detail) => [String(itemIdFromRow(detail) || ''), detail])
+    .filter(([itemId, detail]) => itemId && Number.isFinite(Number(detail?.price)) && Number(detail.price) > 0));
+  const cacheHits = detailTargetIds.map((itemId) => cachedById.get(String(itemId))).filter(Boolean);
+  const platformDetailTargetIds = detailTargetIds.filter((itemId) => !cachedById.has(String(itemId)));
   const readDetail = async (itemId) => {
     try {
       return { ok: true, itemId, detail: await client.getMarketplaceItem(itemId, { signal }) };
@@ -81,9 +90,10 @@ export async function buildSellerCampaignInventoryFallback({
     }
   };
   const details = readScheduler
-    ? await Promise.all(detailTargetIds.map(readDetail))
-    : await mapLimited(detailTargetIds, normalizeConcurrency(detailConcurrency), readDetail);
-  const successfulDetails = details.filter((row) => row?.ok && row.detail).map((row) => row.detail);
+    ? await Promise.all(platformDetailTargetIds.map(readDetail))
+    : await mapLimited(platformDetailTargetIds, normalizeConcurrency(detailConcurrency), readDetail);
+  const platformDetails = details.filter((row) => row?.ok && row.detail).map((row) => row.detail);
+  const successfulDetails = [...cacheHits, ...platformDetails];
   const failedDetails = details.filter((row) => row && !row.ok);
   const candidateRows = buildInventoryFallbackCandidateRows({ itemDetails: successfulDetails, promotion, discountPercent });
   const detailStatus = scan.isFullFetch ? INVENTORY_FALLBACK_READY_STATUS : INVENTORY_FALLBACK_PARTIAL_STATUS;
@@ -95,22 +105,28 @@ export async function buildSellerCampaignInventoryFallback({
     scan_saved: scan.saved,
     scan_is_full_fetch: scan.isFullFetch,
     scan_sample_only: scan.sampleOnly,
+    inventory_snapshot_reused: reusableInventorySnapshot,
     scanned_ids: scan.ids.length,
     excluded_started_pending: excludedIds.size,
     existing_candidate_count: existingCandidateIds.size,
     detail_targets: detailTargetIds.length,
     detail_success: successfulDetails.length,
     detail_failed: failedDetails.length,
+    detail_cache_hits: cacheHits.length,
+    detail_platform_reads: platformDetailTargetIds.length,
     fallback_rows: candidateRows,
     added_count: candidateRows.length,
     detail_status: detailStatus,
     is_full_fetch: scan.isFullFetch,
     blocked: false,
-    note: `库存扫描兜底生成 ${candidateRows.length} 个候选草案；资格以 Mercado 报名返回为准。`,
+    note: `库存扫描兜底生成 ${candidateRows.length} 个候选草案；复用本地已确认商品快照 ${cacheHits.length} 个，平台补读 ${platformDetailTargetIds.length} 个；资格以 Mercado 报名返回为准。`,
     raw: {
       source: INVENTORY_FALLBACK_SOURCE,
       listing_status: listingStatus || 'all',
       scan: scan.rawSummary,
+      inventory_snapshot_reused: reusableInventorySnapshot,
+      detail_cache_hits: cacheHits.length,
+      detail_platform_reads: platformDetailTargetIds.length,
       failed_detail_sample: failedDetails.slice(0, 10)
     }
   };

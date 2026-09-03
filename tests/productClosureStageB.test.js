@@ -11,6 +11,7 @@ import {
   ACTIVE_EXECUTION_GROUP_STATUSES,
   createExecutionGroupPersistence,
   executionGroupBusinessScope,
+  normalizeExecutionGroupTerminalSemantics,
   projectLiveExecutionGroupChildren,
   summarizeExecutionGroup,
 } from '../src/executionGroupPersistence.js';
@@ -170,6 +171,35 @@ test('one shared limiter caps all child workloads and is removable after group t
 
 test('group status vocabulary keeps persistent pending work active while paused', () => {
   assert.deepEqual([...ACTIVE_EXECUTION_GROUP_STATUSES].sort(), ['paused', 'queued', 'running', 'stopping']);
+});
+
+test('closed update with business failures and platform pending is normalized to partial completion', () => {
+  const terminal = {
+    relation_count: 12, success: 9, failed: 1, skipped: 0,
+    platform_pending: 2, unresolved: 0, classified_count: 12,
+    is_closed: true, is_resolved: true,
+  };
+  const normalized = normalizeExecutionGroupTerminalSemantics(groupFixture({
+    status: 'failed',
+    children: [{
+      job_id: 'job-partial', account_id: 'A', status: 'failed', error: null,
+      result: {
+        accounting_complete: true,
+        terminal_counts: terminal,
+        execution: {
+          total: 12, relation_count: 12, success: 9, failed: 1, skipped: 0,
+          pending: 2, platform_pending_count: 2, accounting_complete: true,
+          terminal_counts: terminal,
+        },
+      },
+    }],
+  }));
+  assert.equal(normalized.changed, true);
+  assert.equal(normalized.group.status, 'partial_or_failed');
+  assert.equal(normalized.group.children[0].status, 'partial_or_failed');
+  assert.equal(normalized.group.result.accounting_complete, true);
+  assert.deepEqual(normalized.group.result.incomplete_reasons, []);
+  assert.equal(normalized.group.result.platform_pending_count, 2);
 });
 
 test('paused pending group is recovered as queued instead of being marked interrupted after restart', () => {

@@ -1,25 +1,29 @@
 from __future__ import annotations
 
 import calendar
-from datetime import date, timedelta
-from typing import Any
+import json
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable
 
-from PySide6.QtCore import QDate, QSignalBlocker, Qt, Signal
+from PySide6.QtCore import QDate, QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QDateEdit,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -32,7 +36,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core import Account, site_name
+from callback_endpoints import (
+    DEFAULT_ACTIVITY_CALLBACK_ACK_URL,
+    DEFAULT_ACTIVITY_CALLBACK_CLAIM_URL,
+    DEFAULT_WEBHOOK_CALLBACK_URL,
+)
+from core import Account, parse_targeted_cancel_item_ids, site_name
+from reason_text import business_reason_text
 
 
 class AliasEditorDelegate(QStyledItemDelegate):
@@ -94,6 +104,103 @@ class ConfirmDialog(QDialog):
         layout.addWidget(buttons)
         self.setTabOrder(ok, buttons.buttons()[-1])
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.reject)
+
+
+class TargetedCancelDialog(QDialog):
+    def __init__(
+        self,
+        scope_text: str,
+        parent: QWidget | None = None,
+        submission_ready: Callable[[], bool] | None = None,
+        seller_discount: int = 0,
+        official_discount: int = 0,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("按商品 ID 操作活动")
+        self.setModal(True)
+        self.resize(620, 430)
+        self.setMinimumSize(520, 360)
+        self._item_ids: list[str] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+        heading = QLabel("批量处理指定商品的活动")
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
+
+        scope = QLabel(f"核对范围：{scope_text}\n只会处理该范围内与输入商品 ID 精确匹配的已报名活动关系。")
+        scope.setWordWrap(True)
+        layout.addWidget(scope)
+
+        action_row = QHBoxLayout()
+        action_row.addWidget(QLabel("操作类型"))
+        self.action_combo = QComboBox()
+        self.action_combo.addItem("报名活动", "enroll")
+        self.action_combo.addItem("取消活动", "cancel")
+        self.action_combo.currentIndexChanged.connect(self._sync_submit_state)
+        action_row.addWidget(self.action_combo, 1)
+        layout.addLayout(action_row)
+
+        self.discount_note = QLabel()
+        self.discount_note.setWordWrap(True)
+        layout.addWidget(self.discount_note)
+        self._seller_discount = int(seller_discount)
+        self._official_discount = int(official_discount)
+
+        self.item_input = QPlainTextEdit()
+        self.item_input.setPlaceholderText("每行一个或用逗号分隔，例如：\nMLB1234567890\nMLM1234567890")
+        layout.addWidget(self.item_input, 1)
+
+        self.note = QLabel()
+        self.note.setWordWrap(True)
+        self.note.setObjectName("muted")
+        layout.addWidget(self.note)
+
+        buttons = QDialogButtonBox()
+        self.submit_button = buttons.addButton("开始核对并取消", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.submit_button.setObjectName("primary")
+        buttons.addButton("返回", QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.reject)
+        self._submission_ready = submission_ready
+        self._readiness_timer = QTimer(self)
+        self._readiness_timer.setInterval(500)
+        self._readiness_timer.timeout.connect(self._sync_submit_state)
+        if submission_ready is not None:
+            self._readiness_timer.start()
+        self._sync_submit_state()
+
+    def _sync_submit_state(self) -> None:
+        ready = True if self._submission_ready is None else bool(self._submission_ready())
+        action_text = "报名" if self.action() == "enroll" else "取消"
+        self.discount_note.setText(
+            f"本次报名折扣已锁定：自建活动 {self._seller_discount}%｜官方活动 {self._official_discount}%"
+            if self.action() == "enroll" else "本次取消不使用折扣参数。"
+        )
+        self.submit_button.setText(f"开始核对并{action_text}")
+        self.submit_button.setEnabled(ready)
+        self.note.setText(
+            f"点击后只读取命中的活动；存在匹配商品时会直接提交{action_text}，不再弹出第二个确认框。单次最多 200 个商品 ID。"
+            if ready else
+            "缓存补偿仍在运行。可以先填写商品 ID；补偿结束后本按钮会自动启用，也可以关闭窗口后用主按钮停止补偿。"
+        )
+
+    def _validate_and_accept(self) -> None:
+        try:
+            self._item_ids = parse_targeted_cancel_item_ids(self.item_input.toPlainText())
+        except ValueError as error:
+            QMessageBox.information(self, "按商品 ID 操作活动", str(error))
+            return
+        self.accept()
+
+    def item_ids(self) -> list[str]:
+        return list(self._item_ids)
+
+    def action(self) -> str:
+        return str(self.action_combo.currentData() or "enroll")
 
 
 class SellerCampaignCreateDialog(QDialog):
@@ -211,6 +318,228 @@ class DetailsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
         layout.addWidget(buttons)
+
+
+def _local_time(value: object) -> str:
+    if not value:
+        return "-"
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _item_action_text(value: object) -> str:
+    return {"enroll": "报名", "update": "改价", "cancel": "取消"}.get(str(value or "").lower(), str(value or "-"))
+
+
+def _item_action_status_text(value: object) -> str:
+    return {
+        "success": "成功",
+        "request_success": "已提交",
+        "live_verified_removed": "已确认移除",
+        "live_still_started": "仍在活动",
+        "pending_verification": "待平台确认",
+        "skipped": "已跳过",
+        "failed": "失败",
+        "partial_or_failed": "部分失败",
+        "cancelled": "已取消",
+        "interrupted": "中断",
+    }.get(str(value or "").lower(), str(value or "-"))
+
+
+def _item_promotion_type_text(value: object) -> str:
+    return {
+        "SELLER_CAMPAIGN": "自建活动",
+        "DEAL": "官方活动",
+        "SMART": "SMART",
+        "LIGHTNING": "限时活动",
+    }.get(str(value or "").upper(), str(value or "其它活动"))
+
+
+def _item_platform_status_text(value: object) -> str:
+    return {
+        "started": "进行中",
+        "pending": "待开始",
+        "candidate": "可报名",
+        "completed": "已完成",
+        "failed": "未完整完成",
+        "cancelled": "已停止",
+    }.get(str(value or "").lower(), str(value or "-"))
+
+
+def render_item_status_text(
+    item_id: str,
+    actions: list[dict[str, Any]],
+    items: list[dict[str, Any]],
+    price_cache: list[dict[str, Any]],
+) -> str:
+    lines: list[str] = []
+    lines.append(f"商品：{item_id}")
+    if items:
+        lines.append(f"当前活动关系：{len(items)} 个")
+        for relation in items:
+            raw = {}
+            try:
+                raw = json.loads(relation.get("raw_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            item_status = raw.get("status") or relation.get("cached_status")
+            price = raw.get("price") if raw.get("price") is not None else relation.get("price")
+            original = raw.get("original_price") if raw.get("original_price") is not None else relation.get("original_price")
+            promo_label = relation.get("promotion_name") or relation.get("promotion_id") or "-"
+            price_text = "未报名" if str(item_status or "").lower() == "candidate" else (price if price is not None else "-")
+            base_price = original if original is not None else (price if price is not None else "-")
+            lines.append(
+                "- {promotion}（{promotion_type}）：{status}｜活动价：{price}｜折扣基准：{base} {currency}".format(
+                    promotion=promo_label,
+                    promotion_type=_item_promotion_type_text(relation.get("promotion_type")),
+                    status=_item_platform_status_text(item_status),
+                    price=price_text,
+                    base=base_price,
+                    currency=relation.get("currency_id") or "-",
+                )
+            )
+        first = items[0]
+        lines.append("活动缓存更新：{}　账号：{}".format(_local_time(first.get("updated_at")), first.get("account_name") or first.get("account_id") or "-"))
+    else:
+        lines.append("当前活动关系：无")
+    if price_cache:
+        pc = price_cache[0]
+        lines.append("")
+        lines.append(
+            "最新价格快照：{price}（原价 {original}，{currency}）".format(
+                price=pc.get("price") if pc.get("price") is not None else "-",
+                original=pc.get("original_price") if pc.get("original_price") is not None else "-",
+                currency=pc.get("currency_id") or "-",
+            )
+        )
+        lines.append("快照账号：{}　时间：{}".format(pc.get("account_name") or pc.get("account_id") or "-", _local_time(pc.get("updated_at"))))
+    if actions:
+        latest = actions[0]
+        lines.append("")
+        lines.append("最近一次操作：{action}　{promotion}".format(
+            action=_item_action_text(latest.get("action")),
+            promotion=latest.get("promotion_name") or latest.get("promotion_id") or "-",
+        ))
+        lines.append("结果：{status}　时间：{time}".format(
+            status=_item_action_status_text(latest.get("status")),
+            time=_local_time(latest.get("created_at")),
+        ))
+        if latest.get("deal_price") is not None:
+            lines.append("价格：{}".format(latest.get("deal_price")))
+        if latest.get("error_cn"):
+            lines.append("说明：{}".format(business_reason_text(latest.get("error_cn"))))
+    return "\n".join(lines)
+
+
+class ItemQueryDialog(QDialog):
+    query_requested = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("商品查询")
+        self.resize(840, 620)
+        self.setMinimumSize(680, 440)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 16)
+        root.setSpacing(12)
+
+        heading = QLabel("商品查询")
+        heading.setObjectName("sectionTitle")
+        root.addWidget(heading)
+
+        search_row = QHBoxLayout()
+        self.item_input = QLineEdit()
+        self.item_input.setPlaceholderText("输入商品 ID，如 MLB7258072116")
+        self.item_input.returnPressed.connect(self._on_search)
+        search_row.addWidget(self.item_input, 1)
+        self.search_button = QPushButton("查询")
+        self.search_button.setObjectName("primary")
+        self.search_button.clicked.connect(self._on_search)
+        search_row.addWidget(self.search_button)
+        root.addLayout(search_row)
+
+        self.status_box = QPlainTextEdit()
+        self.status_box.setReadOnly(True)
+        self.status_box.setPlaceholderText("输入商品 ID 后点击查询，或按回车。")
+        self.status_box.setMaximumHeight(190)
+        root.addWidget(self.status_box)
+
+        history_label = QLabel("操作历史")
+        history_label.setObjectName("sectionTitle")
+        root.addWidget(history_label)
+
+        self.history_table = QTableWidget(0, 7)
+        self.history_table.setHorizontalHeaderLabels(["时间", "店铺", "活动", "动作", "状态", "价格", "说明"])
+        self.history_table.setAlternatingRowColors(True)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.history_table.setShowGrid(True)
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.verticalHeader().setDefaultSectionSize(36)
+        header = self.history_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        root.addWidget(self.history_table, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
+        root.addWidget(buttons)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.reject)
+
+    def _on_search(self) -> None:
+        item_id = self.item_input.text().strip().upper()
+        if not item_id:
+            QMessageBox.information(self, "商品查询", "请输入商品 ID。")
+            return
+        self.status_box.setPlainText("正在查询 {} ...".format(item_id))
+        self.history_table.setRowCount(0)
+        self.search_button.setEnabled(False)
+        self.query_requested.emit(item_id)
+
+    def show_result(self, payload: object) -> None:
+        if not self.isVisible():
+            return
+        self.search_button.setEnabled(True)
+        data = dict(payload or {})
+        item_id = str(data.get("item_id") or self.item_input.text().strip().upper())
+        actions = list(data.get("actions") or [])
+        items = list(data.get("items") or [])
+        price_cache = list(data.get("price_cache") or [])
+        if not actions and not items and not price_cache:
+            self.status_box.setPlainText("{}：未找到该商品的任何记录，可能从未参与过活动。".format(item_id))
+            return
+        self.status_box.setPlainText(render_item_status_text(item_id, actions, items, price_cache))
+        self._fill_history(actions)
+
+    def show_error(self, message: object) -> None:
+        if not self.isVisible():
+            return
+        self.search_button.setEnabled(True)
+        self.status_box.setPlainText("查询失败：{}".format(business_reason_text(message or "未知错误")))
+
+    def _fill_history(self, actions: list[dict[str, Any]]) -> None:
+        table = self.history_table
+        table.setRowCount(len(actions))
+        for row, record in enumerate(actions):
+            cells = [
+                _local_time(record.get("created_at")),
+                str(record.get("account_name") or record.get("account_id") or ""),
+                str(record.get("promotion_name") or record.get("promotion_id") or ""),
+                _item_action_text(record.get("action")),
+                _item_action_status_text(record.get("status")),
+                str(record.get("deal_price") if record.get("deal_price") is not None else "-"),
+                business_reason_text(record.get("error_cn") or ""),
+            ]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                table.setItem(row, col, item)
 
 
 class SettingsDialog(QDialog):
@@ -432,7 +761,7 @@ class SettingsDialog(QDialog):
         if bool(self.settings.get("oauthClientSecretConfigured")):
             self.oauth_client_secret.setPlaceholderText("已保存，留空不修改")
         self.oauth_redirect_uri = QLineEdit(str(self.settings.get("oauthRedirectUri") or ""))
-        self.webhook_callback_url = QLineEdit(str(self.settings.get("webhookCallbackUrl") or ""))
+        self.webhook_callback_url = QLineEdit(str(self.settings.get("webhookCallbackUrl") or DEFAULT_WEBHOOK_CALLBACK_URL))
         self.webhook_callback_url.setPlaceholderText("请输入独立回调服务的公网通知地址")
         self.activity_callback_enabled = QCheckBox("启用活动变化回调接收")
         self.activity_callback_enabled.setChecked(bool(self.settings.get("activityCallbackEnabled")))
@@ -440,9 +769,9 @@ class SettingsDialog(QDialog):
         self.activity_callback_application_id.setPlaceholderText("Mercado 应用 Client ID")
         self.activity_callback_secret_file = QLineEdit(str(self.settings.get("activityCallbackSecretFile") or ""))
         self.activity_callback_secret_file.setPlaceholderText("消费密钥文件路径（discount-webhook-consumer.secret）")
-        self.activity_callback_claim_url = QLineEdit(str(self.settings.get("activityCallbackClaimUrl") or "https://xingtupro1020.com/meli-callback/consumer/claim"))
+        self.activity_callback_claim_url = QLineEdit(str(self.settings.get("activityCallbackClaimUrl") or DEFAULT_ACTIVITY_CALLBACK_CLAIM_URL))
         self.activity_callback_claim_url.setPlaceholderText("领取通知地址")
-        self.activity_callback_ack_url = QLineEdit(str(self.settings.get("activityCallbackAckUrl") or "https://xingtupro1020.com/meli-callback/consumer/ack"))
+        self.activity_callback_ack_url = QLineEdit(str(self.settings.get("activityCallbackAckUrl") or DEFAULT_ACTIVITY_CALLBACK_ACK_URL))
         self.activity_callback_ack_url.setPlaceholderText("确认处理地址")
         form.addRow("美客多应用 Client ID", self.oauth_client_id)
         form.addRow("美客多应用 Client Secret", self.oauth_client_secret)
@@ -533,12 +862,12 @@ class SettingsDialog(QDialog):
             ("writeConcurrency", self.write_concurrency, _bounded_int(settings.get("writeConcurrency"), 160, 1, 160)),
             ("oauthClientId", self.oauth_client_id, str(settings.get("oauthClientId") or "")),
             ("oauthRedirectUri", self.oauth_redirect_uri, str(settings.get("oauthRedirectUri") or "")),
-            ("webhookCallbackUrl", self.webhook_callback_url, str(settings.get("webhookCallbackUrl") or "")),
+            ("webhookCallbackUrl", self.webhook_callback_url, str(settings.get("webhookCallbackUrl") or DEFAULT_WEBHOOK_CALLBACK_URL)),
             ("activityCallbackEnabled", self.activity_callback_enabled, bool(settings.get("activityCallbackEnabled"))),
             ("activityCallbackApplicationId", self.activity_callback_application_id, str(settings.get("activityCallbackApplicationId") or "")),
             ("activityCallbackSecretFile", self.activity_callback_secret_file, str(settings.get("activityCallbackSecretFile") or "")),
-            ("activityCallbackClaimUrl", self.activity_callback_claim_url, str(settings.get("activityCallbackClaimUrl") or "https://xingtupro1020.com/meli-callback/consumer/claim")),
-            ("activityCallbackAckUrl", self.activity_callback_ack_url, str(settings.get("activityCallbackAckUrl") or "https://xingtupro1020.com/meli-callback/consumer/ack")),
+            ("activityCallbackClaimUrl", self.activity_callback_claim_url, str(settings.get("activityCallbackClaimUrl") or DEFAULT_ACTIVITY_CALLBACK_CLAIM_URL)),
+            ("activityCallbackAckUrl", self.activity_callback_ack_url, str(settings.get("activityCallbackAckUrl") or DEFAULT_ACTIVITY_CALLBACK_ACK_URL)),
         )
         for key, field, value in fields:
             if isinstance(field, QCheckBox):

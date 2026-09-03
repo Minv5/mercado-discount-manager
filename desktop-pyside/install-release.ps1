@@ -25,6 +25,9 @@ if ([string]::IsNullOrWhiteSpace($ShortcutPath)) {
 }
 $ContractPath = Join-Path $ProjectRoot 'src\productContract.js'
 $Contract = Get-Content -LiteralPath $ContractPath -Raw -Encoding UTF8
+$PackageMetadata = Get-Content -LiteralPath (Join-Path $ProjectRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$ProductVersion = [string]$PackageMetadata.version
+if ($ProductVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') { throw 'Unable to read a valid product version from package.json.' }
 $ProtocolMatch = [regex]::Match($Contract, 'PROTOCOL_VERSION\s*=\s*[''"](?<version>[^''"]+)[''"]')
 if (-not $ProtocolMatch.Success) { throw 'Unable to read protocol version from src/productContract.js.' }
 $ProtocolVersion = $ProtocolMatch.Groups['version'].Value
@@ -38,7 +41,7 @@ function Read-ReleaseManifest([string]$Root) {
   $path = Join-Path $Root 'release-manifest.json'
   if (-not (Test-Path -LiteralPath $path)) { throw 'Candidate package is missing release-manifest.json.' }
   $manifest = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
-  if ($manifest.product -ne $Product -or [string]$manifest.protocol_version -ne $ProtocolVersion) {
+  if ($manifest.product -ne $Product -or [string]$manifest.version -ne $ProductVersion -or [string]$manifest.protocol_version -ne $ProtocolVersion) {
     throw 'Candidate product or protocol does not match.'
   }
   if ([string]$manifest.display_name -ne $DisplayName -or [string]$manifest.executable -ne $ExeName) {
@@ -54,7 +57,7 @@ function Read-ReleaseManifest([string]$Root) {
   if ($manifest.file_count -ne $files.Count -or $manifest.total_bytes -ne $bytes) {
     throw 'Candidate file count or total size does not match the manifest.'
   }
-  foreach ($required in @('_internal\node\node.exe','_internal\app\src\server.js','_internal\app\build-info.json','_internal\PySide6\Qt6Core.dll','_internal\PySide6\Qt6Gui.dll','_internal\PySide6\Qt6Widgets.dll')) {
+  foreach ($required in @('_internal\node\node.exe','_internal\app\src\server.js','_internal\app\src\activityWebhookReplay.js','_internal\app\src\activityWebhookConsumer.js','_internal\app\desktop-pyside\reason_text.py','_internal\app\build-info.json','_internal\PySide6\Qt6Core.dll','_internal\PySide6\Qt6Gui.dll','_internal\PySide6\Qt6Widgets.dll')) {
     if (-not (Test-Path -LiteralPath (Join-Path $Root $required))) { throw "Candidate dependency is missing: $required" }
   }
   return $manifest
@@ -142,7 +145,16 @@ function Invoke-HiddenSmoke([string]$Exe, [string]$DataRoot) {
   try {
     $env:MDM_DATA_DIR = $DataRoot
     foreach ($argument in @('--keyboard-smoke','--smoke-service')) {
-      $process = Start-Process -FilePath $Exe -ArgumentList $argument -WindowStyle Hidden -Wait -PassThru
+      $process = Start-Process -FilePath $Exe -ArgumentList $argument -WindowStyle Hidden -PassThru
+      if (-not $process.WaitForExit(30000)) {
+        $windowTitle = (Get-Process -Id $process.Id -ErrorAction SilentlyContinue).MainWindowTitle
+        if ($process) { $null = $process.CloseMainWindow() }
+        Start-Sleep -Milliseconds 300
+        if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
+          Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        }
+        throw "Installed $argument smoke timed out after 30 seconds. window_title=$windowTitle"
+      }
       if ($process.ExitCode -ne 0) { throw "Installed $argument smoke failed." }
     }
     if (Get-PortOwnerPid) { throw 'Port 28758 remains open after hidden smoke.' }

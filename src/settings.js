@@ -1,5 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import {
+  DEFAULT_ACTIVITY_ACK_URL,
+  DEFAULT_ACTIVITY_CLAIM_URL,
+  DEFAULT_WEBHOOK_CALLBACK_URL,
+  LEGACY_ACTIVITY_ACK_URLS,
+  LEGACY_ACTIVITY_CLAIM_URLS,
+  LEGACY_WEBHOOK_CALLBACK_URLS,
+  migrateCallbackEndpoint,
+} from './callbackEndpoints.js';
 import { DATA_DIR, STANDALONE_AUTH_DIR } from './config.js';
 import { DEFAULT_ACTIVITY_CONCURRENCY, DEFAULT_READ_CONCURRENCY, DEFAULT_WRITE_CONCURRENCY, normalizeActivityConcurrency, normalizeConcurrency, normalizeWriteConcurrency } from './concurrency.js';
 import { normalizeOperatingSites } from './operatingSites.js';
@@ -29,12 +38,12 @@ export const DEFAULT_SETTINGS = {
   concurrencyPolicyVersion: CONCURRENCY_POLICY_VERSION,
   oauthClientId: '',
   oauthRedirectUri: '',
-  webhookCallbackUrl: '',
+  webhookCallbackUrl: DEFAULT_WEBHOOK_CALLBACK_URL,
   activityCallbackEnabled: false,
   activityCallbackApplicationId: '',
   activityCallbackSecretFile: '',
-  activityCallbackClaimUrl: '',
-  activityCallbackAckUrl: '',
+  activityCallbackClaimUrl: DEFAULT_ACTIVITY_CLAIM_URL,
+  activityCallbackAckUrl: DEFAULT_ACTIVITY_ACK_URL,
   autoShutdownAfterExecution: false,
   storeAliases: {},
   operatingSites: {},
@@ -128,12 +137,24 @@ export function normalizeSettings(input) {
     concurrencyPolicyVersion: CONCURRENCY_POLICY_VERSION,
     oauthClientId: text(input.oauthClientId).slice(0, 160),
     oauthRedirectUri: normalizeUrl(input.oauthRedirectUri),
-    webhookCallbackUrl: normalizeUrl(input.webhookCallbackUrl),
+    webhookCallbackUrl: normalizeUrl(migrateCallbackEndpoint(
+      input.webhookCallbackUrl,
+      DEFAULT_WEBHOOK_CALLBACK_URL,
+      LEGACY_WEBHOOK_CALLBACK_URLS,
+    )),
     activityCallbackEnabled: /^(?:1|true|yes)$/i.test(String(input.activityCallbackEnabled ?? '')),
     activityCallbackApplicationId: text(input.activityCallbackApplicationId).slice(0, 160),
     activityCallbackSecretFile: text(input.activityCallbackSecretFile).slice(0, 1000),
-    activityCallbackClaimUrl: normalizeSecureUrl(input.activityCallbackClaimUrl),
-    activityCallbackAckUrl: normalizeSecureUrl(input.activityCallbackAckUrl),
+    activityCallbackClaimUrl: normalizeSecureUrl(migrateCallbackEndpoint(
+      input.activityCallbackClaimUrl,
+      DEFAULT_ACTIVITY_CLAIM_URL,
+      LEGACY_ACTIVITY_CLAIM_URLS,
+    )),
+    activityCallbackAckUrl: normalizeSecureUrl(migrateCallbackEndpoint(
+      input.activityCallbackAckUrl,
+      DEFAULT_ACTIVITY_ACK_URL,
+      LEGACY_ACTIVITY_ACK_URLS,
+    )),
     autoShutdownAfterExecution: /^(?:1|true|yes)$/i.test(String(input.autoShutdownAfterExecution ?? '')),
     oauthClientSecretConfigured: Boolean(String(input.oauthClientSecretCipher || '')),
     storeAliases: normalizeStoreAliases(input.storeAliases || {}),

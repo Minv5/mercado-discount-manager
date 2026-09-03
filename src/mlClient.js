@@ -5,10 +5,24 @@ import { buildItemIdentitySummary } from './activityChangeCache.js';
 
 export const PARTIAL_SPARSE_MARKETPLACE_CANDIDATE = 'partial_api_sparse_marketplace_candidate';
 export const PROMOTION_ITEMS_UNREADABLE_CODE = 'PROMOTION_ITEMS_UNREADABLE';
+export const PROMOTION_ITEMS_CAPACITY_CONFLICT_CODE = 'internal_capacity_conflict';
 const REQUEST_TIMEOUT_MS = Math.max(5000, Number(process.env.ML_REQUEST_TIMEOUT_MS || 45000));
 const SAFE_UNREADABLE_TOP_LEVEL_KEYS = new Set([
   'results', 'paging', 'total', 'offset', 'limit', 'search_after', 'errors', 'code', 'message', 'status'
 ]);
+
+export function isPromotionItemsCapacityConflict(error) {
+  const values = [
+    error?.code,
+    error?.body?.error,
+    error?.body?.code,
+    error?.details?.error,
+    error?.message,
+    error?.body?.message,
+  ].map((value) => String(value || '').toLowerCase());
+  return values.some((value) => value.includes(PROMOTION_ITEMS_CAPACITY_CONFLICT_CODE)
+    || value.includes('internal capacity constraints'));
+}
 
 function safeResponseKind(value) {
   if (value === null) return 'null';
@@ -142,8 +156,13 @@ export class MercadoLibreClient {
     });
   }
 
-  async getMe() {
-    return this.request('/users/me');
+  async getMe({ signal = null, readKind = 'account_access', readKey = null, externalRetry = false } = {}) {
+    return this.request('/users/me', {
+      signal,
+      readKind,
+      readKey,
+      externalRetry,
+    });
   }
 
   async getPromotions({ userId = this.userId, callerId = this.callerId, includeVersionHeader = false, signal = null } = {}) {
@@ -272,6 +291,22 @@ export class MercadoLibreClient {
       readKind: 'detail',
       readKey: `promotion-detail|${String(userId || '')}|${String(promotionType || '').toUpperCase()}|${String(promotionId || '')}`,
     });
+  }
+
+  async getItemPromotions({ itemId, userId = this.userId, signal = null } = {}) {
+    const prefix = this.marketplace ? '/marketplace/seller-promotions' : '/seller-promotions';
+    const path = new URL(`${prefix}/items/${encodeURIComponent(itemId)}`, this.apiBaseUrl);
+    path.searchParams.set('app_version', APP_VERSION);
+    if (this.marketplace && userId) path.searchParams.set('user_id', String(userId));
+    const response = await this.request(path, {
+      headers: this.marketplace ? { version: APP_VERSION } : {},
+      signal,
+      readKind: 'detail',
+      readKey: `item-promotions|${String(userId || '')}|${String(itemId || '')}`,
+    });
+    const rows = Array.isArray(response) ? response : Array.isArray(response?.results) ? response.results : null;
+    if (!rows) throw new ApiError('平台未返回可读取的商品活动清单', 502, { code: 'ITEM_PROMOTIONS_UNREADABLE' });
+    return rows;
   }
 
   async getPromotionItems({ promotionId, promotionType, status, limit = 50, offset = 0, searchAfter = null, signal = null }) {
@@ -420,10 +455,11 @@ export class MercadoLibreClient {
     };
   }
 
-  async getMarketplaceItem(itemId, { signal = null } = {}) {
+  async getMarketplaceItem(itemId, { signal = null, physicalGetPermit = null } = {}) {
     return this.request(`/marketplace/items/${encodeURIComponent(itemId)}`, {
       headers: { version: APP_VERSION },
       signal,
+      physicalGetPermit,
       readKind: 'detail',
     });
   }
@@ -457,9 +493,16 @@ export class MercadoLibreClient {
     initialPage = null,
     signal = null,
     pageConcurrency = 4,
+    capacitySafe = false,
+    capacityRetryDelaysMs = [750, 2_000, 5_000, 10_000, 15_000],
+    sleepFn = delay,
+    onPage = null,
   }) {
-    const pageLimit = clampPromotionItemLimit(limit, promotionType);
+    let pageLimit = clampPromotionItemLimit(limit, promotionType);
     const maxToCollect = normalizeMaxItems(maxItems);
+    const effectiveMaxPages = capacitySafe
+      ? Math.max(2_000, Math.floor(Number(maxPages) || 500))
+      : Math.max(1, Math.floor(Number(maxPages) || 500));
     const collected = [];
     const seenItemIds = new Set();
     let offset = 0;
@@ -474,9 +517,58 @@ export class MercadoLibreClient {
     let duplicateCount = 0;
     let lastSearchAfter = null;
     let stopReason = null;
-    const prefetchConcurrency = Math.max(1, Math.min(8, Math.floor(Number(pageConcurrency) || 4)));
+    const prefetchConcurrency = capacitySafe
+      ? 1
+      : Math.max(1, Math.min(8, Math.floor(Number(pageConcurrency) || 4)));
     let prefetched = [];
     let prefetchCursor = pageLimit;
+    let capacityRetryCount = 0;
+    let capacityBackoffMs = 0;
+    let capacityRecoveryUsed = false;
+    const readPage = async ({ pageOffset, pageSearchAfter }) => {
+      const lowerLimits = [25, 10, 5].filter((value) => value < pageLimit);
+      const attempts = capacitySafe
+        ? [pageLimit, ...lowerLimits, Math.min(pageLimit, 5), Math.min(pageLimit, 5)]
+        : [pageLimit];
+      let lastError = null;
+      for (let index = 0; index < attempts.length; index += 1) {
+        const attemptLimit = attempts[index];
+        try {
+          const page = await this.getPromotionItems({
+            promotionId,
+            promotionType,
+            status,
+            limit: attemptLimit,
+            offset: pageOffset,
+            searchAfter: pageSearchAfter,
+            signal,
+          });
+          if (attemptLimit < pageLimit) {
+            pageLimit = attemptLimit;
+            prefetchCursor = Math.max(prefetchCursor, pageOffset + pageLimit);
+            capacityRecoveryUsed = true;
+          }
+          return normalizePromotionItemsPage(page);
+        } catch (error) {
+          if (!capacitySafe || !isPromotionItemsCapacityConflict(error)) throw error;
+          lastError = error;
+          capacityRetryCount += 1;
+          const isLast = index >= attempts.length - 1;
+          if (isLast) {
+            error.capacity_retry_exhausted = true;
+            error.capacity_retry_count = capacityRetryCount;
+            error.capacity_page_limit = attemptLimit;
+            throw error;
+          }
+          const waitMs = Math.max(0, Number(capacityRetryDelaysMs[
+            Math.min(capacityRetryCount - 1, capacityRetryDelaysMs.length - 1)
+          ] || 0));
+          capacityBackoffMs += waitMs;
+          if (waitMs > 0) await sleepFn(waitMs);
+        }
+      }
+      throw lastError;
+    };
     const prefetchEnabled = () => !searchAfter && total !== null && Number(total) > 0 && prefetchConcurrency > 1;
     const fillPrefetch = () => {
       if (!prefetchEnabled()) return;
@@ -486,8 +578,7 @@ export class MercadoLibreClient {
         prefetchCursor += pageLimit;
         prefetched.push({
           offset: pageOffset,
-          promise: this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset: pageOffset, searchAfter: null, signal })
-            .then((data) => normalizePromotionItemsPage(data))
+          promise: readPage({ pageOffset, pageSearchAfter: null })
             .catch((error) => ({ __prefetch_error: error })),
         });
       }
@@ -503,15 +594,13 @@ export class MercadoLibreClient {
       if (prefetchEnabled()) {
         const pageOffset = prefetchCursor;
         prefetchCursor += pageLimit;
-        return normalizePromotionItemsPage(
-          await this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset: pageOffset, searchAfter: null, signal }),
-        );
+        return readPage({ pageOffset, pageSearchAfter: null });
       }
       return normalizePromotionItemsPage(pagesRead === 0 && initialPage
         ? initialPage
-        : await this.getPromotionItems({ promotionId, promotionType, status, limit: pageLimit, offset, searchAfter, signal }));
+        : await readPage({ pageOffset: offset, pageSearchAfter: searchAfter }));
     };
-    while (collected.length < maxToCollect && pagesRead < maxPages) {
+    while (collected.length < maxToCollect && pagesRead < effectiveMaxPages) {
       const data = await nextPageData();
       pagesRead += 1;
       const shapeError = promotionItemsShapeError(data);
@@ -542,6 +631,16 @@ export class MercadoLibreClient {
       const remainingByTotal = total === null ? remainingByMax : Math.max(0, total - collected.length);
       const remaining = Math.min(remainingByMax, remainingByTotal);
       collected.push(...uniqueResults.slice(0, remaining));
+      onPage?.({
+        pages_read: pagesRead,
+        page_limit: pageLimit,
+        offset,
+        has_search_after: Boolean(searchAfter),
+        collected: collected.length,
+        total,
+        capacity_retry_count: capacityRetryCount,
+        capacity_backoff_ms: capacityBackoffMs,
+      });
       if (!rawFirstPageSummary) {
         rawFirstPageSummary = {
           keys: data && typeof data === 'object' ? Object.keys(data) : [],
@@ -593,7 +692,7 @@ export class MercadoLibreClient {
       if (total !== null && collected.length >= total) break;
       if (results.length < pageLimit && !nextSearchAfter) break;
     }
-    if (pagesRead >= maxPages && total !== null && collected.length < total) {
+    if (pagesRead >= effectiveMaxPages && total !== null && collected.length < total) {
       detailStatus = this.marketplace && status === 'candidate' && collected.length > 0 ? PARTIAL_SPARSE_MARKETPLACE_CANDIDATE : CANDIDATE_INCOMPLETE_CODE;
       warning = detailStatus === PARTIAL_SPARSE_MARKETPLACE_CANDIDATE
         ? sparsePartialWarning({ saved: collected.length, total, emptyPageCount, pagesRead })
@@ -633,6 +732,11 @@ export class MercadoLibreClient {
         duplicate_count: duplicateCount,
         last_search_after: lastSearchAfter ? '[present]' : null,
         stop_reason: stopReason,
+        page_limit_final: pageLimit,
+        capacity_safe: Boolean(capacitySafe),
+        capacity_recovery_used: capacityRecoveryUsed,
+        capacity_retry_count: capacityRetryCount,
+        capacity_backoff_ms: capacityBackoffMs,
         requested_max_items: Number.isFinite(maxToCollect) ? maxToCollect : 'all',
         is_full_fetch: full,
         sample_only: detailStatus === 'partial' || detailStatus === PARTIAL_SPARSE_MARKETPLACE_CANDIDATE,
@@ -647,7 +751,8 @@ export class MercadoLibreClient {
     return this.request(path, {
       method: 'POST',
       body: { promotion_id: promotionId, promotion_type: promotionType, deal_price: dealPrice },
-      headers: this.promotionItemWriteHeaders()
+      headers: this.promotionItemWriteHeaders(),
+      externalRetry: true,
     });
   }
 
@@ -657,7 +762,8 @@ export class MercadoLibreClient {
     return this.request(path, {
       method: 'PUT',
       body: { promotion_id: promotionId, promotion_type: promotionType, deal_price: dealPrice },
-      headers: this.promotionItemWriteHeaders()
+      headers: this.promotionItemWriteHeaders(),
+      externalRetry: true,
     });
   }
 
@@ -667,7 +773,7 @@ export class MercadoLibreClient {
     path.searchParams.set('promotion_type', promotionType);
     path.searchParams.set('promotion_id', promotionId);
     if (offerId) path.searchParams.set('offer_id', offerId);
-    return this.request(path, { method: 'DELETE', headers: this.promotionItemWriteHeaders() });
+    return this.request(path, { method: 'DELETE', headers: this.promotionItemWriteHeaders(), externalRetry: true });
   }
 
   promotionItemWritePath(prefix, itemId) {
@@ -742,7 +848,10 @@ export class MercadoLibreClient {
         signal: options.signal || null,
       }, () => requestJson(url, requestOptions, 1, { includeMeta: Boolean(options.includeResponseMeta), externalRetry: true }));
     }
-    return requestJson(url, requestOptions, 1, { includeMeta: Boolean(options.includeResponseMeta) });
+    return requestJson(url, requestOptions, 1, {
+      includeMeta: Boolean(options.includeResponseMeta),
+      externalRetry: Boolean(options.externalRetry),
+    });
   }
 }
 

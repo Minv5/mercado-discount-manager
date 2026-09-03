@@ -9,6 +9,7 @@ import {
   ADAPTIVE_WRITE_ACTION_PROFILES,
   adaptiveWriteProfileForAction,
   adaptiveWriteProfileForLimit,
+  allocateWriteLimitForStore,
   createAdaptiveWriteScheduler,
 } from '../src/adaptiveWriteScheduler.js';
 import { executePlannedRowsWithConcurrency } from '../src/executor.js';
@@ -22,6 +23,23 @@ test('offer lock failures are retryable while permanent business rejections are 
   assert.equal(isTransientOfferLockError({ status: 400, message: 'LockedEntityException: Offer Locked [MLM1]' }), true);
   assert.equal(isTransientOfferLockError({ status: 400, message: 'Item status is not allowed (under_review)' }), false);
   assert.equal(isTransientOfferLockError({ status: 400, message: 'The discounted price is not credible' }), false);
+});
+
+test('normal enroll/update success is terminal while uncertain responses remain platform pending', () => {
+  const source = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
+  const acknowledged = source.slice(
+    source.indexOf("if (action !== 'cancel')"),
+    source.indexOf('if (Number(execution?.counts?.success', source.indexOf("if (action !== 'cancel')")),
+  );
+  assert.match(acknowledged, /write_request_acknowledged/);
+  assert.match(acknowledged, /execution\.counts\.platform_pending_count = uncertainCount/);
+  assert.doesNotMatch(acknowledged, /readIncompleteRows|pendingWriteQueue\.enqueue|confirmAppliedWrites/);
+  assert.match(source, /retry_category: 'read_incomplete'/);
+  assert.match(source, /'read_incomplete',[\s\S]*?const startsWithReadOnlyVerification/);
+  assert.match(source, /retry_category: classifiedError\?\.ambiguousWrite[\s\S]*?'ambiguous_write_readback'/);
+  assert.match(source, /'ambiguous_write_readback',[\s\S]*?const startsWithReadOnlyVerification/);
+  assert.match(source, /finalCancelRead \|\| action !== 'cancel'[\s\S]*?\? \[\]/);
+  assert.match(source, /hasBusinessFailure[\s\S]*?partial_or_failed/);
 });
 
 test('only successful or uncertain writes invalidate activity item caches', () => {
@@ -131,8 +149,10 @@ test('successful platform write whose result persistence fails stays success and
 
 test('server routes transient offer locks to pending recovery in normal and benchmark writes', () => {
   const source = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
-  assert.match(source, /transientOfferLock = isTransientOfferLockError\(error\)/);
-  assert.match(source, /transientOfferLock \? 'transient_offer_lock'/);
+  const writePolicy = fs.readFileSync(new URL('../src/writeFailurePolicy.js', import.meta.url), 'utf8');
+  assert.match(writePolicy, /transientOfferLock = isTransientOfferLockError\(error\)/);
+  assert.match(writePolicy, /transientOfferLock \? 'transient_offer_lock'/);
+  assert.match(source, /return classifyWriteFailure\(error, \{ toErrorText: toChineseError \}\)/);
   assert.match(source, /is_retryable_failure: isRetryableFailure/);
   assert.match(source, /is_business_failure: !isInterfaceFailure && !isRetryableFailure/);
   assert.match(source, /shouldInvalidateWriteCache\(result\)/);
@@ -254,6 +274,53 @@ test('adaptive write scheduler is fair across routes and never uses the requeste
   assert.ok([...routePeak.values()].every((value) => value <= 2), JSON.stringify(Object.fromEntries(routePeak)));
 });
 
+test('execution-group write budget is partitioned across stores without exceeding the group ceiling', () => {
+  const allocations = [0, 1, 2].map((index) => allocateWriteLimitForStore(160, 3, index));
+  assert.deepEqual(allocations, [54, 53, 53]);
+  assert.equal(allocations.reduce((sum, value) => sum + value, 0), 160);
+  assert.equal(allocateWriteLimitForStore(128, 3, 0), 43);
+  assert.equal(allocateWriteLimitForStore(128, 3, 2), 42);
+});
+
+test('one store overload does not lower or cool down another store scheduler', async () => {
+  let firstClock = 0;
+  let secondClock = 0;
+  const profile = {
+    initialGlobal: 4,
+    maxGlobal: 4,
+    perRoute: 4,
+    minGlobal: 1,
+    successWindow: 100,
+    overloadDecreaseStep: 2,
+    defaultTransientCooldownMs: 1,
+  };
+  const firstStore = createAdaptiveWriteScheduler({
+    profile,
+    now: () => firstClock,
+    sleep: async (ms) => { firstClock += ms; },
+  });
+  const secondStore = createAdaptiveWriteScheduler({
+    profile,
+    now: () => secondClock,
+    sleep: async (ms) => { secondClock += ms; },
+  });
+  await assert.rejects(firstStore.run(async () => {
+    throw Object.assign(new Error('service unavailable'), { status: 503 });
+  }, { accountId: 'A', siteId: 'MLB' }));
+  assert.equal(firstStore.limit, 2);
+  assert.equal(secondStore.limit, 4);
+  await secondStore.run(async () => 'ok', { accountId: 'B', siteId: 'MLM' });
+  assert.equal(secondStore.snapshot().overload_count, 0);
+});
+
+test('execution groups wire one adaptive scheduler per account behind one non-adaptive group guard', () => {
+  const serverSource = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
+  assert.match(serverSource, /getSharedWriteLimiter\(request\.executionGroupId, account\.account_id, action/);
+  assert.match(serverSource, /const key = `\$\{groupKey\}\|\$\{normalizedAccountId\}`/);
+  assert.match(serverSource, /storeLimiter\.run\(\(\) => groupGuard\.run\(fn\), meta\)/);
+  assert.match(serverSource, /deleteSharedWriteLimitersForGroup\(current\.id\)/);
+});
+
 test('real full-volume evidence defines independent action write ceilings', () => {
   assert.deepEqual(
     Object.fromEntries(Object.entries(ADAPTIVE_WRITE_ACTION_PROFILES).map(([action, profile]) => [
@@ -346,7 +413,9 @@ test('successful writes are classified before any bounded semantic retry', () =>
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
   assert.match(serverSource, /retry_category:\s*'pending_verification'/);
   assert.match(serverSource, /recoverPendingVerificationRecords\(/);
-  assert.match(serverSource, /pendingVerificationRecords[\s\S]*?confirmAppliedWrites/);
+  const recoveryBody = serverSource.split('async function recoverPendingVerificationRecords')[1]
+    .split('function finalizeExecutionJob')[0];
+  assert.match(recoveryBody, /confirmAppliedWrites/);
   assert.match(serverSource, /status:\s*'candidate'/);
   assert.match(serverSource, /status:\s*'pending'/);
   assert.match(serverSource, /platform_pending/);
@@ -354,13 +423,11 @@ test('successful writes are classified before any bounded semantic retry', () =>
   assert.match(serverSource, /started_price_mismatch/);
   assert.match(serverSource, /confirmed_candidate_after_write/);
   assert.match(serverSource, /previousAttempts < MAX_CONFIRMED_CANDIDATE_WRITE_ATTEMPTS/);
-  const recoveryBody = serverSource.split('async function recoverPendingVerificationRecords')[1]
-    .split('function finalizeExecutionJob')[0];
   assert.doesNotMatch(recoveryBody, /executeOnePlannedWithTokenRefresh|client\.enrollItem|client\.updateItem|client\.cancelItem/);
   assert.match(recoveryBody, /repeated_write_requests:\s*0/);
 });
 
-test('write confirmation has a complete-read hard gate and never guesses a verdict from partial reads', () => {
+test('readback helper remains bounded for explicit recovery while normal writes do not call it', () => {
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
   // The unified confirmAppliedWrites entry point exists and gates on complete reads.
   assert.match(serverSource, /async function confirmAppliedWrites/);
@@ -369,22 +436,50 @@ test('write confirmation has a complete-read hard gate and never guesses a verdi
   assert.match(serverSource, /verdict: 'read_incomplete'/);
   assert.match(serverSource, /read_incomplete: rows \|\| \[\]/);
   assert.match(serverSource, /verified: \[\],\s*started_price_mismatch: \[\],\s*confirmed_pending: \[\],\s*confirmed_candidate: \[\],\s*unresolved: \[\]/);
-  // All three call sites go through the unified entry point.
+  // Explicit recovery/cancellation may still use this helper, but the normal
+  // enroll/update acknowledgement path must not.
   const confirmCalls = (serverSource.match(/confirmAppliedWrites\(\{/g) || []).length;
-  assert.ok(confirmCalls >= 3, `expected >=3 confirmAppliedWrites call sites, got ${confirmCalls}`);
-  // read_incomplete rows are enqueued as pending, never failed.
+  assert.ok(confirmCalls >= 1, `expected recovery confirmAppliedWrites call sites, got ${confirmCalls}`);
+  const acknowledged = serverSource.slice(
+    serverSource.indexOf("if (action !== 'cancel')"),
+    serverSource.indexOf('if (Number(execution?.counts?.success', serverSource.indexOf("if (action !== 'cancel')")),
+  );
+  assert.doesNotMatch(acknowledged, /confirmAppliedWrites|pendingWriteQueue\.enqueue/);
+  // Legacy read-incomplete recovery remains GET-only and never repeats writes.
   assert.match(serverSource, /retry_category: 'read_incomplete'/);
   assert.match(serverSource, /平台回读不完整[\s\S]*?不会重复写入/);
   // The sync read-back no longer has a 200-row skip.
   assert.doesNotMatch(serverSource, /smallEnoughToReadBack/);
   assert.doesNotMatch(serverSource, /write_response_trusted/);
+  assert.match(serverSource, /const pendingComplete = completeness\.pending === true/);
+});
+
+test('clean cached catalog absence can create seller activity and enrollment preserves real started counts', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  assert.match(serverSource, /confirmedAbsent = Boolean\(\(calibratedFromLive \|\| calibratedFromCache\) && sellerCount === 0\)/);
+  assert.match(serverSource, /Webhook 本地活动缓存完整且无变更/);
+  assert.match(serverSource, /const startedItems = listItems\([\s\S]*?platformTotal: startedItems\.length,[\s\S]*?savedCount: startedItems\.length/);
+  assert.doesNotMatch(serverSource, /报名执行后本地 started 状态已更新[\s\S]*?platformTotal: null/);
+});
+
+test('a transient item read error preserves the previous complete fetch baseline', () => {
+  const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
+  const fetchSource = serverSource.slice(
+    serverSource.indexOf('async function fetchAndSavePromotionItemsForCampaign'),
+    serverSource.indexOf('function shouldPreserveExistingFetchState'),
+  );
+  assert.match(fetchSource, /const preservedCompleteState = isStateFull\(existingState\)/);
+  assert.match(fetchSource, /if \(!preservedCompleteState\) \{[\s\S]*?saveItemFetchState/);
+  assert.match(fetchSource, /已保留此前完整本地基线/);
 });
 
 test('pending recovery closes empty queues idempotently and preserves terminalized accounting', () => {
   const serverSource = fs.readFileSync(path.join(process.cwd(), 'src/server.js'), 'utf8');
   const recoverySource = fs.readFileSync(path.join(process.cwd(), 'scripts/recover-pending-verification-group.mjs'), 'utf8');
 
-  assert.match(serverSource, /startupPendingRecords\.length === 0 && existingRetryablePendingCount === 0/);
+  assert.match(serverSource, /request\.resumePendingOnly && startupPendingRecords\.length === 0/);
+  assert.match(serverSource, /recovery_queue_mismatch:\s*true/);
+  assert.match(serverSource, /未回落普通执行/);
   assert.match(serverSource, /执行结果已幂等收口，未重复提交商品/);
   assert.match(recoverySource, /isVerificationExhausted/);
   assert.match(recoverySource, /failed_terminalized_by_job/);
@@ -432,4 +527,71 @@ test('recorded rate-limit shape accounts every frozen relation without stopping 
   assert.equal(result.counts.success + result.counts.failed + result.counts.skipped + result.counts.pending, 24);
   assert.equal(pending.length, 2);
   assert.equal(saved.filter((row) => row.status === 'pending').length, 2);
+});
+
+test('definite business failure is not retried even when a later call would recover', async () => {
+  let calls = 0;
+  const saved = [];
+  const events = [];
+  const result = await executePlannedRowsWithConcurrency({
+    plan: { rows: [{ status: 'planned', item: { item_id: 'BUSINESS-RECOVER' }, deal_price: null }] },
+    action: 'cancel', promotionId: 'P', promotionType: 'DEAL', accountId: 'A', taskId: 1, mode: 'real',
+    executeOne: async () => {
+      calls += 1;
+      if (calls < 4) {
+        const error = new Error('definite business rejection');
+        error.status = 400;
+        throw error;
+      }
+      return { ok: true };
+    },
+    saveResult: (row) => saved.push(row),
+    classifyError: () => ({ interfaceFailure: false, category: 'business_failure' }),
+    onItemEvent: (event) => events.push(event),
+    retryOptions: {
+      maxImmediateRetries: 3,
+      maxFinalFailureRetries: 3,
+      finalFailureBackoffMs: [0, 0, 0],
+      finalFailureConcurrency: 1,
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.counts.success, 0);
+  assert.equal(result.counts.failed, 1);
+  assert.equal(result.counts.skipped, 0);
+  assert.equal(result.retrySummary.final_failure_retry_attempts, 0);
+  assert.equal(result.retrySummary.final_failure_retry_success, 0);
+  assert.equal(saved.at(-1).status, 'failed');
+  assert.deepEqual(events.filter((event) => event.type === 'final_failure_retry_start'), []);
+});
+
+test('definite business failure is recorded once without batch-end retries', async () => {
+  let calls = 0;
+  const saved = [];
+  const result = await executePlannedRowsWithConcurrency({
+    plan: { rows: [{ status: 'planned', item: { item_id: 'BUSINESS-EXHAUSTED' }, deal_price: null }] },
+    action: 'cancel', promotionId: 'P', promotionType: 'DEAL', accountId: 'A', taskId: 1, mode: 'real',
+    executeOne: async () => {
+      calls += 1;
+      const error = new Error('definite business rejection');
+      error.status = 400;
+      throw error;
+    },
+    saveResult: (row) => saved.push(row),
+    classifyError: () => ({ interfaceFailure: false, category: 'business_failure' }),
+    retryOptions: {
+      maxImmediateRetries: 3,
+      maxFinalFailureRetries: 3,
+      finalFailureBackoffMs: [0, 0, 0],
+      finalFailureConcurrency: 1,
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.counts.success, 0);
+  assert.equal(result.counts.failed, 1);
+  assert.equal(result.counts.skipped, 0);
+  assert.equal(result.retrySummary.final_failure_retry_attempts, 0);
+  assert.equal(result.retrySummary.final_failure_retry_failed, 0);
+  assert.equal(saved.at(-1).status, 'failed');
+  assert.equal(saved.at(-1).errorCn, 'definite business rejection');
 });

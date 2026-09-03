@@ -512,9 +512,9 @@ test('group accounting keeps exact child reasons for pending unresolved platform
   assert.deepEqual(summary.incomplete_details, [
     { job_id: 'job-pending', reasons: ['pending_relations_present'] },
     { job_id: 'job-unresolved', reasons: ['unresolved_relations_present'] },
-    { job_id: 'job-platform-pending', reasons: ['platform_pending_present'] },
     { job_id: 'job-count-gap', reasons: ['relation_count_gap'] },
   ]);
+  assert.equal(summary.stores.find((store) => store.job_id === 'job-platform-pending').incomplete, false);
 });
 
 test('group accounting requires outer and execution terminal counts to match exactly', () => {

@@ -26,7 +26,7 @@ export function applyWriteRepeatGuards(plan = {}, guards = [], action = '') {
     }));
     if (!guard || !guardApplies(guard, row, action)) return row;
     guarded += 1;
-    const pending = String(guard.status || '') === 'pending_verification';
+    const pending = ['pending', 'pending_verification', 'request_success'].includes(String(guard.status || '').toLowerCase());
     return {
       ...row,
       status: 'skipped',
@@ -50,7 +50,7 @@ export function applyWriteRepeatGuards(plan = {}, guards = [], action = '') {
 
 function guardApplies(guard, row, action) {
   const status = String(guard.status || '').toLowerCase();
-  if (status === 'pending_verification') return true;
+  if (['pending', 'pending_verification', 'request_success'].includes(status)) return true;
   if (!['failed', 'live_still_started'].includes(status)) return false;
   if (String(action || '').toLowerCase() === 'cancel') return true;
   const previousPrice = Number(guard.deal_price);

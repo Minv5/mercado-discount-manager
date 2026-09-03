@@ -3,7 +3,7 @@ import path from 'node:path';
 import { writeJsonFileAtomicallySync } from './processInstanceLock.js';
 
 export const ACTIVE_EXECUTION_GROUP_STATUSES = new Set(['queued', 'running', 'stopping', 'paused']);
-export const TERMINAL_EXECUTION_GROUP_STATUSES = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+export const TERMINAL_EXECUTION_GROUP_STATUSES = new Set(['completed', 'partial_or_failed', 'failed', 'cancelled', 'interrupted']);
 
 function safeId(value) {
   return String(value || '').replace(/[^A-Za-z0-9_.-]/g, '');
@@ -72,13 +72,25 @@ function childCounts(child = {}) {
       }
     }
 
-    if (hasPositiveCount([
-      result?.pending,
-      result?.pending_count,
+    const platformPending = Math.max(
+      0,
+      Number(result?.platform_pending || 0),
+      Number(result?.platform_pending_count || 0),
+      Number(result?.terminal_counts?.platform_pending || 0),
+      Number(execution?.platform_pending || 0),
+      Number(execution?.platform_pending_count || 0),
+      Number(execution?.terminal_counts?.platform_pending || 0),
+    );
+    const genericPending = Math.max(
+      0,
+      Number(result?.pending || 0),
+      Number(result?.pending_count || 0),
+      Number(execution?.pending || 0),
+      Number(execution?.pending_count || 0),
+    );
+    if (genericPending > platformPending || hasPositiveCount([
       result?.pending_verification_count,
       result?.retryable_pending_count,
-      execution?.pending,
-      execution?.pending_count,
       execution?.pending_verification_count,
       execution?.retryable_pending_count,
     ])) addReason('pending_relations_present');
@@ -90,14 +102,14 @@ function childCounts(child = {}) {
       execution?.unresolved_count,
       execution?.terminal_counts?.unresolved,
     ])) addReason('unresolved_relations_present');
-    if (hasPositiveCount([
-      result?.platform_pending,
-      result?.platform_pending_count,
-      result?.terminal_counts?.platform_pending,
-      execution?.platform_pending,
-      execution?.platform_pending_count,
-      execution?.terminal_counts?.platform_pending,
-    ])) addReason('platform_pending_present');
+    // platform_pending is already a closed terminal accounting bucket. It is
+    // shown to the user but must not make the group incomplete or trigger a
+    // repeated write.
+    if (result?.account_access_diagnostic
+      || Number(result?.account_access_failure_count || 0) > 0
+      || Number(execution?.account_access_failure_count || 0) > 0) {
+      addReason('account_access_failed');
+    }
   }
   const incomplete = Boolean(child.incomplete) || incompleteReasons.length > 0;
   return {
@@ -110,6 +122,8 @@ function childCounts(child = {}) {
     pending_verification_count: counts.pending_verification_count ?? null,
     platform_pending_count: counts.platform_pending_count ?? null,
     retryable_pending_count: counts.retryable_pending_count ?? null,
+    account_access_failure_count: counts.account_access_failure_count
+      ?? (result?.account_access_diagnostic ? 1 : 0),
     result_present: resultPresent,
     persistence_state: persistenceState || null,
     incomplete,
@@ -196,22 +210,33 @@ export function executionGroupBusinessScope(group = {}) {
 }
 
 export function summarizeExecutionGroup(group = {}) {
-  const stores = (group.children || []).map((child) => ({
-    job_id: String(child.job_id || child.id || ''),
-    account_id: String(child.account_id || child.request_summary?.accountId || ''),
-    store_name: child.store_name || child.request_summary?.storeName || '',
-    site_name: child.site_name || child.request_summary?.selectedSiteName || '',
-    status: String(child.status || 'queued'),
-    error: child.error || null,
-    ...childCounts(child),
-  }));
+  const stores = (group.children || []).map((child) => {
+    const counts = childCounts(child);
+    const rawStatus = String(child.status || 'queued');
+    const status = rawStatus === 'failed'
+      && !child.error
+      && counts.result_present
+      && !counts.incomplete
+      && counts.failed > 0
+      ? 'partial_or_failed'
+      : rawStatus;
+    return {
+      job_id: String(child.job_id || child.id || ''),
+      account_id: String(child.account_id || child.request_summary?.accountId || ''),
+      store_name: child.store_name || child.request_summary?.storeName || '',
+      site_name: child.site_name || child.request_summary?.selectedSiteName || '',
+      status,
+      error: child.error || null,
+      ...counts,
+    };
+  });
   const summary = stores.reduce((summary, store) => {
     summary.total += store.total;
     summary.success += store.success;
     summary.failed += store.failed;
     summary.skipped += store.skipped;
     summary.pending += store.pending;
-    for (const field of ['relation_count', 'unique_item_count', 'activity_failure_count', 'request_success_count', 'live_verified_removed_count', 'pending_verification_count', 'platform_pending_count', 'retryable_pending_count']) {
+    for (const field of ['relation_count', 'unique_item_count', 'activity_failure_count', 'request_success_count', 'live_verified_removed_count', 'pending_verification_count', 'platform_pending_count', 'retryable_pending_count', 'account_access_failure_count']) {
       if (store[field] !== null && store[field] !== undefined) summary[field] += Number(store[field] || 0);
     }
     return summary;
@@ -231,6 +256,7 @@ export function summarizeExecutionGroup(group = {}) {
     pending_verification_count: 0,
     platform_pending_count: 0,
     retryable_pending_count: 0,
+    account_access_failure_count: 0,
     stores,
   });
   const incompleteStores = stores.filter((store) => store.incomplete);
@@ -247,6 +273,31 @@ export function summarizeExecutionGroup(group = {}) {
     reasons: [...(store.incomplete_reasons || [store.incomplete_reason]).filter(Boolean)],
   }));
   return summary;
+}
+
+export function normalizeExecutionGroupTerminalSemantics(input = {}) {
+  const group = clone(input);
+  let changed = false;
+  group.children = (group.children || []).map((child) => {
+    const counts = childCounts(child);
+    if (String(child.status || '') !== 'failed'
+        || child.error
+        || !counts.result_present
+        || counts.incomplete
+        || counts.failed <= 0) return child;
+    changed = true;
+    return { ...child, status: 'partial_or_failed' };
+  });
+  const summary = summarizeExecutionGroup(group);
+  if (String(group.status || '') === 'failed'
+      && !group.error
+      && summary.accounting_complete
+      && !group.children.some((child) => String(child.status || '') === 'failed')) {
+    group.status = summary.failed > 0 ? 'partial_or_failed' : 'completed';
+    changed = true;
+  }
+  if (changed) group.result = summary;
+  return { group, changed };
 }
 
 export function projectLiveExecutionGroupChildren(group = {}, resolveJob = () => null, projectJob = (job) => job) {

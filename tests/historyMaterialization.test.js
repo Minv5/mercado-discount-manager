@@ -153,18 +153,32 @@ test('explicit execution groups publish exactly one terminal history row and nev
       const beforePublish = repo.listTaskSummaries(20, { includeDetails: false });
       repo.publishHistorySummaryForExecutionGroup('GROUP-A');
       const afterA = repo.listTaskSummaries(20, { includeDetails: false });
+      repo.publishHistorySummaryForExecutionGroup('GROUP-A', {
+        authoritative: {
+          relation_count: 1, total: 1, success: 0, failed: 1, skipped: 0, pending: 0,
+          pending_verification_count: 0, accounting_complete: true,
+        },
+        updatedAt: '2026-08-28T11:30:00.000Z',
+      });
+      const afterAReconciled = repo.listTaskSummaries(20, { includeDetails: false });
       const b = addGroup('GROUP-B', 'JOB-B', 'B', 'C-B', 'ITEM-B');
       repo.publishHistorySummaryForExecutionGroup('GROUP-B');
       const afterB = repo.listTaskSummaries(20, { includeDetails: false });
-      console.log(JSON.stringify({ a, b, beforePublish, afterA, afterB }));
+      console.log(JSON.stringify({ a, b, beforePublish, afterA, afterAReconciled, afterB }));
     `, dataDir);
     assert.equal(result.beforePublish.length, 1);
     assert.equal(result.afterA.length, 1);
     assert.equal(result.afterA[0].execution_group_id, 'GROUP-A');
     assert.deepEqual(result.afterA[0].task_ids.sort((a, b) => a - b), [result.a.detail, result.a.batch].sort((a, b) => a - b));
+    assert.equal(result.afterAReconciled.length, 1);
+    assert.equal(result.afterAReconciled[0].success_count, 0);
+    assert.equal(result.afterAReconciled[0].failed_count, 1);
+    assert.equal(result.afterAReconciled[0].total_count, 1);
+    assert.equal(result.afterAReconciled[0].accounting_complete, true);
     assert.equal(result.afterB.length, 2);
     assert.deepEqual(new Set(result.afterB.map((row) => row.execution_group_id)), new Set(['GROUP-A', 'GROUP-B']));
-    assert.ok(result.afterB.every((row) => row.success_count === 1));
+    assert.equal(result.afterB.find((row) => row.execution_group_id === 'GROUP-A').failed_count, 1);
+    assert.equal(result.afterB.find((row) => row.execution_group_id === 'GROUP-B').success_count, 1);
   } finally {
     fs.rmSync(dataDir, { recursive: true, force: true });
   }

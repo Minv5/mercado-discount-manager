@@ -25,6 +25,8 @@ dist/
 dist-full/
 dist-pyside/
 release-backups/
+backup-*/
+*-backup*/
 desktop-pyside/build-release/
 desktop-pyside/runtime-staging/
 desktop-pyside/install-validation/

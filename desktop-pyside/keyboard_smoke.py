@@ -60,6 +60,8 @@ def run_keyboard_smoke(app) -> dict[str, Any]:
     app.processEvents()
     escape_closed = not combo.view().isVisible()
 
+    combo.setFocus()
+    app.processEvents()
     QTest.keyClick(combo, Qt.Key.Key_F4)
     app.processEvents()
     f4_opened = combo.view().isVisible()

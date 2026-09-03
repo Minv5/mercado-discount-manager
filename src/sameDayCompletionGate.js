@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const TERMINAL_GROUP_STATUSES = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+const TERMINAL_GROUP_STATUSES = new Set(['completed', 'partial_or_failed', 'failed', 'cancelled', 'interrupted']);
 const AUTO_ACTIONS = new Set(['auto', 'automatic']);
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
 

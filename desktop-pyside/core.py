@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -31,7 +32,8 @@ SITE_NAMES = {
 
 EXCLUDE_ACTIVITY = "__exclude__"
 BUSINESS_TIMEZONE = timezone(timedelta(hours=8))
-TERMINAL_EXECUTION_GROUP_STATES = {"completed", "failed", "cancelled", "interrupted"}
+TERMINAL_EXECUTION_GROUP_STATES = {"completed", "partial_or_failed", "failed", "cancelled", "interrupted"}
+TARGETED_CANCEL_MAX_ITEMS = 200
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,45 @@ def build_filters(site_id: str, seller_value: str, official_value: str) -> dict[
         "officialActivityNames": [] if exclude_official or not official_value else [official_value],
         "excludeSeller": exclude_seller,
         "excludeOfficial": exclude_official,
+    }
+
+
+def parse_targeted_cancel_item_ids(value: object, *, max_items: int = TARGETED_CANCEL_MAX_ITEMS) -> list[str]:
+    parts = re.split(r"[\s,，;；]+", str(value or ""))
+    result: list[str] = []
+    seen: set[str] = set()
+    invalid: list[str] = []
+    for part in parts:
+        item_id = part.strip().upper()
+        if not item_id:
+            continue
+        if not re.fullmatch(r"[A-Z]{3}\d+", item_id):
+            invalid.append(item_id)
+            continue
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        result.append(item_id)
+    if invalid:
+        raise ValueError("以下商品 ID 格式不正确：" + "、".join(invalid[:10]))
+    if not result:
+        raise ValueError("请至少输入一个商品 ID。")
+    if len(result) > max_items:
+        raise ValueError(f"单次最多处理 {max_items} 个商品 ID，请拆分后重试。")
+    return result
+
+
+def targeted_cancel_filters(site_id: str = "") -> dict[str, Any]:
+    normalized_site = str(site_id or "").strip().upper()
+    return {
+        "siteId": normalized_site,
+        "siteIds": [normalized_site] if normalized_site else [],
+        "promotionTypes": [],
+        "keywords": [],
+        "sellerActivityNames": [],
+        "officialActivityNames": [],
+        "excludeSeller": False,
+        "excludeOfficial": False,
     }
 
 
@@ -270,6 +311,7 @@ def execution_payload(
     return {
         "accountId": account_id,
         "action": action,
+        "mode": "real",
         "confirmText": "REAL_SUBMIT",
         "filters": filters,
         "selectedStoreName": store_name,
@@ -307,6 +349,7 @@ def execution_group_payload(
         "accountIds": list(account_ids),
         "client_submission_id": client_submission_id,
         "action": action,
+        "mode": "real",
         "confirmText": "REAL_SUBMIT",
         "filters": filters,
         "storeNames": dict(store_names),

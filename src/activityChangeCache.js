@@ -101,7 +101,8 @@ export function activityItemsDecision({
   const attemptedToday = isSameShanghaiDay(fetchState?.updated_at, now);
   const cacheChangedAfterAttempt = isNewer(cacheState?.updated_at, fetchState?.updated_at);
   const detailStatus = String(fetchState?.detail_status || '').toLowerCase();
-  if (attemptedToday && !cacheChangedAfterAttempt && detailStatus === 'error') {
+  const unreadableFetch = detailStatus === 'error' || detailStatus === 'unreadable';
+  if (attemptedToday && !cacheChangedAfterAttempt && unreadableFetch) {
     return { refresh: false, blocked: true, reason: 'same_day_failed' };
   }
   if (attemptedToday && !cacheChangedAfterAttempt) {
@@ -121,7 +122,12 @@ export function activityItemsDecision({
   }
   if (Number(cacheState.dirty || 0) === 1) return { refresh: true, reason: 'dirty' };
   if (String(cacheState.continuity || 'continuous') !== 'continuous') return { refresh: true, reason: 'event_gap' };
-  if (!fetchState || String(fetchState.detail_status || '').toLowerCase() === 'error') return { refresh: true, reason: 'unreadable' };
+  if (unreadableFetch
+    && cacheChangedAfterAttempt
+    && isNewer(cacheState.items_full_checked_at, fetchState?.updated_at)) {
+    return { refresh: false, reason: 'webhook_recovered_cache' };
+  }
+  if (!fetchState || unreadableFetch) return { refresh: true, reason: 'unreadable' };
   if (!isFullFetchState(fetchState)) {
     if (isCompositeCandidateState(fetchState, fallbackState)) {
       return { refresh: false, reason: 'verified_composite_cache', effective_state: 'candidate_plus_inventory_fallback' };
@@ -150,6 +156,30 @@ export function activityItemsDecision({
   // Cache is trusted until an anomaly signal says otherwise; no time-based
   // forced refresh (see activityCatalogDecision).
   return { refresh: false, reason: 'verified_cache' };
+}
+
+export function targetedRelationCacheDecision({ activityState = null, routeState = null } = {}) {
+  if (!getActivityCallbackAvailability()) return { refresh: true, reason: 'callback_unavailable' };
+  const states = [activityState, routeState].filter(Boolean);
+  if (!states.length) return { refresh: true, reason: 'unverified' };
+  if (states.some((state) => String(state.continuity || 'continuous') !== 'continuous')) {
+    return { refresh: true, reason: 'event_gap' };
+  }
+  if (states.some((state) => Number(state.dirty || 0) === 1)) {
+    return { refresh: true, reason: 'dirty' };
+  }
+  if (states.some((state) => String(state.last_error || '').trim())) {
+    return { refresh: true, reason: 'cache_error' };
+  }
+  return { refresh: false, reason: 'webhook_cache' };
+}
+
+export function activityRouteChildrenComplete(states = []) {
+  const children = (Array.isArray(states) ? states : []).filter((state) => (
+    String(state?.promotion_id || '').trim() || String(state?.promotion_type || '').trim()
+  ));
+  return children.every((state) => Number(state.dirty || 0) === 0
+    && String(state.continuity || 'continuous') === 'continuous');
 }
 
 export function shouldProbeFreshPreparationItems({
@@ -328,6 +358,22 @@ export function itemIdentityDelta(previousRows = [], nextRows = [], { complete =
     added_count: addedCount,
     removed_count: complete ? missingCount : 0,
     unreturned_count: complete ? 0 : missingCount,
+  };
+}
+
+export function recoveredRelationFetchState(items = [], previousFetchState = null) {
+  const uniqueItemIds = new Set(
+    (Array.isArray(items) ? items : [])
+      .map((row) => String(row?.item_id || row?.itemId || row?.id || '').trim())
+      .filter(Boolean),
+  );
+  const count = uniqueItemIds.size;
+  return {
+    platform_total: count,
+    saved_count: count,
+    detail_status: count === 0 ? 'empty' : 'full',
+    recovery_source: 'newer_verified_local_relation_cache',
+    previous_detail_status: String(previousFetchState?.detail_status || '').trim().toLowerCase() || null,
   };
 }
 

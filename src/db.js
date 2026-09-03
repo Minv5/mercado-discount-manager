@@ -133,9 +133,35 @@ function migrate(database) {
       original_price REAL,
       currency_id TEXT,
       status TEXT,
+      available_quantity REAL,
+      dimensions_json TEXT,
+      weight_json TEXT,
+      snapshot_hash TEXT,
+      source_revision TEXT,
+      observed_at TEXT,
+      change_flags_json TEXT,
+      confirmed INTEGER NOT NULL DEFAULT 1,
       raw_json TEXT,
       updated_at TEXT NOT NULL,
       UNIQUE(account_id, child_user_id, site_id, item_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS activity_price_recalc_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT NOT NULL,
+      child_user_id TEXT NOT NULL DEFAULT '',
+      site_id TEXT NOT NULL DEFAULT '',
+      promotion_id TEXT NOT NULL,
+      promotion_type TEXT NOT NULL,
+      item_id TEXT NOT NULL,
+      previous_base_price REAL,
+      new_base_price REAL,
+      source TEXT NOT NULL DEFAULT 'item_webhook',
+      status TEXT NOT NULL DEFAULT 'pending',
+      detected_at TEXT NOT NULL,
+      resolved_at TEXT,
+      updated_at TEXT NOT NULL,
+      UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type, item_id)
     );
 
     CREATE TABLE IF NOT EXISTS promo_tasks (
@@ -241,6 +267,12 @@ function migrate(database) {
       ON promo_action_results(task_id, account_id, promotion_id, promotion_type, action, item_id, id);
     CREATE INDEX IF NOT EXISTS idx_promo_action_results_task_status_item
       ON promo_action_results(task_id, status, item_id, account_id, promotion_id, promotion_type, action, id);
+    CREATE INDEX IF NOT EXISTS idx_promo_action_results_item_norm
+      ON promo_action_results(UPPER(TRIM(item_id)), id DESC);
+    CREATE INDEX IF NOT EXISTS idx_promo_items_item_norm
+      ON promo_items(UPPER(TRIM(item_id)), updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_item_price_cache_item_norm
+      ON item_price_cache(UPPER(TRIM(item_id)), updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_history_batch_summaries_sort
       ON history_batch_summaries(schema_version, sort_created_at DESC, summary_id DESC);
     CREATE INDEX IF NOT EXISTS idx_history_batch_summaries_action_time
@@ -351,6 +383,14 @@ function migrate(database) {
   addColumnIfMissing(database, 'promo_items', 'site_id', 'TEXT');
   addColumnIfMissing(database, 'promo_items', 'logistic_type', 'TEXT');
   addColumnIfMissing(database, 'promo_items', 'source', 'TEXT');
+  addColumnIfMissing(database, 'item_price_cache', 'available_quantity', 'REAL');
+  addColumnIfMissing(database, 'item_price_cache', 'dimensions_json', 'TEXT');
+  addColumnIfMissing(database, 'item_price_cache', 'weight_json', 'TEXT');
+  addColumnIfMissing(database, 'item_price_cache', 'snapshot_hash', 'TEXT');
+  addColumnIfMissing(database, 'item_price_cache', 'source_revision', 'TEXT');
+  addColumnIfMissing(database, 'item_price_cache', 'observed_at', 'TEXT');
+  addColumnIfMissing(database, 'item_price_cache', 'change_flags_json', 'TEXT');
+  addColumnIfMissing(database, 'item_price_cache', 'confirmed', 'INTEGER NOT NULL DEFAULT 1');
   addColumnIfMissing(database, 'promo_item_fetch_states', 'child_user_id', "TEXT NOT NULL DEFAULT ''");
   addColumnIfMissing(database, 'promo_item_fetch_states', 'site_id', "TEXT NOT NULL DEFAULT ''");
   addColumnIfMissing(database, 'promo_tasks', 'execution_group_id', 'TEXT');
@@ -384,6 +424,8 @@ function migrate(database) {
       ON activity_callback_events(processing_state, claim_expires_at, received_at);
     CREATE INDEX IF NOT EXISTS idx_seller_campaign_create_results_route_name
       ON seller_campaign_create_results(account_id, child_user_id, site_id, promotion_name, created_at);
+    CREATE INDEX IF NOT EXISTS idx_activity_price_recalc_pending
+      ON activity_price_recalc_queue(account_id, status, promotion_id, promotion_type, item_id);
   `);
 }
 

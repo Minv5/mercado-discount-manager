@@ -6,6 +6,8 @@ import { filterPromotions, normalizeItem, normalizePromotion, promotionKey, summ
 import { readSettings } from './settings.js';
 import { storeNameForAccount } from './storeNameDomain.js';
 import { RESULT_CONTRACT_VERSION, summarizeResultContractRows } from './executionResultContract.js';
+import { classifyCbtUnresolved, isNonActionableGlobalParent } from './cbtUnresolvedClassification.js';
+import { compareItemSnapshots, normalizeItemSnapshot, snapshotFromCacheRow, snapshotIsOlder } from './itemSnapshot.js';
 
 const TASK_SUMMARY_CANONICAL_LIMIT = 300;
 const HISTORY_SUMMARY_SCHEMA_VERSION = 1;
@@ -552,7 +554,20 @@ function insufficientDailyDelta(identity, baselineDate, reason) {
     added_item_ids: [],
     removed_item_ids: [],
     reason,
+    reason_cn: dailyDeltaReasonText(reason),
   };
+}
+
+function dailyDeltaReasonText(reason = '') {
+  return {
+    current_snapshot_missing: '当前经营路由缺少今日商品身份快照。',
+    current_snapshot_invalid: '今日商品身份快照校验不完整。',
+    current_snapshot_incomplete: '今日商品身份快照未完整读取。',
+    baseline_snapshot_missing: '前一日商品身份快照缺失。',
+    baseline_snapshot_invalid: '前一日商品身份快照校验不完整。',
+    baseline_snapshot_incomplete: '前一日商品身份快照未完整读取。',
+    no_routes: '没有可验证的完整经营路由。',
+  }[String(reason || '')] || '完整商品快照不足，暂不统计新增/减少。';
 }
 
 export function getDailyItemIdentityDelta(input = {}) {
@@ -587,6 +602,7 @@ export function getDailyItemIdentityDelta(input = {}) {
     added_item_ids: addedItemIds,
     removed_item_ids: removedItemIds,
     reason: '',
+    reason_cn: '',
   };
 }
 
@@ -619,6 +635,16 @@ export function summarizeDailyItemIdentityDeltas({
     reason: routeDeltas.length === 0
       ? 'no_routes'
       : insufficient.map((row) => row.reason).filter(Boolean).join(','),
+    reason_cn: routeDeltas.length === 0
+      ? dailyDeltaReasonText('no_routes')
+      : [...new Set(insufficient.map((row) => row.reason_cn).filter(Boolean))].join('；'),
+    insufficient_routes: insufficient.map((row) => ({
+      account_id: row.account_id,
+      child_user_id: row.child_user_id,
+      site_id: row.site_id,
+      reason: row.reason,
+      reason_cn: row.reason_cn,
+    })),
   };
 }
 
@@ -1232,7 +1258,35 @@ export function applySuccessfulPromotionItemWrites({ accountId, promotionId, pro
     if (normalizedAction === 'cancel') {
       const statement = database.prepare(
         `UPDATE promo_items
-         SET status = 'candidate', price = original_price, updated_at = ?
+         SET status = 'candidate',
+             original_price = COALESCE(
+               (SELECT pc.original_price FROM item_price_cache pc
+                 WHERE pc.account_id = promo_items.account_id
+                   AND pc.child_user_id = promo_items.child_user_id
+                   AND pc.site_id = promo_items.site_id
+                   AND pc.item_id = promo_items.item_id),
+               (SELECT pc.price FROM item_price_cache pc
+                 WHERE pc.account_id = promo_items.account_id
+                   AND pc.child_user_id = promo_items.child_user_id
+                   AND pc.site_id = promo_items.site_id
+                   AND pc.item_id = promo_items.item_id),
+               original_price
+             ),
+             price = COALESCE(
+               (SELECT pc.original_price FROM item_price_cache pc
+                 WHERE pc.account_id = promo_items.account_id
+                   AND pc.child_user_id = promo_items.child_user_id
+                   AND pc.site_id = promo_items.site_id
+                   AND pc.item_id = promo_items.item_id),
+               (SELECT pc.price FROM item_price_cache pc
+                 WHERE pc.account_id = promo_items.account_id
+                   AND pc.child_user_id = promo_items.child_user_id
+                   AND pc.site_id = promo_items.site_id
+                   AND pc.item_id = promo_items.item_id),
+               original_price
+             ),
+             source = 'cancel_verified_local_transition',
+             updated_at = ?
          WHERE account_id = ? AND child_user_id = ? AND site_id = ?
            AND promotion_id = ? AND promotion_type = ? AND item_id = ?`,
       );
@@ -1278,7 +1332,7 @@ export function reconcilePromotionItemFetchCounts({ accountId, promotionId, prom
        WHERE account_id = ? AND child_user_id = ? AND site_id = ?
          AND promotion_id = ? AND promotion_type = ? AND item_status = ?`,
     );
-    for (const status of ['candidate', 'started']) {
+    for (const status of ['candidate', 'pending', 'started']) {
       const count = Number(countStatement.get(...identity, status)?.count || 0);
       updateStatement.run(count, count, ...identity, status);
     }
@@ -1335,13 +1389,17 @@ export function getItemFetchState(accountId, promotionId, promotionType, itemSta
   );
 }
 
-export function invalidatePromotionItemFetchStates({ accountId, promotionId, promotionType, childUserId, siteId }) {
+export function invalidatePromotionItemFetchStates({ accountId, promotionId, promotionType, childUserId, siteId, itemStatuses = null }) {
   const route = resolveRouteForIdentity({ accountId, promotionId, promotionType, route: { childUserId, siteId } });
+  const statuses = [...new Set((Array.isArray(itemStatuses) ? itemStatuses : [])
+    .map((status) => String(status || '').trim().toLowerCase())
+    .filter(Boolean))];
+  const suffix = statuses.length ? ` AND item_status IN (${statuses.map(() => '?').join(',')})` : '';
   run(
     `DELETE FROM promo_item_fetch_states
      WHERE account_id = ? AND child_user_id = ? AND site_id = ?
-       AND promotion_id = ? AND promotion_type = ?`,
-    [String(accountId), route.childUserId, route.siteId, String(promotionId), String(promotionType)]
+       AND promotion_id = ? AND promotion_type = ?${suffix}`,
+    [String(accountId), route.childUserId, route.siteId, String(promotionId), String(promotionType), ...statuses]
   );
 }
 
@@ -1370,6 +1428,16 @@ export function getActivityCacheState(accountOrIdentity, siteId = '', promotionI
     `SELECT * FROM activity_cache_states
      WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND promotion_id = ? AND promotion_type = ?`,
     [identity.accountId, identity.childUserId, identity.siteId, identity.promotionId, identity.promotionType]
+  );
+}
+
+export function listActivityCacheStatesForRoute({ accountId, childUserId = '', siteId = '' } = {}) {
+  if (!accountId || !childUserId || !siteId) return [];
+  return all(
+    `SELECT * FROM activity_cache_states
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+     ORDER BY promotion_id, promotion_type`,
+    [String(accountId), String(childUserId), String(siteId).toUpperCase()],
   );
 }
 
@@ -1467,14 +1535,15 @@ export function markActivityCacheDirty({  accountId,
 export function removeGhostPromotionItem({ accountId, childUserId = '', siteId = '', itemId = '', promotionId = '', promotionType = '' } = {}) {
   if (!accountId || !itemId) return { removed: 0 };
   const route = resolveRouteForIdentity({ accountId, promotionId, promotionType, route: { childUserId, siteId } });
-  const promotionFilter = String(promotionId || '').trim() ? String(promotionId) : '';
+  const promotionFilter = String(promotionId || '').trim();
+  const typeFilter = String(promotionType || '').trim().toUpperCase();
   const result = run(
     `DELETE FROM promo_items
      WHERE account_id = ? AND child_user_id = ? AND site_id = ?
        AND item_id = ?
-       AND (status = 'candidate' OR status IS NULL OR status = '')
-       AND (promotion_id = ? OR ? = '')`,
-    [String(accountId), route.childUserId, route.siteId, String(itemId), promotionFilter, promotionFilter],
+       AND (promotion_id = ? OR ? = '')
+       AND (promotion_type = ? OR ? = '')`,
+    [String(accountId), route.childUserId, route.siteId, String(itemId), promotionFilter, promotionFilter, typeFilter, typeFilter],
   );
   // A removed item must also leave the item price pool, otherwise the local
   // pool keeps a ghost entry that the platform no longer lists.
@@ -1492,16 +1561,60 @@ export function removeGhostPromotionItem({ accountId, childUserId = '', siteId =
 
 export function updateItemPriceByWebhook({ accountId, childUserId = '', siteId = '', itemId = '', price = null, originalPrice = null, status = '' } = {}) {
   if (!accountId || !itemId) return { updated: 0 };
-  const current = get(
-    `SELECT id FROM promo_items WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND item_id = ?`,
+  const relations = all(
+    `SELECT id, account_id, child_user_id, site_id, promotion_id, promotion_type, item_id,
+            status, original_price, price
+       FROM promo_items
+      WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND item_id = ?`,
     [String(accountId), String(childUserId || ''), String(siteId || '').toUpperCase(), String(itemId)],
   );
-  if (!current) return { updated: 0 };
+  if (!relations.length) return { updated: 0, reprice_queued: 0 };
   const nextPrice = price !== null && Number.isFinite(Number(price)) ? Number(price) : null;
   // Never derive original_price from the current price: a missing original
   // price must preserve the existing baseline (COALESCE keeps the old value),
   // otherwise discount calculations would use the discounted price as base.
   const nextOriginal = originalPrice !== null && Number.isFinite(Number(originalPrice)) ? Number(originalPrice) : null;
+  const nextBase = nextOriginal ?? nextPrice;
+  const detectedAt = nowIso();
+  let repriceQueued = 0;
+  if (Number.isFinite(nextBase)) {
+    for (const relation of relations) {
+      const relationStatus = String(relation.status || '').toLowerCase();
+      if (!['started', 'pending'].includes(relationStatus)) continue;
+      const previousBase = Number.isFinite(Number(relation.original_price))
+        ? Number(relation.original_price)
+        : Number.isFinite(Number(relation.price)) ? Number(relation.price) : null;
+      if (!Number.isFinite(previousBase) || Math.abs(previousBase - nextBase) < 0.005) continue;
+      run(
+        `INSERT INTO activity_price_recalc_queue
+          (account_id, child_user_id, site_id, promotion_id, promotion_type, item_id,
+           previous_base_price, new_base_price, source, status, detected_at, resolved_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'item_webhook', 'pending', ?, NULL, ?)
+         ON CONFLICT(account_id, child_user_id, site_id, promotion_id, promotion_type, item_id) DO UPDATE SET
+           previous_base_price = CASE
+             WHEN activity_price_recalc_queue.status = 'pending'
+             THEN activity_price_recalc_queue.previous_base_price
+             ELSE excluded.previous_base_price
+           END,
+           new_base_price = excluded.new_base_price,
+           source = excluded.source,
+           status = 'pending',
+           detected_at = CASE
+             WHEN activity_price_recalc_queue.status = 'pending'
+             THEN activity_price_recalc_queue.detected_at
+             ELSE excluded.detected_at
+           END,
+           resolved_at = NULL,
+           updated_at = excluded.updated_at`,
+        [
+          String(relation.account_id), String(relation.child_user_id || ''), String(relation.site_id || '').toUpperCase(),
+          String(relation.promotion_id), String(relation.promotion_type), String(relation.item_id),
+          previousBase, nextBase, detectedAt, detectedAt,
+        ],
+      );
+      repriceQueued += 1;
+    }
+  }
   const result = run(
     `UPDATE promo_items SET
        price = COALESCE(?, price),
@@ -1510,7 +1623,350 @@ export function updateItemPriceByWebhook({ accountId, childUserId = '', siteId =
      WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND item_id = ?`,
     [nextPrice, nextOriginal, nowIso(), String(accountId), String(childUserId || ''), String(siteId || '').toUpperCase(), String(itemId)],
   );
+  return { updated: Number(result?.changes || 0), reprice_queued: repriceQueued };
+}
+
+export function applyItemSnapshotFromWebhook({
+  accountId,
+  childUserId = '',
+  siteId = '',
+  itemId = '',
+  resource = {},
+  observedAt = '',
+  sourceRevision = '',
+  confirmed = true,
+} = {}) {
+  if (!accountId || !itemId || !resource || typeof resource !== 'object') {
+    return { updated: 0, reprice_queued: 0, ignored: true, reason: 'snapshot_fields_missing' };
+  }
+  const route = {
+    accountId: String(accountId),
+    childUserId: String(childUserId || ''),
+    siteId: String(siteId || '').toUpperCase(),
+    itemId: String(itemId),
+  };
+  const next = normalizeItemSnapshot({ ...resource, id: resource.id || resource.item_id || route.itemId }, {
+    observedAt: observedAt || nowIso(),
+    sourceRevision: sourceRevision || undefined,
+    confirmed: confirmed !== false,
+  });
+  return transaction((database) => {
+    const currentRow = database.prepare(
+      `SELECT * FROM item_price_cache
+       WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND item_id = ?`,
+    ).get(route.accountId, route.childUserId, route.siteId, route.itemId);
+    const previous = currentRow ? snapshotFromCacheRow(currentRow) : null;
+    if (confirmed === false && currentRow) {
+      database.prepare(
+        `UPDATE item_price_cache
+            SET confirmed = 0,
+                change_flags_json = ?,
+                updated_at = ?
+          WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND item_id = ?`,
+      ).run(
+        JSON.stringify(['resource_read_unconfirmed']), nowIso(),
+        route.accountId, route.childUserId, route.siteId, route.itemId,
+      );
+      return {
+        updated: 1,
+        changed: false,
+        changed_fields: [],
+        reprice_queued: 0,
+        snapshot_hash: previous?.snapshot_hash || currentRow.snapshot_hash || null,
+        observed_at: previous?.observed_at || currentRow.observed_at || null,
+        confirmed: false,
+      };
+    }
+    if (snapshotIsOlder(previous, next)) {
+      return {
+        updated: 0,
+        reprice_queued: 0,
+        ignored: true,
+        reason: 'out_of_order_snapshot',
+        snapshot_hash: previous?.snapshot_hash || currentRow?.snapshot_hash || null,
+      };
+    }
+    const comparison = compareItemSnapshots(previous, next);
+    const detectedAt = nowIso();
+    database.prepare(
+      `INSERT INTO item_price_cache
+        (account_id, child_user_id, site_id, item_id, price, original_price, currency_id, status,
+         available_quantity, dimensions_json, weight_json, snapshot_hash, source_revision, observed_at,
+         change_flags_json, confirmed, raw_json, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(account_id, child_user_id, site_id, item_id) DO UPDATE SET
+         price = excluded.price,
+         original_price = excluded.original_price,
+         currency_id = excluded.currency_id,
+         status = excluded.status,
+         available_quantity = excluded.available_quantity,
+         dimensions_json = excluded.dimensions_json,
+         weight_json = excluded.weight_json,
+         snapshot_hash = excluded.snapshot_hash,
+         source_revision = COALESCE(excluded.source_revision, item_price_cache.source_revision),
+         observed_at = excluded.observed_at,
+         change_flags_json = excluded.change_flags_json,
+         confirmed = excluded.confirmed,
+         raw_json = excluded.raw_json,
+         updated_at = excluded.updated_at`,
+    ).run(
+      route.accountId, route.childUserId, route.siteId, route.itemId,
+      next.price, next.original_price, next.currency_id, next.status,
+      next.available_quantity,
+      next.dimensions == null ? null : JSON.stringify(next.dimensions),
+      next.weight == null ? null : JSON.stringify(next.weight),
+      next.snapshot_hash, next.source_revision, next.observed_at,
+      JSON.stringify(comparison.changed_fields), confirmed === false ? 0 : 1, JSON.stringify(resource), detectedAt,
+    );
+
+    const relations = confirmed === false ? [] : database.prepare(
+      `SELECT account_id, child_user_id, site_id, promotion_id, promotion_type, item_id,
+              status, original_price, price
+         FROM promo_items
+        WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND item_id = ?`,
+    ).all(route.accountId, route.childUserId, route.siteId, route.itemId);
+    const nextBase = next.original_price ?? next.price;
+    let repriceQueued = 0;
+    if (comparison.changed_fields.includes('price') || comparison.changed_fields.includes('original_price')) {
+      for (const relation of relations) {
+        if (!['started', 'pending'].includes(String(relation.status || '').toLowerCase())) continue;
+        const previousBase = Number.isFinite(Number(relation.original_price))
+          ? Number(relation.original_price)
+          : Number.isFinite(Number(relation.price)) ? Number(relation.price) : null;
+        if (!Number.isFinite(nextBase) || !Number.isFinite(previousBase) || Math.abs(previousBase - nextBase) < 0.005) continue;
+        database.prepare(
+          `INSERT INTO activity_price_recalc_queue
+            (account_id, child_user_id, site_id, promotion_id, promotion_type, item_id,
+             previous_base_price, new_base_price, source, status, detected_at, resolved_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'item_webhook_snapshot', 'pending', ?, NULL, ?)
+           ON CONFLICT(account_id, child_user_id, site_id, promotion_id, promotion_type, item_id) DO UPDATE SET
+             new_base_price = excluded.new_base_price,
+             source = excluded.source,
+             status = 'pending',
+             resolved_at = NULL,
+             updated_at = excluded.updated_at`,
+        ).run(
+          relation.account_id, relation.child_user_id, relation.site_id,
+          relation.promotion_id, relation.promotion_type, relation.item_id,
+          previousBase, nextBase, detectedAt, detectedAt,
+        );
+        repriceQueued += 1;
+      }
+    }
+    return {
+      updated: 1,
+      changed: comparison.changed,
+      changed_fields: comparison.changed_fields,
+      reprice_queued: repriceQueued,
+      snapshot_hash: next.snapshot_hash,
+      observed_at: next.observed_at,
+      confirmed: confirmed !== false,
+    };
+  });
+}
+
+export function listUnconfirmedItemSnapshots({ limit = 500, includeMissingRelations = true } = {}) {
+  const safeLimit = Math.max(1, Math.min(100_000, Math.floor(Number(limit) || 500)));
+  if (!includeMissingRelations) {
+    return all(
+      `SELECT account_id, child_user_id, site_id, item_id,
+              source_revision, observed_at, updated_at,
+              0 AS execution_priority, 0 AS snapshot_missing
+         FROM item_price_cache
+        WHERE confirmed = 0
+        ORDER BY updated_at ASC, account_id, child_user_id, site_id, item_id
+        LIMIT ?`,
+      [safeLimit],
+    );
+  }
+  return all(
+    `WITH relation_items AS (
+       SELECT account_id, child_user_id, site_id, item_id, MAX(updated_at) AS relation_updated_at
+         FROM promo_items
+        WHERE status IN ('candidate', 'started', 'pending')
+        GROUP BY account_id, child_user_id, site_id, item_id
+     ), queue AS (
+       SELECT rel.account_id, rel.child_user_id, rel.site_id, rel.item_id,
+              pc.source_revision, pc.observed_at,
+              COALESCE(pc.updated_at, rel.relation_updated_at) AS updated_at,
+              1 AS execution_priority,
+              CASE WHEN pc.item_id IS NULL THEN 1 ELSE 0 END AS snapshot_missing
+         FROM relation_items rel
+         LEFT JOIN item_price_cache pc
+           ON pc.account_id = rel.account_id
+          AND pc.child_user_id = rel.child_user_id
+          AND pc.site_id = rel.site_id
+          AND pc.item_id = rel.item_id
+        WHERE pc.item_id IS NULL OR pc.confirmed = 0
+       UNION ALL
+       SELECT pc.account_id, pc.child_user_id, pc.site_id, pc.item_id,
+              pc.source_revision, pc.observed_at, pc.updated_at,
+              0 AS execution_priority, 0 AS snapshot_missing
+         FROM item_price_cache pc
+        WHERE pc.confirmed = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM relation_items rel
+             WHERE rel.account_id = pc.account_id
+               AND rel.child_user_id = pc.child_user_id
+               AND rel.site_id = pc.site_id
+               AND rel.item_id = pc.item_id
+          )
+     )
+     SELECT * FROM queue
+      ORDER BY execution_priority DESC, updated_at ASC, account_id, child_user_id, site_id, item_id
+      LIMIT ?`,
+    [safeLimit],
+  );
+}
+
+export function markLegacyUnverifiedItemSnapshots() {
+  const result = run(
+    `UPDATE item_price_cache
+        SET confirmed = 0,
+            change_flags_json = '["legacy_snapshot_unverified"]',
+            updated_at = ?
+      WHERE confirmed = 1
+        AND (source_revision IS NULL OR source_revision = '')
+        AND (observed_at IS NULL OR observed_at = '')`,
+    [nowIso()],
+  );
   return { updated: Number(result?.changes || 0) };
+}
+
+export function countUnconfirmedItemSnapshots({ includeMissingRelations = true } = {}) {
+  if (!includeMissingRelations) {
+    return get(
+      `SELECT COUNT(*) AS total,
+              0 AS execution_priority,
+              0 AS missing_snapshot
+         FROM item_price_cache
+        WHERE confirmed = 0`,
+    ) || { total: 0, execution_priority: 0, missing_snapshot: 0 };
+  }
+  return get(
+    `WITH relation_items AS (
+       SELECT DISTINCT account_id, child_user_id, site_id, item_id
+         FROM promo_items
+        WHERE status IN ('candidate', 'started', 'pending')
+     ), queue AS (
+       SELECT rel.account_id, rel.child_user_id, rel.site_id, rel.item_id,
+              1 AS execution_priority,
+              CASE WHEN pc.item_id IS NULL THEN 1 ELSE 0 END AS snapshot_missing
+         FROM relation_items rel
+         LEFT JOIN item_price_cache pc
+           ON pc.account_id = rel.account_id
+          AND pc.child_user_id = rel.child_user_id
+          AND pc.site_id = rel.site_id
+          AND pc.item_id = rel.item_id
+        WHERE pc.item_id IS NULL OR pc.confirmed = 0
+       UNION ALL
+       SELECT pc.account_id, pc.child_user_id, pc.site_id, pc.item_id,
+              0 AS execution_priority, 0 AS snapshot_missing
+         FROM item_price_cache pc
+        WHERE pc.confirmed = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM relation_items rel
+             WHERE rel.account_id = pc.account_id
+               AND rel.child_user_id = pc.child_user_id
+               AND rel.site_id = pc.site_id
+               AND rel.item_id = pc.item_id
+          )
+     )
+     SELECT COUNT(*) AS total,
+            COALESCE(SUM(execution_priority), 0) AS execution_priority,
+            COALESCE(SUM(snapshot_missing), 0) AS missing_snapshot
+       FROM queue`,
+  ) || { total: 0, execution_priority: 0 };
+}
+
+export function confirmLegacyTimestampComparedItemSnapshots() {
+  const result = run(
+    `UPDATE item_price_cache
+        SET confirmed = 1,
+            change_flags_json = '[]',
+            updated_at = ?
+      WHERE confirmed = 0
+        AND change_flags_json = '["resource_revision_behind_event"]'
+        AND source_revision IS NOT NULL
+        AND source_revision <> ''`,
+    [nowIso()],
+  );
+  return { updated: Number(result?.changes || 0) };
+}
+
+export function listPendingActivityPriceRecalcCountsForPromotions(accountId, promotions = []) {
+  const counts = new Map();
+  for (const promotion of promotions || []) {
+    const route = resolveRouteForIdentity({
+      accountId,
+      promotionId: promotion.promotion_id,
+      promotionType: promotion.promotion_type,
+      route: promotion,
+    });
+    const row = get(
+      `SELECT COUNT(*) AS count
+         FROM activity_price_recalc_queue
+        WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+          AND promotion_id = ? AND promotion_type = ? AND status = 'pending'`,
+      [String(accountId), route.childUserId, route.siteId, String(promotion.promotion_id), String(promotion.promotion_type)],
+    );
+    counts.set(promotionKey(promotion), Number(row?.count || 0));
+  }
+  return counts;
+}
+
+export function resolveActivityPriceRecalc({ accountId, childUserId = '', siteId = '', promotionId, promotionType, itemId, outcome = 'updated' } = {}) {
+  if (!accountId || !promotionId || !promotionType || !itemId) return { updated: 0 };
+  const timestamp = nowIso();
+  const result = run(
+    `UPDATE activity_price_recalc_queue
+        SET status = ?, resolved_at = ?, updated_at = ?
+      WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+        AND promotion_id = ? AND promotion_type = ? AND item_id = ? AND status = 'pending'`,
+    [String(outcome || 'updated'), timestamp, timestamp, String(accountId), String(childUserId || ''),
+      String(siteId || '').toUpperCase(), String(promotionId), String(promotionType), String(itemId)],
+  );
+  return { updated: Number(result?.changes || 0) };
+}
+
+export function upsertPromotionItemFromWebhook({
+  accountId,
+  childUserId = '',
+  siteId = '',
+  promotionId = '',
+  promotionType = '',
+  itemId = '',
+  item = {},
+  status = '',
+} = {}) {
+  if (!accountId || !promotionId || !promotionType || !itemId) return { updated: 0, status_missing: true };
+  const route = resolveRouteForIdentity({ accountId, promotionId, promotionType, route: { childUserId, siteId } });
+  const current = get(
+    `SELECT * FROM promo_items
+     WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+       AND promotion_id = ? AND promotion_type = ? AND item_id = ?`,
+    [String(accountId), route.childUserId, route.siteId, String(promotionId), String(promotionType), String(itemId)],
+  );
+  const allowedStatuses = new Set(['candidate', 'pending', 'started']);
+  const resolvedStatus = allowedStatuses.has(String(status || '').toLowerCase())
+    ? String(status).toLowerCase()
+    : allowedStatuses.has(String(current?.status || '').toLowerCase())
+      ? String(current.status).toLowerCase()
+      : '';
+  if (!resolvedStatus) return { updated: 0, status_missing: true };
+  const merged = {
+    ...(current || {}),
+    ...(item && typeof item === 'object' ? item : {}),
+    item_id: String(itemId),
+    status: resolvedStatus,
+  };
+  const [saved] = saveItems(accountId, promotionId, promotionType, [merged], {
+    childUserId: route.childUserId,
+    siteId: route.siteId,
+    itemStatus: resolvedStatus,
+    source: 'activity_webhook',
+  });
+  return { updated: 1, status: resolvedStatus, item: saved };
 }
 
 export function upsertItemPriceCache({ accountId, childUserId = '', siteId = '', itemId = '', price = null, originalPrice = null, currencyId = '', status = '', raw = null } = {}) {
@@ -1576,11 +2032,94 @@ export function deletePromotionItemData({ accountId, childUserId = '', siteId = 
   return { removed: 1 };
 }
 
-export function cleanupRemovedCampaignItemData() {
+function shanghaiBusinessDateText(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(now);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+export function summarizeObservedItemSnapshotChanges({ since } = {}) {
+  const sinceIso = String(since || '').trim();
+  if (!sinceIso) return { refreshed_item_count: 0, changed_item_count: 0 };
+  const row = get(
+    `SELECT COUNT(*) AS refreshed_item_count,
+            COALESCE(SUM(CASE
+              WHEN change_flags_json IS NOT NULL AND change_flags_json <> '[]' THEN 1
+              ELSE 0
+            END), 0) AS changed_item_count
+       FROM item_price_cache
+      WHERE observed_at >= ?`,
+    [sinceIso],
+  ) || {};
+  return {
+    refreshed_item_count: Math.max(0, Number(row.refreshed_item_count || 0)),
+    changed_item_count: Math.max(0, Number(row.changed_item_count || 0)),
+  };
+}
+
+export function listConfirmedItemResourcesForRoute({ accountId, childUserId = '', siteId = '' } = {}) {
+  if (!accountId || !childUserId || !siteId) return [];
+  return all(
+    `SELECT item_id, price, original_price, currency_id, status, available_quantity,
+            observed_at, source_revision
+       FROM item_price_cache
+      WHERE account_id = ? AND child_user_id = ? AND site_id = ?
+        AND confirmed = 1 AND price IS NOT NULL AND price > 0`,
+    [String(accountId), String(childUserId), String(siteId).toUpperCase()],
+  ).map((row) => ({
+    id: String(row.item_id || ''),
+    item_id: String(row.item_id || ''),
+    price: Number(row.price),
+    original_price: row.original_price == null ? null : Number(row.original_price),
+    currency_id: row.currency_id || null,
+    status: row.status || null,
+    available_quantity: row.available_quantity == null ? null : Number(row.available_quantity),
+    observed_at: row.observed_at || null,
+    source_revision: row.source_revision || null,
+    snapshot_source: 'confirmed_item_price_cache',
+  }));
+}
+
+export function getConfirmedItemSnapshot(identity = {}) {
+  const row = getItemPriceCache(identity);
+  if (!row) return null;
+  const snapshot = snapshotFromCacheRow(row);
+  let changeFlags = [];
+  try { changeFlags = JSON.parse(row.change_flags_json || '[]'); } catch { changeFlags = []; }
+  return {
+    ...snapshot,
+    snapshot_hash: row.snapshot_hash || snapshot.snapshot_hash,
+    change_flags: Array.isArray(changeFlags) ? changeFlags : [],
+    confirmed: Number(row.confirmed ?? 1) === 1,
+  };
+}
+
+export function markItemSnapshotUnconfirmed({ accountId, childUserId = '', siteId = '', itemId = '', reason = '', observedAt = '' } = {}) {
+  if (!accountId || !itemId) return { updated: 0 };
+  const result = run(
+    `UPDATE item_price_cache
+        SET confirmed = 0,
+            change_flags_json = ?,
+            observed_at = COALESCE(NULLIF(?, ''), observed_at),
+            updated_at = ?
+      WHERE account_id = ? AND child_user_id = ? AND site_id = ? AND item_id = ?`,
+    [JSON.stringify(reason ? [String(reason)] : ['resource_read_unconfirmed']), String(observedAt || ''), nowIso(), String(accountId), String(childUserId || ''), String(siteId || '').toUpperCase(), String(itemId)],
+  );
+  return { updated: Number(result?.changes || 0) };
+}
+
+export function cleanupRemovedCampaignItemData({ businessDate = shanghaiBusinessDateText() } = {}) {
+  const safeBusinessDate = /^\d{4}-\d{2}-\d{2}$/.test(String(businessDate || ''))
+    ? String(businessDate)
+    : shanghaiBusinessDateText();
   const campaigns = all(
     `SELECT account_id, child_user_id, site_id, promotion_id, promotion_type
      FROM promo_campaigns
-     WHERE status = 'catalog_removed'`,
+     WHERE LOWER(COALESCE(status, '')) IN ('catalog_removed', 'finished', 'ended', 'closed')
+        OR (finish_date IS NOT NULL AND finish_date <> '' AND substr(finish_date, 1, 10) < ?)`,
+    [safeBusinessDate],
   );
   let removedRows = 0;
   for (const campaign of campaigns) {
@@ -1632,6 +2171,8 @@ export function cleanupRemovedCampaignItemData() {
        AND NOT EXISTS (
          SELECT 1 FROM promo_campaigns c
          WHERE c.account_id = activity_cache_states.account_id
+           AND c.child_user_id = activity_cache_states.child_user_id
+           AND c.site_id = activity_cache_states.site_id
            AND c.promotion_id = activity_cache_states.promotion_id
            AND c.promotion_type = activity_cache_states.promotion_type
        )`,
@@ -1642,15 +2183,19 @@ export function cleanupRemovedCampaignItemData() {
        AND EXISTS (
          SELECT 1 FROM promo_campaigns c
          WHERE c.account_id = activity_cache_states.account_id
+           AND c.child_user_id = activity_cache_states.child_user_id
+           AND c.site_id = activity_cache_states.site_id
            AND c.promotion_id = activity_cache_states.promotion_id
            AND c.promotion_type = activity_cache_states.promotion_type
            AND c.finish_date IS NOT NULL
            AND c.finish_date <> ''
-           AND substr(c.finish_date, 1, 10) < date('now')
+           AND substr(c.finish_date, 1, 10) < ?
        )`,
+    [safeBusinessDate],
   );
   return {
     cleaned_campaigns: campaigns.length,
+    cleaned_inactive_campaigns: campaigns.length,
     removed_item_rows: removedRows,
     removed_orphaned_cache_states: Number(orphaned?.changes || 0),
     removed_finished_cache_states: Number(finished?.changes || 0),
@@ -1661,8 +2206,12 @@ export function listItemRouteOwners(itemId) {
   const rows = all(
     `SELECT DISTINCT account_id, child_user_id, site_id
      FROM promo_items
+     WHERE item_id = ?
+     UNION
+     SELECT DISTINCT account_id, child_user_id, site_id
+     FROM item_price_cache
      WHERE item_id = ?`,
-    [String(itemId || '')],
+    [String(itemId || ''), String(itemId || '')],
   );
   return (rows || []).map((row) => ({
     account_id: String(row.account_id || ''),
@@ -1682,6 +2231,291 @@ export function hasActivityCallbackEvent(eventId) {
 
 export function getActivityCallbackEvent(eventId) {
   return get('SELECT * FROM activity_callback_events WHERE event_id = ?', [String(eventId)]);
+}
+
+export function listUnresolvedCbtActivityCallbackEvents({
+  since = null,
+  limit = 100,
+  afterReceivedAt = null,
+  afterEventId = null,
+} = {}) {
+  const safeLimit = Math.max(1, Math.min(100, Number(limit) || 100));
+  const params = [];
+  let where = `((processing_state = 'completed' AND outcome = 'route_unresolved_skipped')
+    OR (processing_state = 'failed' AND outcome = 'compensation_failed'))
+    AND topic IN ('items', 'marketplace_items')
+    AND resource LIKE '/items/CBT%'
+    AND COALESCE(child_user_id, '') = ''`;
+  if (since) {
+    where += ' AND received_at >= ?';
+    params.push(String(since));
+  }
+  if (afterReceivedAt && afterEventId) {
+    where += ' AND (received_at > ? OR (received_at = ? AND event_id > ?))';
+    params.push(String(afterReceivedAt), String(afterReceivedAt), String(afterEventId));
+  }
+  params.push(safeLimit);
+  return all(
+    `SELECT event_id, schema_version, account_id, site_id, promotion_id, promotion_type,
+            received_at, topic, resource, remote_user_id, child_user_id, application_id,
+            outcome, resource_status, raw_json, last_error, attempt_count
+     FROM activity_callback_events
+     WHERE ${where}
+     ORDER BY received_at ASC, event_id ASC
+     LIMIT ?`,
+    params,
+  );
+}
+
+export function summarizeUnresolvedCbtActivityCallbackEvents({
+  since = null,
+  afterReceivedAt = null,
+  afterEventId = null,
+} = {}) {
+  const params = [];
+  let where = `((processing_state = 'completed' AND outcome = 'route_unresolved_skipped')
+    OR (processing_state = 'failed' AND outcome = 'compensation_failed'))
+    AND topic IN ('items', 'marketplace_items')
+    AND resource LIKE '/items/CBT%'
+    AND COALESCE(child_user_id, '') = ''`;
+  if (since) {
+    where += ' AND received_at >= ?';
+    params.push(String(since));
+  }
+  if (afterReceivedAt && afterEventId) {
+    where += ' AND (received_at > ? OR (received_at = ? AND event_id > ?))';
+    params.push(String(afterReceivedAt), String(afterReceivedAt), String(afterEventId));
+  }
+  const row = get(
+    `SELECT COUNT(*) AS event_count,
+            COUNT(DISTINCT resource) AS item_count,
+            COUNT(DISTINCT remote_user_id) AS account_count,
+            SUM(CASE WHEN processing_state = 'completed' AND outcome = 'route_unresolved_skipped' THEN 1 ELSE 0 END) AS route_unresolved_count,
+            COUNT(DISTINCT CASE WHEN processing_state = 'completed' AND outcome = 'route_unresolved_skipped' THEN resource END) AS route_unresolved_item_count,
+            SUM(CASE WHEN processing_state = 'failed' AND outcome = 'compensation_failed' THEN 1 ELSE 0 END) AS retryable_failed_count,
+            COUNT(DISTINCT CASE WHEN processing_state = 'failed' AND outcome = 'compensation_failed' THEN resource END) AS retryable_failed_item_count,
+            COUNT(DISTINCT CASE WHEN processing_state = 'completed' AND outcome = 'route_unresolved_skipped' THEN remote_user_id END) AS route_unresolved_account_count,
+            COUNT(DISTINCT CASE WHEN processing_state = 'failed' AND outcome = 'compensation_failed' THEN remote_user_id END) AS retryable_failed_account_count,
+            MIN(received_at) AS oldest_received_at,
+            MAX(received_at) AS newest_received_at
+     FROM activity_callback_events
+     WHERE ${where}`,
+    params,
+  ) || {};
+  const detailRows = all(
+    `SELECT resource, remote_user_id, child_user_id, site_id, gap, received_at, event_id, last_error
+     FROM activity_callback_events
+     WHERE ${where}
+     ORDER BY received_at ASC, event_id ASC`,
+    params,
+  );
+  const routeCatalogReadyAccounts = new Set(all(
+    `SELECT DISTINCT account_id
+       FROM marketplace_sites
+      WHERE COALESCE(account_id, '') <> ''
+        AND COALESCE(child_user_id, '') <> ''
+        AND COALESCE(site_id, '') <> ''`,
+  ).map((row) => String(row.account_id || '').trim()));
+  const localGlobalParentRelations = new Set(all(
+    `SELECT DISTINCT account_id, item_id
+       FROM item_price_cache
+      WHERE UPPER(COALESCE(item_id, '')) LIKE 'CBT%'
+     UNION
+     SELECT DISTINCT account_id, item_id
+       FROM promo_items
+      WHERE UPPER(COALESCE(item_id, '')) LIKE 'CBT%'`,
+  ).map((row) => `${String(row.account_id || '').trim()}|${String(row.item_id || '').trim().toUpperCase()}`));
+  const uniqueClassifications = new Map();
+  const uniqueClassificationsByAccount = new Map();
+  const classificationCounts = {};
+  const classificationAccountCounts = {};
+  let eligibleEventCount = 0;
+  const incrementNested = (target, category, accountId) => {
+    if (!target[category]) target[category] = {};
+    const key = String(accountId || '').trim() || 'unknown';
+    target[category][key] = Number(target[category][key] || 0) + 1;
+  };
+  const classificationRank = (category) => ({
+    terminal_irrelevant: 50,
+    terminal_foreign: 50,
+    terminal_no_actionable_global_parent: 50,
+    route_catalog_gap: 40,
+    quarantined_unknown: 30,
+    eligible_partial: 20,
+    eligible_budget_remaining: 20,
+    eligible_route_unresolved: 10,
+    eligible_retryable: 10,
+  }[category] || 0);
+  for (const detail of detailRows) {
+    const resource = String(detail.resource || '');
+    const parentItemId = resource.replace(/^\/items\//, '').split(/[?#]/, 1)[0].toUpperCase();
+    const accountId = String(detail.remote_user_id || '').trim();
+    const localRelationCount = localGlobalParentRelations.has(`${accountId}|${parentItemId}`) ? 1 : 0;
+    const globalParentContext = {
+      last_error: detail.last_error,
+      resource,
+      child_user_id: detail.child_user_id,
+      site_id: detail.site_id,
+      event_gap: detail.gap,
+      local_relation_count: localRelationCount,
+      route_catalog_ready: routeCatalogReadyAccounts.has(accountId),
+    };
+    const globalParentNoActionable = isNonActionableGlobalParent(globalParentContext);
+    const classification = classifyCbtUnresolved(globalParentNoActionable
+      ? { ...globalParentContext, non_actionable_global_parent: true }
+      : globalParentContext).category;
+    classificationCounts[classification] = Number(classificationCounts[classification] || 0) + 1;
+    incrementNested(classificationAccountCounts, classification, detail.remote_user_id);
+    if (classifyCbtUnresolved({ last_error: detail.last_error }).retryable) eligibleEventCount += 1;
+    if (!resource) continue;
+    const accountResourceKey = `${String(detail.remote_user_id || '').trim()}|${resource}`;
+    const previous = uniqueClassifications.get(resource);
+    if (!previous || classificationRank(classification) >= classificationRank(previous)) {
+      uniqueClassifications.set(resource, classification);
+    }
+    const previousAccount = uniqueClassificationsByAccount.get(accountResourceKey);
+    if (!previousAccount || classificationRank(classification) >= classificationRank(previousAccount)) {
+      uniqueClassificationsByAccount.set(accountResourceKey, classification);
+    }
+  }
+  const classificationItemCounts = {};
+  const classificationItemAccountCounts = {};
+  let eligibleItemCount = 0;
+  for (const [accountResourceKey, classification] of uniqueClassificationsByAccount.entries()) {
+    const accountId = accountResourceKey.split('|', 1)[0];
+    incrementNested(classificationItemAccountCounts, classification, accountId);
+  }
+  for (const classification of uniqueClassifications.values()) {
+    classificationItemCounts[classification] = Number(classificationItemCounts[classification] || 0) + 1;
+    if (classifyCbtUnresolved({ classification }).retryable) eligibleItemCount += 1;
+  }
+  const count = (map, category) => Number(map[category] || 0);
+  return {
+    event_count: Number(row.event_count || 0),
+    item_count: Number(row.item_count || 0),
+    route_unresolved_count: Number(row.route_unresolved_count || 0),
+    route_unresolved_item_count: Number(row.route_unresolved_item_count || 0),
+    route_unresolved_account_count: Number(row.route_unresolved_account_count || 0),
+    retryable_failed_count: Number(row.retryable_failed_count || 0),
+    retryable_failed_item_count: Number(row.retryable_failed_item_count || 0),
+    retryable_failed_account_count: Number(row.retryable_failed_account_count || 0),
+    oldest_received_at: row.oldest_received_at || null,
+    newest_received_at: row.newest_received_at || null,
+    classification_counts: classificationCounts,
+    classification_item_counts: classificationItemCounts,
+    classification_account_counts: classificationAccountCounts,
+    classification_item_account_counts: classificationItemAccountCounts,
+    eligible_event_count: eligibleEventCount,
+    eligible_item_count: eligibleItemCount,
+    route_catalog_gap_count: count(classificationItemCounts, 'route_catalog_gap'),
+    route_catalog_gap_event_count: count(classificationCounts, 'route_catalog_gap'),
+    route_catalog_gap_item_count: count(classificationItemCounts, 'route_catalog_gap'),
+    quarantined_unknown_count: count(classificationItemCounts, 'quarantined_unknown'),
+    quarantined_unknown_event_count: count(classificationCounts, 'quarantined_unknown'),
+    quarantined_unknown_item_count: count(classificationItemCounts, 'quarantined_unknown'),
+    terminal_foreign_count: count(classificationItemCounts, 'terminal_foreign'),
+    terminal_foreign_event_count: count(classificationCounts, 'terminal_foreign'),
+    terminal_foreign_item_count: count(classificationItemCounts, 'terminal_foreign'),
+    terminal_irrelevant_count: count(classificationItemCounts, 'terminal_irrelevant'),
+    terminal_irrelevant_event_count: count(classificationCounts, 'terminal_irrelevant'),
+    terminal_irrelevant_item_count: count(classificationItemCounts, 'terminal_irrelevant'),
+    terminal_no_actionable_global_parent_count: count(classificationItemCounts, 'terminal_no_actionable_global_parent'),
+    terminal_no_actionable_global_parent_event_count: count(classificationCounts, 'terminal_no_actionable_global_parent'),
+    terminal_no_actionable_global_parent_item_count: count(classificationItemCounts, 'terminal_no_actionable_global_parent'),
+    eligible_partial_count: count(classificationItemCounts, 'eligible_partial'),
+    eligible_partial_event_count: count(classificationCounts, 'eligible_partial'),
+    eligible_budget_remaining_count: count(classificationItemCounts, 'eligible_budget_remaining'),
+    eligible_budget_remaining_event_count: count(classificationCounts, 'eligible_budget_remaining'),
+    eligible_retryable_count: count(classificationItemCounts, 'eligible_retryable')
+      + count(classificationItemCounts, 'eligible_route_unresolved'),
+    eligible_retryable_event_count: count(classificationCounts, 'eligible_retryable')
+      + count(classificationCounts, 'eligible_route_unresolved'),
+  };
+}
+
+export function claimActivityCallbackReplayEvent(eventId, {
+  leaseMs = 2 * 60 * 1000,
+  now = new Date(),
+} = {}) {
+  const id = String(eventId || '').trim();
+  if (!id) throw new Error('活动通知缺少事件编号，无法补偿。');
+  const nowDate = now instanceof Date ? now : new Date(now);
+  const claimedAt = nowDate.toISOString();
+  const claimExpiresAt = new Date(nowDate.getTime() + Math.max(1_000, Number(leaseMs) || 0)).toISOString();
+  const claimToken = crypto.randomUUID();
+  return transaction((database) => {
+    const existing = database.prepare(
+      `SELECT event_id, processing_state, claim_expires_at, outcome, topic, resource, attempt_count
+       FROM activity_callback_events WHERE event_id = ?`,
+    ).get(id);
+    if (!existing
+      || !['route_unresolved_skipped', 'compensation_failed'].includes(String(existing.outcome || ''))
+      || !['items', 'marketplace_items'].includes(String(existing.topic || '').toLowerCase())
+      || !/^\/items\/CBT/.test(String(existing.resource || ''))) {
+      return { status: 'not_eligible', event_id: id, claim_token: null };
+    }
+    if (existing.processing_state === 'processing'
+      && Date.parse(String(existing.claim_expires_at || '')) > nowDate.getTime()) {
+      return { status: 'in_progress', event_id: id, claim_token: null };
+    }
+    if (!((existing.processing_state === 'completed' && existing.outcome === 'route_unresolved_skipped')
+      || (existing.processing_state === 'failed' && existing.outcome === 'compensation_failed'))) {
+      return { status: 'not_eligible', event_id: id, claim_token: null };
+    }
+    const result = database.prepare(
+      `UPDATE activity_callback_events
+       SET processing_state = 'processing', claim_token = ?, claimed_at = ?,
+           claim_expires_at = ?, completed_at = NULL, last_error = NULL,
+           attempt_count = COALESCE(attempt_count, 0) + 1
+       WHERE event_id = ?
+         AND ((processing_state = 'completed' AND outcome = 'route_unresolved_skipped')
+           OR (processing_state = 'failed' AND outcome = 'compensation_failed'))`,
+    ).run(claimToken, claimedAt, claimExpiresAt, id);
+    if (Number(result.changes || 0) !== 1) return { status: 'not_eligible', event_id: id, claim_token: null };
+    return {
+      status: 'claimed',
+      event_id: id,
+      claim_token: claimToken,
+      attempt_count: Number(existing.attempt_count || 0) + 1,
+    };
+  });
+}
+
+function serializeActivityCallbackError(error) {
+  if (!error || typeof error !== 'object' || Array.isArray(error)) {
+    return String(error || '活动通知处理失败。').replace(/[\r\n]+/g, ' ').slice(0, 500);
+  }
+  const safe = {};
+  for (const key of ['operation', 'endpoint_family', 'error_kind', 'reason_cn', 'classification', 'terminal_category']) {
+    if (!Object.hasOwn(error, key)) continue;
+    const value = error[key];
+    const text = String(value || '').replace(/[\r\n]+/g, ' ').slice(0, 180);
+    safe[key] = text || null;
+  }
+  const status = error.http_status === null || error.http_status === undefined || error.http_status === ''
+    ? null
+    : Number(error.http_status);
+  safe.http_status = Number.isFinite(status) ? Math.max(0, Math.floor(status)) : null;
+  safe.code = String(error.code || '').replace(/[\r\n]+/g, ' ').slice(0, 80) || null;
+  safe.cause_code = String(error.cause_code || '').replace(/[\r\n]+/g, ' ').slice(0, 80) || null;
+  const attempts = Number(error.attempt_count);
+  safe.attempt_count = Number.isFinite(attempts) ? Math.max(0, Math.floor(attempts)) : 0;
+  if (error.signal_presence && typeof error.signal_presence === 'object') {
+    safe.signal_presence = {
+      seller_signal_count: Math.max(0, Math.floor(Number(error.signal_presence.seller_signal_count || 0))),
+      site_signal_count: Math.max(0, Math.floor(Number(error.signal_presence.site_signal_count || 0))),
+      status_present: Boolean(error.signal_presence.status_present),
+      route_candidate_count: Math.max(0, Math.floor(Number(error.signal_presence.route_candidate_count || 0))),
+      ...(Object.hasOwn(error.signal_presence, 'owned_identity_proven')
+        ? { owned_identity_proven: Boolean(error.signal_presence.owned_identity_proven) }
+        : {}),
+      ...(Object.hasOwn(error.signal_presence, 'foreign_route_candidate_count')
+        ? { foreign_route_candidate_count: Math.max(0, Math.floor(Number(error.signal_presence.foreign_route_candidate_count || 0))) }
+        : {}),
+    };
+  }
+  if (Object.hasOwn(error, 'budget_remaining')) safe.budget_remaining = Boolean(error.budget_remaining);
+  return JSON.stringify(safe).slice(0, 500);
 }
 
 export function claimActivityCallbackEvent(event, {
@@ -1765,8 +2599,11 @@ export function finalizeActivityCallbackEvent({
 } = {}) {
   const normalizedStatus = status === 'failed' ? 'failed' : 'completed';
   const completedAt = (now instanceof Date ? now : new Date(now)).toISOString();
-  const lastError = normalizedStatus === 'failed'
-    ? String(error || '活动通知处理失败。').replace(/[\r\n]+/g, ' ').slice(0, 500)
+  const retainCompletedDiagnostic = normalizedStatus === 'completed'
+    && String(event?.outcome || '') === 'route_unresolved_skipped'
+    && error;
+  const lastError = normalizedStatus === 'failed' || retainCompletedDiagnostic
+    ? serializeActivityCallbackError(error)
     : null;
   return transaction((database) => {
     const result = database.prepare(
@@ -1829,19 +2666,22 @@ export function saveActivityCallbackEvent(event) {
   const value = (field) => (field === undefined ? null : field);
   const accountId = String(event.account_id || event.remote_user_id || '');
   const childUserId = String(event.child_user_id || '');
+  const lastError = event.last_error && typeof event.last_error === 'object'
+    ? serializeActivityCallbackError(event.last_error)
+    : String(event.last_error || '').replace(/[\r\n]+/g, ' ').slice(0, 500) || null;
   const siteMatch = String(event.site_id || event.resource || '').toUpperCase().match(/(?:^|[^A-Z0-9])(ML[A-Z])(?=[A-Z0-9])/);
   const siteId = siteMatch ? siteMatch[1] : String(event.site_id || '');
   return run(
     `INSERT OR IGNORE INTO activity_callback_events
       (event_id, schema_version, account_id, site_id, promotion_id, promotion_type, cursor, previous_cursor, gap, received_at,
        topic, resource, remote_user_id, child_user_id, application_id, outcome, resource_status, raw_json,
-       processing_state, completed_at, attempt_count)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, 1)`,
+       processing_state, completed_at, last_error, attempt_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, 1)`,
     [value(event.event_id), value(event.schema_version), accountId, siteId, String(event.promotion_id || ''),
       String(event.promotion_type || ''), value(event.cursor), value(event.previous_cursor), Number(Boolean(event.gap)), value(event.received_at) || nowIso(),
       value(event.topic), value(event.resource), value(event.remote_user_id), childUserId,
       value(event.application_id), value(event.outcome), value(event.resource_status), value(event.raw_json),
-      value(event.received_at) || nowIso()]
+      value(event.received_at) || nowIso(), lastError]
   );
 }
 
@@ -1933,14 +2773,26 @@ export function recordActivityItemsCalibration({ accountId, siteId = '', promoti
 export function listItems(accountId, promotionId, promotionType, status, route = null) {
   const resolvedRoute = resolveRouteForIdentity({ accountId, promotionId, promotionType, route });
   const params = [String(accountId), resolvedRoute.childUserId, resolvedRoute.siteId, promotionId, promotionType];
-  let sql = `SELECT * FROM promo_items
-             WHERE account_id = ? AND child_user_id = ? AND site_id = ?
-               AND promotion_id = ? AND promotion_type = ?`;
+  let sql = `SELECT p.*,
+                    CASE WHEN q.status = 'pending' THEN 1 ELSE 0 END AS price_recalc_required,
+                    q.previous_base_price AS price_recalc_previous_base,
+                    q.new_base_price AS price_recalc_new_base,
+                    q.detected_at AS price_recalc_detected_at
+               FROM promo_items p
+               LEFT JOIN activity_price_recalc_queue q
+                 ON q.account_id = p.account_id
+                AND q.child_user_id = p.child_user_id
+                AND q.site_id = p.site_id
+                AND q.promotion_id = p.promotion_id
+                AND q.promotion_type = p.promotion_type
+                AND q.item_id = p.item_id
+              WHERE p.account_id = ? AND p.child_user_id = ? AND p.site_id = ?
+                AND p.promotion_id = ? AND p.promotion_type = ?`;
   if (status) {
-    sql += ' AND status = ?';
+    sql += ' AND p.status = ?';
     params.push(status);
   }
-  sql += ' ORDER BY item_id';
+  sql += ' ORDER BY p.item_id';
   const rows = all(sql, params);
   return mergeFreshOriginalPrice(rows, String(accountId));
 }
@@ -1957,7 +2809,9 @@ function mergeFreshOriginalPrice(rows = [], accountId = '') {
   for (let start = 0; start < itemIds.length; start += BATCH) {
     const slice = itemIds.slice(start, start + BATCH);
     cachedRows.push(...all(
-      `SELECT item_id, child_user_id, site_id, original_price, updated_at
+      `SELECT item_id, child_user_id, site_id, price, original_price, currency_id, status, updated_at,
+              available_quantity, dimensions_json, weight_json, snapshot_hash, source_revision,
+              observed_at, change_flags_json, confirmed
        FROM item_price_cache
        WHERE account_id = ? AND item_id IN (${slice.map(() => '?').join(',')})`,
       [accountId, ...slice],
@@ -1972,13 +2826,43 @@ function mergeFreshOriginalPrice(rows = [], accountId = '') {
     const key = `${String(row.item_id || '')}|${String(row.child_user_id || '')}|${String(row.site_id || '').toUpperCase()}`;
     const cached = byKey.get(key);
     if (!cached) return row;
-    const cachedPrice = Number(cached.original_price);
-    if (!Number.isFinite(cachedPrice)) return row;
-    const cachedAt = String(cached.updated_at || '');
-    const localAt = String(row.updated_at || '');
-    if (localAt && cachedAt && cachedAt <= localAt) return row;
-    const merged = { ...row, original_price: cachedPrice };
-    if (String(row.status || '') !== 'started' && row.price !== null && Number(row.price) === Number(row.original_price)) {
+    const positiveNumber = (value) => {
+      if (value === null || value === undefined || value === '') return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    };
+    const cachedOriginal = positiveNumber(cached.original_price);
+    const cachedCurrent = positiveNumber(cached.price);
+    const cachedPrice = cachedOriginal ?? cachedCurrent;
+    const cancelledTransition = String(row.source || '') === 'cancel_verified_local_transition';
+    let dimensions = null;
+    let weight = null;
+    let changeFlags = [];
+    try { dimensions = cached.dimensions_json ? JSON.parse(cached.dimensions_json) : null; } catch { dimensions = null; }
+    try { weight = cached.weight_json ? JSON.parse(cached.weight_json) : null; } catch { weight = null; }
+    try { changeFlags = JSON.parse(cached.change_flags_json || '[]'); } catch { changeFlags = []; }
+    const confirmed = Number(cached.confirmed ?? 1) === 1;
+    const cacheObservedMs = Date.parse(String(cached.observed_at || cached.updated_at || ''));
+    const relationObservedMs = Date.parse(String(row.updated_at || ''));
+    const relationBase = positiveNumber(row.original_price) ?? positiveNumber(row.price);
+    const cacheIsAtLeastAsRecent = !Number.isFinite(relationObservedMs)
+      || (Number.isFinite(cacheObservedMs) && cacheObservedMs >= relationObservedMs);
+    const useCachedPrice = confirmed
+      && cachedPrice !== null
+      && (relationBase === null || cacheIsAtLeastAsRecent);
+    const merged = {
+      ...row,
+      original_price: useCachedPrice ? cachedPrice : row.original_price,
+      snapshot_hash: cached.snapshot_hash || null,
+      snapshot_observed_at: cached.observed_at || cached.updated_at || null,
+      snapshot_source_revision: cached.source_revision || null,
+      snapshot_change_flags: Array.isArray(changeFlags) ? changeFlags : [],
+      snapshot_confirmed: confirmed,
+      available_quantity: cached.available_quantity ?? row.available_quantity ?? null,
+      dimensions,
+      weight,
+    };
+    if (useCachedPrice && (cancelledTransition || (String(row.status || '') !== 'started' && row.price !== null && Number(row.price) === Number(row.original_price)))) {
       merged.price = cachedPrice;
     }
     return merged;
@@ -1993,11 +2877,58 @@ export function listItemsForPromotions(accountId, promotions, status) {
   return map;
 }
 
+export function listItemsForPromotionStatuses(accountId, promotionId, promotionType, statuses = [], route = null) {
+  const orderedStatuses = [...new Set((statuses || []).map((status) => String(status || '').trim()).filter(Boolean))];
+  const byItemId = new Map();
+  for (const status of orderedStatuses) {
+    for (const row of listItems(accountId, promotionId, promotionType, status, route)) {
+      const itemId = String(row.item_id || '').trim();
+      if (!itemId || byItemId.has(itemId)) continue;
+      byItemId.set(itemId, row);
+    }
+  }
+  return [...byItemId.values()].sort((left, right) => String(left.item_id || '').localeCompare(String(right.item_id || '')));
+}
+
+export function listItemsForPromotionsByStatuses(accountId, promotions, statuses = []) {
+  const map = new Map();
+  for (const promo of promotions) {
+    map.set(
+      promotionKey(promo),
+      listItemsForPromotionStatuses(accountId, promo.promotion_id, promo.promotion_type, statuses, promo),
+    );
+  }
+  return map;
+}
+
 export function listItemFetchStatesForPromotions(accountId, promotions, status) {
   const map = new Map();
   for (const promo of promotions) {
     const state = getItemFetchState(accountId, promo.promotion_id, promo.promotion_type, status, promo);
     if (state) map.set(promotionKey(promo), state);
+  }
+  return map;
+}
+
+export function listItemFetchStatesForPromotionsByStatuses(accountId, promotions, statuses = []) {
+  const map = new Map();
+  for (const promo of promotions) {
+    const states = [...new Set((statuses || []).map((status) => String(status || '').trim()).filter(Boolean))]
+      .map((status) => getItemFetchState(accountId, promo.promotion_id, promo.promotion_type, status, promo))
+      .filter(Boolean);
+    if (!states.length) continue;
+    const blocked = states.find((state) => ['error', 'unreadable'].includes(String(state.detail_status || '').toLowerCase()));
+    const platformTotal = states.reduce((sum, state) => sum + (Number.isFinite(Number(state.platform_total)) ? Number(state.platform_total) : 0), 0);
+    const savedCount = states.reduce((sum, state) => sum + (Number.isFinite(Number(state.saved_count)) ? Number(state.saved_count) : 0), 0);
+    map.set(promotionKey(promo), {
+      ...states[0],
+      item_statuses: states.map((state) => state.item_status).filter(Boolean),
+      platform_total: platformTotal || null,
+      saved_count: savedCount || null,
+      detail_status: blocked?.detail_status || states[0].detail_status,
+      warning: blocked?.warning || states[0].warning || null,
+      is_full_fetch: states.every((state) => state.is_full_fetch !== false),
+    });
   }
   return map;
 }
@@ -2088,6 +3019,18 @@ export function saveExecutionResult({ taskId, accountId, promotionId, promotionT
       nowIso()
     ]
   );
+  if (['success', 'live_verified_removed'].includes(String(status || '').toLowerCase())
+      && ['enroll', 'update', 'cancel'].includes(String(action || '').toLowerCase())) {
+    const timestamp = nowIso();
+    run(
+      `UPDATE activity_price_recalc_queue
+          SET status = ?, resolved_at = ?, updated_at = ?
+        WHERE account_id = ? AND promotion_id = ? AND promotion_type = ? AND item_id = ?
+          AND status = 'pending'`,
+      [String(action || 'updated'), timestamp, timestamp, String(accountId), String(promotionId),
+        String(promotionType), String(itemId)],
+    );
+  }
 }
 
 export function finishTask(taskId, counts, status = 'completed', completed = true, options = {}) {
@@ -2223,6 +3166,93 @@ export function listResults(limit = 300) {
      ORDER BY r.id DESC LIMIT ?`,
     [Number(limit)]
   );
+}
+
+export function getItemStatus(itemId) {
+  const normalized = String(itemId || '').trim().toUpperCase();
+  if (!normalized) return null;
+
+  const actions = all(
+    `SELECT r.item_id, r.account_id, r.promotion_id, r.promotion_type, r.action, r.mode,
+            r.status, r.deal_price, r.top_deal_price, r.error_cn, r.error_raw, r.created_at,
+            t.id AS task_id, t.discount_percent, t.direct_price, t.execution_group_id,
+            p.name AS promotion_name, p.status AS promotion_status,
+            p.start_date AS promotion_start_date, p.finish_date AS promotion_finish_date,
+            a.display_name AS account_name, a.site_id AS account_site_id
+     FROM promo_action_results r
+     JOIN promo_tasks t ON t.id = r.task_id
+     LEFT JOIN promo_campaigns p
+       ON p.account_id = r.account_id AND p.promotion_id = r.promotion_id AND p.promotion_type = r.promotion_type
+     LEFT JOIN account_profiles a ON a.account_id = r.account_id
+     WHERE UPPER(TRIM(r.item_id)) = ?
+     ORDER BY r.id DESC`,
+    [normalized]
+  );
+
+  const items = all(
+    `SELECT pi.account_id, pi.promotion_id, pi.promotion_type, pi.child_user_id, pi.site_id,
+            pi.status AS cached_status, pi.original_price, pi.price, pi.currency_id,
+            pi.source, pi.raw_json, pi.updated_at,
+            p.name AS promotion_name, p.status AS promotion_status,
+            p.start_date AS promotion_start_date, p.finish_date AS promotion_finish_date,
+            a.display_name AS account_name
+     FROM promo_items pi
+     LEFT JOIN promo_campaigns p
+       ON p.account_id = pi.account_id AND p.promotion_id = pi.promotion_id AND p.promotion_type = pi.promotion_type
+     LEFT JOIN account_profiles a ON a.account_id = pi.account_id
+     WHERE UPPER(TRIM(pi.item_id)) = ?
+     ORDER BY pi.updated_at DESC`,
+    [normalized]
+  );
+
+  const priceCache = all(
+    `SELECT pc.account_id, pc.child_user_id, pc.site_id, pc.price, pc.original_price,
+            pc.currency_id, pc.status, pc.raw_json, pc.updated_at,
+            a.display_name AS account_name
+     FROM item_price_cache pc
+     LEFT JOIN account_profiles a ON a.account_id = pc.account_id
+     WHERE UPPER(TRIM(pc.item_id)) = ?
+     ORDER BY pc.updated_at DESC`,
+    [normalized]
+  );
+
+  return { item_id: normalized, actions, items, price_cache: priceCache };
+}
+
+export function listPromotionRelationsByItemIds({
+  accountIds = [],
+  itemIds = [],
+  siteIds = [],
+  statuses = ['started', 'pending'],
+} = {}) {
+  const accounts = [...new Set((accountIds || []).map((value) => String(value || '').trim()).filter(Boolean))];
+  const items = [...new Set((itemIds || []).map((value) => String(value || '').trim().toUpperCase()).filter(Boolean))];
+  const sites = [...new Set((siteIds || []).map((value) => String(value || '').trim().toUpperCase()).filter(Boolean))];
+  const wantedStatuses = [...new Set((statuses || []).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean))];
+  if (!accounts.length || !items.length || !wantedStatuses.length) return [];
+
+  const params = [...accounts, ...items, ...wantedStatuses];
+  let sql = `SELECT pi.account_id, pi.child_user_id, pi.site_id,
+                    pi.promotion_id, pi.promotion_type, pi.item_id, pi.status,
+                    pi.raw_json, pi.updated_at,
+                    p.name AS promotion_name, p.status AS promotion_status,
+                    p.start_date AS promotion_start_date, p.finish_date AS promotion_finish_date
+             FROM promo_items pi
+             LEFT JOIN promo_campaigns p
+               ON p.account_id = pi.account_id
+              AND p.child_user_id = pi.child_user_id
+              AND p.site_id = pi.site_id
+              AND p.promotion_id = pi.promotion_id
+              AND p.promotion_type = pi.promotion_type
+             WHERE pi.account_id IN (${accounts.map(() => '?').join(',')})
+               AND UPPER(TRIM(pi.item_id)) IN (${items.map(() => '?').join(',')})
+               AND LOWER(TRIM(pi.status)) IN (${wantedStatuses.map(() => '?').join(',')})`;
+  if (sites.length) {
+    sql += ` AND UPPER(TRIM(pi.site_id)) IN (${sites.map(() => '?').join(',')})`;
+    params.push(...sites);
+  }
+  sql += ' ORDER BY pi.account_id, pi.child_user_id, pi.site_id, pi.promotion_type, pi.promotion_id, pi.item_id';
+  return all(sql, params);
 }
 
 export function listLatestWriteRepeatGuards({ accountId, action, sameDayStartIso }) {
@@ -2488,7 +3518,7 @@ export function publishHistorySummaryForTask(taskId) {
   return { published: true, summary_key: materializedSummaryKey(summary) };
 }
 
-export function publishHistorySummaryForExecutionGroup(executionGroupId) {
+export function publishHistorySummaryForExecutionGroup(executionGroupId, options = {}) {
   const groupId = String(executionGroupId || '');
   if (!groupId) return { published: false, reason: 'execution_group_required' };
   const state = get('SELECT schema_version, status FROM history_summary_state WHERE id = 1');
@@ -2499,7 +3529,28 @@ export function publishHistorySummaryForExecutionGroup(executionGroupId) {
   const settings = readSettings();
   const rows = fetchTaskSummaryRows(null, settings, { executionGroupId: groupId });
   if (!rows.length) return { published: false, reason: 'group_tasks_not_found' };
-  const summary = buildExecutionGroupSummaryRow(groupId, rows, { includeDetails: false, skipActionResults: false });
+  let summary = buildExecutionGroupSummaryRow(groupId, rows, { includeDetails: false, skipActionResults: false });
+  const authoritative = options.authoritative && typeof options.authoritative === 'object'
+    ? options.authoritative
+    : null;
+  if (authoritative) {
+    const relationCount = Math.max(0, Number(authoritative.relation_count ?? authoritative.total ?? 0));
+    summary = {
+      ...summary,
+      status: Number(authoritative.failed || 0) > 0 ? 'partial_or_failed' : 'completed',
+      updated_at: String(options.updatedAt || summary.updated_at || nowIso()),
+      success_count: Math.max(0, Number(authoritative.success || 0)),
+      failed_count: Math.max(0, Number(authoritative.failed || 0)),
+      skipped_count: Math.max(0, Number(authoritative.skipped || 0)),
+      total_count: relationCount,
+      unique_item_count: authoritative.unique_item_count ?? summary.unique_item_count ?? null,
+      relation_count: relationCount,
+      pending_verification_count: Math.max(0, Number(authoritative.pending_verification_count ?? authoritative.pending ?? 0)),
+      platform_pending_count: Math.max(0, Number(authoritative.platform_pending_count || 0)),
+      activity_failure_count: Math.max(0, Number(authoritative.activity_failure_count || 0)),
+      accounting_complete: authoritative.accounting_complete === true,
+    };
+  }
   transaction(() => {
     run('DELETE FROM history_batch_summaries WHERE summary_key = ?', [`v${HISTORY_SUMMARY_SCHEMA_VERSION}:execution-group:${groupId}`]);
     writeMaterializedSummary(summary);

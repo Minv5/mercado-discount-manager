@@ -9,6 +9,8 @@ $AppName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6D3B,0x52A8,0x7BA1,0
 $LegacyAppName = [string]::Concat([char[]](0x7F8E,0x5BA2,0x591A,0x6298,0x6263,0x7BA1,0x5BB6))
 $Candidate = Join-Path $ProjectRoot (Join-Path 'dist-pyside' $AppName)
 $Installer = Join-Path $DesktopDir 'install-release.ps1'
+$PackageMetadata = Get-Content -LiteralPath (Join-Path $ProjectRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$ExpectedProductVersion = [string]$PackageMetadata.version
 $Root = Join-Path $DesktopDir 'install-validation'
 $Install = Join-Path $Root 'MercadoDiscountManagerPySide'
 $StartMenuDir = Join-Path $Root 'Start Menu\Programs'
@@ -18,9 +20,20 @@ $DesktopShortcut = Join-Path $IsolatedDesktopDir ($AppName + '.lnk')
 $LegacyShortcut = Join-Path $StartMenuDir ($LegacyAppName + '.lnk')
 $Exe = Join-Path $Install ($AppName + '.exe')
 
+function Test-ReasonTextResource([string]$Root) {
+  $resource = Join-Path $Root '_internal\app\desktop-pyside\reason_text.py'
+  if (-not (Test-Path -LiteralPath $resource)) { throw 'Installed package is missing the reason_text runtime resource.' }
+  $python = (Get-Command python -ErrorAction Stop).Source
+  $code = 'import importlib.util,sys; p=sys.argv[1]; s=importlib.util.spec_from_file_location("reason_text",p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); assert m.business_reason_text("pending_relations_present") == "存在待平台确认的商品关系。"'
+  & $python -c $code $resource 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Installed reason_text runtime resource could not be imported and used.' }
+}
+
 if (-not (Test-Path -LiteralPath (Join-Path $Candidate 'release-manifest.json'))) {
   throw 'Build the PySide release before running isolated installer validation.'
 }
+$candidateManifest = Get-Content -Raw -LiteralPath (Join-Path $Candidate 'release-manifest.json') | ConvertFrom-Json
+if ([string]$candidateManifest.version -ne $ExpectedProductVersion) { throw 'Candidate release manifest version does not match package.json.' }
 if (Get-NetTCPConnection -LocalPort 28758 -State Listen -ErrorAction SilentlyContinue) {
   throw 'Port 28758 must be free before isolated installer validation.'
 }
@@ -56,6 +69,7 @@ try {
 if ((Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash -ne $beforeHash) { throw 'Active-job gate changed the installation.' }
 
 & $Installer -CandidateRoot $Candidate -InstallRoot $Install -ShortcutPath $Shortcut -IsolatedValidation
+Test-ReasonTextResource $Install
 if (-not (Test-Path -LiteralPath $Shortcut)) { throw 'Start Menu shortcut was not created.' }
 if (Test-Path -LiteralPath $DesktopShortcut) { throw 'Desktop shortcut was created unexpectedly.' }
 if (Test-Path -LiteralPath $LegacyShortcut) { throw 'Legacy Start Menu shortcut was not retired after successful installation.' }

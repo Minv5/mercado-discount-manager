@@ -9,6 +9,7 @@ export function decideToday({
   cycleStatesByPromotion = new Map(),
   startedCountsByPromotion = new Map(),
   candidateCountsByPromotion = new Map(),
+  repriceCountsByPromotion = new Map(),
   globalCycle = null,
   sellerMaxDiscount = 10,
   officialMaxDiscount = 10,
@@ -28,6 +29,7 @@ export function decideToday({
     const key = promotionKey(promotion);
     const state = cycleStatesByPromotion.get(key) || null;
     const startedCount = Number(startedCountsByPromotion.get(key) || 0);
+    const repricePendingCount = Number(repriceCountsByPromotion.get(key) || 0);
     const lastDiscount = state?.seller_discount_percent ?? state?.official_discount_percent;
     const activityDiscount = nextDiscountFor({
       promotionType: promotion.promotion_type,
@@ -47,10 +49,14 @@ export function decideToday({
       maxDiscount: String(promotion.promotion_type || '').toUpperCase() === 'SELLER_CAMPAIGN'
         ? configuredSellerMaximum : configuredOfficialMaximum
     });
-    const discount = hasGlobalCycle
+    const scheduledDiscount = hasGlobalCycle
       ? Number(String(promotion.promotion_type || '').toUpperCase() === 'SELLER_CAMPAIGN'
         ? globalCycle.seller_discount : globalCycle.official_discount)
       : activityDiscount;
+    const repricingRequired = repricePendingCount > 0 && startedCount > 0 && !globalCancelCycle;
+    const discount = repricingRequired && Number.isFinite(Number(lastDiscount))
+      ? Number(lastDiscount)
+      : scheduledDiscount;
     const isSellerCampaign = String(promotion.promotion_type || '').toUpperCase() === 'SELLER_CAMPAIGN';
     const freshSellerCampaign = isSellerCampaign
       && startedCount === 0
@@ -68,21 +74,28 @@ export function decideToday({
         : startedCount === 0 && !globalCancelCycle
           ? 'enroll'
           : hasGlobalCycle
-            ? globalCancelCycle ? 'cancel' : candidateCount > 0 ? 'enroll' : 'update'
+            ? globalCancelCycle ? 'cancel' : repricingRequired ? 'update' : candidateCount > 0 ? 'enroll' : 'update'
             : cycleDecision.action === 'cancel' ? 'cancel'
-              : candidateCount > 0 ? 'enroll'
+              : repricingRequired ? 'update'
+                : candidateCount > 0 ? 'enroll'
                 : startedCount > 0 ? 'update' : 'enroll';
+    const baseCompletedToday = stateCompletedToday(state, today, action);
     return {
       promotion,
       state,
       startedCount,
       candidateCount,
+      repricePendingCount,
+      repricingRequired,
+      baseCompletedToday,
       action,
       discount,
-      completedToday: stateCompletedToday(state, today, action),
+      completedToday: baseCompletedToday && !repricingRequired,
       incompleteToday,
       reason: resumeIncompleteCancel
         ? `今天取消未完成（${state?.status}），本次继续取消剩余商品`
+        : repricingRequired
+          ? `商品基础售价已变化，${repricePendingCount} 个活动商品价格待按现有 ${discount}% 重算`
         : hasGlobalCycle
           ? globalCancelCycle
             ? `上一有效真实报名或更新已达到自建${configuredSellerMaximum}%/官方${configuredOfficialMaximum}%，且当前仍有 started 商品，本次应批量取消折扣`
@@ -102,6 +115,10 @@ export function decideToday({
   const candidates = activeRows.length ? activeRows : rows;
   const priorityAction = chooseAction(candidates);
   const selectedRows = rows.filter((row) => row.action === priorityAction);
+  const selectedOutstanding = selectedRows.filter((row) => !row.completedToday);
+  const repricePendingOnly = priorityAction === 'update'
+    && selectedOutstanding.length > 0
+    && selectedOutstanding.every((row) => row.repricingRequired && row.baseCompletedToday);
   const allSelectedCompleted = selectedRows.length > 0 && selectedRows.every((row) => row.completedToday);
   const maxDiscount = selectedRows.reduce((max, row) => Math.max(max, Number(row.discount || 0)), 0);
 
@@ -111,9 +128,15 @@ export function decideToday({
     discount: maxDiscount || null,
     already_completed: allSelectedCompleted,
     needs_resume: incompleteRows.length > 0,
+    reprice_pending_count: rows.reduce((sum, row) => sum + row.repricePendingCount, 0),
+    reprice_pending_only: repricePendingOnly,
+    seller_discount: selectedRows.find((row) => String(row.promotion.promotion_type || '').toUpperCase() === 'SELLER_CAMPAIGN')?.discount ?? null,
+    official_discount: selectedRows.find((row) => String(row.promotion.promotion_type || '').toUpperCase() === 'DEAL')?.discount ?? null,
     promotions_total: promotions.length,
     selected_promotions: selectedRows.length,
     rows: rows.map((row) => ({
+      account_id: row.promotion.account_id,
+      child_user_id: row.promotion.child_user_id,
       site_id: row.promotion.site_id,
       promotion_id: row.promotion.promotion_id,
       promotion_type: row.promotion.promotion_type,
@@ -122,13 +145,15 @@ export function decideToday({
       discount: row.discount,
       started_count: row.startedCount,
       candidate_count: row.candidateCount,
+      reprice_pending_count: row.repricePendingCount,
+      reprice_required: row.repricingRequired,
       completed_today: row.completedToday,
       incomplete_today: row.incompleteToday,
       reason: row.reason,
       cycle_status: row.state?.status || null,
       cycle_updated_at: row.state?.updated_at || null
     })),
-    reason: summaryReason({ allSelectedCompleted, incompleteRows, priorityAction, maxDiscount })
+    reason: summaryReason({ allSelectedCompleted, incompleteRows, priorityAction, maxDiscount, repricePendingOnly })
   };
 }
 
@@ -162,9 +187,10 @@ function localDateNumber(value) {
   return date.getFullYear() * 10000 + (date.getMonth() + 1) * 100 + date.getDate();
 }
 
-function summaryReason({ allSelectedCompleted, incompleteRows, priorityAction, maxDiscount }) {
+function summaryReason({ allSelectedCompleted, incompleteRows, priorityAction, maxDiscount, repricePendingOnly = false }) {
   if (allSelectedCompleted) return '今天已完整执行，默认不重复提交。';
   if (incompleteRows.length) return '今天存在未完成任务，建议继续/补跑当前动作。';
+  if (repricePendingOnly) return '商品基础售价已变化，本次只更新待重算的活动商品价格。';
   if (priorityAction === 'cancel') return '最近完整折扣已到设置上限，本次应批量取消折扣。';
   if (priorityAction === 'update') return `以上次完整折扣为基准递增，本次应批量更新折扣，建议折扣 ${maxDiscount}%。`;
   return `新周期: 批量报折扣，建议折扣 ${maxDiscount}%。`;

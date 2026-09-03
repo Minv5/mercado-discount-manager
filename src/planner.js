@@ -68,6 +68,14 @@ export function normalizeItem(raw) {
       ?? rawJson.minor_unit
     ),
     offer_id: offerId,
+    snapshot_hash: raw.snapshot_hash || null,
+    snapshot_observed_at: raw.snapshot_observed_at || raw.observed_at || null,
+    snapshot_source_revision: raw.snapshot_source_revision || raw.source_revision || null,
+    snapshot_change_flags: Array.isArray(raw.snapshot_change_flags) ? raw.snapshot_change_flags : [],
+    snapshot_confirmed: raw.snapshot_confirmed !== false,
+    available_quantity: numberOrNull(raw.available_quantity),
+    dimensions: raw.dimensions ?? null,
+    weight: raw.weight ?? null,
     raw_json: raw.raw_json || null,
     raw
   };
@@ -131,27 +139,19 @@ export function calculateDealPrice(item, options) {
 
 export function validateDealPrice(item, dealPrice, promotionType = '') {
   if (!Number.isFinite(dealPrice) || dealPrice <= 0) return '活动价必须大于 0';
-  // Official activities (DEAL) carry platform-enforced price boundaries: locally
-  // rejecting out-of-range prices avoids submitting requests that the platform
-  // will certainly reject. Seller campaigns define their own boundaries, so
-  // only the basic positivity check applies there.
-  if (promotionBucket(promotionType) !== PROMOTION_BUCKETS.seller) {
-    const minPrice = numberOrNull(item.min_discounted_price);
-    const maxPrice = numberOrNull(item.max_discounted_price);
-    if (minPrice !== null && dealPrice < minPrice) {
-      return `活动价 ${dealPrice} 低于最低允许价 ${minPrice}`;
-    }
-    if (maxPrice !== null && dealPrice > maxPrice) {
-      return `活动价 ${dealPrice} 高于最高允许价 ${maxPrice}`;
-    }
-  }
+  // Mercado remains authoritative for eligibility and discounted-price
+  // boundaries. Cached min/max values can lag immediately after listing-price
+  // changes, so they are evidence for diagnostics only and never a local hard
+  // block. Local validation is intentionally limited to request validity.
+  void item;
+  void promotionType;
   return null;
 }
 
 export function isAllowedStatus(action, status) {
   if (action === 'enroll') return status === 'candidate';
   if (action === 'update') return status === 'started';
-  if (action === 'cancel') return status === 'started';
+  if (action === 'cancel') return status === 'started' || status === 'pending';
   return false;
 }
 
@@ -165,7 +165,11 @@ export function buildPlan({ action, promotion, items, priceMode = 'discount', di
     if (!isAllowedStatus(action, item.status)) return planSkip(item, `状态 ${item.status || '未知'} 不适合执行当前动作`);
 
     if (action === 'cancel') {
-      return { item, action, status: 'planned', deal_price: null, reason: '将取消已开始活动商品' };
+      return { item, action, status: 'planned', deal_price: null, reason: item.status === 'pending' ? '将取消待开始活动商品' : '将取消已开始活动商品' };
+    }
+
+    if (item.snapshot_confirmed === false) {
+      return planSkip(item, '商品变动数据仍在定向同步，暂缓本商品');
     }
 
     const dealPrice = calculateDealPrice(item, { priceMode, discountPercent: effectiveDiscount, directPrice });
