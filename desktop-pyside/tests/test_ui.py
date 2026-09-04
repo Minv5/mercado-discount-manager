@@ -2455,7 +2455,7 @@ class QtUiTests(unittest.TestCase):
 
     def test_version_label_is_in_status_bar_permanent_right_side(self) -> None:
         self.assertEqual(self.window.version_label.text(), f"版本 {product_version()}")
-        self.assertEqual(product_version(), "0.1.56")
+        self.assertEqual(product_version(), "0.1.58")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertIs(self.window.version_label.parentWidget(), self.window.statusBar())
 
@@ -2467,7 +2467,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "版本 0.1.56")
+        self.assertEqual(self.window.version_label.text(), "版本 0.1.58")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -2522,6 +2522,31 @@ class QtUiTests(unittest.TestCase):
                         self.assertGreaterEqual(down_rect.width() * dpr, 24 * dpr)
                     self.assertTrue(up_rect.isValid())
                     self.assertTrue(down_rect.isValid())
+
+    def test_startup_refresh_ok_automatically_recovers_scope_when_scope_not_ready(self) -> None:
+        self.window.scope_inputs_ready = True
+        self.window.scope_ready = False
+        refreshed: list[bool] = []
+        self.window.refresh_scope = lambda *args, **kwargs: refreshed.append(True)  # type: ignore[method-assign]
+        self.window._apply_startup_refresh_status({"status": "ok", "readiness": {"ready": True}})
+        self.assertEqual(len(refreshed), 1)
+        self.assertIn("启动缓存已就绪，正在自动同步店铺与活动范围...", self.window.log_box.toPlainText())
+
+    def test_startup_refresh_ok_does_not_retrigger_scope_if_already_ready(self) -> None:
+        self.window.scope_inputs_ready = True
+        self.window.scope_ready = True
+        refreshed: list[bool] = []
+        self.window.refresh_scope = lambda *args, **kwargs: refreshed.append(True)  # type: ignore[method-assign]
+        self.window._apply_startup_refresh_status({"status": "ok", "readiness": {"ready": True}})
+        self.assertEqual(len(refreshed), 0)
+
+    def test_scope_load_failed_auto_retries_when_startup_ready(self) -> None:
+        self.window.startup_ready = True
+        self.window.scope_inputs_ready = True
+        self.window.scope_retry_count = 0
+        self.window._scope_load_failed(self.window.scope_refresh_token, "网络超时")
+        self.assertEqual(self.window.scope_retry_count, 1)
+        self.assertIn("将在 1 秒后自动重试读取活动范围（1/2）", self.window.log_box.toPlainText())
 
 
 if __name__ == "__main__":

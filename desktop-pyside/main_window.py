@@ -132,6 +132,7 @@ class MainWindow(QMainWindow):
         self.initial_site_discovery_pending = False
         self.auto_decision_token = 0
         self.scope_ready = False
+        self.scope_retry_count = 0
         self.running_group: dict[str, Any] = {}
         self.pending_group_payload: dict[str, Any] | None = None
         self.preparing_submission: dict[str, Any] = {}
@@ -580,6 +581,12 @@ class MainWindow(QMainWindow):
             self.startup_status_finalized = True
             self._append_startup_final_log(status, message)
             self._show_status("缓存同步完成" if self.startup_ready else "缓存同步被阻断，详情见运行日志", message)
+            if self.startup_ready and not self.scope_ready and self.scope_inputs_ready:
+                self.log("启动缓存已就绪，正在自动同步店铺与活动范围...")
+                self.refresh_scope()
+            if self.startup_ready and not self.today_completion_ready:
+                self.log("启动缓存已就绪，正在自动核对今日执行记录...")
+                self.refresh_records()
             return
         if status in {"pending", "running"}:
             self.startup_ready = False
@@ -991,7 +998,9 @@ class MainWindow(QMainWindow):
             str(self.official_combo.currentData() or ""),
         )
 
-    def refresh_scope(self) -> None:
+    def refresh_scope(self, *, is_retry: bool = False) -> None:
+        if not is_retry:
+            self.scope_retry_count = 0
         if not self.scope_inputs_ready:
             return
         account_ids = self.selected_account_ids()
@@ -1019,12 +1028,16 @@ class MainWindow(QMainWindow):
             phase="scope_bundle",
         )
 
-    def _scope_load_failed(self, token: int, error: str, startup_token: int | None = None) -> None:
+    def _scope_load_failed(self, token: int, error: object, startup_token: int | None = None) -> None:
         if token != self.scope_refresh_token or (startup_token is not None and startup_token != self.startup_attempt_token):
             return
         self.scope_ready = False
         self._set_busy(False, "店铺站点未准备好")
         self.log("活动范围读取失败：" + product_error(error))
+        if self.startup_ready and self.scope_inputs_ready and self.scope_retry_count < 2:
+            self.scope_retry_count += 1
+            self.log(f"启动缓存已就绪，将在 1 秒后自动重试读取活动范围（{self.scope_retry_count}/2）...")
+            QTimer.singleShot(1000, lambda: self.refresh_scope(is_retry=True))
 
     def _load_scope_bundle(
         self,
@@ -1055,7 +1068,7 @@ class MainWindow(QMainWindow):
                 account_sites = list(
                     self.api.get(
                         f"/api/accounts/{account_id}/sites?refresh=1",
-                        timeout=30,
+                        timeout=60,
                     ).get("sites", [])
                 )
             for row in account_sites:
@@ -1073,6 +1086,7 @@ class MainWindow(QMainWindow):
         data = dict(result or {})
         if data.get("stale"):
             return
+        self.scope_retry_count = 0
         selected_site = str(data.get("selected_site") or "")
         sites = list(data.get("sites") or [])
         account_names = {account.account_id: account.store_name for account in self.accounts}
@@ -1296,6 +1310,7 @@ class MainWindow(QMainWindow):
     def _records_loaded(self, payload: dict[str, list[dict[str, Any]]], token: int) -> None:
         if token != self.records_request_token:
             return
+        self._records_retrying = False
         for view, rows in payload.items():
             if view in RECORD_VIEW_LIMITS:
                 self.records_cache[view] = list(rows or [])
@@ -1323,6 +1338,13 @@ class MainWindow(QMainWindow):
             self.current_today_completion = None
             self.today_label.setText(self._discount_summary() + " 今日执行记录暂未核对，当前不可提交。")
             self._sync_submit_availability()
+            if self.startup_ready and not getattr(self, "_records_retrying", False):
+                self._records_retrying = True
+                def _retry_records() -> None:
+                    self._records_retrying = False
+                    if not self.today_completion_ready:
+                        self.refresh_records()
+                QTimer.singleShot(5000, _retry_records)
 
     def _request_today_execution_groups(self, records: list[dict[str, Any]]) -> None:
         today = datetime.now().date()
@@ -2859,7 +2881,7 @@ def product_version() -> str:
         value = str(payload.get("version") or payload.get("product_version") or "").strip()
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
-    return "0.1.56"
+    return "0.1.58"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

@@ -9146,8 +9146,7 @@ async function recoverPendingVerificationRecords({ job, account, action, records
         && verification?.read_completeness?.started === true
         && verification?.read_completeness?.pending === true;
       const cancelGraceElapsed = action === 'cancel' && cancelPendingGraceElapsed(record);
-      const cancelGraceStillActive = action === 'cancel' && !cancelGraceElapsed;
-      if (cancelGraceElapsed && cancelReadComplete) {
+      if ((cancelGraceElapsed || verification_polling_exhausted) && cancelReadComplete) {
         saveExecutionResult({
           taskId: Number(record?.task_id || taskId),
           accountId: account.account_id,
@@ -9158,12 +9157,40 @@ async function recoverPendingVerificationRecords({ job, account, action, records
           mode: 'real',
           status: CANCEL_RESULT_STATUS.liveStillStarted,
           dealPrice: row.deal_price,
-          errorCn: `取消请求已超过 ${Math.round(cancelPendingGraceMs() / 60000)} 分钟宽限期，商品仍处于已报名或待开始状态，判定取消未生效；已停止自动重试，不会重复提交。`,
+          errorCn: verification_polling_exhausted
+            ? `已连续只读回查 ${verificationAttempts} 次（已达上限 ${MAX_PENDING_VERIFICATION_READ_ATTEMPTS} 次），商品仍处于已报名状态，判定取消未生效；已停止自动轮询结束任务，不会重复提交。`
+            : `取消请求已超过 ${Math.round(cancelPendingGraceMs() / 60000)} 分钟宽限期，商品仍处于已报名或待开始状态，判定取消未生效；已停止自动重试，不会重复提交。`,
         });
         pendingWriteQueue.resolve(job.id, record?.relation_key, 'failed', {
-          recovery_mode: 'confirmed_still_started_after_grace',
+          recovery_mode: verification_polling_exhausted ? 'confirmed_still_started_after_max_attempts' : 'confirmed_still_started_after_grace',
+          verification_attempt_count: verificationAttempts,
+          verification_polling_exhausted: true,
         });
         confirmedStillStartedFailedCount += 1;
+        countedItems.add(itemId);
+        continue;
+      }
+      if (verification_polling_exhausted) {
+        saveExecutionResult({
+          taskId: Number(record?.task_id || taskId),
+          accountId: account.account_id,
+          promotionId: campaign.promotion_id,
+          promotionType: campaign.promotion_type,
+          itemId,
+          action,
+          mode: 'real',
+          status: 'failed',
+          dealPrice: row.deal_price,
+          errorCn: `连续 ${verificationAttempts} 轮只读回查仍无法确认平台状态；已停止自动轮询并结束任务，不会重复写入。`,
+        });
+        pendingWriteQueue.resolve(job.id, record?.relation_key, 'failed', {
+          recovery_mode: 'verification_unknown_after_retries',
+          retry_category: 'verification_unknown_after_retries',
+          verification_attempt_count: verificationAttempts,
+          verification_polling_exhausted: true,
+          error_cn: `自动只读回查已达 ${MAX_PENDING_VERIFICATION_READ_ATTEMPTS} 次上限，平台状态仍无法确认；已停止自动轮询并结束任务。`,
+        });
+        verificationExhaustedCount += 1;
         countedItems.add(itemId);
         continue;
       }
@@ -9177,27 +9204,16 @@ async function recoverPendingVerificationRecords({ job, account, action, records
         mode: 'real',
         status: CANCEL_RESULT_STATUS.pendingVerification,
         dealPrice: row.deal_price,
-        errorCn: cancelGraceStillActive
-          ? `取消请求已提交，平台生效存在延迟；宽限期 ${Math.round(cancelPendingGraceMs() / 60000)} 分钟内自动只读复查，不会重复提交。`
-          : verification_polling_exhausted
-            ? `连续 ${verificationAttempts} 轮只读回查仍无法确认平台状态；已停止自动轮询，不会重复写入。`
-            : verification.read_error || '写入请求已返回，但平台状态仍无法确认；继续只读确认且不会重复写入。',
+        errorCn: `写入请求已返回，平台状态第 ${verificationAttempts} 次回查未能确认；将继续只读轮询（上限 ${MAX_PENDING_VERIFICATION_READ_ATTEMPTS} 次），不会重复写入。`,
       });
       pendingWriteQueue.enqueue(job.id, {
         ...record,
-        retry_category: cancelGraceStillActive
-          ? 'pending_verification'
-          : verification_polling_exhausted ? 'verification_unknown_after_retries' : 'pending_verification',
+        retry_category: 'pending_verification',
         verification_attempt_count: verificationAttempts,
-        verification_polling_exhausted: verification_polling_exhausted && !cancelGraceStillActive,
-        error_cn: cancelGraceStillActive
-          ? '取消请求已提交，等待平台生效宽限期只读复查；不会重复提交。'
-          : verification_polling_exhausted
-            ? '自动只读回查已达上限，等待人工或下次恢复。'
-            : '平台状态仍不可确认；继续只读回查且不会重复写入。',
+        verification_polling_exhausted: false,
+        error_cn: `平台状态第 ${verificationAttempts} 次回查未能确认；等待只读轮询（上限 ${MAX_PENDING_VERIFICATION_READ_ATTEMPTS} 次）。`,
       });
-      if (cancelGraceStillActive || !verification_polling_exhausted) unresolvedPendingCount += 1;
-      else verificationExhaustedCount += 1;
+      unresolvedPendingCount += 1;
       countedItems.add(itemId);
     }
     // Incomplete platform read: retry GET-only at most three times.  Once the
@@ -9257,9 +9273,9 @@ async function recoverPendingVerificationRecords({ job, account, action, records
     const exhaustedCount = confirmedCandidateFailedCount;
     const unresolvedCount = (verification.unresolved || []).length;
     execution.success += verifiedCount;
-    execution.failed += mismatchCount + confirmedStillStartedFailedCount + exhaustedCount + readIncompleteFailedCount;
-    execution.pending += platformPendingCount + unresolvedPendingCount + retryCount + verificationExhaustedCount + readIncompletePendingCount;
-    execution.pending_verification_count += unresolvedPendingCount + verificationExhaustedCount + readIncompletePendingCount;
+    execution.failed += mismatchCount + confirmedStillStartedFailedCount + exhaustedCount + readIncompleteFailedCount + verificationExhaustedCount;
+    execution.pending += platformPendingCount + unresolvedPendingCount + retryCount + readIncompletePendingCount;
+    execution.pending_verification_count += unresolvedPendingCount + readIncompletePendingCount;
     execution.platform_pending_count += platformPendingCount;
     execution.retryable_pending_count += unresolvedPendingCount + retryCount + readIncompletePendingCount;
     execution.total += verifiedCount + mismatchCount + platformPendingCount + candidateCount + unresolvedCount + readIncompletePendingCount + readIncompleteFailedCount;
@@ -9291,13 +9307,13 @@ async function recoverPendingVerificationRecords({ job, account, action, records
       taskId,
       total: verifiedCount + mismatchCount + platformPendingCount + candidateCount + unresolvedCount + readIncompletePendingCount + readIncompleteFailedCount,
       success: verifiedCount,
-      failed: mismatchCount + confirmedStillStartedFailedCount + exhaustedCount + readIncompleteFailedCount,
+      failed: mismatchCount + confirmedStillStartedFailedCount + exhaustedCount + readIncompleteFailedCount + verificationExhaustedCount,
       skipped: 0,
-      pending: platformPendingCount + unresolvedPendingCount + retryCount + verificationExhaustedCount + readIncompletePendingCount,
-      pending_verification_count: unresolvedPendingCount + verificationExhaustedCount + readIncompletePendingCount,
+      pending: platformPendingCount + unresolvedPendingCount + retryCount + readIncompletePendingCount,
+      pending_verification_count: unresolvedPendingCount + readIncompletePendingCount,
       platform_pending_count: platformPendingCount,
       retryable_pending_count: unresolvedPendingCount + retryCount,
-      unresolved: verificationExhaustedCount,
+      unresolved: unresolvedPendingCount,
       confirmed_still_started_failed_count: confirmedStillStartedFailedCount,
       verification_polling_exhausted: exhaustedCount + verificationExhaustedCount + readIncompleteFailedCount > 0,
       recovery_mode: 'read_only_verification',

@@ -15,11 +15,11 @@ from core import build_filters, execution_payload  # noqa: E402
 class ReleaseModeTests(unittest.TestCase):
     def test_product_version_source_is_0118_and_ui_reads_artifact_metadata(self) -> None:
         package = json.loads((ROOT.parent / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(package["version"], "0.1.56")
+        self.assertEqual(package["version"], "0.1.58")
         window_source = (ROOT / "main_window.py").read_text(encoding="utf-8")
         self.assertIn('resource_path("app/build-info.json")', window_source)
         self.assertNotIn('return "0.1.0"', window_source)
-        self.assertIn('return "0.1.56"', window_source)
+        self.assertIn('return "0.1.58"', window_source)
 
     def test_visible_title_and_package_names_have_no_candidate_wording(self) -> None:
         window_source = (ROOT / "main_window.py").read_text(encoding="utf-8")

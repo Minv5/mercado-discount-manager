@@ -246,6 +246,21 @@ test('three incomplete readbacks become terminal verification failures without a
   assert.doesNotMatch(block, /executeOnePlanned|client\.request|method: 'PUT'/);
 });
 
+test('three unresolved verification polling attempts become terminal failures without endless paused loops', () => {
+  const server = fs.readFileSync(path.join(process.cwd(), 'src', 'server.js'), 'utf8');
+  const block = server.slice(
+    server.indexOf('for (const row of verification.unresolved'),
+    server.indexOf('for (const row of verification.read_incomplete'),
+  );
+  assert.match(block, /verificationAttempts >= MAX_PENDING_VERIFICATION_READ_ATTEMPTS/);
+  assert.match(block, /verification_polling_exhausted/);
+  assert.match(block, /pendingWriteQueue\.resolve\(job\.id, record\?\.relation_key, 'failed'/);
+  assert.match(block, /verificationExhaustedCount \+= 1/);
+  assert.match(server, /execution\.failed \+= .*?\+ verificationExhaustedCount/);
+  assert.match(server, /execution\.pending \+= platformPendingCount \+ unresolvedPendingCount \+ retryCount \+ readIncompletePendingCount;/);
+  assert.doesNotMatch(block, /executeOnePlanned|client\.request|method: 'PUT'/);
+});
+
 test('stop request prevents queued verification activities from starting new GETs', () => {
   const server = fs.readFileSync(path.join(process.cwd(), 'src', 'server.js'), 'utf8');
   const recovery = server.slice(
