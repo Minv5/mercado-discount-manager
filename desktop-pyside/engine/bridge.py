@@ -99,7 +99,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.0.14",
+                "build_fingerprint": "native-python-v2.0.15",
             }
 
         # 2. Settings
@@ -496,7 +496,8 @@ class EngineBridge:
         start_time = time.time()
         account_ids = payload.get("accountIds") or payload.get("account_ids") or []
         filters = payload.get("filters") or {}
-        site_id = filters.get("siteId") or ""
+        site_id = payload.get("site_id") or payload.get("siteId") or filters.get("siteId") or filters.get("site_id") or ""
+        target_item_ids = payload.get("itemIds") or payload.get("item_ids") or []
         mode = payload.get("requested_action") or payload.get("action") or "enroll"
         if mode == "auto":
             mode = "enroll"
@@ -562,6 +563,8 @@ class EngineBridge:
                     on_log=lambda m: log_for_store(str(acc_id), m),
                     is_cancelled=lambda: self._group_cancel_flags.get(group_id, False),
                     group_id=group_id,
+                    target_item_ids=target_item_ids,
+                    filters=filters,
                 )
             except Exception as e:
                 log_for_store(str(acc_id), f"执行出现异常: {e}")

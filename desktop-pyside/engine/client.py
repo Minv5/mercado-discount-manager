@@ -113,6 +113,7 @@ class MercadoClient:
     ) -> list[dict[str, Any]]:
         """GET /marketplace/seller-promotions/promotions/{promotion_id}/items with automatic pagination."""
         all_items: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
         offset = 0
         search_after = None
         consecutive_empty = 0
@@ -136,9 +137,18 @@ class MercadoClient:
                 params=params,
             )
 
-            results = data.get("results") or []
-            if results:
-                all_items.extend(results)
+            raw_results = data.get("results") or []
+            new_results = []
+            for r in raw_results:
+                rid = str(r.get("id") or r.get("item_id") or "")
+                if rid:
+                    if rid in seen_ids:
+                        continue
+                    seen_ids.add(rid)
+                new_results.append(r)
+
+            if new_results:
+                all_items.extend(new_results)
                 consecutive_empty = 0
             else:
                 consecutive_empty += 1
@@ -161,9 +171,9 @@ class MercadoClient:
             if next_search_after and str(next_search_after) != str(search_after):
                 search_after = str(next_search_after)
             elif not next_search_after:
-                if not results or len(results) < params["limit"]:
+                if not raw_results or len(raw_results) < params["limit"]:
                     break
-                offset += len(results)
+                offset += len(raw_results)
             else:
                 break
 
@@ -183,8 +193,9 @@ class MercadoClient:
         offer_id: str | None = None,
         original_price: float | None = None,
         stock: int | None = None,
+        action: str = "enroll",
     ) -> dict[str, Any]:
-        """POST /marketplace/seller-promotions/items/{item_id}?user_id={child_user_id}&app_version=v2"""
+        """POST (or PUT if action='update') /marketplace/seller-promotions/items/{item_id}?user_id={child_user_id}&app_version=v2"""
         clean_type = promotion_type.strip().upper()
         params = {"user_id": child_user_id.strip(), "app_version": "v2"}
 
@@ -209,9 +220,10 @@ class MercadoClient:
                 "deal_price": round(deal_price, 2),
             }
 
+        http_method = "PUT" if action.lower() == "update" else "POST"
         return self.request(
             account_id,
-            "POST",
+            http_method,
             f"/marketplace/seller-promotions/items/{item_id.strip()}",
             params=params,
             body=body,

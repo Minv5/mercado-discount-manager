@@ -167,6 +167,21 @@ def calculate_deal_price(
 
     deal_price = round((target_net + shipping) / denom, 2)
 
+    if deal_price <= 0:
+        return PricingResult(
+            item_id=item_info.item_id,
+            original_price=p_orig,
+            original_net=round(orig_net, 2),
+            target_net=round(target_net, 2),
+            deal_price=deal_price,
+            shipping_cost=shipping,
+            sale_fee_at_deal=0.0,
+            final_net_at_deal=0.0,
+            discount_percent=discount_percent,
+            eligible=False,
+            skip_reason="计算活动价小于等于0，跳过",
+        )
+
     # Safety: deal_price cannot exceed original price
     if deal_price > p_orig:
         deal_price = p_orig
@@ -176,7 +191,11 @@ def calculate_deal_price(
     final_net_at_deal = round(deal_price - sale_fee_at_deal - shipping, 2)
 
     # 4. Check against promotion constraints (platform max allowable price)
-    max_allowed = constraints.get("max_discounted_price") or constraints.get("suggested_discounted_price")
+    max_allowed = (
+        constraints.get("max_discounted_price")
+        or constraints.get("top_deal_price")
+        or constraints.get("suggested_discounted_price")
+    )
 
     eligible = True
     skip_reason = None

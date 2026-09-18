@@ -127,6 +127,8 @@ class ActionExecutor:
         on_progress: Callable[[ExecutionProgress], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
         group_id: str | None = None,
+        target_item_ids: list[str] | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run execution for selected store and site across the requested mode with multi-site concurrency."""
         import concurrent.futures
@@ -139,6 +141,8 @@ class ActionExecutor:
         cancelled = is_cancelled or (lambda: False)
 
         group_id = group_id or f"grp_{uuid.uuid4().hex[:12]}"
+        target_item_set = {str(x).strip().upper() for x in target_item_ids if str(x).strip()} if target_item_ids else None
+        flt = filters or {}
 
         store_name = self._get_store_alias(account_id)
         site_label = SITE_NAMES.get(site_id, site_id) if site_id else "全部站点"
@@ -150,7 +154,20 @@ class ActionExecutor:
         if site_id:
             target_sites = [s for s in all_sites if s["site_id"] == site_id]
         else:
-            target_sites = all_sites
+            settings_file = self.db_path.parent / "settings.json"
+            op_sites: set[str] = set()
+            if settings_file.exists():
+                try:
+                    s_data = json.loads(settings_file.read_text(encoding="utf-8"))
+                    raw_op = (s_data.get("operatingSites") or {}).get(str(account_id))
+                    if isinstance(raw_op, (list, set, tuple)) and raw_op:
+                        op_sites = {str(x).strip().upper() for x in raw_op if str(x).strip()}
+                except Exception:
+                    pass
+            if op_sites:
+                target_sites = [s for s in all_sites if s["site_id"].upper() in op_sites]
+            else:
+                target_sites = all_sites
 
         if not target_sites:
             log(f"[{store_name}] 未找到可执行的分站点子账号，任务结束。")
@@ -179,16 +196,22 @@ class ActionExecutor:
             if not item_id:
                 return "skipped"
 
+            if target_item_set and item_id.upper() not in target_item_set:
+                return "skipped"
+
             p_id = str(promo_info.get("id") or promo_info.get("promotion_id") or "")
             p_type = str(promo_info.get("type") or promo_info.get("promotion_type") or "DEAL").upper()
             p_name = promo_info.get("name") or promo_info.get("title") or p_id
-            discount_pct = seller_discount if p_type == "SELLER_CAMPAIGN" else official_discount
+            is_seller = (p_type == "SELLER_CAMPAIGN") or p_id.upper().startswith("C-")
+            discount_pct = seller_discount if is_seller else official_discount
             offer_id = str(item_cand.get("offer_id") or "")
 
             stock_val = 5
-            stock_dict = item_cand.get("stock")
-            if isinstance(stock_dict, dict):
-                stock_val = int(stock_dict.get("min") or 5)
+            stock_raw = item_cand.get("stock")
+            if isinstance(stock_raw, dict):
+                stock_val = int(stock_raw.get("min") or stock_raw.get("minimum") or 5)
+            elif isinstance(stock_raw, (int, float)):
+                stock_val = int(stock_raw)
 
             with progress_lock:
                 progress.total += 1
@@ -246,6 +269,9 @@ class ActionExecutor:
                 return "skipped"
 
             # Step C: Submit promotion enroll/update
+            if cancelled():
+                return "skipped"
+
             try:
                 self.client.enroll_promotion_item(
                     account_id=account_id,
@@ -257,6 +283,7 @@ class ActionExecutor:
                     offer_id=offer_id,
                     original_price=pricing.original_price,
                     stock=stock_val,
+                    action=action,
                 )
                 with progress_lock:
                     progress.success += 1
@@ -331,11 +358,36 @@ class ActionExecutor:
                     break
                 p_id = str(promo.get("id") or promo.get("promotion_id") or "")
                 p_type = str(promo.get("type") or promo.get("promotion_type") or "DEAL").upper()
-                p_name = promo.get("name") or promo.get("title") or p_id
+                p_name = str(promo.get("name") or promo.get("title") or p_id)
+                p_status = str(promo.get("status") or "").strip().lower()
 
-                # Filter out non-item payment-method promotions like Pix/Bank
+                # 1. 过滤已结束/失效的活动
+                if p_status in ("finished", "closed", "expired", "inactive"):
+                    continue
+
+                # 2. Filter out non-item payment-method promotions like Pix/Bank
                 if p_type in ("BANK", "PAYMENT_METHOD"):
                     continue
+
+                # 3. 自建活动与官方活动特征识别及过滤
+                is_seller = (p_type == "SELLER_CAMPAIGN") or p_id.upper().startswith("C-")
+                if flt:
+                    if is_seller:
+                        if flt.get("excludeSeller"):
+                            continue
+                        seller_names = flt.get("sellerActivityNames") or []
+                        if seller_names:
+                            seller_names_set = {str(x).strip() for x in seller_names if str(x).strip()}
+                            if p_name not in seller_names_set and p_id not in seller_names_set:
+                                continue
+                    else:
+                        if flt.get("excludeOfficial"):
+                            continue
+                        official_names = flt.get("officialActivityNames") or []
+                        if official_names:
+                            official_names_set = {str(x).strip() for x in official_names if str(x).strip()}
+                            if p_name not in official_names_set and p_id not in official_names_set:
+                                continue
 
                 try:
                     candidates = self.client.get_promotion_items(
@@ -351,6 +403,14 @@ class ActionExecutor:
 
                 if not candidates:
                     continue
+
+                if target_item_set:
+                    candidates = [
+                        c for c in candidates
+                        if str(c.get("id") or c.get("item_id") or "").strip().upper() in target_item_set
+                    ]
+                    if not candidates:
+                        continue
 
                 log(f"[{store_name}][{site_label}] 活动 [{p_name}] 找到 {len(candidates)} 个候选商品，并发核算处理...")
 

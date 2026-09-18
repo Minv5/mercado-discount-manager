@@ -173,6 +173,153 @@ class NativeEngineTests(unittest.TestCase):
             self.assertEqual(ctx.exception.account_id, "2651442567")
             self.assertIn("授权已失效或在后台被解除", str(ctx.exception))
 
+    def test_pricing_top_deal_price_limit_guard(self) -> None:
+        item = {
+            "id": "MLM111",
+            "price": 20.0,
+            "currency_id": "USD",
+            "net_proceeds": {"amount": 15.0, "additional_concepts": [{"id": "shipping_cost", "amount": 3.0}, {"id": "sale_fee", "amount": 2.0}]},
+        }
+        info = extract_item_net_proceeds(item)
+        res = calculate_deal_price(info, 20.0, {"top_deal_price": 15.00})
+        self.assertFalse(res.eligible)
+        self.assertIn("平台要求限价", res.skip_reason)
+
+    def test_pricing_deal_price_non_positive_guard(self) -> None:
+        from engine.pricing import ItemNetProceeds
+        info = ItemNetProceeds(
+            item_id="TEST001",
+            price=10.0,
+            currency_id="USD",
+            net_proceeds=1.0,
+            shipping_cost=-2.0,
+            sale_fee=1.0,
+            fee_rate=0.1,
+        )
+        res = calculate_deal_price(info, 100.0)
+        self.assertFalse(res.eligible)
+        self.assertIn("计算活动价小于等于0", res.skip_reason)
+
+    def test_client_get_promotion_items_deduplication(self) -> None:
+        from unittest.mock import MagicMock
+        from engine.client import MercadoClient
+        mock_auth = MagicMock()
+        mock_auth.get_valid_token.return_value = "mock_tok"
+        client = MercadoClient(mock_auth)
+
+        page1 = {
+            "results": [{"id": "ITEM1"}, {"id": "ITEM2"}],
+            "paging": {"total": 3, "search_after": "page2"},
+        }
+        page2 = {
+            "results": [{"id": "ITEM2"}, {"id": "ITEM3"}],
+            "paging": {"total": 3, "search_after": None},
+        }
+        client.request = MagicMock(side_effect=[page1, page2])
+
+        items = client.get_promotion_items("2651442567", "c_1", "PROMO1")
+        self.assertEqual(len(items), 3)
+        self.assertEqual([i["id"] for i in items], ["ITEM1", "ITEM2", "ITEM3"])
+
+    def test_client_enroll_promotion_item_uses_put_for_update(self) -> None:
+        from unittest.mock import MagicMock
+        from engine.client import MercadoClient
+        mock_auth = MagicMock()
+        mock_auth.get_valid_token.return_value = "mock_tok"
+        client = MercadoClient(mock_auth)
+        client.request = MagicMock(return_value={"status": "ok"})
+
+        client.enroll_promotion_item(
+            account_id="2651442567",
+            child_user_id="c_1",
+            item_id="ITEM1",
+            promotion_id="P1",
+            promotion_type="DEAL",
+            deal_price=19.99,
+            action="enroll",
+        )
+        self.assertEqual(client.request.call_args[0][1], "POST")
+
+        client.enroll_promotion_item(
+            account_id="2651442567",
+            child_user_id="c_1",
+            item_id="ITEM1",
+            promotion_id="P1",
+            promotion_type="DEAL",
+            deal_price=18.99,
+            action="update",
+        )
+        self.assertEqual(client.request.call_args[0][1], "PUT")
+
+    def test_executor_filters_and_seller_campaign_c_prefix(self) -> None:
+        from unittest.mock import MagicMock
+        from engine.executor import ActionExecutor
+        mock_auth = MagicMock()
+        mock_auth.list_sites.return_value = [{"site_id": "MLM", "child_user_id": "c_mlm"}]
+        mock_client = MagicMock()
+        mock_client.get_seller_promotions.return_value = [
+            {"id": "P_FINISHED", "status": "finished", "type": "DEAL"},
+            {"id": "C-SELLER-1", "status": "active", "type": "CUSTOM", "name": "我的自建"},
+            {"id": "OFFICIAL-1", "status": "active", "type": "DEAL", "name": "官方大促"},
+        ]
+        mock_client.get_promotion_items.return_value = []
+
+        executor = ActionExecutor(mock_auth, mock_client)
+        executor._get_store_alias = MagicMock(return_value="测试店铺")
+        executor._record_task = MagicMock()
+
+        filters = {"excludeSeller": True}
+        executor.run_execution(
+            account_id="2651442567",
+            site_id="MLM",
+            mode="enroll",
+            seller_discount=20.0,
+            official_discount=25.0,
+            filters=filters,
+        )
+
+        called_promo_ids = [call[0][2] for call in mock_client.get_promotion_items.call_args_list]
+        self.assertNotIn("P_FINISHED", called_promo_ids)
+        self.assertNotIn("C-SELLER-1", called_promo_ids)
+        self.assertIn("OFFICIAL-1", called_promo_ids)
+
+    def test_executor_target_item_ids_filtering(self) -> None:
+        from unittest.mock import MagicMock
+        from engine.executor import ActionExecutor
+        mock_auth = MagicMock()
+        mock_auth.list_sites.return_value = [{"site_id": "MLM", "child_user_id": "c_mlm"}]
+        mock_client = MagicMock()
+        mock_client.get_seller_promotions.return_value = [
+            {"id": "OFFICIAL-1", "status": "active", "type": "DEAL", "name": "官方活动"}
+        ]
+        mock_client.get_promotion_items.return_value = [
+            {"id": "MLM100", "price": 10.0},
+            {"id": "MLM200", "price": 20.0},
+            {"id": "MLM300", "price": 30.0},
+        ]
+        mock_client.get_item_detail.return_value = {
+            "id": "MLM100",
+            "price": 10.0,
+            "currency_id": "USD",
+            "net_proceeds": {"amount": 7.0, "additional_concepts": []},
+        }
+
+        executor = ActionExecutor(mock_auth, mock_client)
+        executor._get_store_alias = MagicMock(return_value="测试店铺")
+        executor._record_task = MagicMock()
+
+        res = executor.run_execution(
+            account_id="2651442567",
+            site_id="MLM",
+            mode="enroll",
+            seller_discount=20.0,
+            official_discount=20.0,
+            target_item_ids=["MLM100"],
+        )
+        self.assertEqual(res["total"], 1)
+        self.assertEqual(mock_client.get_item_detail.call_count, 1)
+        self.assertEqual(mock_client.get_item_detail.call_args[0][1], "MLM100")
+
 
 if __name__ == "__main__":
     unittest.main()
