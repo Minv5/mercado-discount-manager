@@ -25,7 +25,11 @@ def diagnostic_path() -> Path:
     override = os.environ.get("MDM_DIAGNOSTIC_LOG", "").strip()
     if override:
         return Path(override)
-    local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    if sys.platform == "darwin":
+        default_local = Path.home() / "Library" / "Application Support"
+    else:
+        default_local = Path.home() / "AppData" / "Local"
+    local = Path(os.environ.get("LOCALAPPDATA", default_local))
     return local / "MercadoDiscountManagerStandalone" / "data" / "logs" / "pyside-candidate-runtime.log"
 
 

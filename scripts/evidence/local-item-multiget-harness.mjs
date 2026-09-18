@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -175,9 +176,15 @@ export async function runSamples({ samples = [], baseUrl = DEFAULT_API_BASE_URL,
 export function isCliEntry(moduleUrl = import.meta.url, argv1 = process.argv[1]) {
   if (!argv1) return false;
   try {
-    return path.resolve(fileURLToPath(moduleUrl)) === path.resolve(argv1);
+    const resolvedModule = fsSync.realpathSync(fileURLToPath(moduleUrl));
+    const resolvedArgv = fsSync.realpathSync(path.resolve(argv1));
+    return resolvedModule === resolvedArgv;
   } catch {
-    return false;
+    try {
+      return path.resolve(fileURLToPath(moduleUrl)) === path.resolve(argv1);
+    } catch {
+      return false;
+    }
   }
 }
 

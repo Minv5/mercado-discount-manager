@@ -1,0 +1,157 @@
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from engine.auth import AuthManager
+from engine.bridge import EngineBridge
+from engine.crypto import decrypt_secret, encrypt_secret
+from engine.pricing import calculate_deal_price, extract_item_net_proceeds
+
+
+class NativeEngineTests(unittest.TestCase):
+    def test_crypto_roundtrip(self) -> None:
+        secret = "meli_access_token_super_secret_12345"
+        encrypted = encrypt_secret(secret)
+        self.assertTrue(encrypted.startswith("v1:"))
+        decrypted = decrypt_secret(encrypted)
+        self.assertEqual(decrypted, secret)
+
+    def test_auth_manager_lists_3_cbt_stores(self) -> None:
+        auth = AuthManager()
+        accounts = auth.list_accounts()
+        self.assertEqual(len(accounts), 3)
+        account_ids = {a["account_id"] for a in accounts}
+        self.assertIn("2651442567", account_ids)
+        self.assertIn("3332096437", account_ids)
+        self.assertIn("3408885754", account_ids)
+
+        # Check sites for account 2651442567
+        sites = auth.list_sites("2651442567")
+        site_ids = {s["site_id"] for s in sites}
+        self.assertIn("MLM", site_ids)
+        self.assertIn("MLB", site_ids)
+
+    def test_pricing_prevents_double_discount_on_promotional_items(self) -> None:
+        # Case MCO4413866694: Item currently on promo price $20.15, official catalog original is $24.82
+        # Base net proceeds in ERP is $14.25, shipping is $6.97, sale fee is $3.60
+        promo_item = {
+            "id": "MCO4413866694",
+            "price": 20.15,
+            "original_price": 24.82,
+            "currency_id": "USD",
+            "net_proceeds": {
+                "amount": 14.25,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 6.97},
+                    {"id": "sale_fee", "amount": 3.60},
+                ],
+            },
+        }
+        info = extract_item_net_proceeds(promo_item)
+        # Must take official base original price $24.82, NOT the current promotional $20.15
+        self.assertEqual(info.price, 24.82)
+        # Must preserve authoritative ERP net proceeds $14.25, NEVER override with discounted price
+        self.assertEqual(info.net_proceeds, 14.25)
+        self.assertEqual(info.shipping_cost, 6.97)
+
+        # 28% discount on net proceeds (14.25 * 0.72 = 10.26)
+        res = calculate_deal_price(info, 28.0)
+        self.assertTrue(res.eligible)
+        # Deal price must be $20.15, NEVER the catastrophic double-discounted $16.79
+        self.assertAlmostEqual(res.deal_price, 20.15, places=2)
+        self.assertAlmostEqual(res.target_net, 10.26, places=2)
+        self.assertAlmostEqual(res.shipping_cost, 6.97, places=2)
+        self.assertAlmostEqual(res.final_net_at_deal, 10.26, places=2)
+
+    def test_pricing_hard_skip_when_platform_demand_exceeds_limit(self) -> None:
+        item = {
+            "id": "MLM3071064725",
+            "price": 21.96,
+            "original_price": 21.96,
+            "currency_id": "USD",
+            "net_proceeds": {
+                "amount": 16.27,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 3.15},
+                    {"id": "sale_fee", "amount": 2.54},
+                ],
+            },
+        }
+        info = extract_item_net_proceeds(item)
+        # Target deal price is ~17.36. If platform demands max 16.00, it must be skipped!
+        res = calculate_deal_price(info, 25.0, {"max_discounted_price": 16.00})
+        self.assertFalse(res.eligible)
+        self.assertIn("低于净回款保护售价", res.skip_reason)
+
+    def test_bridge_dispatches_in_memory_routes(self) -> None:
+        bridge = EngineBridge()
+        health = bridge.handle_request("GET", "/api/health")
+        self.assertTrue(health["ok"])
+        self.assertEqual(health["protocol_version"], "3")
+
+        accounts_res = bridge.handle_request("GET", "/api/accounts")
+        self.assertEqual(len(accounts_res["accounts"]), 3)
+
+        tasks_res = bridge.handle_request("GET", "/api/tasks?limit=10")
+        self.assertIn("tasks", tasks_res)
+
+        details_res = bridge.handle_request("GET", "/api/tasks/details?taskIds=1015")
+        self.assertTrue(details_res["ok"])
+        self.assertIsInstance(details_res["details"], list)
+
+        items_res = bridge.handle_request("GET", "/api/tasks/items?task_ids=1015")
+        self.assertTrue(items_res["ok"])
+        self.assertIn("failed_items", items_res["items"])
+
+    def test_multi_store_concurrency(self) -> None:
+        bridge = EngineBridge()
+        calls = []
+
+        def mock_run(account_id, site_id, mode, seller_discount, official_discount, is_cancelled=None, **kwargs):
+            import time
+            time.sleep(0.01)
+            calls.append(account_id)
+            return {"status": "completed", "success": 2, "failed": 0, "skipped": 1}
+
+        bridge.executor.run_execution = mock_run
+        payload = {
+            "account_ids": ["2651442567", "3332096437", "3408885754"],
+            "action": "批量报活动",
+            "seller_discount": 5.0,
+            "official_discount": 6.0,
+        }
+        bridge._groups["test_grp"] = {"status": "running"}
+        bridge._run_group_worker("test_grp", payload)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(set(calls), {"2651442567", "3332096437", "3408885754"})
+        self.assertEqual(bridge._groups["test_grp"]["result"]["success"], 6)
+        self.assertEqual(bridge._groups["test_grp"]["result"]["skipped"], 3)
+
+    def test_smart_promotion_seller_percentage_guard(self) -> None:
+        item = {
+            "id": "MLA3715427450",
+            "price": 56.43,
+            "currency_id": "USD",
+            "net_proceeds": {"amount": 25.0, "additional_concepts": [{"id": "shipping_cost", "amount": 15.0}, {"id": "sale_fee", "amount": 6.77}]},
+        }
+        info = extract_item_net_proceeds(item)
+
+        # 1. SMART candidate requires seller_percentage 41.16% > 28% -> Should skip!
+        cand_over = {"offer_id": "CAND-123", "seller_percentage": 41.16, "price": 32.85}
+        res_over = calculate_deal_price(info, 28.0, promotion_constraints=cand_over, promotion_type="SMART")
+        self.assertFalse(res_over.eligible)
+        self.assertIn("高于设定上限", res_over.skip_reason)
+
+        # 2. SMART candidate requires seller_percentage 20.5% <= 28% -> Should be eligible!
+        cand_ok = {"offer_id": "CAND-456", "seller_percentage": 20.5, "price": 37.11}
+        res_ok = calculate_deal_price(info, 28.0, promotion_constraints=cand_ok, promotion_type="SMART")
+        self.assertTrue(res_ok.eligible)
+        self.assertEqual(res_ok.deal_price, 37.11)
+
+
+if __name__ == "__main__":
+    unittest.main()

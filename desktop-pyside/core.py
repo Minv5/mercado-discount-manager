@@ -33,7 +33,7 @@ SITE_NAMES = {
 EXCLUDE_ACTIVITY = "__exclude__"
 BUSINESS_TIMEZONE = timezone(timedelta(hours=8))
 TERMINAL_EXECUTION_GROUP_STATES = {"completed", "partial_or_failed", "failed", "cancelled", "interrupted"}
-TARGETED_CANCEL_MAX_ITEMS = 200
+TARGETED_CANCEL_MAX_ITEMS = 100000
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,7 @@ class Account:
     raw_display_name: str
     site_id: str
     store_name: str
+    client_id: str = ""
 
 
 class ActionConflictError(ValueError):
@@ -71,7 +72,8 @@ def account_from_json(row: dict[str, Any]) -> Account:
     account_id = str(row.get("account_id") or row.get("user_id") or "").strip()
     raw_display_name = str(row.get("raw_display_name") or row.get("display_name") or "").strip()
     store_name = str(row.get("store_name") or "店铺待命名").strip() or "店铺待命名"
-    return Account(account_id, raw_display_name, str(row.get("site_id") or ""), store_name)
+    client_id = str(row.get("client_id") or "").strip()
+    return Account(account_id, raw_display_name, str(row.get("site_id") or ""), store_name, client_id)
 
 
 def normalize_activity_name(value: str) -> str:
@@ -244,8 +246,8 @@ def execution_action_summary(group: dict[str, Any]) -> str:
     if action == "cancel":
         return label
     scope = dict(group.get("scope") or {})
-    seller = scope.get("seller_discount_percent")
-    official = scope.get("official_discount_percent")
+    seller = scope.get("seller_discount_percent") if scope.get("seller_discount_percent") is not None else group.get("seller_discount_percent")
+    official = scope.get("official_discount_percent") if scope.get("official_discount_percent") is not None else group.get("official_discount_percent")
     if seller is None or official is None:
         return label
     return f"{label}{int(seller)}%/{int(official)}%"

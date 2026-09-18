@@ -30,6 +30,15 @@ class ApiError(RuntimeError):
 class ApiClient:
     base_url: str = "http://127.0.0.1:28758"
     timeout: float = 20.0
+    bridge: Any = None
+
+    def __post_init__(self) -> None:
+        if self.bridge is None and self.base_url.rstrip("/") == "http://127.0.0.1:28758":
+            try:
+                from engine.bridge import EngineBridge
+                self.bridge = EngineBridge()
+            except Exception:
+                self.bridge = None
 
     def get(self, path: str, *, timeout: float | None = None, timeout_message: str | None = None) -> dict[str, Any]:
         return self.request("GET", path, timeout=timeout, timeout_message=timeout_message)
@@ -46,6 +55,12 @@ class ApiClient:
         timeout: float | None = None,
         timeout_message: str | None = None,
     ) -> dict[str, Any]:
+        if self.bridge is not None:
+            try:
+                return self.bridge.handle_request(method, path, body)
+            except Exception as error:
+                raise ApiError(str(error), 500) from error
+
         url = self.base_url.rstrip("/") + "/" + path.lstrip("/")
         data = None
         headers = {"Accept": "application/json"}

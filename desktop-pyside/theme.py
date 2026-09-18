@@ -49,6 +49,20 @@ QComboBox, QSpinBox, QLineEdit, QDateEdit, QTextEdit, QListWidget, QTableWidget 
   selection-background-color: {COLORS['green']};
   selection-color: #F6F3EA;
 }}
+QComboBox {{
+  padding-left: 10px;
+  padding-right: 32px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  min-height: 22px;
+}}
+QSpinBox {{
+  padding-left: 8px;
+  padding-right: 28px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  min-height: 22px;
+}}
 QComboBox:focus, QSpinBox:focus, QLineEdit:focus, QDateEdit:focus {{ border-color: {COLORS['gold_focus']}; }}
 QComboBox::drop-down {{
   subcontrol-origin: padding;
@@ -87,6 +101,7 @@ QPushButton:hover {{ background: #26352C; }}
 QPushButton:pressed {{ background: #1F5A34; }}
 QPushButton#primary {{ background: {COLORS['green']}; border-color: #6D5B2A; font-weight: 700; }}
 QPushButton#primary:hover {{ background: {COLORS['green_hover']}; }}
+QPushButton#nav {{ padding: 6px 14px; font-weight: 600; }}
 QPushButton#nav[checked="true"] {{ background: {COLORS['green_selected']}; border-color: #3E7B4B; }}
 QHeaderView::section {{
   background: {COLORS['card']};
@@ -104,9 +119,39 @@ QTableWidget {{
 }}
 QTableWidget::item {{ border: 0; padding: 6px; }}
 QTableWidget::item:selected {{ background: {COLORS['green']}; color: #F6F3EA; }}
-QTabWidget::pane {{ border: 1px solid {COLORS['gold']}; border-radius: 6px; }}
-QTabBar::tab {{ background: {COLORS['secondary']}; border: 1px solid {COLORS['gold']}; padding: 8px 14px; }}
-QTabBar::tab:selected {{ background: {COLORS['green_selected']}; }}
+QLineEdit {{
+  padding: 6px 10px;
+  min-height: 24px;
+}}
+QTabWidget::pane {{
+  border: 1px solid {COLORS['gold']};
+  border-radius: 8px;
+  background: {COLORS['secondary']};
+}}
+QTabBar {{
+  background: transparent;
+  border: none;
+}}
+QTabBar::tab {{
+  background: #1C231F;
+  color: {COLORS['muted']};
+  border: 1px solid {COLORS['gold']};
+  border-radius: 6px;
+  padding: 8px 22px;
+  margin-right: 6px;
+  margin-bottom: 6px;
+  font-weight: 600;
+}}
+QTabBar::tab:selected {{
+  background: {COLORS['green_selected']};
+  color: #FFFFFF;
+  border: 1px solid #3E7B4B;
+  font-weight: 700;
+}}
+QTabBar::tab:hover:!selected {{
+  background: #242E27;
+  color: #F6F3EA;
+}}
 QScrollBar:vertical {{ background: {COLORS['main']}; width: 12px; margin: 0; }}
 QScrollBar::handle:vertical {{ background: {COLORS['gold']}; min-height: 24px; border-radius: 5px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}

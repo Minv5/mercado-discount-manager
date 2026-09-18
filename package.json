@@ -1,11 +1,12 @@
 {
   "name": "mercado-discount-manager",
-  "version": "0.1.58",
+  "version": "2.0.13",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "build:mac": "./scripts/build-macos.sh"
   },
   "engines": {
     "node": ">=24"

@@ -24,10 +24,13 @@ obj/
 dist/
 dist-full/
 dist-pyside/
+dist-mac/
+.venv/
 release-backups/
 backup-*/
 *-backup*/
 desktop-pyside/build-release/
+desktop-pyside/build-release-mac/
 desktop-pyside/runtime-staging/
 desktop-pyside/install-validation/
 data/validation-evidence/

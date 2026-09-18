@@ -37,8 +37,12 @@ class NodeServiceManager:
     HARD_START_TIMEOUT_SECONDS = 120.0
 
     def __init__(self, project_root: Path | None = None):
-        self.project_root = project_root or Path(__file__).resolve().parents[1]
-        local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        self.project_root = project_root
+        if sys.platform == "darwin":
+            default_local = Path.home() / "Library" / "Application Support"
+        else:
+            default_local = Path.home() / "AppData" / "Local"
+        local = Path(os.environ.get("LOCALAPPDATA", default_local))
         configured_data = os.environ.get("MDM_DATA_DIR")
         self.data_dir = Path(configured_data) if configured_data else local / "MercadoDiscountManagerStandalone" / "data"
         configured_auth = os.environ.get("ML_STANDALONE_AUTH_DIR")
@@ -62,6 +66,19 @@ class NodeServiceManager:
         return payload is not None and self._health_contract_error(payload) is None
 
     def _read_health(self, timeout: float = 1.0) -> dict[str, object] | None:
+        try:
+            from engine.bridge import EngineBridge
+            health = EngineBridge.dispatch_sync("GET", "/api/health")
+            if isinstance(health, dict) and health.get("ok"):
+                return {
+                    "ok": True,
+                    "product": self.PRODUCT,
+                    "protocol_version": self.PROTOCOL_VERSION,
+                    "build_fingerprint": "native-python-engine",
+                    **health,
+                }
+        except Exception:
+            pass
         try:
             with urllib.request.urlopen(self.HEALTH_URL, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
@@ -158,7 +175,7 @@ class NodeServiceManager:
             env["ML_STANDALONE_AUTH_DIR"] = str(self.auth_dir)
             self._apply_webhook_env(env)
             self.process = subprocess.Popen(
-                [str(node_exe), "src/server.js"],
+                [str(node_exe), "--max-old-space-size=8192", "src/server.js"],
                 cwd=str(app_dir),
                 env=env,
                 stdout=out_handle,
@@ -311,32 +328,73 @@ class NodeServiceManager:
     def _runtime_paths(self) -> tuple[Path, Path]:
         bundle_root = Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "frozen", False) else None
         if bundle_root:
-            return bundle_root / "node" / "node.exe", bundle_root / "app"
+            node_name = "node.exe" if os.name == "nt" else "node"
+            node_candidate = bundle_root / "node" / node_name
+            app_candidate = bundle_root / "app"
+            if not node_candidate.exists():
+                exe_dir = Path(sys.executable).resolve().parent
+                for alt_root in [exe_dir, exe_dir / "_internal", exe_dir.parent / "Resources"]:
+                    if (alt_root / "node" / node_name).exists():
+                        node_candidate = alt_root / "node" / node_name
+                    if (alt_root / "app").exists():
+                        app_candidate = alt_root / "app"
+            if os.name != "nt" and node_candidate.exists():
+                try:
+                    os.chmod(node_candidate, 0o755)
+                except OSError:
+                    pass
+            return node_candidate, app_candidate
         node = shutil.which("node")
+        if not node:
+            for fallback in [
+                "/Users/minv5/.local/bin/node",
+                "/opt/homebrew/bin/node",
+                "/usr/local/bin/node",
+                str(Path.home() / ".local" / "bin" / "node"),
+            ]:
+                if os.path.exists(fallback):
+                    node = fallback
+                    break
         if not node:
             raise ServiceError("未找到项目已使用的 Node 运行组件。")
         return Path(node), self.project_root
 
     def _port_owner_pid(self) -> int | None:
-        if os.name != "nt":
+        if os.name == "nt":
+            result = subprocess.run(
+                ["netstat.exe", "-ano", "-p", "tcp"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+                check=False,
+            )
+            suffix = f":{self.PORT}"
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[1].endswith(suffix) and parts[3].upper() == "LISTENING":
+                    try:
+                        return int(parts[4])
+                    except ValueError:
+                        return None
             return None
-        result = subprocess.run(
-            ["netstat.exe", "-ano", "-p", "tcp"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=CREATE_NO_WINDOW,
-            check=False,
-        )
-        suffix = f":{self.PORT}"
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[1].endswith(suffix) and parts[3].upper() == "LISTENING":
-                try:
-                    return int(parts[4])
-                except ValueError:
-                    return None
+        if sys.platform == "darwin":
+            try:
+                result = subprocess.run(
+                    ["lsof", "-nP", f"-iTCP:{self.PORT}", "-sTCP:LISTEN", "-Fp"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                for line in result.stdout.splitlines():
+                    if line.startswith("p"):
+                        try:
+                            return int(line[1:])
+                        except ValueError:
+                            pass
+            except (OSError, ValueError):
+                return None
         return None
 
     def __enter__(self) -> "NodeServiceManager":

@@ -15,6 +15,14 @@ LEGACY_ACTIVITY_CALLBACK_ACK_URLS = frozenset(
     {"https://xingtupro1020.com/meli-callback/consumer/ack"}
 )
 
+DEFAULT_OAUTH_REDIRECT_URI = "https://xingtupro1020.com/oauth/callback/"
+LEGACY_OAUTH_REDIRECT_URIS = frozenset({
+    "https://xingtupro1020.com/callback/",
+    "https://xingtupro1020.com/callback",
+    "http://xingtupro1020.com/callback/",
+    "http://xingtupro1020.com/callback",
+})
+
 
 def migrate_callback_endpoint(
     value: object,
@@ -25,3 +33,14 @@ def migrate_callback_endpoint(
     if not candidate or candidate in legacy_values:
         return fallback
     return candidate
+
+
+def migrate_oauth_redirect_uri(
+    value: object,
+    fallback: str = DEFAULT_OAUTH_REDIRECT_URI,
+) -> str:
+    candidate = str(value or "").strip()
+    if not candidate or candidate in LEGACY_OAUTH_REDIRECT_URIS:
+        return fallback
+    return candidate
+

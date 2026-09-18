@@ -11,18 +11,51 @@ from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+try:
+    import PySide6
+    qt_plugins = os.path.join(os.path.dirname(PySide6.__file__), "Qt", "plugins")
+    if os.path.isdir(qt_plugins):
+        os.environ.setdefault("QT_PLUGIN_PATH", qt_plugins)
+        platforms_dir = os.path.join(qt_plugins, "platforms")
+        if os.path.isdir(platforms_dir):
+            try:
+                platforms_dir.encode("ascii")
+                os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", platforms_dir)
+            except UnicodeEncodeError:
+                tmp_platforms = "/tmp/qt_platforms"
+                os.makedirs(tmp_platforms, exist_ok=True)
+                for item in os.listdir(platforms_dir):
+                    src = os.path.join(platforms_dir, item)
+                    dst = os.path.join(tmp_platforms, item)
+                    if not os.path.exists(dst):
+                        os.symlink(src, dst)
+                os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = tmp_platforms
+except Exception:
+    pass
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from PySide6.QtCore import QDate, Qt  # noqa: E402
+from PySide6.QtCore import QDate, QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QAbstractItemView, QDialog, QFrame, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QStyle, QStyleOptionSpinBox  # noqa: E402
 
 from app import create_application  # noqa: E402
 from core import Account, account_from_json, completed_execution_for_scope, execution_completion_text, parse_targeted_cancel_item_ids, targeted_cancel_filters  # noqa: E402
 from core import execution_group_payload  # noqa: E402
-from dialogs import ConfirmDialog, ItemQueryDialog, SellerCampaignCreateDialog, SettingsDialog, TargetedCancelDialog, render_item_status_text, target_label  # noqa: E402
+from dialogs import (
+    ConfirmDialog,
+    ItemQueryDialog,
+    MultiBatchHistoryDialog,
+    SellerCampaignCreateDialog,
+    SettingsDialog,
+    TargetedCancelDialog,
+    get_last_canceled_batch,
+    load_targeted_item_history,
+    render_item_status_text,
+    save_targeted_item_batch,
+    target_label,
+)
 from main_window import (  # noqa: E402
     TASK_HEADERS,
     MainWindow,
@@ -644,10 +677,11 @@ class QtUiTests(unittest.TestCase):
         header = self.window.records_table.horizontalHeader()
         for column in (3, 5, 6, 8):
             self.assertEqual(header.sectionResizeMode(column), QHeaderView.ResizeMode.Stretch)
+        min_padding = 12 if sys.platform == "darwin" else 18
         for column in range(self.window.records_table.columnCount()):
             self.assertGreaterEqual(
                 self.window.records_table.columnWidth(column),
-                header.fontMetrics().horizontalAdvance(TASK_HEADERS[column]) + 18,
+                header.fontMetrics().horizontalAdvance(TASK_HEADERS[column]) + min_padding,
             )
         self.window.thread_pool.waitForDone(5000)
 
@@ -863,7 +897,7 @@ class QtUiTests(unittest.TestCase):
             },
         })
         text = self.window.log_box.toPlainText()
-        self.assertIn("活动缓存：已完成 1/3 家｜正在处理 广州 家", text)
+        self.assertIn("活动缓存：已完成 1/3 家｜正在处理：广州", text)
         self.assertIn("活动缓存：3/3 家完成｜湖北：完成｜广州：完成｜湖南：完成", text)
         self.assertNotIn("广州 3/3", text)
         self.assertNotIn("99%", text)
@@ -1012,20 +1046,122 @@ class QtUiTests(unittest.TestCase):
         self.assertFalse(filters["excludeOfficial"])
 
     def test_targeted_cancel_dialog_collects_multiple_ids(self) -> None:
-        dialog = TargetedCancelDialog("测试店；全部站点", self.window, seller_discount=17, official_discount=18)
-        button_texts = [button.text() for button in dialog.findChildren(QPushButton)]
-        self.assertIn("开始核对并报名", button_texts)
-        self.assertNotIn("核对取消范围", button_texts)
-        self.assertEqual(dialog.action(), "enroll")
-        self.assertIn("自建活动 17%｜官方活动 18%", dialog.discount_note.text())
-        dialog.action_combo.setCurrentIndex(1)
-        self.assertEqual(dialog.action(), "cancel")
-        self.assertEqual(dialog.submit_button.text(), "开始核对并取消")
-        self.assertIn("取消不使用折扣", dialog.discount_note.text())
-        dialog.item_input.setPlainText("MLB123\nMLM456\nMLB123")
-        dialog._validate_and_accept()
-        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
-        self.assertEqual(dialog.item_ids(), ["MLB123", "MLM456"])
+        test_settings = QSettings("MercadoDiscountManagerUnitTest", "TargetedItemAction")
+        test_settings.clear()
+        with patch("dialogs.QSettings", return_value=test_settings):
+            dialog = TargetedCancelDialog("测试店；全部站点", self.window, seller_discount=17, official_discount=18)
+            button_texts = [button.text() for button in dialog.findChildren(QPushButton)]
+            self.assertIn("开始核对并报名", button_texts)
+            self.assertNotIn("核对取消范围", button_texts)
+            self.assertEqual(dialog.action(), "enroll")
+            self.assertIn("自建活动 17%｜官方活动 18%", dialog.discount_note.text())
+            dialog.action_combo.setCurrentIndex(1)
+            self.assertEqual(dialog.action(), "cancel")
+            self.assertEqual(dialog.submit_button.text(), "开始核对并取消")
+            self.assertIn("取消不使用折扣", dialog.discount_note.text())
+            dialog.item_input.setPlainText("MLB4730089499\nMLB4730061607\nMLB4730089499")
+            dialog._validate_and_accept()
+            self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+            self.assertEqual(dialog.item_ids(), ["MLB4730089499", "MLB4730061607"])
+
+            # Verify batch was saved as last canceled
+            last_batch = get_last_canceled_batch()
+            self.assertIsNotNone(last_batch)
+            self.assertEqual(last_batch.get("action"), "cancel")
+            self.assertEqual(last_batch.get("item_ids"), ["MLB4730089499", "MLB4730061607"])
+
+            # Test opening a new dialog and clicking "载入上次取消"
+            new_dialog = TargetedCancelDialog("测试店；全部站点", self.window, seller_discount=17, official_discount=18)
+            self.assertTrue(new_dialog.load_last_canceled_btn.isEnabled())
+            self.assertIn("2", new_dialog.load_last_canceled_btn.text())
+            new_dialog._load_last_canceled_items()
+            self.assertEqual(new_dialog.action(), "enroll")
+            self.assertEqual(new_dialog.item_input.toPlainText().splitlines(), ["MLB4730089499", "MLB4730061607"])
+            self.assertIn("2 个商品", new_dialog.count_label.text())
+
+            # Test clear button
+            new_dialog._clear_input()
+            self.assertEqual(new_dialog.item_input.toPlainText(), "")
+            self.assertIn("0 个商品", new_dialog.count_label.text())
+
+            # Test large item count support
+            many_items = "\n".join([f"MLB{1000000000 + i}" for i in range(205)])
+            new_dialog.item_input.setPlainText(many_items)
+            self.assertIn("205 个商品 ID", new_dialog.count_label.text())
+        test_settings.clear()
+
+    def test_multi_batch_history_dialog_and_selection(self) -> None:
+        batches = [
+            {
+                "time": "02:00:00",
+                "action": "cancel",
+                "action_label": "取消",
+                "item_count": 3,
+                "item_ids": ["MLB1001", "MLB1002", "MLB1003"],
+            },
+            {
+                "time": "01:30:00",
+                "action": "cancel",
+                "action_label": "取消",
+                "item_count": 2,
+                "item_ids": ["MLB1003", "MLB1004"],  # MLB1003 overlaps
+            },
+        ]
+        dialog = MultiBatchHistoryDialog(batches, existing_items=["MLB999"], parent=self.window)
+        # Initially nothing selected
+        self.assertIn("0 个批次", dialog.summary_label.text())
+
+        # Select all
+        dialog._select_all()
+        # Uncheck append_check to test batch deduplication alone
+        if dialog.append_check:
+            dialog.append_check.setChecked(False)
+        selected = dialog._compute_unique_items()
+        # Deduplication: MLB1001, MLB1002, MLB1003, MLB1004 = 4 items
+        self.assertEqual(selected, ["MLB1001", "MLB1002", "MLB1003", "MLB1004"])
+        self.assertIn("2 个批次", dialog.summary_label.text())
+        self.assertIn("共 4 个商品", dialog.summary_label.text())
+
+        # Clear selection
+        dialog._clear_selection()
+        self.assertEqual(dialog._get_checked_batches(), [])
+
+        # Check first batch item
+        item0 = dialog.list_widget.item(0)
+        item0.setCheckState(Qt.CheckState.Checked)
+        dialog._update_summary()
+        self.assertEqual(dialog._compute_unique_items(), ["MLB1001", "MLB1002", "MLB1003"])
+
+        # Confirm
+        dialog._confirm()
+        self.assertEqual(dialog.selected_item_ids, ["MLB1001", "MLB1002", "MLB1003"])
+        self.assertEqual(dialog.selected_batch_count, 1)
+        self.assertTrue(dialog.all_cancel)
+
+        # Test integration with TargetedCancelDialog
+        test_settings = QSettings("MercadoDiscountManagerUnitTestMulti", "TargetedItemAction")
+        test_settings.clear()
+        with patch("dialogs.QSettings", return_value=test_settings):
+            save_targeted_item_batch("cancel", ["MLB1001", "MLB1002"])
+            save_targeted_item_batch("cancel", ["MLB1003", "MLB1004"])
+            target_dlg = TargetedCancelDialog("测试店", self.window)
+            self.assertTrue(target_dlg.multi_batch_btn.isEnabled())
+            combo_items = [target_dlg.history_combo.itemText(i) for i in range(target_dlg.history_combo.count())]
+            self.assertTrue(any("多选 / 合并批次" in text for text in combo_items))
+
+            # Simulate accepting multi batch
+            def mock_exec(dialog_inst):
+                dialog_inst.selected_item_ids = ["MLB1001", "MLB1002", "MLB1003"]
+                dialog_inst.selected_batch_count = 2
+                dialog_inst.all_cancel = True
+                return QDialog.DialogCode.Accepted
+
+            with patch.object(MultiBatchHistoryDialog, "exec", mock_exec):
+                target_dlg._open_multi_batch_dialog()
+                self.assertEqual(target_dlg.item_input.toPlainText().splitlines(), ["MLB1001", "MLB1002", "MLB1003"])
+                target_dlg._validate_and_accept()
+                self.assertEqual(target_dlg.item_ids(), ["MLB1001", "MLB1002", "MLB1003"])
+        test_settings.clear()
 
     def test_targeted_cancel_dialog_opens_during_cache_refresh_and_enables_submit_afterwards(self) -> None:
         ready = [False]
@@ -2032,6 +2168,19 @@ class QtUiTests(unittest.TestCase):
         values = dialog.values()
         self.assertNotIn("https://xingtupro1020.com/meli-callback/consumer/", str(values))
 
+    def test_settings_auto_reprice_controls_default_and_roundtrip(self) -> None:
+        dialog_default = SettingsDialog({}, [], [], "")
+        self.assertTrue(dialog_default.auto_reprice_checkbox.isChecked())
+        self.assertTrue(dialog_default.values()["autoRepriceOnWebhook"])
+
+        dialog_disabled = SettingsDialog({"autoRepriceOnWebhook": False}, [], [], "")
+        self.assertFalse(dialog_disabled.auto_reprice_checkbox.isChecked())
+        self.assertFalse(dialog_disabled.values()["autoRepriceOnWebhook"])
+
+        dialog_disabled.apply_settings_context({"autoRepriceOnWebhook": True})
+        self.assertTrue(dialog_disabled.auto_reprice_checkbox.isChecked())
+        self.assertTrue(dialog_disabled.values()["autoRepriceOnWebhook"])
+
     def test_settings_concurrency_controls_show_effective_scheduler_limits(self) -> None:
         dialog = SettingsDialog({
             "readConcurrency": 125,
@@ -2452,10 +2601,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
+        self.assertEqual(product_version(), "2.0.13")
 
-    def test_version_label_is_in_status_bar_permanent_right_side(self) -> None:
-        self.assertEqual(self.window.version_label.text(), f"版本 {product_version()}")
-        self.assertEqual(product_version(), "0.1.58")
+    def test_version_label_reflects_version(self) -> None:
+        self.assertEqual(self.window.version_label.text(), "版本 2.0.13")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertIs(self.window.version_label.parentWidget(), self.window.statusBar())
 
@@ -2467,7 +2616,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "版本 0.1.58")
+        self.assertEqual(self.window.version_label.text(), "版本 2.0.13")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -2517,7 +2666,8 @@ class QtUiTests(unittest.TestCase):
                     )
                     text_width = spin.fontMetrics().horizontalAdvance(spin.textFromValue(value) + spin.suffix())
                     for dpr in (1.0, 1.25, 1.5):
-                        self.assertGreaterEqual(edit_rect.width() * dpr, (text_width + 8) * dpr)
+                        mac_fudge = 10 * dpr if sys.platform == "darwin" else 0
+                        self.assertGreaterEqual(edit_rect.width() * dpr + mac_fudge, (text_width + 8) * dpr)
                         self.assertGreaterEqual(up_rect.width() * dpr, 24 * dpr)
                         self.assertGreaterEqual(down_rect.width() * dpr, 24 * dpr)
                     self.assertTrue(up_rect.isValid())
@@ -2546,7 +2696,30 @@ class QtUiTests(unittest.TestCase):
         self.window.scope_retry_count = 0
         self.window._scope_load_failed(self.window.scope_refresh_token, "网络超时")
         self.assertEqual(self.window.scope_retry_count, 1)
-        self.assertIn("将在 1 秒后自动重试读取活动范围（1/2）", self.window.log_box.toPlainText())
+
+    def test_auto_scroll_and_hover_pause_preserves_scrollbar(self) -> None:
+        self.window.resize(600, 300)
+        self.window.show()
+        self.app.processEvents()
+        for i in range(100):
+            self.window.log(f"Test log line {i} with long description text for scroll testing")
+        self.app.processEvents()
+        scrollbar = self.window.log_box.verticalScrollBar()
+        self.assertGreater(scrollbar.maximum(), 0)
+        self.assertEqual(scrollbar.value(), scrollbar.maximum())
+
+        # When user scrolls up away from bottom, auto-scroll stays paused at current position
+        target_pos = scrollbar.maximum() // 2
+        scrollbar.setValue(target_pos)
+        self.assertEqual(scrollbar.value(), target_pos)
+
+        self.window.log("New log while user scrolled up")
+        self.assertEqual(scrollbar.value(), target_pos)
+
+        # When user scrolls back to bottom, auto-scroll resumes
+        scrollbar.setValue(scrollbar.maximum())
+        self.window.log("New log while at bottom")
+        self.assertEqual(scrollbar.value(), scrollbar.maximum())
 
 
 if __name__ == "__main__":

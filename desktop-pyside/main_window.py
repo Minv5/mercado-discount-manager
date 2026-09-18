@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from api_client import ApiClient, ApiError
+from callback_endpoints import migrate_oauth_redirect_uri
 from core import (
     EXCLUDE_ACTIVITY,
     Account,
@@ -64,7 +65,14 @@ from core import (
     site_name,
     task_display_counts,
 )
-from dialogs import DetailsDialog, ItemQueryDialog, SellerCampaignCreateDialog, SettingsDialog, TargetedCancelDialog
+from dialogs import (
+    DetailsDialog,
+    ItemQueryDialog,
+    SellerCampaignCreateDialog,
+    SettingsDialog,
+    TargetedCancelDialog,
+    get_last_canceled_batch,
+)
 from diagnostics import diagnostic_event
 from reason_text import (
     business_reason_text,
@@ -122,8 +130,8 @@ class MainWindow(QMainWindow):
         self.today_completion_request_token = 0
         self.operating_rows_cache: list[dict[str, Any]] = []
         self.benchmark_text_cache = "自动并发按实测和接口反馈调整。"
-        self.global_seller_discount = 5
-        self.global_official_discount = 6
+        self.global_seller_discount = 28
+        self.global_official_discount = 28
         self.auto_action = ""
         self.scope_refresh_token = 0
         self.scope_inputs_ready = False
@@ -134,6 +142,7 @@ class MainWindow(QMainWindow):
         self.scope_ready = False
         self.scope_retry_count = 0
         self.running_group: dict[str, Any] = {}
+        self.execution_started_at: float = 0.0
         self.pending_group_payload: dict[str, Any] | None = None
         self.preparing_submission: dict[str, Any] = {}
         self.pending_prepare_payload: dict[str, Any] | None = None
@@ -176,13 +185,26 @@ class MainWindow(QMainWindow):
         self.prepare_poll_timer = QTimer(self)
         self.prepare_poll_timer.setInterval(1000)
         self.prepare_poll_timer.timeout.connect(self._poll_prepare)
+        self.auto_reprice_timer = QTimer(self)
+        self.auto_reprice_timer.setInterval(5000)
+        self.auto_reprice_timer.timeout.connect(self._poll_auto_reprice)
         if auto_start:
             QTimer.singleShot(0, self.startup)
 
     def _build_ui(self) -> None:
         self.setWindowTitle("美客多活动管家")
-        self.setMinimumSize(1180, 720)
-        self.resize(1440, 900)
+        screen = QApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            target_w = min(1440, max(1120, int(avail.width() * 0.92)))
+            target_h = min(880, max(680, int(avail.height() * 0.88)))
+            min_w = min(1080, max(800, avail.width() - 40))
+            min_h = min(640, max(500, avail.height() - 80))
+            self.setMinimumSize(min_w, min_h)
+            self.resize(target_w, target_h)
+        else:
+            self.setMinimumSize(1080, 640)
+            self.resize(1280, 780)
         icon_path = resource_path("assets/app.ico")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -195,8 +217,8 @@ class MainWindow(QMainWindow):
         workspace = QSplitter(Qt.Orientation.Horizontal)
         workspace.setChildrenCollapsible(False)
         controls = self._build_controls()
-        controls.setMinimumWidth(310)
-        controls.setMaximumWidth(360)
+        controls.setMinimumWidth(320)
+        controls.setMaximumWidth(400)
         workspace.addWidget(controls)
 
         right = QSplitter(Qt.Orientation.Vertical)
@@ -208,9 +230,9 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.activity_page)
         right.addWidget(self.pages)
         right.addWidget(self._build_log_surface())
-        right.setSizes([610, 190])
+        right.setSizes([480, 160])
         workspace.addWidget(right)
-        workspace.setSizes([330, 1050])
+        workspace.setSizes([340, 960])
         root.addWidget(workspace, 1)
         self.setCentralWidget(central)
         self.statusBar().clearMessage()
@@ -230,10 +252,10 @@ class MainWindow(QMainWindow):
     def _build_header(self) -> QFrame:
         header = QFrame()
         header.setObjectName("brandSurface")
-        header.setFixedHeight(84)
+        header.setFixedHeight(72)
         layout = QHBoxLayout(header)
-        layout.setContentsMargins(16, 10, 16, 10)
-        layout.setSpacing(12)
+        layout.setContentsMargins(14, 8, 14, 8)
+        layout.setSpacing(8)
         icon = QLabel()
         icon.setFixedSize(44, 44)
         pixmap = QIcon(str(resource_path("assets/app-icon.png"))).pixmap(QSize(44, 44))
@@ -275,6 +297,11 @@ class MainWindow(QMainWindow):
         self.targeted_cancel_button.setFixedHeight(36)
         self.targeted_cancel_button.clicked.connect(self._open_targeted_cancel)
         layout.addWidget(self.targeted_cancel_button)
+        self.full_get_button = QPushButton("全量GET数据")
+        self.full_get_button.setObjectName("nav")
+        self.full_get_button.setFixedHeight(36)
+        self.full_get_button.clicked.connect(self._on_full_get_clicked)
+        layout.addWidget(self.full_get_button)
         self.auto_shutdown_check = QCheckBox("执行完自动关机")
         self.auto_shutdown_check.setObjectName("muted")
         self.auto_shutdown_check.setChecked(bool(self.settings.get("autoShutdownAfterExecution")))
@@ -286,7 +313,7 @@ class MainWindow(QMainWindow):
     def _build_controls(self) -> QFrame:
         frame = self._surface()
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -295,7 +322,7 @@ class MainWindow(QMainWindow):
         content = QWidget()
         content.setObjectName("controlContent")
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setContentsMargins(0, 0, 4, 0)
         content_layout.setSpacing(8)
 
         scope_section, scope_layout = self._control_section("执行范围")
@@ -314,8 +341,10 @@ class MainWindow(QMainWindow):
         activity_section, activity_layout = self._control_section("活动参数")
         self.seller_combo = QComboBox()
         self.official_combo = QComboBox()
-        self.seller_discount = discount_spin(5)
-        self.official_discount = discount_spin(6)
+        self.seller_discount = discount_spin(self.global_seller_discount)
+        self.official_discount = discount_spin(self.global_official_discount)
+        self.seller_discount.valueChanged.connect(self._on_discount_spin_changed)
+        self.official_discount.valueChanged.connect(self._on_discount_spin_changed)
         activity_layout.addWidget(field_label("自建活动"))
         seller_row = QHBoxLayout()
         seller_row.addWidget(self.seller_combo, 1)
@@ -416,12 +445,20 @@ class MainWindow(QMainWindow):
         top.addStretch(1)
         refresh_local = QPushButton("刷新列表")
         reload_live = QPushButton("重新读取活动")
+        full_get = QPushButton("全量GET数据")
         refresh_local.clicked.connect(self.refresh_scope)
         reload_live.clicked.connect(self._reload_live_promotions)
+        full_get.clicked.connect(self._on_full_get_clicked)
         top.addWidget(refresh_local)
         top.addWidget(reload_live)
+        top.addWidget(full_get)
         layout.addLayout(top)
         table = make_table(ACTIVITY_HEADERS)
+        header = table.horizontalHeader()
+        header.setMinimumSectionSize(54)
+        for column in (0, 1, 2, 4, 5):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(table, 1)
         return surface, table
 
@@ -513,6 +550,8 @@ class MainWindow(QMainWindow):
         # state or leave the UI showing only the component-connected line.
         if not self.refresh_poll_timer.isActive():
             self.refresh_poll_timer.start()
+        if hasattr(self, "auto_reprice_timer") and not self.auto_reprice_timer.isActive():
+            self.auto_reprice_timer.start()
         self._request_initial_bundle(token)
 
     def _request_initial_bundle(self, token: int) -> None:
@@ -620,7 +659,7 @@ class MainWindow(QMainWindow):
                 active_store = str(account_progress.get("active_store") or "").strip()
                 account_text = (
                     f"活动缓存：已完成 {completed}/{total} 家"
-                    + (f"｜正在处理 {active_store} 家" if active_store else "")
+                    + (f"｜正在处理：{active_store}" if active_store else "")
                 )
                 if account_text != self.account_progress_key:
                     self.account_progress_key = account_text
@@ -785,6 +824,11 @@ class MainWindow(QMainWindow):
                 self.refresh_poll_timer.start()
                 return
 
+            if isinstance(data, dict):
+                for log_entry in data.get("auto_reprice_logs") or []:
+                    if log_entry:
+                        self.log(str(log_entry))
+
             refresh, status, percent = self._refresh_poll_response_summary(data)
             if request_token != self.refresh_poll_token:
                 stale_result = True
@@ -916,8 +960,18 @@ class MainWindow(QMainWindow):
         self.accounts = [account_from_json(row) for row in data.get("accounts") or []]
         self.accounts = [account for account in self.accounts if account.account_id]
         discount = dict(data.get("discount") or {})
-        self.global_seller_discount = int(discount.get("seller_discount") or self.settings.get("sellerDefaultDiscount") or 5)
-        self.global_official_discount = int(discount.get("official_discount") or self.settings.get("officialDefaultDiscount") or 6)
+        self.global_seller_discount = int(
+            discount.get("seller_discount")
+            or discount.get("seller")
+            or self.settings.get("sellerDefaultDiscount")
+            or 28
+        )
+        self.global_official_discount = int(
+            discount.get("official_discount")
+            or discount.get("official")
+            or self.settings.get("officialDefaultDiscount")
+            or 28
+        )
         self._apply_global_discounts()
         # Compatibility for explicit/focused callers that pass a refresh
         # snapshot. The real startup path uses the independent poll timer,
@@ -1051,6 +1105,7 @@ class MainWindow(QMainWindow):
             return {"stale": True, "selected_site": selected_site}
         sites: list[dict[str, Any]] = []
         promotions: list[dict[str, Any]] = []
+
         for account_id in account_ids:
             if startup_token is not None and startup_token != self.startup_attempt_token:
                 return {"stale": True, "selected_site": selected_site}
@@ -1136,7 +1191,7 @@ class MainWindow(QMainWindow):
 
         self._run_worker(
             lambda: self.api.post("/api/startup-refresh/start", {}, timeout=10),
-            lambda _result: self.refresh_poll_timer.start(),
+            lambda _result: (self.refresh_poll_timer.start(), self._poll_startup_refresh()),
             failed,
             phase="startup_readiness",
             soft_error=True,
@@ -1181,9 +1236,28 @@ class MainWindow(QMainWindow):
         self.refresh_scope()
 
     def _apply_global_discounts(self) -> None:
+        blocker_s = QSignalBlocker(self.seller_discount)
+        blocker_o = QSignalBlocker(self.official_discount)
+        self.seller_discount.setValue(self.global_seller_discount)
+        self.official_discount.setValue(self.global_official_discount)
+        del blocker_s, blocker_o
+
+    def _on_discount_spin_changed(self) -> None:
         if self.mode_combo.currentText() == "自动判断":
-            self.seller_discount.setValue(self.global_seller_discount)
-            self.official_discount.setValue(self.global_official_discount)
+            self.global_seller_discount = int(self.seller_discount.value())
+            self.global_official_discount = int(self.official_discount.value())
+            self._refresh_auto_decision()
+        else:
+            self._sync_submit_availability()
+        self._run_worker(
+            lambda: self.api.post("/api/settings", {
+                "sellerDefaultDiscount": int(self.seller_discount.value()),
+                "officialDefaultDiscount": int(self.official_discount.value()),
+            }),
+            lambda _res: None,
+            lambda _err: None,
+            phase="settings_save",
+        )
 
     def _update_discount_state(self) -> None:
         enabled = discount_inputs_enabled(self.mode_combo.currentText(), self.auto_action)
@@ -1236,10 +1310,16 @@ class MainWindow(QMainWindow):
 
     def _resolve_action(self, account_ids: list[str], filters: dict[str, Any]) -> str:
         result = self.api.post("/api/today/decision", {"accountIds": account_ids, "filters": filters})
-        decision = result.get("decision") or {}
+        raw_decision = result.get("decision")
+        if isinstance(raw_decision, str):
+            decision = {"action": raw_decision}
+        elif isinstance(raw_decision, dict):
+            decision = raw_decision
+        else:
+            decision = {}
         if str(decision.get("action") or "") == "configuration_required":
             raise RuntimeError(str(decision.get("reason") or "请先在设置中填写自动周期最高折扣。"))
-        return str(decision.get("action") or "")
+        return str(decision.get("action") or "enroll")
 
     def _auto_action_ready(self, action: object, decision_token: int | None = None) -> None:
         if decision_token is not None and decision_token != self.auto_decision_token:
@@ -1436,6 +1516,26 @@ class MainWindow(QMainWindow):
 
         self._run_worker(load, success, failure)
 
+    def _poll_auto_reprice(self) -> None:
+        if getattr(self, "_auto_reprice_poll_busy", False) or self._closing:
+            return
+        self._auto_reprice_poll_busy = True
+
+        def load() -> dict[str, Any]:
+            return self.api.get("/api/auto-reprice/status", timeout=5)
+
+        def success(payload: object) -> None:
+            self._auto_reprice_poll_busy = False
+            if isinstance(payload, dict):
+                for log_entry in payload.get("logs") or []:
+                    if log_entry:
+                        self.log(str(log_entry))
+
+        def failure(_error: object) -> None:
+            self._auto_reprice_poll_busy = False
+
+        self._run_worker(load, success, failure, phase="auto_reprice_poll", soft_error=True)
+
     def _append_background_group_summary(self, groups: list[dict[str, Any]]) -> None:
         terminal = [
             dict(group)
@@ -1508,7 +1608,7 @@ class MainWindow(QMainWindow):
                 action_label(str(task.get("action") or "")),
                 record_discount_text(task),
                 record_activity_text(task),
-                "提交" if str(task.get("mode") or "real") == "real" else "预览",
+                "已中止" if str(task.get("status") or "") == "cancelled" else ("提交" if str(task.get("mode") or "real") == "real" else "预览"),
                 record_scope_text(unique_items, relation_count),
                 record_result_text(task),
                 f"商品 {failed} / 活动 {count_or_marker(activity_failures)}",
@@ -1604,6 +1704,85 @@ class MainWindow(QMainWindow):
             self.refresh_scope()
 
         self._run_worker(reload, done, lambda error: self._operation_error("活动读取", error))
+
+    def _on_full_get_clicked(self) -> None:
+        if self.ui_busy or self.refresh_busy:
+            QMessageBox.information(self, "全量GET数据", "当前有刷新任务正在进行，请稍候。")
+            return
+        if self.running_group or self.pending_group_payload or self.preparing_submission:
+            QMessageBox.information(self, "全量GET数据", "当前有执行任务正在运行，请等待任务完成后再拉取数据。")
+            return
+        account_ids = self.selected_account_ids()
+        if not account_ids:
+            QMessageBox.information(self, "全量GET数据", "未找到可用店铺授权。")
+            return
+        store_names = "、".join(self._store_for_account(acc) for acc in account_ids)
+        confirm = QMessageBox.question(
+            self,
+            "全量GET数据确认",
+            f"将对【{store_names}】执行全量 GET 数据：\n\n"
+            "• 从美客多官方接口读取最新活动列表\n"
+            "• 逐活动读取已报名商品及可报名商品明细\n"
+            "• 刷新本地全部活动与商品数据库缓存\n\n"
+            "（全程仅做 GET 查询，不会提交任何修改或写操作）\n\n"
+            "是否立即开始？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._start_full_get_data(account_ids)
+
+    def _start_full_get_data(self, account_ids: list[str]) -> None:
+        self._set_busy(True, "正在全量 GET 美客多数据...")
+        self.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        self.log("【全量GET】正在向美客多发起全量数据读取任务...")
+
+        def fetch_loop() -> dict[str, Any]:
+            start_res = self.api.post("/api/full-data/start", {"accountIds": account_ids}, timeout=15)
+            job_id = str(start_res.get("job_id") or "")
+            if not job_id:
+                raise RuntimeError("未能启动全量读取任务。")
+            if start_res.get("already_running"):
+                self.gui_dispatcher.dispatch(lambda: self.log("【全量GET】检测到后台已有全量读取任务正在进行，正在接入实时进度..."))
+
+            cursor = 0
+            while True:
+                time.sleep(1.0)
+                try:
+                    res = self.api.get(f"/api/full-data/jobs/{job_id}?after={cursor}", timeout=10)
+                except Exception:
+                    continue
+                job = dict(res.get("job") or {})
+                new_logs = list(job.get("logs") or [])
+                if new_logs:
+                    cursor = int(res.get("total_logs") or (cursor + len(new_logs)))
+                    for line in new_logs:
+                        self.gui_dispatcher.dispatch(lambda msg=line: self.log(msg))
+
+                status = str(job.get("status") or "")
+                if status == "completed":
+                    return job
+                elif status == "failed":
+                    raise RuntimeError(str(job.get("error") or "全量读取任务异常中断。"))
+
+        def done(job_data: object) -> None:
+            self._set_busy(False, "全量 GET 数据完成")
+            data = dict(job_data or {})
+            progress = dict(data.get("progress") or {})
+            tot_promos = progress.get("total_promotions", 0)
+            tot_started = progress.get("total_started", 0)
+            tot_cand = progress.get("total_candidate", 0)
+            self.log(f"【全量GET】完成！共刷新 {tot_promos} 个活动，已报商品 {tot_started} 件，候选商品 {tot_cand} 件。正在刷新界面...")
+            self.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            self.refresh_scope()
+            self.refresh_records()
+
+        def error(err: object) -> None:
+            self._set_busy(False, "全量 GET 失败")
+            self._operation_error("全量GET数据", err)
+
+        self._run_worker(fetch_loop, done, error, phase="full_get_data")
 
     def _on_execute_clicked(self) -> None:
         if self.refresh_busy:
@@ -2011,6 +2190,7 @@ class MainWindow(QMainWindow):
         if not group.get("id"):
             self._operation_error("提交执行", "后台没有返回执行组。", execution=True)
             return
+        self.execution_started_at = time.perf_counter()
         self.running_group = group
         self.prepare_poll_timer.stop()
         self.preparing_submission = {}
@@ -2112,6 +2292,14 @@ class MainWindow(QMainWindow):
             result = dict(group.get("result") or {})
             stores = list(result.get("stores") or [])
             action = str(result.get("action") or group.get("action") or "")
+            duration_text = str(result.get("duration_text") or "")
+            if not duration_text and getattr(self, "execution_started_at", 0.0) > 0.0:
+                elapsed_sec = max(0.0, time.perf_counter() - self.execution_started_at)
+                if elapsed_sec >= 60:
+                    duration_text = f"{int(elapsed_sec // 60)}分{int(elapsed_sec % 60)}秒"
+                else:
+                    duration_text = f"{int(elapsed_sec)}秒"
+
             for store_result in stores:
                 status = str(store_result.get("status") or "")
                 account_id = str(store_result.get("account_id") or "")
@@ -2124,10 +2312,12 @@ class MainWindow(QMainWindow):
                     "cancelled": "已停止",
                     "interrupted": "意外中断",
                 }.get(status.lower(), status_text(status))
-                self.log(f"{store} / {site}：{action_label(action)}{ending}，{execution_result_text(store_result, action)}。")
+                store_dur = f"（耗时 {store_result['duration_text']}）" if store_result.get("duration_text") else ""
+                self.log(f"{store} / {site}：{action_label(action)}{ending}{store_dur}，{execution_result_text(store_result, action)}。")
+            dur_suffix = f"，总耗时：{duration_text}" if duration_text else ""
             self.log(
                 f"本次{action_label(action)}总汇总：店铺 {int(result.get('store_count') or len(stores))} 个，"
-                f"{execution_result_text(result, action)}。"
+                f"{execution_result_text(result, action)}{dur_suffix}。"
             )
             self.running_group.clear()
             self.pending_group_payload = None
@@ -2139,6 +2329,25 @@ class MainWindow(QMainWindow):
             # Refresh it after every terminal execution so cancelled items do
             # not remain visible until the next manual scope refresh.
             self.refresh_scope()
+            if action == "cancel":
+                group_id = str(group.get("id") or "")
+                if group_id:
+                    self.log("取消活动已完成，正在立即同步刷新涉及活动的最新商品缓存...")
+                    self._run_worker(
+                        lambda: self.api.post(f"/api/execution/groups/{group_id}/post-cancel-refresh", timeout=60),
+                        self._post_cancel_refresh_finished,
+                        lambda error: self.log(f"涉及活动商品缓存同步提示：{product_error(error)}"),
+                    )
+
+    def _post_cancel_refresh_finished(self, result: object) -> None:
+        payload = dict(result or {})
+        refreshed = int(payload.get("refreshed") or 0)
+        self.log(f"涉及活动商品缓存刷新完成，已同步最新价格与状态（{refreshed} 个活动）。")
+        last_canceled = get_last_canceled_batch()
+        if last_canceled and last_canceled.get("count"):
+            count = int(last_canceled["count"])
+            self.log(f"💡 提示：刚刚取消的 {count} 个商品已自动记录，点击「按商品 ID 操作活动」即可一键载入重新报名。")
+        self.refresh_scope()
 
     def _commit_submission_polled(self, prepare: dict[str, Any]) -> None:
         state = str(prepare.get("state") or "").lower()
@@ -2285,11 +2494,34 @@ class MainWindow(QMainWindow):
         )
         if dialog.exec() != QDialogAccepted:
             return
+        item_ids = dialog.item_ids()
+        action = dialog.action()
+        if not item_ids:
+            return
+
+        if action == "refresh_cache":
+            self.log(f"正在向美客多官方接口刷新 {len(item_ids)} 个指定商品的最新数据与活动资格...")
+            selected_site = str(self.site_combo.currentData() or "").strip()
+            refresh_timeout = max(300, len(item_ids) * 3)
+            self._run_worker(
+                lambda: self.api.post(
+                    "/api/items/targeted-refresh",
+                    {
+                        "accountIds": account_ids,
+                        "itemIds": item_ids,
+                        "siteIds": [selected_site] if selected_site else [],
+                    },
+                    timeout=refresh_timeout,
+                    timeout_message="商品缓存刷新时间较长，后台仍在处理中...",
+                ),
+                self._targeted_refresh_finished,
+                self._targeted_refresh_failed,
+            )
+            return
+
         if not self._can_start_targeted_cancel():
             QMessageBox.information(self, "按商品 ID 操作活动", "缓存补偿或其它任务仍在运行，本次没有提交；请稍后重试。")
             return
-        item_ids = dialog.item_ids()
-        action = dialog.action()
         settings = self.settings
         submission_id = str(uuid.uuid4())
         payload = execution_group_payload(
@@ -2323,6 +2555,31 @@ class MainWindow(QMainWindow):
             self._prepare_started,
             self._prepare_start_failed,
         )
+
+    def _targeted_refresh_failed(self, error: Exception) -> None:
+        msg = product_error(error)
+        if "后台仍在处理中" in msg or "超时" in msg or "timed out" in msg.lower():
+            self.log(f"⏳ 商品缓存刷新提示：{msg}（完成后将自动生效，无需重复点击）")
+        else:
+            self.log(f"❌ 商品缓存刷新失败：{msg}")
+
+    def _targeted_refresh_finished(self, payload: object) -> None:
+        data = dict(payload or {})
+        count = int(data.get("refreshed_count") or 0)
+        total = int(data.get("total_count") or 0)
+        results = list(data.get("results") or [])
+        self.log(f"✅ 已成功刷新 {count}/{total} 个商品的平台最新数据与活动资格！")
+        for res in results[:10]:
+            item_id = str(res.get("item_id") or "")
+            price = res.get("price")
+            candidates = int(res.get("candidate_count") or 0)
+            if res.get("ok"):
+                self.log(f"  • {item_id}: 原价 {price}，当前可报 {candidates} 个活动")
+            else:
+                self.log(f"  • {item_id}: 刷新失败 - {res.get('error', '未知错误')}")
+        if len(results) > 10:
+            self.log(f"  ...其余 {len(results) - 10} 个商品已全部更新至本地缓存。")
+        self._refresh_scope()
 
     def _run_item_query(self, dialog: ItemQueryDialog, item_id: str) -> None:
         safe_id = quote(item_id, safe="")
@@ -2410,20 +2667,65 @@ class MainWindow(QMainWindow):
                 write=self.settings.get("writeConcurrency", 160),
             )
         )
-        self._run_worker(self._load_initial_bundle, self._apply_initial_bundle, lambda error: self._operation_error("刷新设置", error))
+        self._run_worker(
+            self._load_initial_bundle,
+            self._apply_initial_bundle,
+            lambda error: self._operation_error("刷新设置", error),
+            phase="initial_bundle",
+        )
 
     def _start_oauth(self, dialog: SettingsDialog) -> None:
+        client_id = dialog.oauth_client_id.text().strip()
+        client_secret = dialog.oauth_client_secret.text().strip()
+        redirect_uri = migrate_oauth_redirect_uri(dialog.oauth_redirect_uri.text().strip())
+        if client_id and not client_secret:
+            for app in getattr(dialog, "oauth_apps", []):
+                if str(app.get("clientId") or "").strip() == client_id:
+                    uncommitted_secret = str(app.get("clientSecret") or "").strip()
+                    if uncommitted_secret:
+                        client_secret = uncommitted_secret
+                    break
+        payload: dict[str, str] = {}
+        if client_id:
+            payload["clientId"] = client_id
+        if client_secret:
+            payload["clientSecret"] = client_secret
+        if redirect_uri:
+            payload["redirectUri"] = redirect_uri
+
+        def call_start() -> dict[str, Any]:
+            if client_id:
+                return self.api.post("/api/oauth/start", payload)
+            return self.api.post("/api/oauth/start/from-config", payload)
+
         self._run_worker(
-            lambda: self.api.post("/api/oauth/start/from-config", {}),
+            call_start,
             lambda result: self._oauth_started(dialog, dict(result or {})),
             lambda error: QMessageBox.warning(dialog, "账号授权", product_error(error)),
         )
 
     def _oauth_started(self, dialog: SettingsDialog, result: dict[str, Any]) -> None:
-        url = str(result.get("authorization_url") or result.get("url") or "")
+        url = str(
+            result.get("authorizationUrl")
+            or result.get("authorization_url")
+            or result.get("url")
+            or ""
+        )
         if url:
-            QDesktopServices.openUrl(QUrl(url))
-            QMessageBox.information(dialog, "账号授权", "已打开授权页面。完成后请粘贴浏览器回调链接。")
+            opened = QDesktopServices.openUrl(QUrl(url))
+            QApplication.clipboard().setText(url)
+            if opened:
+                QMessageBox.information(
+                    dialog,
+                    "账号授权",
+                    "已在浏览器中打开授权页面（授权链接也已同步复制到剪贴板）。\n\n请在浏览器中完成登录并同意授权；完成后复制地址栏跳转的完整回调网址，粘贴至下方输入框并点击「完成授权」。",
+                )
+            else:
+                QMessageBox.information(
+                    dialog,
+                    "账号授权",
+                    "已将授权链接复制到剪贴板，请粘贴至浏览器地址栏打开以完成授权。\n\n授权完成后请复制地址栏跳转的完整回调网址，粘贴至下方输入框并点击「完成授权」。",
+                )
         else:
             QMessageBox.warning(dialog, "账号授权", str(result.get("error") or "未读取到授权链接。"))
 
@@ -2431,9 +2733,25 @@ class MainWindow(QMainWindow):
         if not callback:
             QMessageBox.information(dialog, "账号授权", "请粘贴浏览器回调链接。")
             return
+        payload = {
+            "callbackUrl": callback,
+            "callback": callback,
+            "callbackText": callback,
+        }
+
+        def _on_success(result: dict[str, Any]) -> None:
+            self._refresh_accounts_from_settings(dialog)
+            dialog.callback_edit.clear()
+            account_name = ""
+            if isinstance(result, dict) and result.get("account"):
+                acc = result["account"]
+                account_name = str(acc.get("store_name") or acc.get("account_id") or "")
+            msg = f"账号授权成功：{account_name} 已绑定。" if account_name else "账号授权成功！已绑定至当前系统。"
+            QMessageBox.information(dialog, "账号授权", msg)
+
         self._run_worker(
-            lambda: self.api.post("/api/oauth/complete-callback", {"callback": callback, "callbackText": callback}),
-            lambda _result: self._refresh_accounts_from_settings(dialog),
+            lambda: self.api.post("/api/oauth/complete-callback", payload),
+            _on_success,
             lambda error: QMessageBox.warning(dialog, "账号授权", product_error(error)),
         )
 
@@ -2472,12 +2790,16 @@ class MainWindow(QMainWindow):
         if not self.running_group and not self.pending_group_payload and not self.preparing_submission:
             self.execute_button.setEnabled(not busy and self._can_start_submission())
             self.targeted_cancel_button.setEnabled(self._can_open_targeted_cancel())
+            if hasattr(self, "full_get_button"):
+                self.full_get_button.setEnabled(not busy)
         self.records_refresh_button.setEnabled(not busy)
 
     def _set_execution_busy(self, busy: bool) -> None:
         self.execute_button.setEnabled(busy or self._can_start_submission())
         self.execute_button.setText("停止任务" if busy else "开始执行")
         self.targeted_cancel_button.setEnabled(not busy and self._can_open_targeted_cancel())
+        if hasattr(self, "full_get_button"):
+            self.full_get_button.setEnabled(not busy)
         for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
             control.setEnabled(not busy)
         self._update_discount_state()
@@ -2487,6 +2809,8 @@ class MainWindow(QMainWindow):
             self.execute_button.setText("开始执行")
             self.execute_button.setEnabled(self._can_start_submission())
             self.targeted_cancel_button.setEnabled(self._can_open_targeted_cancel())
+            if hasattr(self, "full_get_button"):
+                self.full_get_button.setEnabled(True)
             for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
                 control.setEnabled(True)
             self._update_discount_state()
@@ -2496,6 +2820,8 @@ class MainWindow(QMainWindow):
         self.execute_button.setText("正在停止" if state == "stopping" else "停止准备" if has_prepare_id else "正在准备")
         self.execute_button.setEnabled(has_prepare_id and state != "stopping")
         self.targeted_cancel_button.setEnabled(False)
+        if hasattr(self, "full_get_button"):
+            self.full_get_button.setEnabled(False)
         for control in (self.mode_combo, self.store_combo, self.site_combo, self.seller_combo, self.official_combo):
             control.setEnabled(False)
         self._update_discount_state()
@@ -2590,7 +2916,18 @@ class MainWindow(QMainWindow):
         )
 
     def log(self, message: str) -> None:
+        scrollbar = self.log_box.verticalScrollBar()
+        saved_pos = scrollbar.value()
+        was_at_bottom = saved_pos >= (scrollbar.maximum() - 20)
+        is_hovered = self.log_box.underMouse() or self.log_box.viewport().underMouse()
+        has_selection = self.log_box.textCursor().hasSelection()
+
         self.log_box.append(f"[{datetime.now():%H:%M:%S}] {message}")
+
+        if is_hovered or not was_at_bottom or has_selection:
+            scrollbar.setValue(saved_pos)
+        else:
+            scrollbar.setValue(scrollbar.maximum())
 
     def _append_startup_final_log(self, status: str, message: str) -> None:
         """Append one timestamped terminal startup summary per final state."""
@@ -2823,6 +3160,9 @@ class MainWindow(QMainWindow):
             refresh_timer = getattr(self, "refresh_poll_timer", None)
             if refresh_timer is not None:
                 refresh_timer.stop()
+            auto_reprice_timer = getattr(self, "auto_reprice_timer", None)
+            if auto_reprice_timer is not None:
+                auto_reprice_timer.stop()
             self.service.detach()
             event.accept()
             return
@@ -2855,6 +3195,9 @@ class MainWindow(QMainWindow):
         refresh_timer = getattr(self, "refresh_poll_timer", None)
         if refresh_timer is not None:
             refresh_timer.stop()
+        auto_reprice_timer = getattr(self, "auto_reprice_timer", None)
+        if auto_reprice_timer is not None:
+            auto_reprice_timer.stop()
         self.service.stop()
         event.accept()
 
@@ -2881,7 +3224,7 @@ def product_version() -> str:
         value = str(payload.get("version") or payload.get("product_version") or "").strip()
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
-    return "0.1.58"
+    return "2.0.13"
 
 
 def make_table(headers: list[str]) -> QTableWidget:
@@ -2930,7 +3273,7 @@ def discount_spin(value: int) -> QSpinBox:
     )
     non_text_width = probe_width - edit_rect.width()
     text_width = spin.fontMetrics().horizontalAdvance("90%")
-    spin.setFixedWidth(text_width + 8 + non_text_width)
+    spin.setFixedWidth(max(76, min(100, text_width + 8 + non_text_width)))
     return spin
 
 
@@ -3181,12 +3524,16 @@ def startup_refresh_blocked_text(refresh: dict[str, Any]) -> str:
 
 
 def record_activity_text(task: dict[str, Any]) -> str:
+    store = task.get("store_name") or ""
+    site = task.get("site_name") or (site_name(str(task.get("site_id") or "")) if task.get("site_id") else "全部站点")
     if str(task.get("promotion_type") or "").upper() == "BATCH" or not task.get("promotion_id"):
+        if store and store != "当前店铺":
+            return f"{store} / {site}"
         return "批量汇总"
-    store = task.get("store_name") or "当前店铺"
-    site = task.get("site_name") or site_name(str(task.get("site_id") or ""))
     activity = task.get("promotion_name") or task.get("activity_name") or "当前活动"
-    return f"{store} / {site} / {activity}"
+    if store and store != "当前店铺":
+        return f"{store} / {site} / {activity}"
+    return f"{site} / {activity}" if site else activity
 
 
 def activity_summary_text(task: dict[str, Any]) -> str:
@@ -3448,16 +3795,38 @@ def record_discount_text(task: dict[str, Any]) -> str:
         return "-"
     parts = []
     seller = task.get("seller_activity_text")
-    if not seller and task.get("seller_discount_percent"):
-        seller = f"{task.get('seller_discount_percent')}%"
+    if not seller and task.get("seller_discount_percent") is not None:
+        s_dp = task.get("seller_discount_percent")
+        try:
+            s_val = float(s_dp)
+            s_str = f"{int(s_val)}" if s_val.is_integer() else f"{s_val}"
+            seller = f"{s_str}%"
+        except (ValueError, TypeError):
+            seller = f"{s_dp}%"
     official = task.get("official_activity_text")
-    if not official and task.get("official_discount_percent"):
-        official = f"{task.get('official_discount_percent')}%"
+    if not official and task.get("official_discount_percent") is not None:
+        o_dp = task.get("official_discount_percent")
+        try:
+            o_val = float(o_dp)
+            o_str = f"{int(o_val)}" if o_val.is_integer() else f"{o_val}"
+            official = f"{o_str}%"
+        except (ValueError, TypeError):
+            official = f"{o_dp}%"
     if seller:
         parts.append(f"自建{seller}")
     if official:
         parts.append(f"官方{official}")
-    return " / ".join(parts) if parts else "-"
+    if parts:
+        return " / ".join(parts)
+    dp = task.get("discount_percent") if task.get("discount_percent") is not None else task.get("discount")
+    if dp is not None:
+        try:
+            val = float(dp)
+            val_str = f"{int(val)}" if val.is_integer() else f"{val}"
+            return f"自建{val_str}% / 官方{val_str}%"
+        except (ValueError, TypeError):
+            return f"{dp}%"
+    return "-"
 
 
 def task_detail_text(task: dict[str, Any], details: list[dict[str, Any]], items: dict[str, Any]) -> str:
@@ -3507,9 +3876,20 @@ def business_task_text(task: dict[str, Any], reserved_count: int | None = None) 
     # persisted seller/official_discount_percent is the enroll/update value and
     # would mislead a cancel summary.
     if action != "cancel":
-        seller_text = task.get("seller_activity_text") or (f"{task.get('seller_discount_percent')}%" if task.get("seller_discount_percent") else "-")
-        official_text = task.get("official_activity_text") or (f"{task.get('official_discount_percent')}%" if task.get("official_discount_percent") else "-")
-        lines.append(f"自建折扣：{seller_text}\n官方折扣：{official_text}")
+        seller_text = task.get("seller_activity_text") or (f"{task.get('seller_discount_percent')}%" if task.get("seller_discount_percent") else "")
+        official_text = task.get("official_activity_text") or (f"{task.get('official_discount_percent')}%" if task.get("official_discount_percent") else "")
+        if not seller_text and not official_text:
+            dp = task.get("discount_percent") if task.get("discount_percent") is not None else task.get("discount")
+            if dp is not None:
+                try:
+                    val = float(dp)
+                    val_str = f"{int(val)}" if val.is_integer() else f"{val}"
+                    seller_text = f"{val_str}%"
+                    official_text = f"{val_str}%"
+                except (ValueError, TypeError):
+                    seller_text = f"{dp}%"
+                    official_text = f"{dp}%"
+        lines.append(f"自建折扣：{seller_text or '-'}\n官方折扣：{official_text or '-'}")
     lines.extend([
         f"涉及商品：{count_or_marker(unique_items, '旧记录未区分')} 件（按商品编号去重）",
         f"需处理项：{count_or_marker(relations, '旧记录未区分')} 项（商品×活动）",
