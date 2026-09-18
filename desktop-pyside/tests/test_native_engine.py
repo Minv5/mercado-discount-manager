@@ -92,7 +92,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.17")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.18")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -141,16 +141,17 @@ class NativeEngineTests(unittest.TestCase):
         }
         info = extract_item_net_proceeds(item)
 
-        # 1. SMART candidate requires seller_percentage 41.16% > 28% -> Should skip!
+        # 1. SMART candidate requires seller_percentage 41.16% -> final net below target net -> Should skip!
         cand_over = {"offer_id": "CAND-123", "seller_percentage": 41.16, "price": 32.85}
         res_over = calculate_deal_price(info, 28.0, promotion_constraints=cand_over, promotion_type="SMART")
         self.assertFalse(res_over.eligible)
-        self.assertIn("高于设定上限", res_over.skip_reason)
+        self.assertIn("低于目标保底净回款", res_over.skip_reason)
 
-        # 2. SMART candidate requires seller_percentage 20.5% <= 28% -> Should be eligible!
-        cand_ok = {"offer_id": "CAND-456", "seller_percentage": 20.5, "price": 37.11}
+        # 2. SMART candidate final net proceeds >= target net -> Should be eligible!
+        cand_ok = {"offer_id": "CAND-456", "seller_percentage": 10.0, "price": 42.09}
         res_ok = calculate_deal_price(info, 28.0, promotion_constraints=cand_ok, promotion_type="SMART")
         self.assertTrue(res_ok.eligible)
+        self.assertGreaterEqual(res_ok.final_net_at_deal, res_ok.target_net)
     def test_oauth_invalid_grant_error_raised(self) -> None:
         import io
         import urllib.error

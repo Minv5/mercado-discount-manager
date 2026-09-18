@@ -126,30 +126,45 @@ def calculate_deal_price(
     if clean_p_type == "SMART" or constraints.get("offer_id"):
         seller_pct = float(constraints.get("seller_percentage") or 0.0)
         smart_price = float(constraints.get("price") or p_orig)
-        if seller_pct > 0 and seller_pct > discount_percent:
+
+        # 1. Target net proceeds threshold strictly based on user's net proceeds discount
+        target_net = round(orig_net * (1.0 - discount_percent / 100.0), 2)
+
+        # 2. Seller's effective settlement price after seller-funded discount
+        if seller_pct > 0:
+            effective_seller_price = round(p_orig * (1.0 - seller_pct / 100.0), 2)
+        else:
+            effective_seller_price = smart_price
+
+        # 3. Final net proceeds strictly protecting shipping cost in full
+        sale_fee_at_deal = round(effective_seller_price * fee_rate, 2)
+        final_net_at_deal = round(effective_seller_price - sale_fee_at_deal - shipping, 2)
+
+        # 4. Strict net proceeds floor check: must not breach target_net
+        if final_net_at_deal < target_net:
             return PricingResult(
                 item_id=item_info.item_id,
                 original_price=p_orig,
                 original_net=orig_net,
-                target_net=round(orig_net * (1.0 - discount_percent / 100.0), 2),
+                target_net=target_net,
                 deal_price=smart_price,
                 shipping_cost=shipping,
-                sale_fee_at_deal=round(smart_price * fee_rate, 2),
-                final_net_at_deal=round(smart_price * (1.0 - fee_rate) - shipping, 2),
+                sale_fee_at_deal=sale_fee_at_deal,
+                final_net_at_deal=final_net_at_deal,
                 discount_percent=discount_percent,
                 eligible=False,
-                skip_reason=f"平台联合活动要求卖家承担折扣({seller_pct:.2f}%)高于设定上限({discount_percent:.1f}%)，跳过",
+                skip_reason=f"联合活动实际净回款(${final_net_at_deal:.2f})低于目标保底净回款(${target_net:.2f})，跳过",
             )
         else:
             return PricingResult(
                 item_id=item_info.item_id,
                 original_price=p_orig,
                 original_net=orig_net,
-                target_net=round(orig_net * (1.0 - seller_pct / 100.0), 2),
+                target_net=target_net,
                 deal_price=smart_price,
                 shipping_cost=shipping,
-                sale_fee_at_deal=round(smart_price * fee_rate, 2),
-                final_net_at_deal=round(smart_price * (1.0 - fee_rate) - shipping, 2),
+                sale_fee_at_deal=sale_fee_at_deal,
+                final_net_at_deal=final_net_at_deal,
                 discount_percent=discount_percent,
                 eligible=True,
                 skip_reason=None,

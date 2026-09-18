@@ -2601,10 +2601,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.0.17")
+        self.assertEqual(product_version(), "2.0.18")
 
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "版本 2.0.17")
+        self.assertEqual(self.window.version_label.text(), "版本 2.0.18")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertIs(self.window.version_label.parentWidget(), self.window.statusBar())
 
@@ -2616,7 +2616,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "版本 2.0.17")
+        self.assertEqual(self.window.version_label.text(), "版本 2.0.18")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")

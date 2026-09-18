@@ -317,7 +317,11 @@ class ActionExecutor:
                     })
                     report_progress(progress)
                 if p_type == "SMART":
-                    log(f"[{store_name}][{s_label}] 提报成功: 商品 {item_id} 报入联合活动 [{p_name}] (卖家承担 {item_cand.get('seller_percentage', 0)}%)")
+                    seller_pct_str = f"{item_cand.get('seller_percentage')}%" if item_cand.get('seller_percentage') is not None else "平台固定价"
+                    log(
+                        f"[{store_name}][{s_label}] 提报成功: 商品 {item_id} 报入联合活动 [{p_name}] | "
+                        f"卖家承担 {seller_pct_str} -> 预计净回款 ${pricing.final_net_at_deal:.2f} (全额保运费 ${pricing.shipping_cost:.2f}, 目标底线 ${pricing.target_net:.2f})"
+                    )
                 else:
                     log(
                         f"[{store_name}][{s_label}] 提报成功: 商品 {item_id} 报入 [{p_name}] | "
