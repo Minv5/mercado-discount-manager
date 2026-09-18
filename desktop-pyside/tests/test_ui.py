@@ -2601,10 +2601,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.0.13")
+        self.assertEqual(product_version(), "2.0.14")
 
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "版本 2.0.13")
+        self.assertEqual(self.window.version_label.text(), "版本 2.0.14")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertIs(self.window.version_label.parentWidget(), self.window.statusBar())
 
@@ -2616,7 +2616,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "版本 2.0.13")
+        self.assertEqual(self.window.version_label.text(), "版本 2.0.14")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -2720,6 +2720,33 @@ class QtUiTests(unittest.TestCase):
         scrollbar.setValue(scrollbar.maximum())
         self.window.log("New log while at bottom")
         self.assertEqual(scrollbar.value(), scrollbar.maximum())
+
+    def test_handle_oauth_expired_prompts_and_debounces(self) -> None:
+        from unittest.mock import patch
+        from PySide6.QtWidgets import QMessageBox
+
+        opened_tabs: list[str] = []
+
+        def mock_open_settings(initial_tab: str = "") -> None:
+            opened_tabs.append(initial_tab)
+
+        self.window._open_settings = mock_open_settings
+
+        with patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.Yes) as mock_warn:
+            # First call for account 2651442567 triggers warning dialog
+            self.window.handle_oauth_expired("2651442567", "广州店")
+            self.assertEqual(mock_warn.call_count, 1)
+            self.assertEqual(opened_tabs, ["auth"])
+
+            # Second call for the same account must be debounced (no second dialog)
+            self.window.handle_oauth_expired("2651442567", "广州店")
+            self.assertEqual(mock_warn.call_count, 1)
+            self.assertEqual(opened_tabs, ["auth"])
+
+            # Different account triggers new dialog
+            self.window.handle_oauth_expired("3332096437", "湖北店")
+            self.assertEqual(mock_warn.call_count, 2)
+            self.assertEqual(opened_tabs, ["auth", "auth"])
 
 
 if __name__ == "__main__":

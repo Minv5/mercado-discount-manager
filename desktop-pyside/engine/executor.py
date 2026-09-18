@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .auth import AuthManager
+from .auth import AuthManager, OAuthInvalidGrantError
 from .client import MercadoClient
 from .crypto import get_data_dir
 from .pricing import calculate_deal_price, extract_item_net_proceeds
@@ -169,6 +169,8 @@ class ActionExecutor:
         elif mode in ("cancel", "批量取消"):
             action = "cancel"
 
+        oauth_expired = False
+
         def process_item(item_cand: dict[str, Any], promo_info: dict[str, Any], s_id: str, c_uid: str, s_label: str) -> str:
             if cancelled():
                 return "skipped"
@@ -300,6 +302,7 @@ class ActionExecutor:
                 return "failed"
 
         def process_site(site_info: dict[str, Any]):
+            nonlocal oauth_expired
             if cancelled():
                 return
             c_uid = site_info["child_user_id"]
@@ -309,6 +312,10 @@ class ActionExecutor:
 
             try:
                 promotions = self.client.get_seller_promotions(account_id, c_uid)
+            except OAuthInvalidGrantError as err:
+                oauth_expired = True
+                log(f"[{store_name}] 店铺授权失效: {err}")
+                return
             except Exception as err:
                 log(f"[{store_name}][{site_label}] 读取活动列表失败: {err}")
                 return
@@ -320,7 +327,7 @@ class ActionExecutor:
             query_status = "started" if action in ("update", "cancel") else "candidate"
 
             for promo in promotions:
-                if cancelled():
+                if cancelled() or oauth_expired:
                     break
                 p_id = str(promo.get("id") or promo.get("promotion_id") or "")
                 p_type = str(promo.get("type") or promo.get("promotion_type") or "DEAL").upper()
@@ -334,6 +341,10 @@ class ActionExecutor:
                     candidates = self.client.get_promotion_items(
                         account_id, c_uid, p_id, status=query_status
                     )
+                except OAuthInvalidGrantError as err:
+                    oauth_expired = True
+                    log(f"[{store_name}] 店铺授权失效: {err}")
+                    break
                 except Exception as err:
                     log(f"[{store_name}][{site_label}] 读取活动 [{p_name}] 商品候选失败: {err}")
                     continue
@@ -431,6 +442,11 @@ class ActionExecutor:
             "group_id": group_id,
             "elapsed_seconds": round(elapsed_sec, 1),
             "duration_text": duration_text,
+            "account_id": str(account_id),
+            "store_name": store_name,
+            "oauth_expired": oauth_expired,
+            "expired_account": str(account_id) if oauth_expired else None,
+            "expired_store_name": store_name if oauth_expired else None,
         }
 
     def _record_task(

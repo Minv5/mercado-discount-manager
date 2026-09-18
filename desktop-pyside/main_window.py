@@ -2300,7 +2300,14 @@ class MainWindow(QMainWindow):
                 else:
                     duration_text = f"{int(elapsed_sec)}秒"
 
+            if group.get("oauth_expired"):
+                self.handle_oauth_expired(str(group.get("expired_account") or ""), str(group.get("expired_store_name") or ""))
+
             for store_result in stores:
+                if store_result.get("oauth_expired"):
+                    acc = str(store_result.get("account_id") or "")
+                    name = str(store_result.get("store_name") or "")
+                    self.handle_oauth_expired(acc, name)
                 status = str(store_result.get("status") or "")
                 account_id = str(store_result.get("account_id") or "")
                 store = self._store_for_account(account_id) if account_id else str(store_result.get("store_name") or "当前店铺")
@@ -2593,13 +2600,14 @@ class MainWindow(QMainWindow):
             lambda error: dialog.show_error(product_error(error)),
         )
 
-    def _open_settings(self) -> None:
+    def _open_settings(self, initial_tab: str = "") -> None:
         dialog = SettingsDialog(
             self.settings,
             self.accounts,
             list(self.operating_rows_cache),
             self.benchmark_text_cache,
             self,
+            initial_tab=initial_tab,
         )
         dialog.authorize_requested.connect(lambda: self._start_oauth(dialog))
         dialog.complete_authorization_requested.connect(lambda callback: self._complete_oauth(dialog, callback))
@@ -2771,6 +2779,31 @@ class MainWindow(QMainWindow):
     def _show_settings_page(self) -> None:
         self._open_settings()
 
+    def handle_oauth_expired(self, account_id: str, display_name: str = "") -> None:
+        """Prompt user to re-authorize account when refresh token is revoked or expired."""
+        account_id_str = str(account_id or "").strip()
+        if not hasattr(self, "_notified_expired_accounts"):
+            self._notified_expired_accounts = set()
+        if account_id_str and account_id_str in self._notified_expired_accounts:
+            return
+        if account_id_str:
+            self._notified_expired_accounts.add(account_id_str)
+
+        store_title = display_name or (self._store_for_account(account_id_str) if account_id_str else "指定店铺")
+        msg = (
+            f"检测到店铺「{store_title}」美客多授权已过期或在后台被解除授权。\n\n"
+            "需要重新获取授权才能继续提报活动。是否立即打开设置页面重新授权？"
+        )
+        reply = QMessageBox.warning(
+            self,
+            "店铺授权失效",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._open_settings(initial_tab="auth")
+
     def _operation_error(self, operation: str, message: str, *, execution: bool = False) -> None:
         self.poll_busy = False
         self._set_busy(False, f"{operation}未完成")
@@ -2778,6 +2811,13 @@ class MainWindow(QMainWindow):
             self._set_execution_busy(False)
         readable = product_error(message)
         self.log(f"{operation}未完成：{readable}")
+
+        msg_str = str(message)
+        if "invalid_grant" in msg_str.lower() or "授权已失效或在后台被解除" in msg_str:
+            acc_id = self.current_account_id() or ""
+            self.handle_oauth_expired(acc_id, readable)
+            return
+
         QMessageBox.warning(self, operation, readable)
 
     def _set_busy(self, busy: bool, message: str) -> None:
@@ -3224,7 +3264,7 @@ def product_version() -> str:
         value = str(payload.get("version") or payload.get("product_version") or "").strip()
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
-    return "2.0.13"
+    return "2.0.14"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

@@ -13,6 +13,17 @@ from typing import Any
 from .crypto import decrypt_secret, encrypt_secret, get_data_dir
 
 
+class OAuthInvalidGrantError(RuntimeError):
+    """Raised when a refresh token is expired, revoked, or rejected with invalid_grant."""
+
+    def __init__(self, account_id: str, display_name: str = "", raw_error: str = ""):
+        name = display_name or f"账号 {account_id}"
+        super().__init__(f"店铺【{name}】美客多授权已失效或在后台被解除，请重新扫码授权。详情: {raw_error}")
+        self.account_id = account_id
+        self.display_name = name
+        self.raw_error = raw_error
+
+
 @dataclass
 class AccountToken:
     account_id: str
@@ -178,7 +189,12 @@ class AuthManager:
                 result = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as err:
             err_body = err.read().decode("utf-8", errors="replace")
+            lower_body = err_body.lower()
+            if err.code in (400, 401) and any(kw in lower_body for kw in ("invalid_grant", "invalid_client", "unauthorized", "revoked")):
+                raise OAuthInvalidGrantError(account_id, display_name or "", err_body) from err
             raise RuntimeError(f"刷新店铺 {account_id} 授权失败: HTTP {err.code} {err_body}") from err
+        except OAuthInvalidGrantError:
+            raise
         except Exception as err:
             raise RuntimeError(f"刷新店铺 {account_id} 授权网络异常: {err}") from err
 

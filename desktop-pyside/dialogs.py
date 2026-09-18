@@ -1145,6 +1145,7 @@ class SettingsDialog(QDialog):
         operating_rows: list[dict[str, Any]],
         benchmark_text: str,
         parent: QWidget | None = None,
+        initial_tab: str = "",
     ):
         super().__init__(parent)
         self.settings = settings
@@ -1190,6 +1191,12 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._stores_tab(), "店铺与站点")
         tabs.addTab(self._auth_tab(), "账号授权")
         tabs.addTab(self._advanced_tab(benchmark_text), "高级")
+        if initial_tab == "auth":
+            tabs.setCurrentIndex(2)
+        elif initial_tab == "stores":
+            tabs.setCurrentIndex(1)
+        elif initial_tab == "advanced":
+            tabs.setCurrentIndex(3)
         root.addWidget(tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")

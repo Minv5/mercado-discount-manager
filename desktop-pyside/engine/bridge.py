@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .auth import AuthManager
+from .auth import AuthManager, OAuthInvalidGrantError
 from .client import MercadoClient
 from .crypto import get_data_dir
 from .executor import ActionExecutor, ExecutionProgress
@@ -99,7 +99,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.0.13",
+                "build_fingerprint": "native-python-v2.0.14",
             }
 
         # 2. Settings
@@ -578,6 +578,8 @@ class EngineBridge:
             child = children_map.get(acc_id)
             if child:
                 child["status"] = "completed"
+                if res.get("oauth_expired"):
+                    child["oauth_expired"] = True
 
             with lock:
                 per_store_results[str(acc_id)] = res
@@ -598,9 +600,17 @@ class EngineBridge:
         is_canc = self._group_cancel_flags.get(group_id, False)
         status = "cancelled" if is_canc else "completed"
         stores_list = []
+        any_oauth_expired = False
+        expired_acc_id = None
+        expired_store = None
         for acc_id in account_ids:
             r = per_store_results.get(acc_id, {})
             child = children_map.get(acc_id, {})
+            is_expired = bool(r.get("oauth_expired"))
+            if is_expired:
+                any_oauth_expired = True
+                expired_acc_id = acc_id
+                expired_store = child.get("store_name") or acc_id
             stores_list.append({
                 "account_id": acc_id,
                 "store_name": child.get("store_name") or acc_id,
@@ -611,6 +621,7 @@ class EngineBridge:
                 "total": r.get("total", 0),
                 "elapsed_seconds": r.get("elapsed_seconds", 0),
                 "duration_text": r.get("duration_text", ""),
+                "oauth_expired": is_expired,
             })
 
         total_elapsed = time.time() - start_time
@@ -621,6 +632,10 @@ class EngineBridge:
 
         if group_id in self._groups:
             self._groups[group_id]["status"] = status
+            if any_oauth_expired:
+                self._groups[group_id]["oauth_expired"] = True
+                self._groups[group_id]["expired_account"] = expired_acc_id
+                self._groups[group_id]["expired_store_name"] = expired_store
             self._groups[group_id]["result"] = {
                 "store_count": len(account_ids),
                 "stores": stores_list,

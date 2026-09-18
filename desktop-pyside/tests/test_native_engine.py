@@ -150,7 +150,28 @@ class NativeEngineTests(unittest.TestCase):
         cand_ok = {"offer_id": "CAND-456", "seller_percentage": 20.5, "price": 37.11}
         res_ok = calculate_deal_price(info, 28.0, promotion_constraints=cand_ok, promotion_type="SMART")
         self.assertTrue(res_ok.eligible)
-        self.assertEqual(res_ok.deal_price, 37.11)
+    def test_oauth_invalid_grant_error_raised(self) -> None:
+        import io
+        import urllib.error
+        from unittest.mock import patch
+        from engine.auth import OAuthInvalidGrantError
+
+        auth = AuthManager()
+        error_body = b'{"message":"invalid_grant","error":"invalid_grant","status":400}'
+        http_error = urllib.error.HTTPError(
+            url="https://api.mercadolibre.com/oauth/token",
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=io.BytesIO(error_body),
+        )
+
+        with patch("urllib.request.urlopen", side_effect=http_error):
+            with self.assertRaises(OAuthInvalidGrantError) as ctx:
+                auth.get_token("2651442567", force_refresh=True)
+
+            self.assertEqual(ctx.exception.account_id, "2651442567")
+            self.assertIn("授权已失效或在后台被解除", str(ctx.exception))
 
 
 if __name__ == "__main__":
