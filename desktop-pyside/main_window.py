@@ -3264,7 +3264,7 @@ def product_version() -> str:
         value = str(payload.get("version") or payload.get("product_version") or "").strip()
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
-    return "2.0.16"
+    return "2.0.17"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

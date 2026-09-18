@@ -92,7 +92,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.16")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.17")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -185,6 +185,19 @@ class NativeEngineTests(unittest.TestCase):
         res = calculate_deal_price(info, 20.0, {"top_deal_price": 15.00})
         self.assertFalse(res.eligible)
         self.assertIn("平台要求限价", res.skip_reason)
+
+    def test_pricing_suggested_price_does_not_block_enrollment(self) -> None:
+        item = {
+            "id": "MLM222",
+            "price": 20.0,
+            "currency_id": "USD",
+            "net_proceeds": {"amount": 15.0, "additional_concepts": [{"id": "shipping_cost", "amount": 3.0}, {"id": "sale_fee", "amount": 2.0}]},
+        }
+        info = extract_item_net_proceeds(item)
+        # Platform suggested price must NOT be treated as a hard skip threshold
+        res = calculate_deal_price(info, 20.0, {"suggested_discounted_price": 14.00})
+        self.assertTrue(res.eligible)
+        self.assertIsNone(res.skip_reason)
 
     def test_pricing_deal_price_non_positive_guard(self) -> None:
         from engine.pricing import ItemNetProceeds

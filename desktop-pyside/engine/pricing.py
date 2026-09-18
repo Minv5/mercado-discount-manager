@@ -190,11 +190,10 @@ def calculate_deal_price(
     sale_fee_at_deal = round(deal_price * fee_rate, 2)
     final_net_at_deal = round(deal_price - sale_fee_at_deal - shipping, 2)
 
-    # 4. Check against promotion constraints (platform max allowable price)
+    # 4. Check against mandatory promotion constraints (platform strict max allowable price)
     max_allowed = (
         constraints.get("max_discounted_price")
         or constraints.get("top_deal_price")
-        or constraints.get("suggested_discounted_price")
     )
 
     eligible = True
