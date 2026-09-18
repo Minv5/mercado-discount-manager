@@ -92,7 +92,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.18")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.19")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -131,6 +131,56 @@ class NativeEngineTests(unittest.TestCase):
         self.assertEqual(set(calls), {"2651442567", "3332096437", "3408885754"})
         self.assertEqual(bridge._groups["test_grp"]["result"]["success"], 6)
         self.assertEqual(bridge._groups["test_grp"]["result"]["skipped"], 3)
+
+    def test_cancel_group_graceful_shutdown(self) -> None:
+        bridge = EngineBridge()
+        grp_id = "grp_test_cancel"
+
+        def mock_cancelled_run(account_id, site_id, mode, seller_discount, official_discount, on_progress=None, is_cancelled=None, **kwargs):
+            from engine.executor import ExecutionProgress
+            # Report partial success before cancel
+            p = ExecutionProgress(total=5, success=3, failed=0, skipped=1)
+            if on_progress:
+                on_progress(p)
+            
+            # Mid-execution: User clicks cancel!
+            cancel_res = bridge.handle_request("POST", f"/api/execution/groups/{grp_id}/cancel")
+            self.assertTrue(cancel_res.get("ok"))
+            # Must be cancelling, not terminal cancelled prematurely!
+            self.assertEqual(bridge._groups[grp_id]["status"], "cancelling")
+
+            # Active endpoint should still recognize it while cancelling
+            active_res = bridge.handle_request("GET", "/api/execution/groups/active")
+            self.assertIsNotNone(active_res.get("group"))
+            self.assertEqual(active_res["group"]["id"], grp_id)
+
+            is_canc = is_cancelled() if is_cancelled else False
+            self.assertTrue(is_canc)
+
+            return {
+                "status": "cancelled" if is_canc else "completed",
+                "success": 3,
+                "failed": 0,
+                "skipped": 1,
+                "total": 4,
+            }
+
+        bridge.executor.run_execution = mock_cancelled_run
+        payload = {
+            "account_ids": ["2651442567"],
+            "action": "批量报活动",
+            "seller_discount": 5.0,
+            "official_discount": 6.0,
+        }
+        bridge._groups[grp_id] = {"id": grp_id, "status": "running", "result": {"success": 0, "failed": 0, "skipped": 0}}
+
+        # Worker executes and wraps up
+        bridge._run_group_worker(grp_id, payload)
+
+        # Now status is terminal cancelled AND successful items are preserved
+        self.assertEqual(bridge._groups[grp_id]["status"], "cancelled")
+        self.assertEqual(bridge._groups[grp_id]["result"]["success"], 3)
+        self.assertEqual(bridge._groups[grp_id]["result"]["skipped"], 1)
 
     def test_smart_promotion_seller_percentage_guard(self) -> None:
         item = {

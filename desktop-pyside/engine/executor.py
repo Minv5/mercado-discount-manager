@@ -251,6 +251,8 @@ class ActionExecutor:
                     return "failed"
 
             # Step A: Authoritative Real-time GET /marketplace/items/{id}
+            if cancelled():
+                return "skipped"
             try:
                 raw_item = self.client.get_item_detail(account_id, item_id)
                 item_info = extract_item_net_proceeds(raw_item)
@@ -457,6 +459,8 @@ class ActionExecutor:
 
                 def wrapped_process_item(cand):
                     nonlocal p_success, p_failed, p_skipped
+                    if cancelled():
+                        return
                     res = process_item(cand, promo, s_id, c_uid, site_label)
                     with p_lock:
                         if res == "success":

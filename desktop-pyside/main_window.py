@@ -3264,7 +3264,7 @@ def product_version() -> str:
         value = str(payload.get("version") or payload.get("product_version") or "").strip()
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
-    return "2.0.18"
+    return "2.0.19"
 
 
 def make_table(headers: list[str]) -> QTableWidget:
@@ -3766,6 +3766,7 @@ def status_text(value: str) -> str:
         "partial_or_failed": "部分完成",
         "failed": "未完整完成",
         "cancelled": "已停止",
+        "cancelling": "停止中",
         "interrupted": "意外中断",
         "running": "执行中",
     }.get(value.lower(), value or "-")

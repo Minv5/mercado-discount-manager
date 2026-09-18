@@ -102,7 +102,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.0.18",
+                "build_fingerprint": "native-python-v2.0.19",
             }
 
         # 2. Settings
@@ -576,8 +576,8 @@ class EngineBridge:
 
         # 12. Execution active groups / submissions
         if route == "/api/execution/groups/active":
-            # Return any currently running group
-            running = [g for g in self._groups.values() if g.get("status") == "running"]
+            # Return any currently running or cancelling group
+            running = [g for g in self._groups.values() if g.get("status") in ("running", "cancelling")]
             return {"group": running[0] if running else None}
         if route == "/api/execution/submissions/active":
             return {"submission": None}
@@ -658,8 +658,8 @@ class EngineBridge:
         if route.startswith("/api/execution/groups/") and route.endswith("/cancel"):
             group_id = route.split("/")[-2]
             self._group_cancel_flags[group_id] = True
-            if group_id in self._groups:
-                self._groups[group_id]["status"] = "cancelled"
+            if group_id in self._groups and self._groups[group_id].get("status") == "running":
+                self._groups[group_id]["status"] = "cancelling"
             return {"ok": True}
 
         # Default catch-all
@@ -687,9 +687,11 @@ class EngineBridge:
                         pass
                 seller_disc = summary.get("seller_discount_percent") or first.get("discount_percent") or 28
                 official_disc = summary.get("official_discount_percent") or first.get("discount_percent") or 28
+                is_all_cancelled = all(r.get("status") == "cancelled" for r in rows)
+                g_status = "cancelled" if is_all_cancelled else ("completed" if any(r.get("status") == "completed" for r in rows) else first.get("status", "completed"))
                 return {
                     "id": group_id,
-                    "status": "completed",
+                    "status": g_status,
                     "action": first.get("action") or "enroll",
                     "created_at": first.get("created_at"),
                     "finished_at": first.get("updated_at") or first.get("created_at"),
@@ -763,6 +765,25 @@ class EngineBridge:
         total_items = 0
         lock = threading.Lock()
         per_store_results: dict[str, dict[str, Any]] = {}
+        store_progress_map: dict[str, dict[str, int]] = {
+            str(acc_id): {"success": 0, "failed": 0, "skipped": 0, "total": 0}
+            for acc_id in account_ids
+        }
+
+        def on_store_progress(acc_id: str, p: Any):
+            with lock:
+                store_progress_map[str(acc_id)] = {
+                    "success": getattr(p, "success", 0),
+                    "failed": getattr(p, "failed", 0),
+                    "skipped": getattr(p, "skipped", 0),
+                    "total": getattr(p, "total", 0),
+                }
+                if group_id in self._groups:
+                    res_dict = self._groups[group_id].setdefault("result", {})
+                    res_dict["success"] = sum(sp["success"] for sp in store_progress_map.values())
+                    res_dict["failed"] = sum(sp["failed"] for sp in store_progress_map.values())
+                    res_dict["skipped"] = sum(sp["skipped"] for sp in store_progress_map.values())
+                    res_dict["total"] = sum(sp["total"] for sp in store_progress_map.values())
 
         def log_for_store(acc_id: str, msg: str):
             child = children_map.get(acc_id)
@@ -777,6 +798,19 @@ class EngineBridge:
         def run_store(acc_id: str):
             nonlocal total_success, total_failed, total_skipped, total_items
             if self._group_cancel_flags.get(group_id):
+                with lock:
+                    per_store_results[str(acc_id)] = {
+                        "status": "cancelled",
+                        "success": 0,
+                        "failed": 0,
+                        "skipped": 0,
+                        "total": 0,
+                        "duration_text": "0秒",
+                        "elapsed_seconds": 0.0,
+                    }
+                child = children_map.get(acc_id)
+                if child:
+                    child["status"] = "cancelled"
                 return
             store_start = time.time()
             try:
@@ -787,6 +821,7 @@ class EngineBridge:
                     seller_discount=seller_discount,
                     official_discount=official_discount,
                     on_log=lambda m: log_for_store(str(acc_id), m),
+                    on_progress=lambda p: on_store_progress(str(acc_id), p),
                     is_cancelled=lambda: self._group_cancel_flags.get(group_id, False),
                     group_id=group_id,
                     target_item_ids=target_item_ids,
@@ -806,7 +841,7 @@ class EngineBridge:
 
             child = children_map.get(acc_id)
             if child:
-                child["status"] = "completed"
+                child["status"] = "cancelled" if (self._group_cancel_flags.get(group_id) or res.get("status") == "cancelled") else "completed"
                 if res.get("oauth_expired"):
                     child["oauth_expired"] = True
 
@@ -876,7 +911,6 @@ class EngineBridge:
             total_dur_text = f"{int(total_elapsed)}秒"
 
         if group_id in self._groups:
-            self._groups[group_id]["status"] = status
             if any_oauth_expired:
                 self._groups[group_id]["oauth_expired"] = True
                 self._groups[group_id]["expired_account"] = expired_acc_id
@@ -894,4 +928,8 @@ class EngineBridge:
                 "duration_text": total_dur_text,
             }
             self._groups[group_id]["children"] = list(children_map.values())
+            self._groups[group_id]["updated_at"] = datetime.datetime.now().isoformat()
+            # CRITICAL: Only set status to terminal ("cancelled" / "completed" / "failed")
+            # AFTER result, stores_list and children are fully assembled and DB writes are done!
+            self._groups[group_id]["status"] = status
             self._groups[group_id]["updated_at"] = datetime.datetime.now().isoformat()
