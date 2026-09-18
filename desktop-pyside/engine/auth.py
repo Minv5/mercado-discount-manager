@@ -1,8 +1,7 @@
-from __future__ import annotations
-
 import datetime
 import json
 import sqlite3
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -49,6 +48,7 @@ class AuthManager:
 
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path or (get_data_dir() / "discount-manager.sqlite")
+        self._refresh_lock = threading.Lock()
 
     def _get_connection(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,8 +143,45 @@ class AuthManager:
                 needs_refresh = True
 
             if needs_refresh and refresh_token and client_id and client_secret:
-                token_obj = self._refresh_token(account_id, client_id, client_secret, refresh_token, row["display_name"], row["site_id"])
-                return token_obj
+                with self._refresh_lock:
+                    # Double check under lock in case another thread just refreshed this token
+                    cur.execute("""
+                        SELECT account_id, display_name, site_id, access_token_cipher, refresh_token_cipher,
+                               client_id, client_secret_cipher, expires_at, auth_domain
+                        FROM oauth_tokens
+                        WHERE account_id = ?
+                    """, (str(account_id),))
+                    fresh_row = cur.fetchone()
+                    if fresh_row:
+                        fresh_exp = fresh_row["expires_at"] or ""
+                        if not force_refresh and fresh_exp:
+                            try:
+                                clean_fresh = fresh_exp.replace("Z", "+00:00")
+                                exp_dt = datetime.datetime.fromisoformat(clean_fresh)
+                                now_dt = datetime.datetime.now(datetime.timezone.utc)
+                                if (exp_dt - now_dt).total_seconds() >= 600:
+                                    return AccountToken(
+                                        account_id=str(fresh_row["account_id"]),
+                                        display_name=fresh_row["display_name"] or f"账号 {fresh_row['account_id']}",
+                                        access_token=decrypt_secret(fresh_row["access_token_cipher"]) or "",
+                                        refresh_token=decrypt_secret(fresh_row["refresh_token_cipher"]) or "",
+                                        client_id=fresh_row["client_id"] or "",
+                                        client_secret=decrypt_secret(fresh_row["client_secret_cipher"]) if fresh_row["client_secret_cipher"] else "",
+                                        expires_at=fresh_exp,
+                                        site_id=fresh_row["site_id"],
+                                        auth_domain=fresh_row["auth_domain"],
+                                    )
+                            except Exception:
+                                pass
+                        token_obj = self._refresh_token(
+                            account_id,
+                            client_id,
+                            client_secret,
+                            decrypt_secret(fresh_row["refresh_token_cipher"]) or refresh_token,
+                            fresh_row["display_name"],
+                            fresh_row["site_id"],
+                        )
+                        return token_obj
 
             return AccountToken(
                 account_id=str(row["account_id"]),

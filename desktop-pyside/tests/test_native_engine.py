@@ -92,6 +92,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.16")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -320,6 +321,44 @@ class NativeEngineTests(unittest.TestCase):
         self.assertEqual(mock_client.get_item_detail.call_count, 1)
         self.assertEqual(mock_client.get_item_detail.call_args[0][1], "MLM100")
 
+    def test_webhook_worker_resolve_route_matches_by_site_prefix(self) -> None:
+        from unittest.mock import MagicMock
+        from engine.webhook_worker import WebhookWorker
+        mock_auth = MagicMock()
+        mock_auth.list_accounts.return_value = [{"account_id": "2651442567", "store_name": "店1"}]
+        mock_auth.list_sites.return_value = [
+            {"site_id": "MLM", "child_user_id": "child_mlm"},
+            {"site_id": "MLB", "child_user_id": "child_mlb"},
+        ]
+        mock_client = MagicMock()
+        worker = WebhookWorker(mock_auth, mock_client)
+
+        acc, c_uid, site = worker._resolve_route("2651442567", "MLB999888")
+        self.assertEqual(acc, "2651442567")
+        self.assertEqual(c_uid, "child_mlb")
+        self.assertEqual(site, "MLB")
+
+        acc2, c_uid2, site2 = worker._resolve_route("2651442567", "MLM111222")
+        self.assertEqual(acc2, "2651442567")
+        self.assertEqual(c_uid2, "child_mlm")
+        self.assertEqual(site2, "MLM")
+
+    def test_bridge_targeted_refresh_and_item_status_and_oauth_start(self) -> None:
+        bridge = EngineBridge()
+        status_res = bridge.handle_request("GET", "/api/items/MLM12345/status")
+        self.assertTrue(status_res["ok"])
+        self.assertEqual(status_res["item_id"], "MLM12345")
+
+        ref_res = bridge.handle_request("POST", "/api/items/targeted-refresh", body={"item_ids": ["MLM12345"]})
+        self.assertTrue(ref_res["ok"])
+        self.assertEqual(ref_res["total_count"], 1)
+
+        oauth_start = bridge.handle_request("POST", "/api/oauth/start", body={"clientId": "test_app_id"})
+        self.assertTrue(oauth_start["ok"])
+        self.assertIn("auth.mercadolibre.com.mx", oauth_start["authorizationUrl"])
+        self.assertIn("test_app_id", oauth_start["authorizationUrl"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

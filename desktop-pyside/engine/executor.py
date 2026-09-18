@@ -218,6 +218,8 @@ class ActionExecutor:
                 progress.current_item = item_id
 
             if action == "cancel":
+                if cancelled():
+                    return "skipped"
                 try:
                     self.client.cancel_promotion_item(
                         account_id, c_uid, item_id, p_id, p_type, offer_id=offer_id
@@ -228,6 +230,16 @@ class ActionExecutor:
                         report_progress(progress)
                     log(f"[{store_name}][{s_label}] 商品 {item_id} 已退出活动 [{p_name}]")
                     return "success"
+                except OAuthInvalidGrantError as err:
+                    oauth_expired = True
+                    with progress_lock:
+                        progress.failed += 1
+                        all_results.append({"item_id": item_id, "promotion_id": p_id, "status": "failed", "error": str(err)})
+                        report_progress(progress)
+                    with activity_lock:
+                        failed_items.append({"item_id": item_id, "promotion_id": p_id, "promotion_name": p_name, "site_id": s_id, "reason": str(err)})
+                    log(f"[{store_name}] 店铺授权失效: {err}")
+                    return "failed"
                 except Exception as err:
                     with progress_lock:
                         progress.failed += 1
@@ -242,6 +254,16 @@ class ActionExecutor:
             try:
                 raw_item = self.client.get_item_detail(account_id, item_id)
                 item_info = extract_item_net_proceeds(raw_item)
+            except OAuthInvalidGrantError as err:
+                oauth_expired = True
+                with progress_lock:
+                    progress.failed += 1
+                    all_results.append({"item_id": item_id, "promotion_id": p_id, "status": "failed", "error": str(err)})
+                    report_progress(progress)
+                with activity_lock:
+                    failed_items.append({"item_id": item_id, "promotion_id": p_id, "promotion_name": p_name, "site_id": s_id, "reason": str(err)})
+                log(f"[{store_name}] 店铺授权失效: {err}")
+                return "failed"
             except Exception as err:
                 with progress_lock:
                     progress.failed += 1
@@ -302,6 +324,16 @@ class ActionExecutor:
                         f"原价 ${pricing.original_price:.2f} -> 折扣价 ${pricing.deal_price:.2f} (全额保运费 ${pricing.shipping_cost:.2f}, 目标净回款 ${pricing.target_net:.2f})"
                     )
                 return "success"
+            except OAuthInvalidGrantError as err:
+                oauth_expired = True
+                with progress_lock:
+                    progress.failed += 1
+                    all_results.append({"item_id": item_id, "promotion_id": p_id, "status": "failed", "error": str(err)})
+                    report_progress(progress)
+                with activity_lock:
+                    failed_items.append({"item_id": item_id, "promotion_id": p_id, "promotion_name": p_name, "site_id": s_id, "reason": str(err)})
+                log(f"[{store_name}] 店铺授权失效: {err}")
+                return "failed"
             except Exception as err:
                 err_msg = str(err)
                 if "ERROR_CREDIBILITY_DISCOUNTED_PRICE" in err_msg:

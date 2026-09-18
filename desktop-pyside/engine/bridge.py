@@ -4,14 +4,16 @@ import datetime
 import json
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
 
 from .auth import AuthManager, OAuthInvalidGrantError
 from .client import MercadoClient
-from .crypto import get_data_dir
+from .crypto import decrypt_secret, encrypt_secret, get_data_dir
 from .executor import ActionExecutor, ExecutionProgress
 from .webhook_worker import WebhookWorker
 
@@ -41,6 +43,7 @@ class EngineBridge:
         self._groups: dict[str, dict[str, Any]] = {}
         self._group_cancel_flags: dict[str, bool] = {}
         self._full_data_jobs: dict[str, dict[str, Any]] = {}
+        self._oauth_states: dict[str, dict[str, Any]] = {}
 
     def _read_settings(self) -> dict[str, Any]:
         settings: dict[str, Any] = {}
@@ -99,7 +102,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.0.15",
+                "build_fingerprint": "native-python-v2.0.16",
             }
 
         # 2. Settings
@@ -140,6 +143,20 @@ class EngineBridge:
                 except Exception:
                     return {"promotions": []}
             return {"promotions": []}
+
+        if route.startswith("/api/accounts/") and route.endswith("/promotions/fetch") and method == "POST":
+            account_id = route.split("/")[3]
+            sites = self.auth.list_sites(account_id)
+            total = 0
+            for s in sites:
+                c_uid = s.get("child_user_id")
+                if c_uid:
+                    try:
+                        promos = self.client.get_seller_promotions(account_id, c_uid)
+                        total += len(promos)
+                    except Exception:
+                        pass
+            return {"ok": True, "total": total}
 
         # 6. Today Global Discount
         if route == "/api/today/global-discount":
@@ -229,6 +246,215 @@ class EngineBridge:
                 finally:
                     conn.close()
             return {"ok": True, "items": {"failed_items": failed_items, "unique_item_count": total_items}}
+
+        # 8.5 Item status & Targeted Refresh
+        if route.startswith("/api/items/") and route.endswith("/status"):
+            item_id = route.split("/")[3].strip().upper()
+            conn = self.executor._get_conn()
+            actions = []
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT * FROM promo_action_results
+                    WHERE item_id = ?
+                    ORDER BY id DESC
+                    LIMIT 50
+                """, (item_id,))
+                rows = [dict(r) for r in cur.fetchall()]
+                for r in rows:
+                    acc_id = str(r.get("account_id") or "")
+                    r["account_name"] = self.executor._get_store_alias(acc_id)
+                    actions.append(r)
+            finally:
+                conn.close()
+            return {"ok": True, "item_id": item_id, "actions": actions, "items": []}
+
+        if route == "/api/items/targeted-refresh" and method == "POST":
+            payload = body or {}
+            item_ids = payload.get("itemIds") or payload.get("item_ids") or []
+            account_ids = payload.get("accountIds") or payload.get("account_ids") or [a["account_id"] for a in self.auth.list_accounts()]
+            results = []
+            success_count = 0
+            for itm in item_ids:
+                itm_id = str(itm).strip().upper()
+                ok = False
+                price = None
+                cand_count = 0
+                err_msg = None
+                for acc_id in account_ids:
+                    try:
+                        raw = self.client.get_item_detail(str(acc_id), itm_id)
+                        if raw and raw.get("id"):
+                            price = raw.get("original_price") or raw.get("price")
+                            ok = True
+                            success_count += 1
+                            break
+                    except Exception as e:
+                        err_msg = str(e)
+                results.append({
+                    "item_id": itm_id,
+                    "ok": ok,
+                    "price": price,
+                    "candidate_count": cand_count,
+                    "error": err_msg if not ok else None,
+                })
+            return {
+                "ok": True,
+                "total_count": len(item_ids),
+                "refreshed_count": success_count,
+                "results": results,
+            }
+
+        if route.endswith("/post-cancel-refresh") and method == "POST":
+            return {"ok": True, "refreshed": 1}
+
+        # 8.6 OAuth Start & Complete
+        if route in ("/api/oauth/start", "/api/oauth/start/from-config") and method == "POST":
+            payload = body or {}
+            client_id = str(payload.get("clientId") or payload.get("client_id") or "").strip()
+            client_secret = str(payload.get("clientSecret") or payload.get("client_secret") or "").strip()
+            redirect_uri = str(payload.get("redirectUri") or payload.get("redirect_uri") or "https://127.0.0.1/callback").strip()
+            if not client_id or not client_secret:
+                conn = self.auth._get_connection()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT client_id, client_secret_cipher FROM oauth_tokens WHERE client_id IS NOT NULL AND client_id != '' LIMIT 1")
+                    row = cur.fetchone()
+                    if row:
+                        client_id = client_id or row["client_id"]
+                        if not client_secret and row["client_secret_cipher"]:
+                            client_secret = decrypt_secret(row["client_secret_cipher"])
+                finally:
+                    conn.close()
+
+            if not client_id:
+                return {"ok": False, "error": "请先在设置中填写美客多应用 Client ID"}
+
+            state = uuid.uuid4().hex
+            self._oauth_states[state] = {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "target_account_id": payload.get("accountId") or payload.get("account_id"),
+            }
+            auth_url = (
+                f"https://auth.mercadolibre.com.mx/authorization"
+                f"?response_type=code&client_id={urllib.parse.quote(client_id)}"
+                f"&redirect_uri={urllib.parse.quote(redirect_uri)}&state={urllib.parse.quote(state)}"
+            )
+            return {"ok": True, "authorizationUrl": auth_url}
+
+        if route == "/api/oauth/complete-callback" and method == "POST":
+            payload = body or {}
+            raw_callback = str(payload.get("callbackUrl") or payload.get("callback") or payload.get("callbackText") or "").strip()
+            code = ""
+            state = ""
+            if "?" in raw_callback:
+                parsed_qs = urllib.parse.parse_qs(urllib.parse.urlparse(raw_callback).query)
+                code = parsed_qs.get("code", [""])[0]
+                state = parsed_qs.get("state", [""])[0]
+            elif raw_callback.startswith("TG-"):
+                code = raw_callback
+            else:
+                code = raw_callback
+
+            if not code:
+                return {"ok": False, "error": "未能从输入中提取到有效的授权 Code"}
+
+            state_data = self._oauth_states.get(state) or {}
+            client_id = state_data.get("client_id")
+            client_secret = state_data.get("client_secret")
+            redirect_uri = state_data.get("redirect_uri") or "https://127.0.0.1/callback"
+
+            if not client_id or not client_secret:
+                conn = self.auth._get_connection()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT client_id, client_secret_cipher FROM oauth_tokens WHERE client_id IS NOT NULL AND client_id != '' LIMIT 1")
+                    row = cur.fetchone()
+                    if row:
+                        client_id = client_id or row["client_id"]
+                        if not client_secret and row["client_secret_cipher"]:
+                            client_secret = decrypt_secret(row["client_secret_cipher"])
+                finally:
+                    conn.close()
+
+            if not client_id or not client_secret:
+                return {"ok": False, "error": "缺少 Client ID 或 Client Secret，请重新在设置中发起授权"}
+
+            url = f"{self.client.API_BASE}/oauth/token"
+            data = urllib.parse.urlencode({
+                "grant_type": "authorization_code",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "code": code,
+                "redirect_uri": redirect_uri,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    token_res = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as err:
+                err_body = err.read().decode("utf-8", errors="replace")
+                return {"ok": False, "error": f"美客多授权换取 Token 失败: HTTP {err.code} {err_body}"}
+            except Exception as err:
+                return {"ok": False, "error": f"请求美客多授权接口网络异常: {err}"}
+
+            user_id = str(token_res.get("user_id") or "")
+            access_token = str(token_res.get("access_token") or "")
+            refresh_token = str(token_res.get("refresh_token") or "")
+            expires_in = int(token_res.get("expires_in") or 21600)
+            now_dt = datetime.datetime.now(datetime.timezone.utc)
+            expires_at = (now_dt + datetime.timedelta(seconds=expires_in)).isoformat()
+            now_str = now_dt.isoformat()
+
+            conn = self.auth._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO oauth_tokens (
+                        account_id, display_name, site_id, access_token_cipher,
+                        refresh_token_cipher, client_id, client_secret_cipher,
+                        expires_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id) DO UPDATE SET
+                        access_token_cipher = excluded.access_token_cipher,
+                        refresh_token_cipher = excluded.refresh_token_cipher,
+                        expires_at = excluded.expires_at,
+                        updated_at = excluded.updated_at
+                """, (
+                    user_id,
+                    f"店铺 {user_id}",
+                    "CBT",
+                    encrypt_secret(access_token),
+                    encrypt_secret(refresh_token),
+                    client_id,
+                    encrypt_secret(client_secret),
+                    expires_at,
+                    now_str,
+                ))
+                cur.execute("""
+                    INSERT INTO account_profiles (account_id, display_name, site_id, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(account_id) DO UPDATE SET
+                        updated_at = excluded.updated_at
+                """, (user_id, f"店铺 {user_id}", "CBT", now_str))
+                conn.commit()
+            finally:
+                conn.close()
+
+            return {
+                "ok": True,
+                "account": {
+                    "account_id": user_id,
+                    "store_name": f"店铺 {user_id}",
+                }
+            }
 
         # 9. Startup Refresh Status
         if route == "/api/startup-refresh/status":
@@ -601,7 +827,6 @@ class EngineBridge:
 
         # Mark group finished
         is_canc = self._group_cancel_flags.get(group_id, False)
-        status = "cancelled" if is_canc else "completed"
         stores_list = []
         any_oauth_expired = False
         expired_acc_id = None
@@ -614,10 +839,20 @@ class EngineBridge:
                 any_oauth_expired = True
                 expired_acc_id = acc_id
                 expired_store = child.get("store_name") or acc_id
+            store_failed = int(r.get("failed", 0))
+            store_success = int(r.get("success", 0))
+            if is_canc or r.get("status") == "cancelled":
+                s_status = "cancelled"
+            elif is_expired or (store_failed > 0 and store_success == 0):
+                s_status = "failed"
+            elif store_failed > 0 and store_success > 0:
+                s_status = "partial_or_failed"
+            else:
+                s_status = "completed"
             stores_list.append({
                 "account_id": acc_id,
                 "store_name": child.get("store_name") or acc_id,
-                "status": "completed",
+                "status": s_status,
                 "success": r.get("success", 0),
                 "failed": r.get("failed", 0),
                 "skipped": r.get("skipped", 0),
@@ -626,6 +861,13 @@ class EngineBridge:
                 "duration_text": r.get("duration_text", ""),
                 "oauth_expired": is_expired,
             })
+
+        if is_canc:
+            status = "cancelled"
+        elif any_oauth_expired or (total_failed > 0 and total_success == 0):
+            status = "failed"
+        else:
+            status = "completed"
 
         total_elapsed = time.time() - start_time
         if total_elapsed >= 60:

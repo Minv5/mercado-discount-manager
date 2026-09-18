@@ -150,15 +150,27 @@ class WebhookWorker:
     def _resolve_route(self, remote_user_id: str, item_id: str) -> tuple[str | None, str | None, str | None]:
         """Match remote_user_id or item_id to account_id, child_user_id, site_id."""
         accounts = self.auth.list_accounts()
-        # Direct match by parent account id
+        item_prefix = item_id[:3].upper() if len(item_id) >= 3 else ""
+
+        def find_best_site(sites: list[dict[str, Any]]) -> dict[str, Any] | None:
+            if not sites:
+                return None
+            if item_prefix:
+                for s in sites:
+                    if str(s.get("site_id") or "").upper() == item_prefix:
+                        return s
+            return sites[0]
+
+        # 1. Direct match by parent account id
         for acc in accounts:
             acc_id = acc["account_id"]
             if acc_id == remote_user_id:
                 sites = self.auth.list_sites(acc_id)
-                if sites:
-                    return acc_id, sites[0]["child_user_id"], sites[0]["site_id"]
+                best = find_best_site(sites)
+                if best:
+                    return acc_id, best["child_user_id"], best["site_id"]
 
-        # Match by child_user_id across sites
+        # 2. Match by child_user_id across sites
         for acc in accounts:
             acc_id = acc["account_id"]
             sites = self.auth.list_sites(acc_id)
@@ -166,12 +178,22 @@ class WebhookWorker:
                 if s["child_user_id"] == remote_user_id:
                     return acc_id, s["child_user_id"], s["site_id"]
 
-        # Fallback to first active account
+        # 3. Match by item_id site prefix across accounts
+        if item_prefix:
+            for acc in accounts:
+                acc_id = acc["account_id"]
+                sites = self.auth.list_sites(acc_id)
+                for s in sites:
+                    if str(s.get("site_id") or "").upper() == item_prefix:
+                        return acc_id, s["child_user_id"], s["site_id"]
+
+        # 4. Fallback to first active account
         if accounts:
             first_acc = accounts[0]["account_id"]
             sites = self.auth.list_sites(first_acc)
-            if sites:
-                return first_acc, sites[0]["child_user_id"], sites[0]["site_id"]
+            best = find_best_site(sites)
+            if best:
+                return first_acc, best["child_user_id"], best["site_id"]
 
         return None, None, None
 
