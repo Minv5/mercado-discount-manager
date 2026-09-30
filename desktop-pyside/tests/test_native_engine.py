@@ -1,4 +1,7 @@
+import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,6 +16,87 @@ from engine.pricing import calculate_deal_price, extract_item_net_proceeds
 
 
 class NativeEngineTests(unittest.TestCase):
+    _temp_dir: str | None = None
+    _prev_data_dir: str | None = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._prev_data_dir = os.environ.get("MDM_DATA_DIR")
+        cls._temp_dir = tempfile.mkdtemp(prefix="mdm_native_test_")
+        os.environ["MDM_DATA_DIR"] = cls._temp_dir
+        EngineBridge._instance = None
+
+        auth = AuthManager()
+        conn = auth._get_connection()
+        try:
+            now = "2026-09-30T00:00:00Z"
+            exp = "2099-01-01T00:00:00Z"
+            tok_cipher = encrypt_secret("test_access_token_fixture")
+            ref_cipher = encrypt_secret("test_refresh_token_fixture")
+            sec_cipher = encrypt_secret("test_client_secret_fixture")
+
+            profiles = [
+                ("2651442567", "mercadolibre", "CNHUBEISHENGRUIHESHANGM", "CBT", now, "oauth"),
+                ("3332096437", "mercadolibre", "CNGUANGZHOULINGTANGMINB", "CBT", now, "oauth"),
+                ("3408885754", "mercadolibre", "CNLIUYANGSHIZHEPINGDIAN", "CBT", now, "oauth"),
+            ]
+            for acc_id, provider, name, site_id, fetched_at, source in profiles:
+                conn.execute(
+                    "INSERT OR REPLACE INTO account_profiles (account_id, provider, display_name, site_id, fetched_at, source) VALUES (?, ?, ?, ?, ?, ?)",
+                    (acc_id, provider, name, site_id, fetched_at, source),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO oauth_tokens
+                    (provider, account_id, display_name, site_id, access_token_cipher, refresh_token_cipher,
+                     client_id, client_secret_cipher, expires_at, auth_domain, created_at, updated_at)
+                    VALUES ('mercadolibre', ?, ?, 'CBT', ?, ?, 'test_client_id', ?, ?, 'https://api.mercadolibre.com', ?, ?)
+                    """,
+                    (acc_id, name, tok_cipher, ref_cipher, sec_cipher, exp, now, now),
+                )
+
+            sites = [
+                ("2651442567", "2668033833", "MLC"),
+                ("2651442567", "2668031897", "MLB"),
+                ("2651442567", "2668034137", "MCO"),
+                ("2651442567", "2668034127", "MLM"),
+                ("2651442567", "2668033839", "MLM"),
+                ("2651442567", "3005675422", "MLA"),
+                ("2651442567", "3184159748", "MLU"),
+                ("3332096437", "3333531536", "MLM"),
+                ("3332096437", "3333531544", "MLU"),
+                ("3332096437", "3333531540", "MLA"),
+                ("3332096437", "3333531550", "MLM"),
+                ("3332096437", "3333531560", "MLB"),
+                ("3332096437", "3333531568", "MLC"),
+                ("3332096437", "3333530776", "MCO"),
+                ("3408885754", "3407224975", "MCO"),
+                ("3408885754", "3407225955", "MLC"),
+                ("3408885754", "3407225957", "MLM"),
+                ("3408885754", "3407224977", "MLA"),
+                ("3408885754", "3407225959", "MLU"),
+                ("3408885754", "3407227823", "MLM"),
+                ("3408885754", "3407227825", "MLB"),
+            ]
+            for acc_id, child_id, site_id in sites:
+                conn.execute(
+                    "INSERT OR REPLACE INTO marketplace_sites (account_id, child_user_id, site_id, updated_at) VALUES (?, ?, ?, ?)",
+                    (acc_id, child_id, site_id, now),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        EngineBridge._instance = None
+        if cls._prev_data_dir is None:
+            os.environ.pop("MDM_DATA_DIR", None)
+        else:
+            os.environ["MDM_DATA_DIR"] = cls._prev_data_dir
+        if cls._temp_dir and os.path.exists(cls._temp_dir):
+            shutil.rmtree(cls._temp_dir, ignore_errors=True)
+
     def test_crypto_roundtrip(self) -> None:
         secret = "meli_access_token_super_secret_12345"
         encrypted = encrypt_secret(secret)

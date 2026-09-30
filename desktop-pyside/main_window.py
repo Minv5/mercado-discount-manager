@@ -3367,7 +3367,7 @@ def discount_spin(value: int) -> QSpinBox:
     )
     non_text_width = probe_width - edit_rect.width()
     text_width = spin.fontMetrics().horizontalAdvance("90%")
-    spin.setFixedWidth(max(76, min(100, text_width + 8 + non_text_width)))
+    spin.setFixedWidth(max(88, min(104, text_width + 18 + non_text_width)))
     return spin
 
 

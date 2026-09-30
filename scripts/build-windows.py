@@ -105,8 +105,10 @@ def build() -> None:
 
     print("[*] Testing bundled application smoke service...")
     res = subprocess.run([str(main_exe), "--smoke-service"], capture_output=True, text=True, check=True)
-    print(f"[*] Smoke output: {res.stdout.strip()}")
-    smoke_data = json.loads(res.stdout.strip())
+    lines = [line.strip() for line in res.stdout.splitlines() if line.strip().startswith("{")]
+    smoke_line = lines[-1] if lines else res.stdout.strip()
+    print(f"[*] Smoke output: {smoke_line}")
+    smoke_data = json.loads(smoke_line)
     if not smoke_data.get("ok"):
         raise RuntimeError(f"Smoke test failed: {res.stdout}")
 

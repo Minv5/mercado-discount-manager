@@ -41,7 +41,7 @@ class ActionExecutor:
     def __init__(self, auth_manager: AuthManager | None = None, client: MercadoClient | None = None):
         self.auth = auth_manager or AuthManager()
         self.client = client or MercadoClient(self.auth)
-        self.db_path = get_data_dir() / "discount-manager.sqlite"
+        self.db_path = self.auth.db_path
 
     def _get_conn(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

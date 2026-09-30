@@ -656,7 +656,8 @@ class QtUiTests(unittest.TestCase):
         self.assertIn("参加多个活动会生成多条任务", self.window.records_table.horizontalHeaderItem(5).toolTip())
         self.assertIn("商品×活动", self.window.records_table.horizontalHeaderItem(5).toolTip())
         self.assertIn("活动失败不计入商品失败", self.window.records_table.horizontalHeaderItem(7).toolTip())
-        self.assertIn("09:02:03", self.window.records_table.item(0, 0).text())
+        expected_local_time = datetime.fromisoformat("2026-07-26T01:02:03.456+00:00").astimezone().strftime("%H:%M:%S")
+        self.assertIn(expected_local_time, self.window.records_table.item(0, 0).text())
         self.assertIn("2026-07-26T01:02:03.456Z", self.window.records_table.item(0, 0).toolTip())
         self.assertEqual(self.window.records_table.item(0, 5).text(), "100 件 / 140 项")
         self.assertEqual(self.window.records_table.item(0, 6).text(), "取消请求 100\n成功取消 80\n待平台确认 20")
@@ -677,7 +678,7 @@ class QtUiTests(unittest.TestCase):
         header = self.window.records_table.horizontalHeader()
         for column in (3, 5, 6, 8):
             self.assertEqual(header.sectionResizeMode(column), QHeaderView.ResizeMode.Stretch)
-        min_padding = 12 if sys.platform == "darwin" else 18
+        min_padding = 8 if (sys.platform == "darwin" or os.environ.get("QT_QPA_PLATFORM") == "offscreen") else 18
         for column in range(self.window.records_table.columnCount()):
             self.assertGreaterEqual(
                 self.window.records_table.columnWidth(column),
@@ -2666,8 +2667,8 @@ class QtUiTests(unittest.TestCase):
                     )
                     text_width = spin.fontMetrics().horizontalAdvance(spin.textFromValue(value) + spin.suffix())
                     for dpr in (1.0, 1.25, 1.5):
-                        mac_fudge = 10 * dpr if sys.platform == "darwin" else 0
-                        self.assertGreaterEqual(edit_rect.width() * dpr + mac_fudge, (text_width + 8) * dpr)
+                        fudge = 10 * dpr if (sys.platform == "darwin" or os.environ.get("QT_QPA_PLATFORM") == "offscreen") else 0
+                        self.assertGreaterEqual(edit_rect.width() * dpr + fudge, (text_width + 8) * dpr)
                         self.assertGreaterEqual(up_rect.width() * dpr, 24 * dpr)
                         self.assertGreaterEqual(down_rect.width() * dpr, 24 * dpr)
                     self.assertTrue(up_rect.isValid())

@@ -49,12 +49,195 @@ class AuthManager:
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path or (get_data_dir() / "discount-manager.sqlite")
         self._refresh_lock = threading.Lock()
+        self._ensure_schema()
 
     def _get_connection(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _ensure_schema(self) -> None:
+        conn = self._get_connection()
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS account_profiles (
+                    account_id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL DEFAULT 'mercadolibre',
+                    display_name TEXT NOT NULL,
+                    site_id TEXT,
+                    fetched_at TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'oauth'
+                );
+                CREATE TABLE IF NOT EXISTS oauth_tokens (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL DEFAULT 'mercadolibre',
+                    account_id TEXT NOT NULL UNIQUE,
+                    display_name TEXT,
+                    site_id TEXT,
+                    scopes TEXT,
+                    access_token_cipher TEXT NOT NULL,
+                    refresh_token_cipher TEXT,
+                    token_type TEXT,
+                    expires_at TEXT,
+                    raw_json TEXT,
+                    client_id TEXT,
+                    client_secret_cipher TEXT,
+                    redirect_uri TEXT,
+                    auth_domain TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS oauth_states (
+                    state TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    client_secret_cipher TEXT NOT NULL,
+                    redirect_uri TEXT NOT NULL,
+                    auth_domain TEXT NOT NULL,
+                    code_verifier TEXT NOT NULL,
+                    code_challenge TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    processing_state TEXT NOT NULL DEFAULT 'pending',
+                    claim_token TEXT,
+                    claimed_at TEXT,
+                    claim_expires_at TEXT,
+                    consumed_at TEXT,
+                    last_error_code TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS marketplace_sites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    child_user_id TEXT NOT NULL,
+                    site_id TEXT,
+                    logistic_type TEXT,
+                    last_promotion_status TEXT,
+                    last_promotion_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    raw_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(account_id, child_user_id)
+                );
+                CREATE TABLE IF NOT EXISTS promo_campaigns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    promotion_id TEXT NOT NULL,
+                    promotion_type TEXT NOT NULL,
+                    merchant_id TEXT,
+                    child_user_id TEXT NOT NULL DEFAULT '',
+                    site_id TEXT NOT NULL DEFAULT '',
+                    logistic_type TEXT,
+                    name TEXT,
+                    status TEXT,
+                    start_date TEXT,
+                    finish_date TEXT,
+                    raw_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type)
+                );
+                CREATE TABLE IF NOT EXISTS promo_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    promotion_id TEXT NOT NULL,
+                    promotion_type TEXT NOT NULL,
+                    child_user_id TEXT NOT NULL DEFAULT '',
+                    site_id TEXT NOT NULL DEFAULT '',
+                    logistic_type TEXT,
+                    item_id TEXT NOT NULL,
+                    status TEXT,
+                    currency_id TEXT,
+                    original_price REAL,
+                    price REAL,
+                    suggested_discounted_price REAL,
+                    min_discounted_price REAL,
+                    max_discounted_price REAL,
+                    source TEXT,
+                    raw_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type, item_id)
+                );
+                CREATE TABLE IF NOT EXISTS promo_item_fetch_states (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    child_user_id TEXT NOT NULL DEFAULT '',
+                    site_id TEXT NOT NULL DEFAULT '',
+                    promotion_id TEXT NOT NULL,
+                    promotion_type TEXT NOT NULL,
+                    item_status TEXT NOT NULL,
+                    platform_total INTEGER,
+                    saved_count INTEGER NOT NULL DEFAULT 0,
+                    detail_status TEXT NOT NULL,
+                    warning TEXT,
+                    raw_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(account_id, child_user_id, site_id, promotion_id, promotion_type, item_status)
+                );
+                CREATE TABLE IF NOT EXISTS promo_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    promotion_id TEXT NOT NULL,
+                    promotion_type TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    discount_percent REAL,
+                    direct_price REAL,
+                    status TEXT NOT NULL,
+                    total_count INTEGER NOT NULL DEFAULT 0,
+                    success_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    skipped_count INTEGER NOT NULL DEFAULT 0,
+                    empty_count INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    summary_json TEXT,
+                    execution_group_id TEXT,
+                    execution_job_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS promo_action_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL,
+                    account_id TEXT NOT NULL,
+                    promotion_id TEXT NOT NULL,
+                    promotion_type TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    deal_price REAL,
+                    top_deal_price REAL,
+                    error_cn TEXT,
+                    error_raw TEXT,
+                    response_json TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(task_id) REFERENCES promo_tasks(id)
+                );
+                CREATE TABLE IF NOT EXISTS item_price_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    child_user_id TEXT NOT NULL DEFAULT '',
+                    site_id TEXT NOT NULL DEFAULT '',
+                    item_id TEXT NOT NULL,
+                    price REAL,
+                    original_price REAL,
+                    currency_id TEXT,
+                    status TEXT,
+                    available_quantity REAL,
+                    dimensions_json TEXT,
+                    weight_json TEXT,
+                    snapshot_hash TEXT,
+                    source_revision TEXT,
+                    observed_at TEXT,
+                    change_flags_json TEXT,
+                    confirmed INTEGER NOT NULL DEFAULT 1,
+                    raw_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(account_id, child_user_id, site_id, item_id)
+                );
+            """)
+            conn.commit()
+        finally:
+            conn.close()
 
     def list_accounts(self) -> list[dict[str, Any]]:
         """List all authorized accounts with their display names and status."""
