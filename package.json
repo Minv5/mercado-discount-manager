@@ -1,15 +1,12 @@
 {
   "name": "mercado-discount-manager",
-  "version": "2.0.34",
-  "description": "美客多折扣管家 (Mercado Libre Discount Manager)",
+  "version": "2.0.35",
+  "description": "美客多活动管家 (Mercado Libre Discount Manager - Native PySide6 Desktop)",
   "private": true,
-  "type": "module",
   "scripts": {
-    "start": "node src/server.js",
-    "test": "node --test",
-    "build:mac": "./scripts/build-macos.sh"
-  },
-  "engines": {
-    "node": ">=24"
+    "start": "python desktop-pyside/app.py",
+    "test": "python -m unittest discover -s desktop-pyside/tests -p \"test_*.py\"",
+    "build:mac": "./scripts/build-macos.sh",
+    "build:win": "python scripts/build-windows.py"
   }
 }

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
 import unittest
-import json
 from pathlib import Path
 
 
@@ -13,12 +13,12 @@ from core import build_filters, execution_payload  # noqa: E402
 
 
 class ReleaseModeTests(unittest.TestCase):
-    def test_product_version_source_is_0118_and_ui_reads_artifact_metadata(self) -> None:
+    def test_product_version_source_and_ui_reads_artifact_metadata(self) -> None:
         package = json.loads((ROOT.parent / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(package["version"], "2.0.34")
+        self.assertEqual(package["version"], "2.0.35")
         window_source = (ROOT / "main_window.py").read_text(encoding="utf-8")
         self.assertIn("def product_version() -> str:", window_source)
-        self.assertIn('return "2.0.34"', window_source)
+        self.assertIn('return "2.0.35"', window_source)
 
     def test_visible_title_and_package_names_have_no_candidate_wording(self) -> None:
         window_source = (ROOT / "main_window.py").read_text(encoding="utf-8")
@@ -51,97 +51,27 @@ class ReleaseModeTests(unittest.TestCase):
         window_source = (ROOT / "main_window.py").read_text(encoding="utf-8")
         self.assertIn('commit_body["createConfirmText"] = "CREATE_SELLER_CAMPAIGN"', window_source)
 
-    def test_release_uses_verified_independent_node_staging(self) -> None:
+    def test_release_spec_uses_pure_python_engine_without_node_binary(self) -> None:
         spec_source = (ROOT / "mercado_discount_manager_pyside.spec").read_text(encoding="utf-8")
-        build_source = (ROOT / "build-release.ps1").read_text(encoding="utf-8")
         self.assertNotIn("standalone", spec_source.lower())
-        self.assertNotIn("PayloadWork", spec_source)
+        self.assertNotIn("node.exe", spec_source)
         self.assertIn("runtime-staging", spec_source)
-        self.assertIn("node-runtime.lock.json", build_source)
-        self.assertIn("SHA256", build_source)
-
-    def test_release_generates_manifest_and_product_installer(self) -> None:
-        build_source = (ROOT / "build-release.ps1").read_text(encoding="utf-8")
-        installer = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
-        self.assertIn("release-manifest.json", build_source)
-        for field in ("display_name", "version", "file_count", "total_bytes", "exe_sha256", "protocol_version", "build_fingerprint"):
-            self.assertIn(field, build_source)
-        self.assertIn("ProductVersion", build_source)
-        self.assertIn('version=str(desktop / "version_info.txt")', (ROOT / "mercado_discount_manager_pyside.spec").read_text(encoding="utf-8"))
-        self.assertIn("$ProductVersion", installer)
-        self.assertIn("manifest.version", installer)
-        self.assertIn("active", installer.lower())
-        self.assertIn("backup", installer.lower())
-        self.assertIn("rollback", installer.lower())
-        self.assertIn("--keyboard-smoke", installer)
-        self.assertIn("--smoke-service", installer)
-
-    def test_release_packages_reason_text_as_a_runtime_resource(self) -> None:
-        spec_source = (ROOT / "mercado_discount_manager_pyside.spec").read_text(encoding="utf-8")
-        build_source = (ROOT / "build-release.ps1").read_text(encoding="utf-8")
-        installer = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
         self.assertIn('reason_text.py', spec_source)
         self.assertIn('"app/desktop-pyside"', spec_source)
-        self.assertIn('_internal\\app\\desktop-pyside\\reason_text.py', build_source)
-        self.assertIn('_internal\\app\\desktop-pyside\\reason_text.py', installer)
 
-    def test_installer_defaults_to_current_user_start_menu_without_desktop_policy(self) -> None:
-        installer = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
-        self.assertIn("GetFolderPath('Programs')", installer)
-        self.assertNotIn("GetFolderPath('Desktop')", installer)
-        self.assertNotIn("DesktopDirectory", installer)
-        self.assertIn("0x6D3B,0x52A8,0x7BA1,0x5BB6", installer)
-        self.assertIn("Remove-LegacyStartMenuShortcut", installer)
-
-    def test_installer_resolves_default_candidate_after_script_root_is_available(self) -> None:
-        installer = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
-        self.assertRegex(installer, r"\[string\]\$CandidateRoot\s*=\s*\$null")
-        self.assertIn("if ([string]::IsNullOrWhiteSpace($CandidateRoot))", installer)
-
-    def test_installer_blocks_active_submission_prepare_as_well_as_jobs_and_groups(self) -> None:
-        installer = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
-        self.assertIn("/api/execution/submissions/active", installer)
-        self.assertIn("$activeSubmission.active", installer)
-
-    def test_release_json_is_bom_free_and_installer_keeps_current_backup_by_identity(self) -> None:
-        build_source = (ROOT / "build-release.ps1").read_text(encoding="utf-8")
-        installer = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
-        contract = (ROOT.parent / "src" / "productContract.js").read_text(encoding="utf-8")
-        self.assertIn("UTF8Encoding]::new($false)", build_source)
-        self.assertIn("replace(/^\\uFEFF/", contract)
-        self.assertIn("$_.FullName -ne $backup", installer)
-        self.assertNotIn("Sort-Object LastWriteTime -Descending", installer)
-        self.assertIn("Copy-Item -LiteralPath $backup -Destination $install -Recurse", installer)
-
-    def test_release_protocol_comes_from_product_contract(self) -> None:
-        build_source = (ROOT / "build-release.ps1").read_text(encoding="utf-8")
-        installer = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
-        for source in (build_source, installer):
-            self.assertIn("src\\productContract.js", source)
-            self.assertIn("PROTOCOL_VERSION", source)
-            self.assertNotRegex(source, r"\$ProtocolVersion\s*=\s*['\"]\d+['\"]")
-
-    def test_release_filters_workspace_runtime_dlls_and_rejects_unversioned_icu(self) -> None:
-        source = (ROOT / "build-release.ps1").read_text(encoding="utf-8")
-        self.assertIn("codex-runtimes", source)
-        self.assertIn("ForbiddenUnversionedIcu", source)
-        self.assertIn("icuuc.dll", source)
-        self.assertIn("conflicting unversioned ICU runtime", source)
-
-    def test_hidden_smoke_has_a_hard_timeout_and_process_cleanup(self) -> None:
-        source = (ROOT / "install-release.ps1").read_text(encoding="utf-8")
-        self.assertIn("WaitForExit(30000)", source)
-        self.assertIn("smoke timed out after 30 seconds", source)
-        self.assertIn("Stop-Process -Id $process.Id -Force", source)
-
-    def test_validation_defaults_to_pyside_and_legacy_is_explicit(self) -> None:
-        validate = (ROOT.parent / "scripts" / "validate.ps1").read_text(encoding="utf-8")
-        self.assertIn("[string]$PackageTarget = 'PySide'", validate)
-        self.assertIn("'Legacy'", validate)
-        self.assertNotIn("[string]$PackageTarget = 'Standalone'", validate)
-        legacy_gate = validate.index("if ($PackageTarget -in @('Legacy','Both'))")
-        dotnet_build = validate.index("standalone\\MercadoDiscountManager.Standalone.csproj")
-        self.assertLess(legacy_gate, dotnet_build)
+    def test_cross_platform_build_scripts_and_github_workflow_exist(self) -> None:
+        build_mac = (ROOT.parent / "scripts" / "build-macos.py").read_text(encoding="utf-8")
+        build_win = (ROOT.parent / "scripts" / "build-windows.py").read_text(encoding="utf-8")
+        workflow = (ROOT.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        for script_src in (build_mac, build_win):
+            self.assertIn("release-manifest.json", script_src)
+            self.assertIn("--smoke-service", script_src)
+            for field in ("display_name", "version", "file_count", "total_bytes", "exe_sha256", "protocol_version", "build_fingerprint"):
+                self.assertIn(field, script_src)
+        self.assertIn("windows-latest", workflow)
+        self.assertIn("macos-latest", workflow)
+        self.assertIn("scripts/build-windows.py", workflow)
+        self.assertIn("scripts/build-macos.py", workflow)
 
 
 if __name__ == "__main__":

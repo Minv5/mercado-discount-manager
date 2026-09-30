@@ -5,14 +5,10 @@ import sys
 desktop = Path(SPECPATH)
 project = desktop.parent
 
-node_name = "node.exe" if sys.platform == "win32" else "node"
-node_staged = desktop / "runtime-staging" / "node" / node_name
-
 datas = [
     (str(desktop / "assets"), "assets"),
     (str(desktop / "runtime-staging" / "app"), "app"),
     (str(desktop / "reason_text.py"), "app/desktop-pyside"),
-    (str(node_staged), "node"),
 ]
 
 a = Analysis(
@@ -75,8 +71,8 @@ if sys.platform == "darwin":
             "CFBundleName": "美客多活动管家",
             "CFBundleDisplayName": "美客多活动管家",
             "CFBundleIdentifier": "com.mercadodiscountmanager.app",
-            "CFBundleVersion": "2.0.34",
-            "CFBundleShortVersionString": "2.0.34",
+            "CFBundleVersion": "2.0.35",
+            "CFBundleShortVersionString": "2.0.35",
             "NSHighResolutionCapable": True,
             "NSRequiresAquaSystemAppearance": False,
             "LSMinimumSystemVersion": "12.0",

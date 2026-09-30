@@ -1,0 +1,121 @@
+name: Build & Publish Desktop Releases (Windows & macOS)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Unit Tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m unittest discover -s desktop-pyside/tests -p "test_*.py"
+
+      - name: Build Windows Executable & Archive
+        run: |
+          python scripts/build-windows.py
+
+      - name: Upload Windows Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-zip
+          path: dist-win/*.zip
+
+  build-macos:
+    name: Build macOS (arm64)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Unit Tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m unittest discover -s desktop-pyside/tests -p "test_*.py"
+
+      - name: Build macOS App Bundle & Archive
+        env:
+          CI: "true"
+        run: |
+          python scripts/build-macos.py --zip
+
+      - name: Upload macOS Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-zip
+          path: dist-mac/*.zip
+
+  publish-release:
+    name: Publish to GitHub Releases
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Read Version from package.json
+        id: pkg
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pkg.outputs.tag }}
+          name: "美客多活动管家 ${{ steps.pkg.outputs.tag }}"
+          body: |
+            ## 美客多活动管家 ${{ steps.pkg.outputs.tag }}（Windows / macOS 免安装版）
+            
+            ### 📥 下载与使用说明
+            - **Windows 用户**：下载 `美客多活动管家-Windows-x64-${{ steps.pkg.outputs.tag }}.zip`，解压后直接双击文件夹内的 **`美客多活动管家.exe`** 即可运行（无需安装 Python）。
+            - **macOS 用户**：下载 `美客多活动管家-macOS-arm64-${{ steps.pkg.outputs.tag }}.zip`，解压后将 **`美客多活动管家.app`** 拖入应用程序即可运行。
+          files: release-assets/*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
