@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import calendar
 import json
+import subprocess
+import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -1927,3 +1929,78 @@ def target_label(target: dict[str, Any]) -> str:
     store = str(target.get("store_name") or target.get("storeName") or "当前店铺")
     site = str(target.get("site_name") or target.get("siteName") or site_name(target_site_id(target)))
     return f"{store} / {site}"
+
+
+def execute_system_shutdown() -> None:
+    """Execute graceful system shutdown across macOS, Windows and Linux."""
+    if sys.platform == "darwin":
+        subprocess.run(["osascript", "-e", 'tell application "System Events" to shut down'], check=False)
+    elif sys.platform == "win32":
+        subprocess.run(["shutdown.exe", "/s", "/t", "0"], check=False)
+    else:
+        subprocess.run(["shutdown", "-h", "now"], check=False)
+
+
+class AutoShutdownCountdownDialog(QDialog):
+    def __init__(self, seconds: int = 60, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("执行完自动关机")
+        self.setFixedSize(380, 170)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        self.remaining_seconds = seconds
+        self.cancelled = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        self.title_label = QLabel("任务已全部完成！")
+        self.title_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #1f2937;")
+        layout.addWidget(self.title_label)
+
+        self.message_label = QLabel(f"系统将在 {self.remaining_seconds} 秒后自动关机...")
+        self.message_label.setStyleSheet("font-size: 13px; color: #4b5563;")
+        layout.addWidget(self.message_label)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+        btn_layout.addStretch()
+
+        self.cancel_btn = QPushButton("取消关机")
+        self.cancel_btn.clicked.connect(self._on_cancel)
+        btn_layout.addWidget(self.cancel_btn)
+
+        self.shutdown_now_btn = QPushButton("立即关机")
+        self.shutdown_now_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold;")
+        self.shutdown_now_btn.clicked.connect(self._on_shutdown_now)
+        btn_layout.addWidget(self.shutdown_now_btn)
+
+        layout.addLayout(btn_layout)
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self._on_tick)
+        self.timer.start()
+
+    def _on_tick(self) -> None:
+        self.remaining_seconds -= 1
+        if self.remaining_seconds <= 0:
+            self.timer.stop()
+            self.accept()
+        else:
+            self.message_label.setText(f"系统将在 {self.remaining_seconds} 秒后自动关机...")
+
+    def _on_cancel(self) -> None:
+        self.cancelled = True
+        self.timer.stop()
+        self.reject()
+
+    def _on_shutdown_now(self) -> None:
+        self.timer.stop()
+        self.accept()
+
+    def closeEvent(self, event) -> None:
+        self.cancelled = True
+        self.timer.stop()
+        super().closeEvent(event)
+

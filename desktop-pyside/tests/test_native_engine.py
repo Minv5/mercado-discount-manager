@@ -67,7 +67,7 @@ class NativeEngineTests(unittest.TestCase):
         self.assertAlmostEqual(res.shipping_cost, 6.97, places=2)
         self.assertAlmostEqual(res.final_net_at_deal, 10.26, places=2)
 
-    def test_pricing_hard_skip_when_platform_demand_exceeds_limit(self) -> None:
+    def test_pricing_does_not_locally_block_when_platform_demand_lower(self) -> None:
         item = {
             "id": "MLM3071064725",
             "price": 21.96,
@@ -82,17 +82,18 @@ class NativeEngineTests(unittest.TestCase):
             },
         }
         info = extract_item_net_proceeds(item)
-        # Target deal price is ~17.36. If platform demands max 16.00, it must be skipped!
+        # Target deal price is ~17.36. Platform metadata requires max 16.00.
+        # Strict rule: Software must NOT locally intercept or pre-filter; directly submit to platform API!
         res = calculate_deal_price(info, 25.0, {"max_discounted_price": 16.00})
-        self.assertFalse(res.eligible)
-        self.assertIn("低于净回款保护售价", res.skip_reason)
+        self.assertTrue(res.eligible)
+        self.assertIsNone(res.skip_reason)
 
     def test_bridge_dispatches_in_memory_routes(self) -> None:
         bridge = EngineBridge()
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.19")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.34")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -225,7 +226,7 @@ class NativeEngineTests(unittest.TestCase):
             self.assertEqual(ctx.exception.account_id, "2651442567")
             self.assertIn("授权已失效或在后台被解除", str(ctx.exception))
 
-    def test_pricing_top_deal_price_limit_guard(self) -> None:
+    def test_pricing_top_deal_price_does_not_locally_block(self) -> None:
         item = {
             "id": "MLM111",
             "price": 20.0,
@@ -234,8 +235,8 @@ class NativeEngineTests(unittest.TestCase):
         }
         info = extract_item_net_proceeds(item)
         res = calculate_deal_price(info, 20.0, {"top_deal_price": 15.00})
-        self.assertFalse(res.eligible)
-        self.assertIn("平台要求限价", res.skip_reason)
+        self.assertTrue(res.eligible)
+        self.assertIsNone(res.skip_reason)
 
     def test_pricing_suggested_price_does_not_block_enrollment(self) -> None:
         item = {
@@ -331,6 +332,8 @@ class NativeEngineTests(unittest.TestCase):
 
         executor = ActionExecutor(mock_auth, mock_client)
         executor._get_store_alias = MagicMock(return_value="测试店铺")
+        executor._init_task_record = MagicMock(return_value=None)
+        executor._checkpoint_task = MagicMock()
         executor._record_task = MagicMock()
 
         filters = {"excludeSeller": True}
@@ -371,6 +374,8 @@ class NativeEngineTests(unittest.TestCase):
 
         executor = ActionExecutor(mock_auth, mock_client)
         executor._get_store_alias = MagicMock(return_value="测试店铺")
+        executor._init_task_record = MagicMock(return_value=None)
+        executor._checkpoint_task = MagicMock()
         executor._record_task = MagicMock()
 
         res = executor.run_execution(
@@ -407,8 +412,29 @@ class NativeEngineTests(unittest.TestCase):
         self.assertEqual(c_uid2, "child_mlm")
         self.assertEqual(site2, "MLM")
 
+    def test_webhook_worker_extract_item_id_and_pop_logs(self) -> None:
+        from unittest.mock import MagicMock
+        from engine.webhook_worker import WebhookWorker
+        worker = WebhookWorker(MagicMock(), MagicMock())
+        self.assertEqual(worker._extract_item_id("/marketplace/items/MLC4393139538"), "MLC4393139538")
+        self.assertEqual(worker._extract_item_id("/items/CBT4704373846"), "CBT4704373846")
+        self.assertEqual(
+            worker._extract_item_id("/marketplace/seller-promotions/promotions/candidate/CANDIDATE-MLB4977530443-77310235931/3333531560"),
+            "MLB4977530443",
+        )
+        self.assertIsNone(worker._extract_item_id("/orders/12345"))
+
+        worker.log("测试日志1")
+        worker.log("测试日志2")
+        logs = worker.pop_logs()
+        self.assertEqual(len(logs), 2)
+        self.assertIn("测试日志1", logs[0])
+        self.assertEqual(len(worker.pop_logs()), 0)
+
     def test_bridge_targeted_refresh_and_item_status_and_oauth_start(self) -> None:
+        from unittest.mock import MagicMock
         bridge = EngineBridge()
+        bridge.client.get_item_detail = MagicMock(return_value={"id": "MLM12345", "price": 19.99})
         status_res = bridge.handle_request("GET", "/api/items/MLM12345/status")
         self.assertTrue(status_res["ok"])
         self.assertEqual(status_res["item_id"], "MLM12345")
@@ -422,7 +448,593 @@ class NativeEngineTests(unittest.TestCase):
         self.assertIn("auth.mercadolibre.com.mx", oauth_start["authorizationUrl"])
         self.assertIn("test_app_id", oauth_start["authorizationUrl"])
 
+    def test_client_per_account_semaphore_isolation(self) -> None:
+        from engine.client import MercadoClient
+        client = MercadoClient(max_concurrency=10)
+        sem1 = client._get_semaphore("account_1")
+        sem2 = client._get_semaphore("account_2")
+        self.assertIsNot(sem1, sem2)
+        sem1.acquire()
+        self.assertTrue(sem2.acquire(blocking=False))
+        sem2.release()
+        sem1.release()
+
+    def test_https_connection_pool_reuses_connection(self) -> None:
+        from engine.client import HTTPSConnectionPool
+        import http.client
+        pool = HTTPSConnectionPool(max_size=2)
+        conn1 = pool.get_connection()
+        self.assertIsInstance(conn1, http.client.HTTPSConnection)
+        pool.release_connection(conn1, close=False)
+        conn2 = pool.get_connection()
+        self.assertIs(conn1, conn2)
+        pool.release_connection(conn2, close=True)
+
+    def test_executor_item_detail_cache_avoids_duplicate_requests(self) -> None:
+        from unittest.mock import MagicMock
+        from engine.executor import ActionExecutor
+        mock_auth = MagicMock()
+        mock_auth.list_sites.return_value = [{"site_id": "MLM", "child_user_id": "c_mlm"}]
+        mock_client = MagicMock()
+        mock_client.get_seller_promotions.return_value = [
+            {"id": "PROMO_A", "status": "active", "type": "DEAL", "name": "促A"},
+            {"id": "PROMO_B", "status": "active", "type": "DEAL", "name": "促B"},
+        ]
+        # Same item appears in both promotions!
+        mock_client.get_promotion_items.side_effect = [
+            [{"id": "MLM_SAME", "price": 10.0}],
+            [{"id": "MLM_SAME", "price": 10.0}],
+        ]
+        mock_client.get_item_detail.return_value = {
+            "id": "MLM_SAME",
+            "price": 10.0,
+            "currency_id": "USD",
+            "net_proceeds": {"amount": 8.0, "additional_concepts": []},
+        }
+
+        executor = ActionExecutor(mock_auth, mock_client)
+        executor._get_store_alias = MagicMock(return_value="测试店铺")
+        executor._init_task_record = MagicMock(return_value=999)
+        executor._checkpoint_task = MagicMock()
+        executor._record_task = MagicMock()
+
+        res = executor.run_execution(
+            account_id="2651442567",
+            site_id="MLM",
+            mode="enroll",
+            seller_discount=20.0,
+            official_discount=20.0,
+        )
+
+        # Even though item appeared in two promotions, get_item_detail was only fetched once!
+        self.assertEqual(mock_client.get_item_detail.call_count, 1)
+        self.assertEqual(executor._init_task_record.call_count, 1)
+        self.assertGreaterEqual(executor._checkpoint_task.call_count, 1)
+        self.assertEqual(executor._record_task.call_count, 1)
+
+    def test_bridge_user_logs_capped_at_rolling_buffer(self) -> None:
+        from engine.bridge import EngineBridge
+        bridge = EngineBridge()
+        # Mock group with a child
+        group_id = "grp_test_buffer"
+        bridge._groups[group_id] = {
+            "id": group_id,
+            "status": "running",
+            "children": [{
+                "id": "job_acc1",
+                "account_id": "acc1",
+                "user_logs": [{"id": f"log_{i}", "message": f"msg {i}"} for i in range(250)],
+            }],
+        }
+        res = bridge.handle_request("GET", f"/api/execution/groups/{group_id}")
+        self.assertTrue(res["ok"])
+
+    def test_webhook_worker_strict_account_routing_rejects_external_stores(self) -> None:
+        from engine.webhook_worker import WebhookWorker
+        worker = WebhookWorker()
+
+        # 1. External account that does not match local parent or child store IDs
+        acc_id, child_id, site_id = worker._resolve_route("3560797046", "MLM3227815447")
+        self.assertIsNone(acc_id)
+        self.assertIsNone(child_id)
+        self.assertIsNone(site_id)
+
+        # 2. Known local parent account resolves correctly
+        acc_id, child_id, site_id = worker._resolve_route("2651442567", "MLM123456")
+        self.assertEqual(acc_id, "2651442567")
+        self.assertEqual(site_id, "MLM")
+        self.assertIn(child_id, ["2668034127", "2668033839"])
+
+    def test_webhook_worker_handles_404_deleted_item_gracefully(self) -> None:
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker.client.get_item_detail.side_effect = RuntimeError("美客多 API 报错 (404): Item with id MLB123 not found")
+        worker._ack_event = MagicMock()
+
+        event = {
+            "event_id": "test_evt_404",
+            "lease_id": "test_lease_404",
+            "topic": "items",
+            "resource": "/marketplace/items/MLB123",
+            "user_id": "2651442567",
+        }
+
+        worker._process_single_event(event)
+        worker._ack_event.assert_called_once_with("test_evt_404", "test_lease_404", ok=True)
+        # 404 is now completely silent (Silent ACK, zero log pollution)
+        self.assertEqual(len(worker._logs), 0)
+        self.assertNotIn("MLB123", worker._price_cache)
+
+    def test_webhook_worker_handles_closed_item_gracefully(self) -> None:
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker.client.get_item_detail.return_value = {"id": "MLB123", "status": "closed"}
+        worker._ack_event = MagicMock()
+
+        event = {
+            "event_id": "test_evt_closed",
+            "lease_id": "test_lease_closed",
+            "topic": "items",
+            "resource": "/marketplace/items/MLB123",
+            "user_id": "2651442567",
+        }
+
+        worker._process_single_event(event)
+        worker._ack_event.assert_called_once_with("test_evt_closed", "test_lease_closed", ok=True)
+        # Closed items are now completely silent (Silent ACK)
+        self.assertEqual(len(worker._logs), 0)
+
+    def test_webhook_worker_fast_bypasses_candidates_and_offers(self) -> None:
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker._ack_event = MagicMock()
+
+        for topic in ["public_candidates", "public_offers"]:
+            event = {
+                "event_id": f"evt_{topic}",
+                "lease_id": f"lease_{topic}",
+                "topic": topic,
+                "resource": "/marketplace/seller-promotions/promotions/candidate/123",
+                "user_id": "2651442567",
+            }
+            worker._process_single_event(event)
+            worker._ack_event.assert_called_with(f"evt_{topic}", f"lease_{topic}", ok=True)
+            # Must NOT invoke Mercado API for candidate/offer broadcasts
+            worker.client.get_item_detail.assert_not_called()
+            self.assertEqual(len(worker._logs), 0)
+
+    def test_webhook_worker_silent_ack_when_price_unchanged(self) -> None:
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker.client.get_item_detail.return_value = {
+            "id": "MLB123",
+            "status": "active",
+            "price": 100.0,
+            "shipping": {"free_shipping": False},
+        }
+        worker._ack_event = MagicMock()
+        worker._price_cache["MLB123"] = 100.0
+
+        event = {
+            "event_id": "test_evt_stock",
+            "lease_id": "test_lease_stock",
+            "topic": "items",
+            "resource": "/marketplace/items/MLB123",
+            "user_id": "2651442567",
+        }
+
+        worker._process_single_event(event)
+        worker._ack_event.assert_called_once_with("test_evt_stock", "test_lease_stock", ok=True)
+        # Price hasn't changed, so no recalculation logs
+        self.assertEqual(len(worker._logs), 0)
+
+    def test_webhook_worker_cold_start_initializes_cache_without_touching_promotions(self) -> None:
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker.client.get_item_detail.return_value = {
+            "id": "MLB123",
+            "status": "active",
+            "price": 100.0,
+            "shipping": {"free_shipping": False},
+        }
+        worker._ack_event = MagicMock()
+        # Empty cache simulates cold start
+        self.assertNotIn("MLB123", worker._price_cache)
+
+        event = {
+            "event_id": "test_evt_cold",
+            "lease_id": "test_lease_cold",
+            "topic": "items",
+            "resource": "/marketplace/items/MLB123",
+            "user_id": "2651442567",
+        }
+
+        worker._process_single_event(event)
+        worker._ack_event.assert_called_once_with("test_evt_cold", "test_lease_cold", ok=True)
+        # Baseline cached
+        self.assertEqual(worker._price_cache["MLB123"], 100.0)
+        # Absolutely NO promo cancellation or enrollment
+        worker.client.cancel_promotion_item.assert_not_called()
+        worker.client.enroll_promotion_item.assert_not_called()
+        self.assertEqual(len(worker._logs), 0)
+
+    def test_webhook_worker_detects_price_diff_and_cancels_all_promotions_without_re_enroll(self) -> None:
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker.client.get_item_detail.return_value = {
+            "id": "MLB123",
+            "status": "active",
+            "price": 80.0,
+            "shipping": {"free_shipping": False},
+        }
+        # Simulate active promo returned
+        worker.client.request.return_value = [{"id": "PROMO_999", "type": "DEAL", "status": "started"}]
+        worker._ack_event = MagicMock()
+        worker._price_cache["MLB123"] = 100.0
+
+        event = {
+            "event_id": "test_evt_price_change",
+            "lease_id": "test_lease_price_change",
+            "topic": "items",
+            "resource": "/marketplace/items/MLB123",
+            "user_id": "2651442567",
+        }
+
+        worker._process_single_event(event)
+        worker._ack_event.assert_called_once_with("test_evt_price_change", "test_lease_price_change", ok=True)
+        # Verify cancel called
+        worker.client.cancel_promotion_item.assert_called_once()
+        # Strictly verify re-enroll is NEVER called
+        worker.client.enroll_promotion_item.assert_not_called()
+        self.assertTrue(any("售价变动 ($100.00 -> $80.00)" in line for line in worker._logs))
+        self.assertTrue(any("已退出活动 PROMO_999" in line for line in worker._logs))
+        self.assertEqual(worker._price_cache["MLB123"], 80.0)
+
+    def test_client_default_concurrency_is_18(self) -> None:
+        from engine.client import MercadoClient
+        client = MercadoClient()
+        self.assertEqual(client.max_concurrency_per_account, 18)
+        sem = client._get_semaphore("test_acc")
+        self.assertEqual(sem._value, 18)
+
+
+    def test_executor_empty_promotions_log_distinguishes_action(self) -> None:
+        from engine.executor import ActionExecutor
+        from unittest.mock import MagicMock
+        executor = ActionExecutor()
+        executor.client = MagicMock()
+        executor.auth = MagicMock()
+        executor._init_task_record = MagicMock(return_value=9999)
+        executor._checkpoint_task = MagicMock()
+        executor._record_task = MagicMock()
+        executor.auth.list_sites.return_value = [
+            {"site_id": "MLM", "child_user_id": "3333531536"},
+        ]
+        executor.client.get_seller_promotions.return_value = []
+        logs = []
+
+        # 1. Action = cancel
+        executor.run_execution(
+            account_id="test_acc",
+            site_id="MLM",
+            mode="批量取消",
+            seller_discount=0,
+            official_discount=0,
+            on_log=logs.append,
+            target_item_ids=["ITEM1"],
+        )
+        self.assertTrue(any("当前无活动需要退出" in msg and "子账号: 3333531536" in msg for msg in logs))
+        self.assertFalse(any("暂无可报活动" in msg for msg in logs))
+
+        # 2. Action = enroll
+        logs.clear()
+        executor.run_execution(
+            account_id="test_acc",
+            site_id="MLM",
+            mode="批量提报",
+            seller_discount=10,
+            official_discount=10,
+            on_log=logs.append,
+            target_item_ids=["ITEM1"],
+        )
+        self.assertTrue(any("暂无可报活动" in msg and "子账号: 3333531536" in msg for msg in logs))
+        self.assertFalse(any("当前无活动需要退出" in msg for msg in logs))
+
+    def test_webhook_worker_detects_in_promo_breakdown_inconsistency_without_prior_cache(self) -> None:
+        """Real case MLB7269271374: item modified during promo, original_price locked at 14.94 while breakdown is 27.43."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker.client.get_item_detail.return_value = {
+            "id": "MLB7269271374",
+            "site_id": "MLB",
+            "seller_id": 3407227825,
+            "status": "active",
+            "price": 11.51,
+            "original_price": 14.94,
+            "net_proceeds": {
+                "amount": 14.60,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 9.40},
+                    {"id": "sale_fee", "amount": 3.43},
+                ],
+                "currency_id": "USD",
+            },
+        }
+        worker.client.request.return_value = [
+            {"id": "C-MLB5402231", "type": "SELLER_CAMPAIGN", "status": "started"},
+            {"id": "P-MLB18049186", "type": "DEAL", "status": "started"},
+            {"id": "P-MLB18061082", "type": "DEAL", "status": "pending"},
+        ]
+        worker._ack_event = MagicMock()
+        # Even with empty _price_cache (first notification after restart), must detect and cancel all 3 promos!
+        self.assertNotIn("MLB7269271374", worker._price_cache)
+
+        event = {
+            "event_id": "evt_mlb_inconsistent",
+            "lease_id": "lease_mlb_inconsistent",
+            "topic": "marketplace_items",
+            "resource": "/marketplace/items/MLB7269271374",
+            "remote_user_id": "3408885754",
+        }
+        worker._process_single_event(event)
+        worker._ack_event.assert_called_once_with("evt_mlb_inconsistent", "lease_mlb_inconsistent", ok=True)
+        self.assertEqual(worker.client.cancel_promotion_item.call_count, 3)
+
+    def test_webhook_worker_expands_cbt_parent_item_to_site_children(self) -> None:
+        """Real case CBT3819274457: parent item notification fans out to MLB7269271374 and MLM5826739672."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+
+        def fake_detail(acc_id: str, iid: str):
+            if iid == "CBT3819274457":
+                return {
+                    "id": "CBT3819274457",
+                    "site_id": "CBT",
+                    "marketplace_items": [
+                        {"item_id": "MLB7269271374", "user_id": 3407227825, "site_id": "MLB"},
+                        {"item_id": "MLM5826739672", "user_id": 3407227823, "site_id": "MLM"},
+                    ],
+                }
+            if iid == "MLB7269271374":
+                return {
+                    "id": "MLB7269271374",
+                    "site_id": "MLB",
+                    "seller_id": 3407227825,
+                    "status": "active",
+                    "price": 11.51,
+                    "original_price": 14.94,
+                    "net_proceeds": {
+                        "amount": 14.60,
+                        "additional_concepts": [
+                            {"id": "shipping_cost", "amount": 9.40},
+                            {"id": "sale_fee", "amount": 3.43},
+                        ],
+                    },
+                }
+            return {
+                "id": "MLM5826739672",
+                "site_id": "MLM",
+                "seller_id": 3407227823,
+                "status": "active",
+                "price": 11.72,
+                "original_price": 15.21,
+                "net_proceeds": {
+                    "amount": 14.60,
+                    "additional_concepts": [
+                        {"id": "shipping_cost", "amount": 7.00},
+                        {"id": "sale_fee", "amount": 3.96},
+                    ],
+                },
+            }
+
+        worker.client.get_item_detail.side_effect = fake_detail
+        worker.client.request.return_value = [{"id": "C-PROMO1", "type": "SELLER_CAMPAIGN", "status": "started"}]
+        worker._ack_event = MagicMock()
+
+        event = {
+            "event_id": "evt_cbt_fanout",
+            "lease_id": "lease_cbt_fanout",
+            "topic": "items",
+            "resource": "/items/CBT3819274457",
+            "remote_user_id": "3408885754",
+        }
+        worker._process_single_event(event)
+        worker._ack_event.assert_called_once_with("evt_cbt_fanout", "lease_cbt_fanout", ok=True)
+        self.assertEqual(worker.client.cancel_promotion_item.call_count, 2)
+
+    def test_webhook_worker_system1_platform_shipping_change_re_enrolls(self) -> None:
+        """System 1 item: seller net_proceeds (15.13) unchanged, only platform shipping_cost increased -> exit and re-enroll at discount."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        # Cached net_proceeds is 15.13, old total price was 25.83
+        worker._price_cache["MLM6192859628"] = 25.83
+        worker._net_cache["MLM6192859628"] = 15.13
+
+        worker.client.get_item_detail.return_value = {
+            "id": "MLM6192859628",
+            "site_id": "MLM",
+            "seller_id": 3407227823,
+            "status": "active",
+            "price": 19.62,
+            "original_price": 25.83,
+            "net_proceeds": {
+                "amount": 15.13,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 7.70},
+                    {"id": "sale_fee", "amount": 4.19},
+                ],
+                "currency_id": "USD",
+            },
+        }
+        worker.client.request.return_value = [
+            {"id": "C-MLM1477572", "type": "SELLER_CAMPAIGN", "status": "started"}
+        ]
+        worker._ack_event = MagicMock()
+
+        event = {
+            "event_id": "evt_sys1_ship",
+            "lease_id": "lease_sys1_ship",
+            "topic": "marketplace_items",
+            "resource": "/marketplace/items/MLM6192859628",
+            "remote_user_id": "3408885754",
+        }
+        worker._process_single_event(event)
+        worker._ack_event.assert_called_once_with("evt_sys1_ship", "lease_sys1_ship", ok=True)
+        worker.client.cancel_promotion_item.assert_called_once()
+        worker.client.enroll_promotion_item.assert_called_once()
+        self.assertTrue(any("已按新运费继续报回活动 C-MLM1477572" in line for line in worker._logs))
+
+    def test_webhook_worker_system2_unenrolled_item_never_enrolls_on_shipping_change(self) -> None:
+        """System 2 / newly uploaded 155% item (original_price=None): platform shipping change never triggers enrollment."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker._price_cache["MLB_NEW_155"] = 25.00
+        worker._net_cache["MLB_NEW_155"] = 14.60
+
+        worker.client.get_item_detail.return_value = {
+            "id": "MLB_NEW_155",
+            "site_id": "MLB",
+            "seller_id": 3407227825,
+            "status": "active",
+            "price": 26.20,
+            "original_price": None,
+            "net_proceeds": {
+                "amount": 14.60,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 8.20},
+                    {"id": "sale_fee", "amount": 3.40},
+                ],
+                "currency_id": "USD",
+            },
+        }
+        worker._ack_event = MagicMock()
+
+        event = {
+            "event_id": "evt_sys2_ship",
+            "lease_id": "lease_sys2_ship",
+            "topic": "marketplace_items",
+            "resource": "/marketplace/items/MLB_NEW_155",
+            "remote_user_id": "3408885754",
+        }
+        worker._process_single_event(event)
+        worker._ack_event.assert_called_once_with("evt_sys2_ship", "lease_sys2_ship", ok=True)
+        worker.client.cancel_promotion_item.assert_not_called()
+        worker.client.enroll_promotion_item.assert_not_called()
+        self.assertEqual(len(worker._logs), 0)
+
+    def test_webhook_worker_cbt_cascade_system2_exit_across_sites(self) -> None:
+        """When one child item under a CBT parent triggers System 2 exit, all sibling sites under the same CBT also exit promotions."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker._price_cache["MLB111111"] = 14.02
+        worker._net_cache["MLB111111"] = 10.40
+
+        def fake_get_item_detail(acc_id: str, item_id: str) -> dict:
+            if item_id == "MLB111111":
+                return {
+                    "id": "MLB111111",
+                    "cbt_item_id": "CBT999888",
+                    "site_id": "MLB",
+                    "seller_id": 3407227825,
+                    "status": "active",
+                    "price": 29.63,
+                    "original_price": None,
+                    "net_proceeds": {
+                        "amount": 19.33,
+                        "additional_concepts": [
+                            {"id": "shipping_cost", "amount": 6.00},
+                            {"id": "sale_fee", "amount": 4.30},
+                        ],
+                        "currency_id": "USD",
+                    },
+                }
+            if item_id == "CBT999888":
+                return {
+                    "id": "CBT999888",
+                    "marketplace_items": [
+                        {"item_id": "MLB111111", "user_id": 3407227825, "site_id": "MLB"},
+                        {"item_id": "MLM222222", "user_id": 3407227823, "site_id": "MLM"},
+                    ],
+                }
+            if item_id == "MLM222222":
+                return {
+                    "id": "MLM222222",
+                    "cbt_item_id": "CBT999888",
+                    "site_id": "MLM",
+                    "seller_id": 3407227823,
+                    "status": "active",
+                    "price": 8.04,
+                    "original_price": 10.40,
+                    "net_proceeds": {
+                        "amount": 6.75,
+                        "additional_concepts": [
+                            {"id": "shipping_cost", "amount": 2.25},
+                            {"id": "sale_fee", "amount": 1.40},
+                        ],
+                        "currency_id": "USD",
+                    },
+                }
+            return {}
+
+        worker.client.get_item_detail.side_effect = fake_get_item_detail
+
+        def fake_request(acc_id: str, method: str, path: str, params: dict | None = None) -> list:
+            if "MLM222222" in path:
+                return [{"id": "P-MLM17611046", "type": "DEAL", "status": "started"}]
+            return []
+
+        worker.client.request.side_effect = fake_request
+        worker._ack_event = MagicMock()
+
+        event = {
+            "event_id": "evt_cbt_cascade",
+            "lease_id": "lease_cbt_cascade",
+            "topic": "marketplace_items",
+            "resource": "/marketplace/items/MLB111111",
+            "remote_user_id": "3408885754",
+        }
+        worker._process_single_event(event)
+        worker._ack_event.assert_called_once_with("evt_cbt_cascade", "lease_cbt_cascade", ok=True)
+        worker.client.cancel_promotion_item.assert_called_once_with(
+            "3408885754", "3407227823", "MLM222222", "P-MLM17611046", "DEAL"
+        )
+        self.assertTrue(any("因同父商品 CBT999888 数据变动，已联动退出活动 P-MLM17611046" in line for line in worker._logs))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

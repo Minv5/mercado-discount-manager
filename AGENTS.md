@@ -3,13 +3,13 @@
 ## 1. 全局规则引用
 
 <!-- CODEX-MANAGED:global-reference:BEGIN -->
-本项目遵守 Codex App 全局自定义指令；本文件只记录已验证的项目事实、配置、硬边界和专属验收参数。授权、停止、诊断、正式验收、高风险操作和主智能体协作流程按需调用 `$codex-workflow-guard`。
+本项目遵守 Codex App 全局自定义指令；本文件只记录已验证的项目事实、配置、硬边界和专属验收参数。特殊操作按需调用 `$codex-workflow-guard` 的相关参考文件，不把完整流程作为普通任务的前置门。
 <!-- CODEX-MANAGED:global-reference:END -->
 
-- 模板版本/提交：codex-rules `c433d4991b09f85604f0315d3eb02de75129f197`
-- 模板校验：SHA256 `d3b67140d1818a6eb84a2bd8ef4364eddc63eec8de0bac031982780d678e5515`
-- 受管规则块版本：9
-- 上次同步时间：2026-08-25
+- 模板版本/提交：本地未发布，基于 2e46fa3；本次仅同步受管引用
+- 模板校验：24416f13ef485af56da15574f98c1b4f93644625ca28ef5c5abce5de8eef1ec9（受管引用来源模板）
+- 受管规则块版本：2026-09-30
+- 上次同步时间：2026-09-30T03:17:18+08:00
 - 待确认模板冲突：无
 
 ## 2. 项目概览
@@ -79,7 +79,7 @@ Legacy 回退版发布：
 ## 9. 开发与修改流程
 
 <!-- CODEX-MANAGED:workflow-reference:BEGIN -->
-已授权、边界明确且不涉及故障诊断、范围变化、高风险或外部状态的普通修改，可直接执行并做相称验证；其他情况按 `$codex-workflow-guard` 执行。本节只记录项目特有的执行顺序、回滚和交接。
+普通实施、修复与验证遵守全局原则；高风险变更、迁移、规则维护等特殊操作按需使用 `$codex-workflow-guard`。本节只记录项目特有的执行顺序、回滚和交接。
 <!-- CODEX-MANAGED:workflow-reference:END -->
 
 - 正式 PowerShell 入口及其叶子脚本必须保持 PowerShell 7.6 Core 运行时声明和固定路径调用链。
@@ -88,7 +88,7 @@ Legacy 回退版发布：
 ## 10. 验证要求
 
 <!-- CODEX-MANAGED:validation-reference:BEGIN -->
-按影响范围验证真实对象、真实路径和实际交付物。普通离线验证失败按 `$codex-workflow-guard` 定位责任层并在原路径复验；工具、命令或资格夹具自身失败按未执行资格分类，不计产品独立/正式失败，也不消费授权；只有合格工具对冻结候选形成的产品复核或正式结果才进入对应失败门。不得跳过、替换或降低适用质量门。本节只配置项目专属验证参数。
+按影响范围验证目标行为、相关正常路径和实际交付物，不跳过、替换或降低适用质量门。受限正式执行与异常恢复的详细边界按需见 `$codex-workflow-guard` 的 formal-acceptance。本节只配置项目专属验证参数。
 <!-- CODEX-MANAGED:validation-reference:END -->
 
 ### Quick
@@ -125,7 +125,7 @@ Legacy 回退版发布：
 ## 11. 批量操作与业务质量门控
 
 <!-- CODEX-MANAGED:quality-gate-reference:BEGIN -->
-批量写入、提交、上传、发布或外部修改按 `$codex-workflow-guard` 执行业务门禁；本节只配置项目对象、业务验收参数和项目专属硬阻断。
+批量业务质量按 `$codex-workflow-guard` 的 interface-and-reporting 执行；异常影响与恢复按 formal-acceptance 判断。本节只配置项目对象、业务验收参数和专属硬阻断。
 <!-- CODEX-MANAGED:quality-gate-reference:END -->
 
 ### Mercado 零写入边界
@@ -154,7 +154,7 @@ Legacy 回退版发布：
 ## 12. 人工审核队列
 
 <!-- CODEX-MANAGED:human-review-reference:BEGIN -->
-低置信、缺事实、权限、安全、账号或外部异常按 `$codex-workflow-guard` 分流；本节只配置项目队列和项目专属阻断条件。
+需要人工取舍的异常按 `$codex-workflow-guard` 的 interface-and-reporting 分流；本节只配置项目队列和专属阻断条件，不把所有异常自动升级为用户决策。
 <!-- CODEX-MANAGED:human-review-reference:END -->
 
 本项目未配置独立的长期人工审核队列。

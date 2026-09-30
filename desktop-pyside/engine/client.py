@@ -2,22 +2,67 @@ from __future__ import annotations
 
 import http.client
 import json
+import queue
+import ssl
 import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Any
 
 from .auth import AuthManager
 
 
+class HTTPSConnectionPool:
+    """Thread-safe persistent HTTPS connection pool supporting HTTP Keep-Alive."""
+
+    def __init__(self, host: str = "api.mercadolibre.com", timeout: int = 30, max_size: int = 16):
+        self.host = host
+        self.timeout = timeout
+        self.max_size = max_size
+        self._pool: queue.LifoQueue[http.client.HTTPSConnection] = queue.LifoQueue(maxsize=max_size)
+        self._ctx = ssl.create_default_context()
+
+    def get_connection(self) -> http.client.HTTPSConnection:
+        try:
+            return self._pool.get_nowait()
+        except queue.Empty:
+            return http.client.HTTPSConnection(self.host, timeout=self.timeout, context=self._ctx)
+
+    def release_connection(self, conn: http.client.HTTPSConnection, close: bool = False) -> None:
+        if close:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        try:
+            self._pool.put_nowait(conn)
+        except queue.Full:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 class MercadoClient:
     API_BASE = "https://api.mercadolibre.com"
 
-    def __init__(self, auth_manager: AuthManager | None = None, max_concurrency: int = 8):
+    def __init__(self, auth_manager: AuthManager | None = None, max_concurrency: int = 18):
         self.auth = auth_manager or AuthManager()
-        self._semaphore = threading.Semaphore(max_concurrency)
+        self.max_concurrency_per_account = max_concurrency
+        self._account_semaphores: dict[str, threading.Semaphore] = {}
+        self._sem_lock = threading.Lock()
+        parsed = urllib.parse.urlparse(self.API_BASE)
+        self._host = parsed.netloc or "api.mercadolibre.com"
+        self._conn_pool = HTTPSConnectionPool(host=self._host, timeout=30, max_size=max(30, max_concurrency * 4))
+
+    def _get_semaphore(self, account_id: str) -> threading.Semaphore:
+        clean_acc = str(account_id or "default").strip()
+        with self._sem_lock:
+            if clean_acc not in self._account_semaphores:
+                self._account_semaphores[clean_acc] = threading.Semaphore(self.max_concurrency_per_account)
+            return self._account_semaphores[clean_acc]
 
     def request(
         self,
@@ -28,7 +73,7 @@ class MercadoClient:
         body: dict[str, Any] | None = None,
         max_retries: int = 3,
     ) -> dict[str, Any]:
-        """Make an authenticated request to Mercado Libre API with 429 retry and token auto-refresh."""
+        """Make an authenticated request to Mercado Libre API with Keep-Alive connection reuse, 429 retry and token auto-refresh."""
         token_info = self.auth.get_token(account_id)
         access_token = token_info.access_token
 
@@ -38,11 +83,12 @@ class MercadoClient:
             if clean_params:
                 query_str = "?" + urllib.parse.urlencode(clean_params)
 
-        url = f"{self.API_BASE.rstrip('/')}/{path.lstrip('/')}{query_str}"
+        req_path = f"/{path.lstrip('/')}{query_str}"
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {access_token}",
             "version": "v2",
+            "Connection": "keep-alive",
         }
 
         data = None
@@ -50,42 +96,55 @@ class MercadoClient:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
 
-        with self._semaphore:
+        with self._get_semaphore(account_id):
             for attempt in range(max_retries):
-                req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+                conn = self._conn_pool.get_connection()
                 try:
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        raw = resp.read().decode("utf-8")
-                        if not raw:
+                    conn.request(method.upper(), req_path, body=data, headers=headers)
+                    resp = conn.getresponse()
+                    status_code = resp.status
+                    raw_bytes = resp.read()
+                    raw = raw_bytes.decode("utf-8", errors="replace")
+                    is_close = resp.getheader("Connection", "").lower() == "close"
+                    self._conn_pool.release_connection(conn, close=is_close)
+
+                    if 200 <= status_code < 300:
+                        if not raw.strip():
                             return {}
                         return json.loads(raw)
-                except urllib.error.HTTPError as err:
-                    raw_err = err.read().decode("utf-8", errors="replace")
+
                     # Handle Token Expiration (401) -> refresh once and retry
-                    if err.code == 401 and attempt < max_retries - 1:
+                    if status_code == 401 and attempt < max_retries - 1:
                         new_token = self.auth.get_token(account_id, force_refresh=True)
                         headers["Authorization"] = f"Bearer {new_token.access_token}"
                         time.sleep(0.5)
                         continue
 
                     # Handle Rate Limit (429) & Capacity Constraints (409) -> exponential backoff
-                    if err.code in (409, 429) and attempt < max_retries - 1:
+                    if status_code in (409, 429) and attempt < max_retries - 1:
                         sleep_time = (2 ** attempt) * 1.5
                         time.sleep(sleep_time)
                         continue
 
                     # Parse JSON error if possible
                     try:
-                        err_json = json.loads(raw_err)
-                        msg = err_json.get("message") or err_json.get("error") or raw_err
+                        err_json = json.loads(raw)
+                        msg = err_json.get("message") or err_json.get("error") or raw
                     except Exception:
-                        msg = raw_err
-                    raise RuntimeError(f"美客多 API 报错 ({err.code}): {msg}") from err
-                except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as err:
+                        msg = raw
+                    raise RuntimeError(f"美客多 API 报错 ({status_code}): {msg}")
+
+                except (http.client.RemoteDisconnected, http.client.CannotSendRequest,
+                        BrokenPipeError, ConnectionResetError, urllib.error.URLError,
+                        TimeoutError, OSError, http.client.HTTPException) as err:
+                    self._conn_pool.release_connection(conn, close=True)
                     if attempt < max_retries - 1:
                         time.sleep(1.0 + attempt * 0.5)
                         continue
                     raise RuntimeError(f"美客多网络请求超时或连接失败: {err}") from err
+                except Exception:
+                    self._conn_pool.release_connection(conn, close=True)
+                    raise
 
             raise RuntimeError("美客多 API 请求重试次数已耗尽")
 

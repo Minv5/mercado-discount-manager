@@ -92,6 +92,10 @@ class ActionExecutor:
             tasks = []
             for r in rows:
                 t = dict(r)
+                if t.get("status") == "running":
+                    t["status"] = "cancelled"
+                    if not t.get("short_failure_reason"):
+                        t["short_failure_reason"] = "中途异常中断（已保留已完成商品数据）"
                 if t.get("summary_json"):
                     try:
                         summary = json.loads(t["summary_json"])
@@ -176,6 +180,8 @@ class ActionExecutor:
         progress = ExecutionProgress()
         progress_lock = threading.Lock()
         activity_lock = threading.Lock()
+        item_cache_lock = threading.Lock()
+        item_details_cache: dict[str, dict[str, Any]] = {}
         all_results: list[dict[str, Any]] = []
         activity_details: list[dict[str, Any]] = []
         failed_items: list[dict[str, Any]] = []
@@ -185,6 +191,17 @@ class ActionExecutor:
             action = "update"
         elif mode in ("cancel", "批量取消"):
             action = "cancel"
+
+        # 启动即在 SQLite 建立任务检查点（状态标为 running），防止任何意外退出导致记录丢失
+        task_db_id = self._init_task_record(
+            account_id=account_id,
+            action=action,
+            mode=mode,
+            seller_discount=seller_discount,
+            official_discount=official_discount,
+            group_id=group_id,
+            store_name=store_name,
+        )
 
         oauth_expired = False
 
@@ -250,11 +267,19 @@ class ActionExecutor:
                     log(f"[{store_name}][{s_label}] 商品 {item_id} 退出活动失败: {err}")
                     return "failed"
 
-            # Step A: Authoritative Real-time GET /marketplace/items/{id}
+            # Step A: Authoritative Real-time GET /marketplace/items/{id} (带内存缓存避免跨活动重复抓取)
             if cancelled():
                 return "skipped"
             try:
-                raw_item = self.client.get_item_detail(account_id, item_id)
+                cached_raw = None
+                with item_cache_lock:
+                    cached_raw = item_details_cache.get(item_id)
+                if cached_raw is None:
+                    raw_item = self.client.get_item_detail(account_id, item_id)
+                    with item_cache_lock:
+                        item_details_cache[item_id] = raw_item
+                else:
+                    raw_item = cached_raw
                 item_info = extract_item_net_proceeds(raw_item)
             except OAuthInvalidGrantError as err:
                 oauth_expired = True
@@ -386,7 +411,12 @@ class ActionExecutor:
                 return
 
             if not promotions:
-                log(f"[{store_name}][{site_label}] 暂无可报活动。")
+                if action == "cancel":
+                    log(f"[{store_name}][{site_label}] (子账号: {c_uid}) 当前无活动需要退出。")
+                elif action == "update":
+                    log(f"[{store_name}][{site_label}] (子账号: {c_uid}) 当前无活动需要更新。")
+                else:
+                    log(f"[{store_name}][{site_label}] (子账号: {c_uid}) 暂无可报活动。")
                 return
 
             query_status = "started" if action in ("update", "cancel") else "candidate"
@@ -469,9 +499,22 @@ class ActionExecutor:
                             p_failed += 1
                         elif res == "skipped":
                             p_skipped += 1
+                    # 每处理 25 件商品增量持久化一次检查点
+                    if progress.total > 0 and progress.total % 25 == 0:
+                        self._checkpoint_task(
+                            task_id=task_db_id,
+                            progress=progress,
+                            activity_details=activity_details,
+                            failed_items=failed_items,
+                            elapsed_seconds=round(time.time() - start_time, 1),
+                            store_name=store_name,
+                            seller_discount=seller_discount,
+                            official_discount=official_discount,
+                            action=action,
+                        )
 
                 # Process items concurrently within this promotion!
-                max_item_workers = min(len(candidates), 6)
+                max_item_workers = min(len(candidates), 18)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_item_workers) as item_pool:
                     futures = [
                         item_pool.submit(wrapped_process_item, cand)
@@ -499,39 +542,53 @@ class ActionExecutor:
                         "request_success_count": p_success,
                         "live_verified_removed_count": p_success if action == "cancel" else 0,
                     })
+                # 每跑完一个活动立即增量存盘
+                self._checkpoint_task(
+                    task_id=task_db_id,
+                    progress=progress,
+                    activity_details=activity_details,
+                    failed_items=failed_items,
+                    elapsed_seconds=round(time.time() - start_time, 1),
+                    store_name=store_name,
+                    seller_discount=seller_discount,
+                    official_discount=official_discount,
+                    action=action,
+                )
 
-        # Process sites concurrently! (多站点并发)
-        max_site_workers = min(len(target_sites), 5)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_site_workers) as site_pool:
-            futures = [site_pool.submit(process_site, s_info) for s_info in target_sites]
-            concurrent.futures.wait(futures)
+        try:
+            # Process sites concurrently! (多站点并发)
+            max_site_workers = min(len(target_sites), 5)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_site_workers) as site_pool:
+                futures = [site_pool.submit(process_site, s_info) for s_info in target_sites]
+                concurrent.futures.wait(futures)
+        finally:
+            elapsed_sec = time.time() - start_time
+            if elapsed_sec >= 60:
+                duration_text = f"{int(elapsed_sec // 60)}分{int(elapsed_sec % 60)}秒"
+            else:
+                duration_text = f"{int(elapsed_sec)}秒"
 
-        elapsed_sec = time.time() - start_time
-        if elapsed_sec >= 60:
-            duration_text = f"{int(elapsed_sec // 60)}分{int(elapsed_sec % 60)}秒"
-        else:
-            duration_text = f"{int(elapsed_sec)}秒"
+            progress.status = "completed" if not cancelled() else "cancelled"
+            progress.message = f"[{store_name}] 执行完毕（耗时 {duration_text}）：成功 {progress.success}，跳过 {progress.skipped}，失败 {progress.failed}"
+            log(progress.message)
+            report_progress(progress)
 
-        progress.status = "completed" if not cancelled() else "cancelled"
-        progress.message = f"[{store_name}] 执行完毕（耗时 {duration_text}）：成功 {progress.success}，跳过 {progress.skipped}，失败 {progress.failed}"
-        log(progress.message)
-        report_progress(progress)
-
-        # 记录本次执行入库
-        self._record_task(
-            account_id=account_id,
-            action=action,
-            mode=mode,
-            seller_discount=seller_discount,
-            official_discount=official_discount,
-            progress=progress,
-            group_id=group_id,
-            store_name=store_name,
-            activity_details=activity_details,
-            failed_items=failed_items,
-            elapsed_seconds=round(elapsed_sec, 1),
-            duration_text=duration_text,
-        )
+            # 最终收尾入库（更新已有的 task_db_id 或插入新记录）
+            self._record_task(
+                account_id=account_id,
+                action=action,
+                mode=mode,
+                seller_discount=seller_discount,
+                official_discount=official_discount,
+                progress=progress,
+                group_id=group_id,
+                store_name=store_name,
+                activity_details=activity_details,
+                failed_items=failed_items,
+                elapsed_seconds=round(elapsed_sec, 1),
+                duration_text=duration_text,
+                task_id=task_db_id,
+            )
 
         return {
             "status": progress.status,
@@ -549,6 +606,133 @@ class ActionExecutor:
             "expired_store_name": store_name if oauth_expired else None,
         }
 
+    def _init_task_record(
+        self,
+        account_id: str,
+        action: str,
+        mode: str,
+        seller_discount: float,
+        official_discount: float,
+        group_id: str,
+        store_name: str = "",
+    ) -> int | None:
+        """Insert an initial promo_tasks row with status='running' to ensure checkpoint durability."""
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        s_val = int(seller_discount) if float(seller_discount).is_integer() else seller_discount
+        o_val = int(official_discount) if float(official_discount).is_integer() else official_discount
+        discount_percent = float(s_val)
+        summary = {
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+            "total": 0,
+            "seller_discount_percent": s_val,
+            "official_discount_percent": o_val,
+            "seller_activity_text": f"{s_val}%",
+            "official_activity_text": f"{o_val}%",
+            "store_name": store_name or self._get_store_alias(account_id),
+            "activity_details": [],
+            "failed_items": [],
+        }
+        for retry in range(5):
+            conn = self._get_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO promo_tasks (
+                        account_id, promotion_id, promotion_type, action, mode,
+                        discount_percent, status, total_count, success_count,
+                        failed_count, skipped_count, completed, summary_json,
+                        execution_group_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    str(account_id),
+                    "ALL",
+                    "BATCH",
+                    action,
+                    "real",
+                    discount_percent,
+                    "running",
+                    0, 0, 0, 0, 0,
+                    json.dumps(summary, ensure_ascii=False),
+                    group_id,
+                    now_str,
+                    now_str,
+                ))
+                task_id = cur.lastrowid
+                conn.commit()
+                return task_id
+            except Exception:
+                time.sleep(0.2 * (retry + 1))
+            finally:
+                conn.close()
+        return None
+
+    def _checkpoint_task(
+        self,
+        task_id: int | None,
+        progress: ExecutionProgress,
+        activity_details: list[dict[str, Any]] | None = None,
+        failed_items: list[dict[str, Any]] | None = None,
+        elapsed_seconds: float = 0.0,
+        duration_text: str = "",
+        store_name: str = "",
+        seller_discount: float = 28.0,
+        official_discount: float = 28.0,
+        action: str = "enroll",
+    ) -> None:
+        """Incrementally update execution progress into promo_tasks table."""
+        if not task_id:
+            return
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        s_val = int(seller_discount) if float(seller_discount).is_integer() else seller_discount
+        o_val = int(official_discount) if float(official_discount).is_integer() else official_discount
+        summary = {
+            "success": progress.success,
+            "failed": progress.failed,
+            "skipped": progress.skipped,
+            "total": progress.total,
+            "unique_item_count": progress.total,
+            "relation_count": progress.total,
+            "request_success_count": progress.success,
+            "live_verified_removed_count": progress.success if action == "cancel" else 0,
+            "pending_verification_count": 0,
+            "activity_failure_count": 0,
+            "elapsed_seconds": elapsed_seconds,
+            "duration_text": duration_text,
+            "seller_discount_percent": s_val,
+            "official_discount_percent": o_val,
+            "seller_activity_text": f"{s_val}%",
+            "official_activity_text": f"{o_val}%",
+            "store_name": store_name or "",
+            "activity_details": list(activity_details or []),
+            "failed_items": list(failed_items or []),
+        }
+        for retry in range(3):
+            conn = self._get_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE promo_tasks
+                    SET total_count = ?, success_count = ?, failed_count = ?,
+                        skipped_count = ?, summary_json = ?, updated_at = ?
+                    WHERE id = ?
+                """, (
+                    progress.total,
+                    progress.success,
+                    progress.failed,
+                    progress.skipped,
+                    json.dumps(summary, ensure_ascii=False),
+                    now_str,
+                    task_id,
+                ))
+                conn.commit()
+                break
+            except Exception:
+                time.sleep(0.1 * (retry + 1))
+            finally:
+                conn.close()
+
     def _record_task(
         self,
         account_id: str,
@@ -563,6 +747,7 @@ class ActionExecutor:
         failed_items: list[dict[str, Any]] | None = None,
         elapsed_seconds: float = 0.0,
         duration_text: str = "",
+        task_id: int | None = None,
     ) -> None:
         """Save execution summary row to promo_tasks for workbench display."""
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -597,32 +782,52 @@ class ActionExecutor:
             conn = self._get_conn()
             try:
                 cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO promo_tasks (
-                        account_id, promotion_id, promotion_type, action, mode,
-                        discount_percent, status, total_count, success_count,
-                        failed_count, skipped_count, completed, summary_json,
-                        execution_group_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    str(account_id),
-                    "ALL",
-                    "BATCH",
-                    action,
-                    "real",
-                    discount_percent,
-                    progress.status,
-                    progress.total,
-                    progress.success,
-                    progress.failed,
-                    progress.skipped,
-                    1 if progress.status == "completed" else 0,
-                    summary_str,
-                    group_id,
-                    now_str,
-                    now_str,
-                ))
-                task_id = cur.lastrowid
+                if task_id:
+                    cur.execute("""
+                        UPDATE promo_tasks
+                        SET status = ?, total_count = ?, success_count = ?,
+                            failed_count = ?, skipped_count = ?, completed = ?,
+                            summary_json = ?, updated_at = ?
+                        WHERE id = ?
+                    """, (
+                        progress.status,
+                        progress.total,
+                        progress.success,
+                        progress.failed,
+                        progress.skipped,
+                        1 if progress.status == "completed" else 0,
+                        summary_str,
+                        now_str,
+                        task_id,
+                    ))
+                else:
+                    cur.execute("""
+                        INSERT INTO promo_tasks (
+                            account_id, promotion_id, promotion_type, action, mode,
+                            discount_percent, status, total_count, success_count,
+                            failed_count, skipped_count, completed, summary_json,
+                            execution_group_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        str(account_id),
+                        "ALL",
+                        "BATCH",
+                        action,
+                        "real",
+                        discount_percent,
+                        progress.status,
+                        progress.total,
+                        progress.success,
+                        progress.failed,
+                        progress.skipped,
+                        1 if progress.status == "completed" else 0,
+                        summary_str,
+                        group_id,
+                        now_str,
+                        now_str,
+                    ))
+                    task_id = cur.lastrowid
+
                 if f_items and task_id:
                     for item in f_items:
                         try:

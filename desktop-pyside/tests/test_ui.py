@@ -2601,10 +2601,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.0.19")
+        self.assertEqual(product_version(), "2.0.34")
 
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "版本 2.0.19")
+        self.assertEqual(self.window.version_label.text(), "版本 2.0.34")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertIs(self.window.version_label.parentWidget(), self.window.statusBar())
 
@@ -2616,7 +2616,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "版本 2.0.19")
+        self.assertEqual(self.window.version_label.text(), "版本 2.0.34")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -2747,6 +2747,27 @@ class QtUiTests(unittest.TestCase):
             self.window.handle_oauth_expired("3332096437", "湖北店")
             self.assertEqual(mock_warn.call_count, 2)
             self.assertEqual(opened_tabs, ["auth", "auth"])
+
+    def test_auto_shutdown_countdown_dialog_countdown_and_cancel(self) -> None:
+        from dialogs import AutoShutdownCountdownDialog
+        dlg = AutoShutdownCountdownDialog(seconds=5, parent=self.window)
+        self.assertEqual(dlg.remaining_seconds, 5)
+        dlg._on_tick()
+        self.assertEqual(dlg.remaining_seconds, 4)
+        dlg._on_cancel()
+        self.assertTrue(dlg.cancelled)
+
+    def test_log_viewer_wheel_decouples_auto_scroll(self) -> None:
+        from main_window import LogViewer
+        viewer = LogViewer()
+        self.assertTrue(viewer.auto_scroll)
+        from PySide6.QtGui import QWheelEvent
+        from PySide6.QtCore import QPointF, QPoint
+        event = QWheelEvent(QPointF(0, 0), QPointF(0, 0), QPoint(0, 0), QPoint(0, 120), Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+        viewer.wheelEvent(event)
+        self.assertFalse(viewer.auto_scroll)
+        viewer.append_log_line("test log line")
+        self.assertIn("test log line", viewer.toPlainText())
 
 
 if __name__ == "__main__":

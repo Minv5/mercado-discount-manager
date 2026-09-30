@@ -53,12 +53,21 @@ def extract_item_net_proceeds(item: dict[str, Any]) -> ItemNetProceeds:
             sale_fee = amt
 
     # Authoritative catalog original price:
-    # 1. Prefer item.get("original_price") (Mercado official catalog base price)
-    # 2. If missing, use breakdown sum (net_proceeds + shipping + sale_fee)
-    # 3. Fallback to item.get("price") only if breakdown sum is 0
+    # When an item is modified during an active promotion, Mercado Libre updates
+    # net_proceeds.amount immediately while locking top-level original_price to the
+    # pre-modification enrollment price. Therefore, when breakdown_sum diverges from
+    # official_original (>= 0.05), breakdown_sum reflects the true updated base price
+    # and signals an in-promotion item modification (is_inconsistent=True).
     breakdown_sum = round(raw_amount + shipping_cost + sale_fee, 2)
     official_original = float(item.get("original_price") or 0.0)
-    if official_original > 0:
+    is_inconsistent = False
+    inconsistent_reason = None
+
+    if official_original > 0 and breakdown_sum > 0 and abs(breakdown_sum - official_original) >= 0.05:
+        is_inconsistent = True
+        inconsistent_reason = f"最新价格构成(${breakdown_sum:.2f})与活动锁死原价(${official_original:.2f})不一致"
+        base_price = breakdown_sum
+    elif official_original > 0:
         base_price = official_original
     elif breakdown_sum > 0:
         base_price = breakdown_sum
@@ -66,7 +75,9 @@ def extract_item_net_proceeds(item: dict[str, Any]) -> ItemNetProceeds:
         base_price = float(item.get("price") or 0.0)
 
     # Fee rate derived from the official breakdown: sale_fee / base_price
-    if base_price > 0 and sale_fee > 0:
+    if official_original > 0 and sale_fee > 0:
+        fee_rate = round(sale_fee / official_original, 6)
+    elif base_price > 0 and sale_fee > 0:
         fee_rate = round(sale_fee / base_price, 6)
     elif breakdown_sum > 0 and sale_fee > 0:
         fee_rate = round(sale_fee / breakdown_sum, 6)
@@ -85,8 +96,8 @@ def extract_item_net_proceeds(item: dict[str, Any]) -> ItemNetProceeds:
         sale_fee=sale_fee,
         fee_rate=fee_rate,
         net_proceeds=effective_net,
-        is_inconsistent=False,
-        inconsistent_reason=None,
+        is_inconsistent=is_inconsistent,
+        inconsistent_reason=inconsistent_reason,
     )
 
 
@@ -205,26 +216,7 @@ def calculate_deal_price(
     sale_fee_at_deal = round(deal_price * fee_rate, 2)
     final_net_at_deal = round(deal_price - sale_fee_at_deal - shipping, 2)
 
-    # 4. Check against mandatory promotion constraints (platform strict max allowable price)
-    max_allowed = (
-        constraints.get("max_discounted_price")
-        or constraints.get("top_deal_price")
-    )
-
-    eligible = True
-    skip_reason = None
-
-    if max_allowed is not None:
-        try:
-            max_allowed_val = float(max_allowed)
-            if max_allowed_val > 0 and deal_price > max_allowed_val:
-                # Platform requires a lower price than our floor!
-                # Iron rule: "依照设置的折扣为准，参加不上就不参加"
-                eligible = False
-                skip_reason = f"平台要求限价(${max_allowed_val:.2f})低于净回款保护售价(${deal_price:.2f})，跳过"
-        except (ValueError, TypeError):
-            pass
-
+    # 4. Result is handed over to Mercado Libre API directly without local pre-filtering
     return PricingResult(
         item_id=item_info.item_id,
         original_price=p_orig,
@@ -235,6 +227,6 @@ def calculate_deal_price(
         sale_fee_at_deal=sale_fee_at_deal,
         final_net_at_deal=final_net_at_deal,
         discount_percent=discount_percent,
-        eligible=eligible,
-        skip_reason=skip_reason,
+        eligible=True,
+        skip_reason=None,
     )

@@ -13,13 +13,14 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from PySide6.QtCore import QSignalBlocker, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon, QTextCursor
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -66,11 +67,13 @@ from core import (
     task_display_counts,
 )
 from dialogs import (
+    AutoShutdownCountdownDialog,
     DetailsDialog,
     ItemQueryDialog,
     SellerCampaignCreateDialog,
     SettingsDialog,
     TargetedCancelDialog,
+    execute_system_shutdown,
     get_last_canceled_batch,
 )
 from diagnostics import diagnostic_event
@@ -95,6 +98,47 @@ STARTUP_PHASE_LABELS = {
     "records_bundle": "今日执行记录",
     "startup_readiness": "启动缓存",
 }
+
+
+class LogViewer(QTextEdit):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.auto_scroll = True
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
+
+    def _on_scroll_changed(self, value: int) -> None:
+        scrollbar = self.verticalScrollBar()
+        if scrollbar.isSliderDown() or value < (scrollbar.maximum() - 15):
+            self.auto_scroll = False
+        elif value >= (scrollbar.maximum() - 5):
+            self.auto_scroll = True
+
+    def wheelEvent(self, event) -> None:
+        if event.angleDelta().y() > 0:
+            self.auto_scroll = False
+        super().wheelEvent(event)
+
+    def append_log_line(self, line: str) -> None:
+        scrollbar = self.verticalScrollBar()
+        was_at_bottom = self.auto_scroll and not scrollbar.isSliderDown()
+
+        cursor = QTextCursor(self.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(line + "\n")
+
+        # 仅在吸底状态下安全修剪超出 1000 行的旧记录；用户向上翻阅时绝对不削减，防止视口跳动
+        if was_at_bottom:
+            excess = self.document().blockCount() - 1000
+            if excess > 0:
+                prune_cursor = QTextCursor(self.document())
+                prune_cursor.movePosition(QTextCursor.MoveOperation.Start)
+                for _ in range(excess):
+                    prune_cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                    prune_cursor.movePosition(QTextCursor.MoveOperation.NextBlock, QTextCursor.MoveMode.KeepAnchor)
+                prune_cursor.removeSelectedText()
+            scrollbar.setValue(scrollbar.maximum())
 
 
 class MainWindow(QMainWindow):
@@ -467,12 +511,20 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(surface)
         layout.setContentsMargins(12, 10, 12, 12)
         layout.addWidget(section_label("运行日志"))
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.document().setMaximumBlockCount(1000)
-        self.log_box.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.log_box = LogViewer()
+        self._log_auto_scroll = True
+        self.log_box.verticalScrollBar().valueChanged.connect(self._on_log_scroll_changed)
         layout.addWidget(self.log_box, 1)
         return surface
+
+    def _on_log_scroll_changed(self, value: int) -> None:
+        scrollbar = self.log_box.verticalScrollBar()
+        if scrollbar.isSliderDown() or value < (scrollbar.maximum() - 15):
+            self._log_auto_scroll = False
+            self.log_box.auto_scroll = False
+        elif value >= (scrollbar.maximum() - 5):
+            self._log_auto_scroll = True
+            self.log_box.auto_scroll = True
 
     def startup(self) -> None:
         self.startup_attempt_token += 1
@@ -2336,6 +2388,7 @@ class MainWindow(QMainWindow):
             # Refresh it after every terminal execution so cancelled items do
             # not remain visible until the next manual scope refresh.
             self.refresh_scope()
+            self._maybe_auto_shutdown()
             if action == "cancel":
                 group_id = str(group.get("id") or "")
                 if group_id:
@@ -2345,6 +2398,17 @@ class MainWindow(QMainWindow):
                         self._post_cancel_refresh_finished,
                         lambda error: self.log(f"涉及活动商品缓存同步提示：{product_error(error)}"),
                     )
+
+    def _maybe_auto_shutdown(self) -> None:
+        if not self.auto_shutdown_check.isChecked():
+            return
+        self.log("所有执行任务已结束，已触发自动关机倒计时（60 秒）...")
+        dialog = AutoShutdownCountdownDialog(seconds=60, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and not dialog.cancelled:
+            self.log("正在执行系统关机命令...")
+            execute_system_shutdown()
+        else:
+            self.log("用户已取消自动关机。")
 
     def _post_cancel_refresh_finished(self, result: object) -> None:
         payload = dict(result or {})
@@ -2956,18 +3020,7 @@ class MainWindow(QMainWindow):
         )
 
     def log(self, message: str) -> None:
-        scrollbar = self.log_box.verticalScrollBar()
-        saved_pos = scrollbar.value()
-        was_at_bottom = saved_pos >= (scrollbar.maximum() - 20)
-        is_hovered = self.log_box.underMouse() or self.log_box.viewport().underMouse()
-        has_selection = self.log_box.textCursor().hasSelection()
-
-        self.log_box.append(f"[{datetime.now():%H:%M:%S}] {message}")
-
-        if is_hovered or not was_at_bottom or has_selection:
-            scrollbar.setValue(saved_pos)
-        else:
-            scrollbar.setValue(scrollbar.maximum())
+        self.log_box.append_log_line(f"[{datetime.now():%H:%M:%S}] {message}")
 
     def _append_startup_final_log(self, status: str, message: str) -> None:
         """Append one timestamped terminal startup summary per final state."""
@@ -3264,7 +3317,8 @@ def product_version() -> str:
         value = str(payload.get("version") or payload.get("product_version") or "").strip()
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
-    return "2.0.19"
+    # Native Python engine release product version
+    return "2.0.34"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

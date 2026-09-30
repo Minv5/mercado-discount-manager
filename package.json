@@ -1,6 +1,7 @@
 {
   "name": "mercado-discount-manager",
-  "version": "2.0.19",
+  "version": "2.0.34",
+  "description": "美客多折扣管家 (Mercado Libre Discount Manager)",
   "private": true,
   "type": "module",
   "scripts": {

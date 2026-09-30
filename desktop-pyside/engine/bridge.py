@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -45,6 +48,17 @@ class EngineBridge:
         self._full_data_jobs: dict[str, dict[str, Any]] = {}
         self._oauth_states: dict[str, dict[str, Any]] = {}
 
+        self._init_webhook_from_settings()
+
+    def _init_webhook_from_settings(self) -> None:
+        try:
+            settings = self._read_settings()
+            if settings.get("autoRepriceOnWebhook", True):
+                discount = float(settings.get("sellerDefaultDiscount") or 28.0)
+                self.webhook.start(discount)
+        except Exception:
+            pass
+
     def _read_settings(self) -> dict[str, Any]:
         settings: dict[str, Any] = {}
         if self.settings_file.exists():
@@ -85,6 +99,16 @@ class EngineBridge:
         current.update(updates)
         self.settings_file.parent.mkdir(parents=True, exist_ok=True)
         self.settings_file.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        auto_enabled = bool(current.get("autoRepriceOnWebhook", True))
+        seller_disc = float(current.get("sellerDefaultDiscount") or 28.0)
+        if auto_enabled and not self.webhook.is_running():
+            self.webhook.start(seller_disc)
+        elif auto_enabled and self.webhook.is_running():
+            self.webhook.discount_percent = seller_disc
+        elif not auto_enabled and self.webhook.is_running():
+            self.webhook.stop()
+
         return current
 
     def handle_request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -102,7 +126,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.0.19",
+                "build_fingerprint": "native-python-v2.0.34",
             }
 
         # 2. Settings
@@ -501,7 +525,11 @@ class EngineBridge:
 
         # 10. Auto-reprice / Webhook Status
         if route == "/api/auto-reprice/status":
-            return {"running": self.webhook.is_running()}
+            return {
+                "running": self.webhook.is_running(),
+                "logs": self.webhook.pop_logs(),
+                "processed_count": getattr(self.webhook, "processed_count", 0),
+            }
 
         # 11. Concurrency benchmark
         if route == "/api/concurrency-benchmark/results":
@@ -722,6 +750,16 @@ class EngineBridge:
         import concurrent.futures
 
         start_time = time.time()
+        caffeinate_proc = None
+        if sys.platform == "darwin":
+            try:
+                caffeinate_proc = subprocess.Popen(
+                    ["caffeinate", "-dims", "-w", str(os.getpid())],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
         account_ids = payload.get("accountIds") or payload.get("account_ids") or []
         filters = payload.get("filters") or {}
         site_id = payload.get("site_id") or payload.get("siteId") or filters.get("siteId") or filters.get("site_id") or ""
@@ -789,11 +827,15 @@ class EngineBridge:
             child = children_map.get(acc_id)
             if child:
                 with lock:
-                    child["user_logs"].append({
+                    logs = child["user_logs"]
+                    logs.append({
                         "id": f"log_{uuid.uuid4().hex[:8]}",
                         "message": msg,
                         "at": datetime.datetime.now().isoformat(),
                     })
+                    # 限制内存中只保留最新 200 条，杜绝数小时累积数万条导致 2.7MB 轮询负载与内存膨胀
+                    if len(logs) > 200:
+                        child["user_logs"] = logs[-200:]
 
         def run_store(acc_id: str):
             nonlocal total_success, total_failed, total_skipped, total_items
@@ -933,3 +975,9 @@ class EngineBridge:
             # AFTER result, stores_list and children are fully assembled and DB writes are done!
             self._groups[group_id]["status"] = status
             self._groups[group_id]["updated_at"] = datetime.datetime.now().isoformat()
+
+        if caffeinate_proc:
+            try:
+                caffeinate_proc.terminate()
+            except Exception:
+                pass
