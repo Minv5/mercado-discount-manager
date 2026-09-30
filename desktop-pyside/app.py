@@ -52,6 +52,16 @@ def create_application(argv: list[str] | None = None) -> QApplication:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     install_runtime_diagnostics()
     if "--smoke-service" in sys.argv:
         project_root = Path(__file__).resolve().parents[1]

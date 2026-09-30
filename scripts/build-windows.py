@@ -11,12 +11,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 def get_sha256(path: Path) -> str:
@@ -104,7 +110,16 @@ def build() -> None:
         raise RuntimeError(f"Expected Windows executable not found: {main_exe}")
 
     print("[*] Testing bundled application smoke service...")
-    res = subprocess.run([str(main_exe), "--smoke-service"], capture_output=True, text=True, check=True)
+    smoke_env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    res = subprocess.run(
+        [str(main_exe), "--smoke-service"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=smoke_env,
+        check=True,
+    )
     lines = [line.strip() for line in res.stdout.splitlines() if line.strip().startswith("{")]
     smoke_line = lines[-1] if lines else res.stdout.strip()
     print(f"[*] Smoke output: {smoke_line}")
