@@ -56,6 +56,7 @@ from core import (
     action_label,
     business_date_from_timestamp,
     build_filters,
+    _coerce_business_date,
     completed_execution_for_scope,
     discount_inputs_enabled,
     execution_completion_text,
@@ -2681,7 +2682,7 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(5000, _retry_records)
 
     def _request_today_execution_groups(self, records: list[dict[str, Any]]) -> None:
-        today = datetime.now().date()
+        today = _coerce_business_date(None)
         group_ids: list[str] = []
         seen: set[str] = set()
         for task in records:
@@ -4614,7 +4615,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.0.80"
+    return "2.0.81"
 
 
 def make_table(headers: list[str]) -> QTableWidget:
