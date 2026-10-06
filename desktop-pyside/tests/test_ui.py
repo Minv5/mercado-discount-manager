@@ -50,12 +50,14 @@ from dialogs import (
     SellerCampaignCreateDialog,
     SettingsDialog,
     TargetedCancelDialog,
+    UpdateDialog,
     get_last_canceled_batch,
     load_targeted_item_history,
     render_item_status_text,
     save_targeted_item_batch,
     target_label,
 )
+from engine.updater import ReleaseInfo  # noqa: E402
 from main_window import (  # noqa: E402
     TASK_HEADERS,
     MainWindow,
@@ -2649,10 +2651,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.0.81")
+        self.assertEqual(product_version(), "2.0.82")
  
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.0.81")
+        self.assertEqual(self.window.version_label.text(), "v2.0.82")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2664,7 +2666,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.0.81")
+        self.assertEqual(self.window.version_label.text(), "v2.0.82")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -3104,7 +3106,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.0.81")
+        self.assertEqual(self.window.version_label.text(), "v2.0.82")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
@@ -3297,6 +3299,51 @@ class QtUiTests(unittest.TestCase):
         button_texts = [btn.text().strip() for btn in buttons]
         expected_order = ["活动报名", "活动管理", "查  询", "按ID操作", "商品清理", "设  置"]
         self.assertEqual(button_texts, expected_order)
+
+    def test_update_dialog_ui_and_cancel(self) -> None:
+        info = ReleaseInfo(
+            tag_name="v2.0.83",
+            version="2.0.83",
+            release_notes="1. 修复偶发网络问题\n2. 增加自动更新引擎",
+            is_newer=True,
+            asset_name="mock.zip",
+            download_url="https://mock/download.zip",
+            asset_size=10485760,
+            published_at="2026-10-07T00:00:00Z",
+        )
+        dlg = UpdateDialog(info, "2.0.82", parent=self.window)
+        self.assertEqual(dlg.windowTitle(), "软件更新 - 美客多活动管家")
+        self.assertIn("自动更新引擎", dlg.notes_edit.toPlainText())
+        self.assertTrue(dlg.update_btn.isEnabled())
+        self.assertEqual(dlg.update_btn.text(), "立即更新并重启")
+        self.assertFalse(dlg.progress_bar.isVisible())
+        self.assertEqual(dlg.cancel_btn.text(), "稍后提醒")
+        dlg.reject()
+
+    def test_main_window_update_notice_button_workflow(self) -> None:
+        # 初始状态未发现更新时药丸按钮隐藏
+        self.assertTrue(self.window.update_notice_btn.isHidden())
+
+        # 触发发现新版本回调
+        info = ReleaseInfo(
+            tag_name="v2.0.83",
+            version="2.0.83",
+            release_notes="新版修复",
+            is_newer=True,
+            asset_name="mock.zip",
+            download_url="https://mock/download.zip",
+            asset_size=52428800,
+            published_at="2026-10-07T00:00:00Z",
+        )
+        self.window._handle_update_check_result(info, manual=False)
+        self.assertFalse(self.window.update_notice_btn.isHidden())
+        self.assertEqual(self.window.update_notice_btn.text(), "🚀 发现新版 v2.0.83")
+        self.assertEqual(self.window._latest_release_info, info)
+
+        # 恢复初始隐藏状态以便后续测试
+        self.window.update_notice_btn.setVisible(False)
+        self.window._latest_release_info = None
+        self.assertTrue(self.window.update_notice_btn.isHidden())
 
 
 if __name__ == "__main__":

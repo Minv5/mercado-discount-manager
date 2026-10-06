@@ -78,9 +78,11 @@ from dialogs import (
     SellerCampaignCreateDialog,
     SettingsDialog,
     TargetedCancelDialog,
+    UpdateDialog,
     execute_system_shutdown,
     get_last_canceled_batch,
 )
+from engine.updater import ReleaseInfo, check_github_latest_release
 from diagnostics import diagnostic_event
 from reason_text import (
     business_reason_text,
@@ -454,6 +456,7 @@ class MainWindow(QMainWindow):
         self.query_log_box: LogViewer | None = None
         self.log_box: LogViewer | None = None
         self._log_auto_scroll = True
+        self._latest_release_info: ReleaseInfo | None = None
         self._build_ui()
         self._load_cleaner_draft()
         self.poll_timer = QTimer(self)
@@ -476,6 +479,7 @@ class MainWindow(QMainWindow):
         self.auto_reprice_timer.timeout.connect(self._poll_auto_reprice)
         if auto_start:
             QTimer.singleShot(0, self.startup)
+            QTimer.singleShot(3000, lambda: self._check_update_async(manual=False))
 
     def _build_ui(self) -> None:
         self.setWindowTitle("美客多活动管家")
@@ -536,6 +540,7 @@ class MainWindow(QMainWindow):
         self.settings_page.refresh_requested.connect(lambda: self._refresh_accounts_from_settings(self.settings_page))
         self.settings_page.save_requested.connect(self._save_settings_from_page)
         self.settings_page.back_requested.connect(lambda: self._show_page(0))
+        self.settings_page.check_update_requested.connect(lambda: self._check_update_async(manual=True))
         self.view_stack.addWidget(self.settings_page)
 
         self.query_page = ItemQueryDialog(self, embedded=True)
@@ -600,6 +605,25 @@ class MainWindow(QMainWindow):
             "background: rgba(78, 71, 47, 0.25);"
         )
         title_row.addWidget(self.version_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.update_notice_btn = QPushButton("🚀 发现新版")
+        self.update_notice_btn.setObjectName("updateNoticeBtn")
+        self.update_notice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_notice_btn.setVisible(False)
+        self.update_notice_btn.setStyleSheet(
+            "QPushButton {"
+            "  color: #10B981; font-size: 11px; font-weight: bold;"
+            "  padding: 2px 9px; border: 1px solid #059669; border-radius: 4px;"
+            "  background: rgba(16, 185, 129, 0.15);"
+            "}"
+            "QPushButton:hover {"
+            "  background: rgba(16, 185, 129, 0.35);"
+            "  border-color: #10B981;"
+            "  color: #34D399;"
+            "}"
+        )
+        self.update_notice_btn.clicked.connect(self._on_update_notice_clicked)
+        title_row.addWidget(self.update_notice_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         title_row.addStretch(1)
 
         subtitle = QLabel("批量管理美客多促销与折扣活动")
@@ -2938,6 +2962,52 @@ class MainWindow(QMainWindow):
                 lambda error: self.log("设置后台刷新未完成：" + product_error(error)),
             )
 
+    def _check_update_async(self, manual: bool = False) -> None:
+        """后台异步检测 GitHub 最新 Release，静默不阻塞主界面。"""
+        curr_ver = product_version()
+
+        def _worker() -> None:
+            info = check_github_latest_release(curr_ver)
+            QTimer.singleShot(0, lambda: self._handle_update_check_result(info, manual))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _handle_update_check_result(self, info: ReleaseInfo | None, manual: bool = False) -> None:
+        """主线程处理更新检测结果。"""
+        if info and info.is_newer:
+            self._latest_release_info = info
+            self.update_notice_btn.setText(f"🚀 发现新版 v{info.version}")
+            self.update_notice_btn.setToolTip(f"发现新版本 v{info.version}，点击查看详情并一键升级")
+            self.update_notice_btn.setVisible(True)
+            if manual:
+                self._open_update_dialog(info)
+        elif manual:
+            curr_ver = product_version()
+            if info:
+                QMessageBox.information(
+                    self,
+                    "检查更新",
+                    f"当前安装版本 (v{curr_ver}) 已经是最新版本，暂无可用更新。",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "检查更新",
+                    f"当前安装版本为 v{curr_ver}。\n检查更新服务器连接失败，请稍后重试或前往 GitHub 查看最新版本。",
+                )
+
+    def _on_update_notice_clicked(self) -> None:
+        """点击标题栏提示药丸触发。"""
+        if self._latest_release_info:
+            self._open_update_dialog(self._latest_release_info)
+        else:
+            self._check_update_async(manual=True)
+
+    def _open_update_dialog(self, info: ReleaseInfo) -> None:
+        """弹出更新模态对话框。"""
+        dlg = UpdateDialog(info, product_version(), parent=self)
+        dlg.exec()
+
     def _show_query_page(self) -> None:
         if hasattr(self, "view_stack") and hasattr(self, "query_page"):
             if self.view_stack.currentWidget() == self.query_page:
@@ -4615,7 +4685,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.0.81"
+    return "2.0.82"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

@@ -5,13 +5,15 @@ import dataclasses
 import json
 import subprocess
 import sys
+import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
-from PySide6.QtCore import QDate, QModelIndex, QSettings, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtCore import QDate, QModelIndex, QObject, QSettings, QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeySequence, QPainter, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDateEdit,
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -1390,6 +1393,7 @@ class SettingsDialog(QDialog):
     refresh_requested = Signal()
     save_requested = Signal()
     back_requested = Signal()
+    check_update_requested = Signal()
 
     def __init__(
         self,
@@ -2266,6 +2270,20 @@ class SettingsDialog(QDialog):
         perf_hint.setWordWrap(True)
         note_layout.addWidget(perf_hint)
 
+        update_box = QWidget()
+        update_box_layout = QHBoxLayout(update_box)
+        update_box_layout.setContentsMargins(0, 8, 0, 0)
+        update_box_layout.setSpacing(10)
+        update_title = QLabel("客户端软件更新：")
+        update_title.setStyleSheet("font-weight: bold; color: #F6F3EA;")
+        update_box_layout.addWidget(update_title)
+        self.check_update_btn = QPushButton("检查新版本")
+        self.check_update_btn.setFixedWidth(110)
+        self.check_update_btn.clicked.connect(self.check_update_requested.emit)
+        update_box_layout.addWidget(self.check_update_btn)
+        update_box_layout.addStretch(1)
+        note_layout.addWidget(update_box)
+
         note_layout.addStretch(1)
         layout.addWidget(note_card, 1)
 
@@ -2631,5 +2649,211 @@ class CopyZeroVisitIdsDialog(QDialog):
             status_item.setFont(font)
 
         self.tip_label.setText(f"✅ 批次 {row + 1:02d} 的 {len(batch)} 个 ID 已成功复制到剪贴板！可直接在 ERP 中 Ctrl+V 粘贴。")
+
+
+class UpdateDialog(QDialog):
+    """一键自动原地更新对话框。展示更新说明、下载进度条、完整性解压与跳板重启。"""
+
+    update_progress = Signal(int, int)
+    update_status = Signal(str)
+    update_finished = Signal()
+    update_error = Signal(str)
+
+    def __init__(
+        self,
+        release_info: Any,
+        current_version: str,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.release_info = release_info
+        self.current_version = current_version
+        self.setWindowTitle("软件更新 - 美客多活动管家")
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        self.setMaximumWidth(700)
+        self.resize(600, 480)
+
+        self._stop_event = threading.Event()
+        self._is_updating = False
+        self.update_progress.connect(self._on_progress)
+        self.update_status.connect(self._on_status)
+        self.update_finished.connect(self._on_finished)
+        self.update_error.connect(self._on_error)
+
+        self._init_ui()
+
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(4)
+        heading = QLabel(f"🚀 发现新版本：v{self.release_info.version}")
+        heading.setStyleSheet("font-size: 16px; font-weight: bold; color: #10B981;")
+        title_box.addWidget(heading)
+
+        size_mb = (self.release_info.asset_size or 0) / (1024 * 1024)
+        date_str = str(self.release_info.published_at or "")[:10] or "近期"
+        sub_text = f"当前版本：v{self.current_version}  |  发布日期：{date_str}"
+        if size_mb > 0:
+            sub_text += f"  |  更新大小：约 {size_mb:.1f} MB"
+        sub_label = QLabel(sub_text)
+        sub_label.setObjectName("muted")
+        title_box.addWidget(sub_label)
+        layout.addLayout(title_box)
+
+        notes_label = QLabel("更新说明与改进项：")
+        notes_label.setStyleSheet("font-weight: bold; color: #F6F3EA; margin-top: 4px;")
+        layout.addWidget(notes_label)
+
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setReadOnly(True)
+        notes = str(self.release_info.release_notes or "").strip() or "常规性能优化与问题修复。"
+        self.notes_edit.setPlainText(notes)
+        self.notes_edit.setStyleSheet(
+            "background: #141816; border: 1px solid #3E3827; border-radius: 6px; padding: 10px; color: #D8D4CA; font-size: 12px; line-height: 1.5;"
+        )
+        layout.addWidget(self.notes_edit, 1)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setStyleSheet(
+            "QProgressBar { background: #18201C; border: 1px solid #4E472F; border-radius: 6px; text-align: center; color: #F6F3EA; font-weight: bold; height: 20px; }"
+            "QProgressBar::chunk { background-color: #10B981; border-radius: 5px; }"
+        )
+        layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("点击下方按钮即可一键自动下载并重启生效")
+        self.status_label.setObjectName("muted")
+        layout.addWidget(self.status_label)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+        btn_layout.addStretch(1)
+
+        self.cancel_btn = QPushButton("稍后提醒")
+        self.cancel_btn.setFixedWidth(100)
+        self.cancel_btn.clicked.connect(self._on_cancel_clicked)
+        btn_layout.addWidget(self.cancel_btn)
+
+        self.update_btn = QPushButton("立即更新并重启")
+        self.update_btn.setObjectName("primary")
+        self.update_btn.setMinimumWidth(150)
+        self.update_btn.setStyleSheet(
+            "QPushButton { background: #10B981; color: #FFFFFF; font-weight: bold; border: 1px solid #059669; border-radius: 6px; padding: 7px 16px; }"
+            "QPushButton:hover { background: #059669; }"
+            "QPushButton:disabled { background: #233529; color: #66776C; border-color: #2D4234; }"
+        )
+        self.update_btn.clicked.connect(self._start_update)
+        btn_layout.addWidget(self.update_btn)
+
+        layout.addLayout(btn_layout)
+
+    def _start_update(self) -> None:
+        if self._is_updating:
+            return
+        if not self.release_info.download_url:
+            self.status_label.setStyleSheet("color: #EF4444; font-weight: bold;")
+            self.status_label.setText("❌ 未能匹配到适合当前操作系统的更新包，请前往 GitHub 手动下载。")
+            return
+
+        self._is_updating = True
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("正在准备下载...")
+        self.cancel_btn.setText("取消")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setStyleSheet("color: #C8C3B7;")
+        self.status_label.setText("正在建立高速下载连接...")
+
+        threading.Thread(target=self._run_update_worker, daemon=True).start()
+
+    def _run_update_worker(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from engine.updater import (
+            download_release_archive,
+            verify_and_extract_update,
+            launch_in_place_update,
+        )
+
+        zip_dest = Path(tempfile.gettempdir()) / f"mdm_update_{self.release_info.version}.zip"
+        extract_dir = Path(tempfile.gettempdir()) / f"mdm_update_{self.release_info.version}_extracted"
+
+        def _prog_cb(downloaded: int, total: int) -> None:
+            self.update_progress.emit(downloaded, total)
+
+        ok = download_release_archive(
+            url=self.release_info.download_url,
+            dest_path=zip_dest,
+            on_progress=_prog_cb,
+            stop_event=self._stop_event,
+        )
+        if self._stop_event.is_set():
+            return
+
+        if not ok or not zip_dest.exists():
+            self.update_error.emit("下载更新安装包失败，请检查网络后重试。")
+            return
+
+        self.update_status.emit("正在校验并解压安装包...")
+        try:
+            extracted_target = verify_and_extract_update(zip_dest, extract_dir)
+        except Exception as e:
+            self.update_error.emit(f"解压安装包校验失败: {e}")
+            return
+
+        self.update_status.emit("更新就绪，正在准备重启应用...")
+        try:
+            launch_in_place_update(extracted_target)
+        except Exception as e:
+            self.update_error.emit(f"拉起更新跳板失败: {e}")
+            return
+
+        self.update_finished.emit()
+
+    def _on_progress(self, downloaded: int, total: int) -> None:
+        if total > 0:
+            pct = int(downloaded * 100 / total)
+            self.progress_bar.setValue(min(100, max(0, pct)))
+            d_mb = downloaded / (1024 * 1024)
+            t_mb = total / (1024 * 1024)
+            self.status_label.setText(f"正在下载安装包... {d_mb:.1f} MB / {t_mb:.1f} MB ({pct}%)")
+        else:
+            d_mb = downloaded / (1024 * 1024)
+            self.status_label.setText(f"正在下载安装包... {d_mb:.1f} MB")
+
+    def _on_status(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def _on_error(self, err_msg: str) -> None:
+        self._is_updating = False
+        self.update_btn.setEnabled(True)
+        self.update_btn.setText("重试更新")
+        self.cancel_btn.setText("关闭")
+        self.status_label.setStyleSheet("color: #EF4444; font-weight: bold;")
+        self.status_label.setText(f"❌ {err_msg}")
+
+    def _on_finished(self) -> None:
+        self.status_label.setStyleSheet("color: #10B981; font-weight: bold;")
+        self.status_label.setText("✅ 更新包已就绪！程序即将退出并重启生效...")
+        self.update_btn.setText("即将重启...")
+        QTimer.singleShot(1200, lambda: QApplication.quit())
+
+    def _on_cancel_clicked(self) -> None:
+        if self._is_updating:
+            self._stop_event.set()
+        self.reject()
+
+    def closeEvent(self, event: Any) -> None:
+        if self._is_updating:
+            self._stop_event.set()
+        super().closeEvent(event)
+
 
 
