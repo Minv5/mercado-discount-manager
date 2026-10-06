@@ -123,18 +123,26 @@ class QtUiTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         import tempfile
         cls._prev_data_dir = os.environ.get("MDM_DATA_DIR")
-        cls._temp_dir_obj = tempfile.TemporaryDirectory()
+        try:
+            cls._temp_dir_obj = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        except TypeError:
+            cls._temp_dir_obj = tempfile.TemporaryDirectory()
         os.environ["MDM_DATA_DIR"] = cls._temp_dir_obj.name
         cls.app = create_application(["test-ui"])
 
     @classmethod
     def tearDownClass(cls) -> None:
+        import gc
+        gc.collect()
         if cls._prev_data_dir is None:
             os.environ.pop("MDM_DATA_DIR", None)
         else:
             os.environ["MDM_DATA_DIR"] = cls._prev_data_dir
         if hasattr(cls, "_temp_dir_obj"):
-            cls._temp_dir_obj.cleanup()
+            try:
+                cls._temp_dir_obj.cleanup()
+            except Exception:
+                pass
 
     def setUp(self) -> None:
         from engine.item_cleaner import get_cleaner_draft_file
@@ -2641,10 +2649,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.0.79")
+        self.assertEqual(product_version(), "2.0.80")
  
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.0.79")
+        self.assertEqual(self.window.version_label.text(), "v2.0.80")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2656,7 +2664,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.0.79")
+        self.assertEqual(self.window.version_label.text(), "v2.0.80")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -3096,7 +3104,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.0.79")
+        self.assertEqual(self.window.version_label.text(), "v2.0.80")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")

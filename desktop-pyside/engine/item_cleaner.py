@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import datetime
 import json
 import sqlite3
@@ -125,14 +126,24 @@ def _ensure_cleaner_tables_once(conn: sqlite3.Connection) -> None:
     _cleaner_tables_ensured = True
 
 
+@contextlib.contextmanager
+def _open_cleaner_db(db_path: Path, timeout: float = 10.0):
+    """确保 SQLite 连接在事务完成后立即显式关闭，避免 Windows 文件句柄锁泄漏。"""
+    conn = sqlite3.connect(db_path, timeout=timeout)
+    try:
+        _ensure_cleaner_tables_once(conn)
+        yield conn
+    finally:
+        conn.close()
+
+
 def get_cached_score(item_id: str) -> tuple[int, str] | None:
     """从本地 SQLite 读取缓存的商品刊登评分（7天内有效）。"""
     db_path = _get_db_path()
     if not db_path.exists():
         return None
     try:
-        with sqlite3.connect(db_path, timeout=5) as conn:
-            _ensure_cleaner_tables_once(conn)
+        with _open_cleaner_db(db_path, timeout=5) as conn:
             cur = conn.cursor()
             cur.execute(
                 "SELECT score, level_wording, updated_at FROM item_cleaner_score_cache WHERE item_id = ?",
@@ -155,8 +166,7 @@ def save_cached_scores(score_entries: list[tuple[str, int, str]]) -> None:
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        with sqlite3.connect(db_path, timeout=10) as conn:
-            _ensure_cleaner_tables_once(conn)
+        with _open_cleaner_db(db_path, timeout=10) as conn:
             cur = conn.cursor()
             cur.executemany(
                 "INSERT OR REPLACE INTO item_cleaner_score_cache (item_id, score, level_wording, updated_at) "
@@ -174,8 +184,7 @@ def get_cached_visits(item_id: str, max_age_hours: int = 24) -> int | None:
     if not db_path.exists():
         return None
     try:
-        with sqlite3.connect(db_path, timeout=5) as conn:
-            _ensure_cleaner_tables_once(conn)
+        with _open_cleaner_db(db_path, timeout=5) as conn:
             cur = conn.cursor()
             cur.execute(
                 "SELECT visits, updated_at FROM item_cleaner_visits_cache WHERE item_id = ?",
@@ -203,8 +212,7 @@ def save_cached_visits(visit_entries: list[tuple[str, int]]) -> None:
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        with sqlite3.connect(db_path, timeout=10) as conn:
-            _ensure_cleaner_tables_once(conn)
+        with _open_cleaner_db(db_path, timeout=10) as conn:
             cur = conn.cursor()
             cur.executemany(
                 "INSERT OR REPLACE INTO item_cleaner_visits_cache (item_id, visits, updated_at) "
@@ -222,8 +230,7 @@ def get_cached_item_info(item_id: str, max_age_hours: int = 72) -> dict[str, Any
     if not db_path.exists():
         return None
     try:
-        with sqlite3.connect(db_path, timeout=5) as conn:
-            _ensure_cleaner_tables_once(conn)
+        with _open_cleaner_db(db_path, timeout=5) as conn:
             cur = conn.cursor()
             cur.execute(
                 "SELECT title, sold_quantity, date_created, status, sub_status, site_id, updated_at FROM item_cleaner_info_cache WHERE item_id = ?",
@@ -260,8 +267,7 @@ def save_cached_item_info(item_entries: list[dict[str, Any]]) -> None:
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        with sqlite3.connect(db_path, timeout=10) as conn:
-            _ensure_cleaner_tables_once(conn)
+        with _open_cleaner_db(db_path, timeout=10) as conn:
             cur = conn.cursor()
             rows = []
             for it in item_entries:

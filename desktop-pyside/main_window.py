@@ -4614,7 +4614,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.0.79"
+    return "2.0.80"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

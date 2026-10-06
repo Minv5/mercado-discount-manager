@@ -24,17 +24,25 @@ class TestItemCleanerEngine(unittest.TestCase):
     def setUpClass(cls):
         import tempfile
         cls._prev_data_dir = os.environ.get("MDM_DATA_DIR")
-        cls._temp_dir_obj = tempfile.TemporaryDirectory()
+        try:
+            cls._temp_dir_obj = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        except TypeError:
+            cls._temp_dir_obj = tempfile.TemporaryDirectory()
         os.environ["MDM_DATA_DIR"] = cls._temp_dir_obj.name
 
     @classmethod
     def tearDownClass(cls):
+        import gc
+        gc.collect()
         if cls._prev_data_dir is None:
             os.environ.pop("MDM_DATA_DIR", None)
         else:
             os.environ["MDM_DATA_DIR"] = cls._prev_data_dir
         if hasattr(cls, "_temp_dir_obj"):
-            cls._temp_dir_obj.cleanup()
+            try:
+                cls._temp_dir_obj.cleanup()
+            except Exception:
+                pass
 
     def setUp(self):
         self.mock_client = MagicMock()
