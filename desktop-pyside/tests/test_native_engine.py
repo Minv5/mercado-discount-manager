@@ -177,7 +177,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.35")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.79")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)

@@ -856,6 +856,55 @@ class WebhookWorker:
         # Strictly reject external accounts not matching local parent or child store IDs
         return None, None, None
 
+    def _get_consumer_scope(self) -> tuple[str, list[str]]:
+        """Get comma-separated application IDs and unique user IDs for claim scope."""
+        app_ids: set[str] = set()
+        user_ids: set[str] = set()
+
+        try:
+            settings_path = get_data_dir() / "settings.json"
+            if settings_path.exists():
+                with open(settings_path, encoding="utf-8") as handle:
+                    st = json.load(handle)
+                    cfg_app = str(st.get("activityCallbackApplicationId") or "").strip()
+                    if cfg_app:
+                        for part in cfg_app.split(","):
+                            clean_app = part.strip()
+                            if clean_app.isdigit():
+                                app_ids.add(clean_app)
+        except Exception:
+            pass
+
+        if hasattr(self.auth, "_get_connection"):
+            try:
+                conn = self.auth._get_connection()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT DISTINCT client_id FROM oauth_tokens WHERE client_id IS NOT NULL AND client_id != ''")
+                    for (cid,) in cur.fetchall():
+                        cid_str = str(cid).strip()
+                        if cid_str.isdigit():
+                            app_ids.add(cid_str)
+
+                    cur.execute("SELECT DISTINCT account_id FROM account_profiles WHERE account_id IS NOT NULL AND account_id != ''")
+                    for (aid,) in cur.fetchall():
+                        aid_str = str(aid).strip()
+                        if aid_str.isdigit():
+                            user_ids.add(aid_str)
+
+                    cur.execute("SELECT DISTINCT child_user_id FROM marketplace_sites WHERE child_user_id IS NOT NULL AND child_user_id != ''")
+                    for (cuid,) in cur.fetchall():
+                        cuid_str = str(cuid).strip()
+                        if cuid_str.isdigit():
+                            user_ids.add(cuid_str)
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+        app_id_str = ", ".join(sorted(app_ids))
+        return app_id_str, sorted(user_ids)
+
     def _claim_events(self) -> list[dict[str, Any]]:
         """Call claim endpoint with Bearer auth to retrieve a batch of pending notifications."""
         secret = self._get_secret()
@@ -867,10 +916,17 @@ class WebhookWorker:
         if secret:
             headers["Authorization"] = f"Bearer {secret}"
 
+        app_id_str, user_ids = self._get_consumer_scope()
+        body_dict: dict[str, Any] = {}
+        if app_id_str and user_ids:
+            body_dict["application_id"] = app_id_str
+            body_dict["user_ids"] = user_ids
+        data_bytes = json.dumps(body_dict).encode("utf-8")
+
         try:
             req = urllib.request.Request(
                 self.claim_url,
-                data=b"{}",
+                data=data_bytes,
                 headers=headers,
                 method="POST",
             )

@@ -13,7 +13,7 @@ COLORS = {
     "gold": "#4E472F",
     "gold_focus": "#8A7432",
     "text": "#E6E2D8",
-    "muted": "#AFA89B",
+    "muted": "#C8C3B7",
     "weak": "#777266",
 }
 
@@ -32,13 +32,14 @@ QFrame#surface, QFrame#brandSurface {{
 }}
 QFrame#brandSurface {{ background: {COLORS['secondary']}; }}
 QWidget#controlContent {{ background: transparent; border: 0; }}
-QFrame#controlSection {{
+QFrame#controlSection, QFrame#settingsSection, QFrame#cleanerFilterSection {{
   background: {COLORS['table']};
   border: 1px solid {COLORS['gold']};
   border-radius: 8px;
 }}
+QLabel {{ background: transparent; }}
 QLabel#brandTitle {{ font-size: 16pt; font-weight: 700; color: #F6F3EA; }}
-QLabel#brandSubtitle, QLabel#muted {{ color: {COLORS['muted']}; }}
+QLabel#brandSubtitle, QLabel#muted {{ color: {COLORS['muted']}; font-size: 13px; line-height: 1.4; }}
 QLabel#sectionTitle {{ font-size: 11pt; font-weight: 700; color: #F6F3EA; }}
 QComboBox, QSpinBox, QLineEdit, QDateEdit, QTextEdit, QListWidget, QTableWidget {{
   background: {COLORS['input']};
@@ -102,7 +103,7 @@ QPushButton:pressed {{ background: #1F5A34; }}
 QPushButton#primary {{ background: {COLORS['green']}; border-color: #6D5B2A; font-weight: 700; }}
 QPushButton#primary:hover {{ background: {COLORS['green_hover']}; }}
 QPushButton#nav {{ padding: 6px 14px; font-weight: 600; }}
-QPushButton#nav[checked="true"] {{ background: {COLORS['green_selected']}; border-color: #3E7B4B; }}
+QPushButton#nav:checked, QPushButton#nav[checked="true"] {{ background: {COLORS['green_selected']}; border-color: #3E7B4B; }}
 QHeaderView::section {{
   background: {COLORS['card']};
   color: {COLORS['text']};
@@ -137,10 +138,12 @@ QTabBar::tab {{
   color: {COLORS['muted']};
   border: 1px solid {COLORS['gold']};
   border-radius: 6px;
-  padding: 8px 22px;
+  padding: 8px 18px;
+  min-width: 104px;
   margin-right: 6px;
   margin-bottom: 6px;
   font-weight: 600;
+  text-align: center;
 }}
 QTabBar::tab:selected {{
   background: {COLORS['green_selected']};

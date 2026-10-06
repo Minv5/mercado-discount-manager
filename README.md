@@ -12,11 +12,11 @@
 
 1. **Windows 系统用户**：
    * 点击仓库页面右侧的 **[Releases](../../releases)**；
-   * 下载最新版本的 **`美客多活动管家-Windows-x64-v2.0.35.zip`**；
+   * 下载最新版本的 **`美客多活动管家-Windows-x64-v2.0.44.zip`**；
    * 解压压缩包后，直接双击文件夹内的 **`美客多活动管家.exe`** 即可打开使用（无需安装 Python）。
 2. **macOS 系统用户**：
    * 点击仓库页面右侧的 **[Releases](../../releases)**；
-   * 下载最新版本的 **`美客多活动管家-macOS-arm64-v2.0.35.zip`**；
+   * 下载最新版本的 **`美客多活动管家-macOS-arm64-v2.0.44.zip`**；
    * 解压后将 **`美客多活动管家.app`** 拖入 `/Applications`（应用程序）即可打开使用。
 
 ---
@@ -55,6 +55,7 @@
 │   │   ├── client.py                # HTTPS Keep-Alive 连接池与高并发 API 客户端
 │   │   ├── pricing.py               # 净回款（net_proceeds）权威算价引擎
 │   │   ├── executor.py              # 多站点促销活动并发报名与取消执行器
+│   │   ├── item_cleaner.py          # 刊登表现评分、全周期浏览量分析与出单风控批量清理引擎
 │   │   ├── webhook_worker.py        # 实时 Webhook 回调监听与双定价体系自动分流
 │   │   ├── bridge.py                # UI 与本地引擎通信桥接层
 │   │   └── crypto.py                # AES-GCM 本地凭据加密存储

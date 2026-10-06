@@ -42,6 +42,24 @@ class ActionExecutor:
         self.auth = auth_manager or AuthManager()
         self.client = client or MercadoClient(self.auth)
         self.db_path = self.auth.db_path
+        self._recover_stale_running_tasks()
+
+    def _recover_stale_running_tasks(self) -> None:
+        try:
+            conn = self._get_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE promo_tasks
+                    SET status = 'cancelled',
+                        short_failure_reason = COALESCE(NULLIF(short_failure_reason, ''), '中途异常中断（已保留已完成商品数据）')
+                    WHERE status = 'running'
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
 
     def _get_conn(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,10 +110,6 @@ class ActionExecutor:
             tasks = []
             for r in rows:
                 t = dict(r)
-                if t.get("status") == "running":
-                    t["status"] = "cancelled"
-                    if not t.get("short_failure_reason"):
-                        t["short_failure_reason"] = "中途异常中断（已保留已完成商品数据）"
                 if t.get("summary_json"):
                     try:
                         summary = json.loads(t["summary_json"])
@@ -492,6 +506,7 @@ class ActionExecutor:
                     if cancelled():
                         return
                     res = process_item(cand, promo, s_id, c_uid, site_label)
+                    should_checkpoint = False
                     with p_lock:
                         if res == "success":
                             p_success += 1
@@ -499,13 +514,20 @@ class ActionExecutor:
                             p_failed += 1
                         elif res == "skipped":
                             p_skipped += 1
-                    # 每处理 25 件商品增量持久化一次检查点
-                    if progress.total > 0 and progress.total % 25 == 0:
+                        current_done = p_success + p_failed + p_skipped
+                        if current_done > 0 and current_done % 25 == 0:
+                            should_checkpoint = True
+
+                    # 每处理 25 件商品增量持久化一次检查点（严格单线程触发并做快照保护）
+                    if should_checkpoint:
+                        with activity_lock:
+                            act_details_snapshot = list(activity_details)
+                            failed_items_snapshot = list(failed_items)
                         self._checkpoint_task(
                             task_id=task_db_id,
                             progress=progress,
-                            activity_details=activity_details,
-                            failed_items=failed_items,
+                            activity_details=act_details_snapshot,
+                            failed_items=failed_items_snapshot,
                             elapsed_seconds=round(time.time() - start_time, 1),
                             store_name=store_name,
                             seller_discount=seller_discount,

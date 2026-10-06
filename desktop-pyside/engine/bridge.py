@@ -111,6 +111,18 @@ class EngineBridge:
 
         return current
 
+    def _apply_store_aliases(self, accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        settings = self._read_settings()
+        aliases = settings.get("storeAliases") or {}
+        for acc in accounts:
+            acc_id = str(acc.get("account_id") or acc.get("id") or "")
+            if acc_id in aliases and str(aliases[acc_id]).strip():
+                alias = str(aliases[acc_id]).strip()
+                acc["raw_display_name"] = acc.get("raw_display_name") or acc.get("display_name") or acc.get("store_name") or alias
+                acc["store_name"] = alias
+                acc["display_name"] = alias
+        return accounts
+
     def handle_request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         """Dispatch route matching GET /api/... or POST /api/... to the native Python engine."""
         method = method.upper()
@@ -126,7 +138,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.0.35",
+                "build_fingerprint": "native-python-v2.0.79",
             }
 
         # 2. Settings
@@ -137,9 +149,9 @@ class EngineBridge:
             return {"settings": self._read_settings()}
 
         # 3. Accounts
-        if route == "/api/accounts":
+        if route in ("/api/accounts", "/api/accounts/profiles/refresh"):
             accounts = self.auth.list_accounts()
-            return {"accounts": accounts}
+            return {"ok": True, "accounts": self._apply_store_aliases(accounts)}
 
         # 4. Sites
         if route.startswith("/api/accounts/") and route.endswith("/sites"):
@@ -276,6 +288,7 @@ class EngineBridge:
             item_id = route.split("/")[3].strip().upper()
             conn = self.executor._get_conn()
             actions = []
+            price_cache = []
             try:
                 cur = conn.cursor()
                 cur.execute("""
@@ -289,9 +302,84 @@ class EngineBridge:
                     acc_id = str(r.get("account_id") or "")
                     r["account_name"] = self.executor._get_store_alias(acc_id)
                     actions.append(r)
+
+                cur.execute("""
+                    SELECT * FROM item_price_cache
+                    WHERE item_id = ?
+                    ORDER BY id DESC
+                    LIMIT 10
+                """, (item_id,))
+                for r in cur.fetchall():
+                    pc_dict = dict(r)
+                    pc_acc = str(pc_dict.get("account_id") or "")
+                    pc_dict["account_name"] = self.executor._get_store_alias(pc_acc)
+                    price_cache.append(pc_dict)
             finally:
                 conn.close()
-            return {"ok": True, "item_id": item_id, "actions": actions, "items": []}
+
+            items = []
+            # Live query Mercado Libre API for official promotion relationship & pricing
+            accounts = self.auth.list_accounts()
+            for acc in accounts:
+                acc_id = acc["account_id"]
+                store_alias = self.executor._get_store_alias(acc_id)
+                sites = self.auth.list_sites(acc_id)
+                found = False
+                for s in sites:
+                    c_uid = str(s.get("child_user_id") or "")
+                    s_id = str(s.get("site_id") or "")
+                    if s_id and not item_id.startswith(s_id) and not item_id.startswith("CBT"):
+                        continue
+                    try:
+                        raw_detail = self.client.get_item_detail(acc_id, item_id)
+                        if raw_detail and raw_detail.get("id"):
+                            found = True
+                            live_p = raw_detail.get("price")
+                            orig_p = raw_detail.get("original_price")
+                            curr_id = raw_detail.get("currency_id") or "USD"
+                            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            if not price_cache:
+                                price_cache.append({
+                                    "price": live_p,
+                                    "original_price": orig_p,
+                                    "currency_id": curr_id,
+                                    "account_name": store_alias,
+                                    "account_id": acc_id,
+                                    "updated_at": now_iso,
+                                })
+                            promos = self.client.get_item_promotions(acc_id, c_uid, item_id)
+                            for pr in promos:
+                                p_id = str(pr.get("id") or "")
+                                p_name = str(pr.get("name") or p_id)
+                                p_type = str(pr.get("type") or "")
+                                p_status = str(pr.get("status") or "")
+                                p_price = pr.get("price") if pr.get("price") is not None else live_p
+                                items.append({
+                                    "promotion_id": p_id,
+                                    "promotion_name": p_name,
+                                    "promotion_type": p_type,
+                                    "cached_status": p_status,
+                                    "raw_json": json.dumps(pr, ensure_ascii=False),
+                                    "currency_id": curr_id,
+                                    "account_name": store_alias,
+                                    "account_id": acc_id,
+                                    "price": p_price,
+                                    "original_price": orig_p,
+                                    "updated_at": now_iso,
+                                })
+                            break
+                    except Exception:
+                        pass
+                if found:
+                    break
+
+            return {
+                "ok": True,
+                "item_id": item_id,
+                "actions": actions,
+                "items": items,
+                "price_cache": price_cache,
+            }
 
         if route == "/api/items/targeted-refresh" and method == "POST":
             payload = body or {}
@@ -574,8 +662,8 @@ class EngineBridge:
                             for p in promos:
                                 p_id = str(p.get("id") or p.get("promotion_id") or "")
                                 p_name = p.get("name") or p.get("title") or p_id
-                                started = self.client.get_promotion_items(acc_id, c_uid, p_id, status="started", limit=50)
-                                cand = self.client.get_promotion_items(acc_id, c_uid, p_id, status="candidate", limit=50)
+                                started = self.client.get_promotion_items(acc_id, c_uid, p_id, status="started", max_items=50)
+                                cand = self.client.get_promotion_items(acc_id, c_uid, p_id, status="candidate", max_items=50)
                                 tot_s += len(started)
                                 tot_c += len(cand)
                                 job_data["logs"].append(f"[{store_name}][{s_id}] 活动 [{p_name}]: 已报 {len(started)} 件，可报 {len(cand)} 件")

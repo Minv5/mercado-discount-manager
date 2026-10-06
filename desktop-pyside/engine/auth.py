@@ -49,6 +49,8 @@ class AuthManager:
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path or (get_data_dir() / "discount-manager.sqlite")
         self._refresh_lock = threading.Lock()
+        self._token_cache: dict[str, AccountToken] = {}
+        self._cache_lock = threading.Lock()
         self._ensure_schema()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -234,6 +236,22 @@ class AuthManager:
                     updated_at TEXT NOT NULL,
                     UNIQUE(account_id, child_user_id, site_id, item_id)
                 );
+                CREATE TABLE IF NOT EXISTS item_cleaner_score_cache (
+                    item_id TEXT PRIMARY KEY,
+                    score INTEGER,
+                    level_wording TEXT,
+                    updated_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS item_cleaner_visits_cache (
+                    item_id TEXT PRIMARY KEY,
+                    visits INTEGER,
+                    updated_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS item_cleaner_info_cache (
+                    item_id TEXT PRIMARY KEY,
+                    data_json TEXT,
+                    updated_at TEXT
+                );
             """)
             conn.commit()
         finally:
@@ -245,7 +263,7 @@ class AuthManager:
         try:
             cur = conn.cursor()
             cur.execute("""
-                SELECT p.account_id, p.display_name, p.site_id, t.expires_at, t.updated_at
+                SELECT p.account_id, p.display_name, p.site_id, t.expires_at, t.updated_at, t.client_id
                 FROM account_profiles p
                 LEFT JOIN oauth_tokens t ON p.account_id = t.account_id
                 ORDER BY p.account_id
@@ -261,6 +279,7 @@ class AuthManager:
                     "site_id": r["site_id"] or "CBT",
                     "expires_at": r["expires_at"],
                     "status": "active" if r["expires_at"] else "unauthorized",
+                    "client_id": r["client_id"] or "",
                 })
             return accounts
         finally:
@@ -291,6 +310,20 @@ class AuthManager:
 
     def get_token(self, account_id: str, force_refresh: bool = False) -> AccountToken:
         """Get valid decrypted access token for account, automatically refreshing if expired/expiring."""
+        clean_aid = str(account_id).strip()
+        if not force_refresh:
+            with self._cache_lock:
+                cached = self._token_cache.get(clean_aid)
+            if cached and cached.expires_at:
+                try:
+                    clean_exp = cached.expires_at.replace("Z", "+00:00")
+                    exp_dt = datetime.datetime.fromisoformat(clean_exp)
+                    now_dt = datetime.datetime.now(datetime.timezone.utc)
+                    if (exp_dt - now_dt).total_seconds() >= 600:
+                        return cached
+                except Exception:
+                    pass
+
         conn = self._get_connection()
         try:
             cur = conn.cursor()
@@ -299,7 +332,7 @@ class AuthManager:
                        client_id, client_secret_cipher, expires_at, auth_domain
                 FROM oauth_tokens
                 WHERE account_id = ?
-            """, (str(account_id),))
+            """, (clean_aid,))
             row = cur.fetchone()
             if not row:
                 raise RuntimeError(f"未找到店铺 {account_id} 的授权凭据，请在设置中授权。")
@@ -314,7 +347,6 @@ class AuthManager:
             needs_refresh = force_refresh
             if expires_at and not needs_refresh:
                 try:
-                    # Clean ISO format
                     clean_exp = expires_at.replace("Z", "+00:00")
                     exp_dt = datetime.datetime.fromisoformat(clean_exp)
                     now_dt = datetime.datetime.now(datetime.timezone.utc)
@@ -327,13 +359,12 @@ class AuthManager:
 
             if needs_refresh and refresh_token and client_id and client_secret:
                 with self._refresh_lock:
-                    # Double check under lock in case another thread just refreshed this token
                     cur.execute("""
                         SELECT account_id, display_name, site_id, access_token_cipher, refresh_token_cipher,
                                client_id, client_secret_cipher, expires_at, auth_domain
                         FROM oauth_tokens
                         WHERE account_id = ?
-                    """, (str(account_id),))
+                    """, (clean_aid,))
                     fresh_row = cur.fetchone()
                     if fresh_row:
                         fresh_exp = fresh_row["expires_at"] or ""
@@ -343,7 +374,7 @@ class AuthManager:
                                 exp_dt = datetime.datetime.fromisoformat(clean_fresh)
                                 now_dt = datetime.datetime.now(datetime.timezone.utc)
                                 if (exp_dt - now_dt).total_seconds() >= 600:
-                                    return AccountToken(
+                                    token_inst = AccountToken(
                                         account_id=str(fresh_row["account_id"]),
                                         display_name=fresh_row["display_name"] or f"账号 {fresh_row['account_id']}",
                                         access_token=decrypt_secret(fresh_row["access_token_cipher"]) or "",
@@ -354,19 +385,24 @@ class AuthManager:
                                         site_id=fresh_row["site_id"],
                                         auth_domain=fresh_row["auth_domain"],
                                     )
+                                    with self._cache_lock:
+                                        self._token_cache[clean_aid] = token_inst
+                                    return token_inst
                             except Exception:
                                 pass
                         token_obj = self._refresh_token(
-                            account_id,
+                            clean_aid,
                             client_id,
                             client_secret,
                             decrypt_secret(fresh_row["refresh_token_cipher"]) or refresh_token,
                             fresh_row["display_name"],
                             fresh_row["site_id"],
                         )
+                        with self._cache_lock:
+                            self._token_cache[clean_aid] = token_obj
                         return token_obj
 
-            return AccountToken(
+            res_token = AccountToken(
                 account_id=str(row["account_id"]),
                 display_name=row["display_name"] or f"账号 {row['account_id']}",
                 access_token=access_token or "",
@@ -377,6 +413,9 @@ class AuthManager:
                 site_id=row["site_id"],
                 auth_domain=row["auth_domain"],
             )
+            with self._cache_lock:
+                self._token_cache[clean_aid] = res_token
+            return res_token
         finally:
             conn.close()
 
@@ -448,7 +487,7 @@ class AuthManager:
         finally:
             conn.close()
 
-        return AccountToken(
+        tok = AccountToken(
             account_id=str(account_id),
             display_name=display_name or f"账号 {account_id}",
             access_token=new_access,
@@ -458,3 +497,6 @@ class AuthManager:
             expires_at=new_exp,
             site_id=site_id,
         )
+        with self._cache_lock:
+            self._token_cache[str(account_id).strip()] = tok
+        return tok

@@ -121,9 +121,26 @@ class FakeApi:
 class QtUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        import tempfile
+        cls._prev_data_dir = os.environ.get("MDM_DATA_DIR")
+        cls._temp_dir_obj = tempfile.TemporaryDirectory()
+        os.environ["MDM_DATA_DIR"] = cls._temp_dir_obj.name
         cls.app = create_application(["test-ui"])
 
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._prev_data_dir is None:
+            os.environ.pop("MDM_DATA_DIR", None)
+        else:
+            os.environ["MDM_DATA_DIR"] = cls._prev_data_dir
+        if hasattr(cls, "_temp_dir_obj"):
+            cls._temp_dir_obj.cleanup()
+
     def setUp(self) -> None:
+        from engine.item_cleaner import get_cleaner_draft_file
+        draft = get_cleaner_draft_file()
+        if draft.exists():
+            draft.unlink(missing_ok=True)
         self.api = FakeApi()
         self.service = FakeService()
         self.window = MainWindow(self.api, self.service, auto_start=False)
@@ -167,6 +184,10 @@ class QtUiTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.window.close()
+        from engine.item_cleaner import get_cleaner_draft_file
+        draft = get_cleaner_draft_file()
+        if draft.exists():
+            draft.unlink(missing_ok=True)
 
     def test_confirm_dialog_short_current_and_long_text_fit_or_scroll(self) -> None:
         messages = [
@@ -583,10 +604,29 @@ class QtUiTests(unittest.TestCase):
         self.window.refresh_records = lambda: calls.append(self.window.records_view)  # type: ignore[method-assign]
         self.window.records_refresh_button.clicked.emit()
         self.assertEqual(calls, ["recent"])
-        self.assertEqual([button.text() for button in self.window.nav_buttons], ["工作台", "活动管理"])
+        self.assertEqual([button.text() for button in self.window.nav_buttons], ["活动报名", "活动管理", "商品清理"])
         self.assertFalse(hasattr(self.window, "history_table"))
         self.assertFalse(hasattr(self.window, "workbench_table"))
-        self.assertEqual(self.window.pages.count(), 2)
+        self.assertEqual(self.window.pages.count(), 3)
+
+        # 验证切换到商品清理 (index=2) 时，当前主视图为 cleaner_page，controls 归属于 enrollment_page 而不在当前视图
+        self.window._show_page(2)
+        self.assertEqual(self.window.pages.currentIndex(), 2)
+        self.assertIs(self.window.pages.currentWidget(), self.window.cleaner_page)
+        self.assertTrue(self.window.nav_buttons[2].isChecked())
+        self.assertTrue(bool(self.window.nav_buttons[2].property("checked")))
+        self.assertFalse(self.window.nav_buttons[0].isChecked())
+        self.assertFalse(bool(self.window.nav_buttons[0].property("checked")))
+
+        # 验证切换回活动报名 (index=0) 时，当前主视图为 enrollment_page（自包含 controls 与 records_page）
+        self.window._show_page(0)
+        self.assertEqual(self.window.pages.currentIndex(), 0)
+        self.assertIs(self.window.pages.currentWidget(), self.window.enrollment_page)
+        self.assertIs(self.window.controls.parent(), self.window.enrollment_page)
+        self.assertTrue(self.window.nav_buttons[0].isChecked())
+        self.assertTrue(bool(self.window.nav_buttons[0].property("checked")))
+        self.assertFalse(self.window.nav_buttons[2].isChecked())
+        self.assertFalse(bool(self.window.nav_buttons[2].property("checked")))
 
     def test_execution_record_details_and_selection_work_in_both_views(self) -> None:
         paths: list[str] = []
@@ -2195,8 +2235,8 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(dialog.values()["previewConcurrency"], 42)
         self.assertEqual(dialog.values()["writeConcurrency"], 24)
         labels = {label.text() for label in dialog.findChildren(QLabel)}
-        self.assertTrue({"读取全局上限", "活动目录并发上限", "商品写入全局上限"}.issubset(labels))
-        self.assertNotIn("读取并发（当前使用值）", labels)
+        self.assertTrue({"并发调度机制", "官方防封保护模式（自适应 18 线程安全并发）"}.issubset(labels))
+        self.assertFalse(dialog.read_concurrency.isVisible())
 
     def test_settings_dialog_uses_safe_effective_defaults_and_server_refresh(self) -> None:
         dialog = SettingsDialog({}, [], [], "旧并发说明")
@@ -2253,9 +2293,7 @@ class QtUiTests(unittest.TestCase):
             scheduled.append((function, on_result, on_error))
 
         started = time.perf_counter()
-        with patch.object(self.window, "_run_worker", side_effect=capture), patch.object(
-            SettingsDialog, "exec", return_value=QDialog.DialogCode.Rejected
-        ):
+        with patch.object(self.window, "_run_worker", side_effect=capture):
             self.window._open_settings()
         self.assertLess((time.perf_counter() - started) * 1000, 200)
         self.assertEqual(len(scheduled), 1)
@@ -2433,6 +2471,7 @@ class QtUiTests(unittest.TestCase):
             reopened_names,
             {"2651442567": "湖北", "3332096437": "广州新店", "3408885754": "湖南"},
         )
+        self.assertEqual(reopened.values()["storeAliases"], {"3332096437": "广州新店"})
 
         self.window.accounts = reopened_accounts
         self.window._fill_store_combo()
@@ -2602,12 +2641,12 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.0.35")
-
+        self.assertEqual(product_version(), "2.0.79")
+ 
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "版本 2.0.35")
+        self.assertEqual(self.window.version_label.text(), "v2.0.79")
         self.assertNotIn("0.1.12", self.window.version_label.text())
-        self.assertIs(self.window.version_label.parentWidget(), self.window.statusBar())
+        self.assertTrue(self.window.statusBar().isHidden())
 
     def test_status_bar_left_side_stays_empty_during_runtime_updates_and_version_survives_resize(self) -> None:
         self.window._show_status("缓存同步被阻断，详情见运行日志", "长原因不应进入底部边框")
@@ -2617,7 +2656,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "版本 2.0.35")
+        self.assertEqual(self.window.version_label.text(), "v2.0.79")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -2770,6 +2809,488 @@ class QtUiTests(unittest.TestCase):
         viewer.append_log_line("test log line")
         self.assertIn("test log line", viewer.toPlainText())
 
+    def test_embedded_surfaces_navigation_and_switching(self) -> None:
+        self.window.show()
+        self.app.processEvents()
+
+        # 1. Switch to settings
+        self.window.settings_button.click()
+        self.assertIs(self.window.view_stack.currentWidget(), self.window.settings_page)
+        self.assertTrue(self.window.settings_button.isChecked())
+        self.assertFalse(self.window.nav_buttons[0].isChecked())
+
+        # Back from settings
+        self.window.settings_page.back_button.click()
+        self.assertIs(self.window.view_stack.currentWidget(), self.window.pages)
+        self.assertEqual(self.window.pages.currentIndex(), 0)
+        self.assertTrue(self.window.nav_buttons[0].isChecked())
+
+        # 2. Switch to query
+        self.window.query_button.click()
+        self.assertIs(self.window.view_stack.currentWidget(), self.window.query_page)
+        self.assertTrue(self.window.query_button.isChecked())
+
+        # Back from query
+        self.window.query_page.back_button.click()
+        self.assertIs(self.window.view_stack.currentWidget(), self.window.pages)
+
+        # 3. Switch to targeted cancel
+        self.window.targeted_cancel_button.click()
+        self.assertIs(self.window.view_stack.currentWidget(), self.window.targeted_cancel_page)
+        self.assertTrue(self.window.targeted_cancel_button.isChecked())
+
+        # Back from targeted cancel
+        self.window.targeted_cancel_page.cancel_button.click()
+        self.assertIs(self.window.view_stack.currentWidget(), self.window.pages)
+        self.assertTrue(self.window.nav_buttons[0].isChecked())
+
+    def test_copy_zero_visits_ids_button_and_dialog(self) -> None:
+        from dialogs import CopyZeroVisitIdsDialog
+        from PySide6.QtGui import QGuiApplication
+
+        self.assertTrue(hasattr(self.window, "cleaner_copy_zero_visits_btn"))
+        self.assertEqual(self.window.cleaner_copy_zero_visits_btn.text(), "复制0浏览ID")
+
+        batches = [["MLM1001", "MLM1002"], ["MLB2001", "MLB2002"]]
+        dialog = CopyZeroVisitIdsDialog(batches, self.window)
+        self.assertEqual(dialog.table.rowCount(), 2)
+        self.assertEqual(dialog.table.columnCount(), 2)
+        self.assertEqual(dialog.table.item(0, 1).text(), "点击复制")
+
+        # Simulate clicking row 0
+        dialog._on_row_clicked(0, 0)
+        self.assertEqual(dialog.table.item(0, 1).text(), "已复制")
+        self.assertEqual(QGuiApplication.clipboard().text(), "MLM1001 MLM1002")
+
+        # Simulate clicking row 1
+        dialog._on_row_clicked(1, 0)
+        self.assertEqual(dialog.table.item(1, 1).text(), "已复制")
+        self.assertEqual(QGuiApplication.clipboard().text(), "MLB2001 MLB2002")
+        dialog.close()
+
+    def test_cleaner_action_bar_simplified(self) -> None:
+        self.assertTrue(hasattr(self.window, "cleaner_batch_delete_btn"))
+        self.assertEqual(self.window.cleaner_batch_delete_btn.text(), "批量删除")
+        self.assertTrue(hasattr(self.window, "cleaner_clear_draft_btn"))
+        self.assertEqual(self.window.cleaner_clear_draft_btn.text(), "清除记录")
+        self.assertFalse(hasattr(self.window, "cleaner_select_all_btn"))
+        self.assertFalse(hasattr(self.window, "cleaner_unselect_all_btn"))
+
+    def test_cleaner_table_model_virtualization_and_methods(self) -> None:
+        from main_window import CLEANER_HEADERS, CleanerTableModel
+        from engine.item_cleaner import ScannedItemRecord
+
+        model = CleanerTableModel(CLEANER_HEADERS)
+        self.assertEqual(model.rowCount(), 0)
+        self.assertEqual(model.columnCount(), len(CLEANER_HEADERS))
+
+        rec1 = ScannedItemRecord(
+            item_id="CBT1001",
+            account_id="ACC1",
+            site_id="MLM",
+            title="Sample CBT 1",
+            status="active",
+            store_name="Store 1",
+            visits=0,
+            has_sales=False,
+            is_selected_for_delete=True,
+            score=50.0,
+            level_wording="差",
+            unmet_reasons=["曝光不足"],
+        )
+        rec2 = ScannedItemRecord(
+            item_id="CBT1002",
+            account_id="ACC1",
+            site_id="MLB",
+            title="Sample CBT 2 (Sold)",
+            status="active",
+            store_name="Store 1",
+            visits=10,
+            sold_quantity=2,
+            has_sales=True,
+            is_selected_for_delete=False,
+            score=70.0,
+            level_wording="良",
+            unmet_reasons=["评分不达标"],
+        )
+        model.set_records([rec1, rec2])
+        self.assertEqual(model.rowCount(), 2)
+
+        idx0 = model.index(0, 0)
+        self.assertEqual(model.data(idx0, Qt.ItemDataRole.CheckStateRole), Qt.CheckState.Checked)
+
+        idx1 = model.index(0, 1)
+        self.assertEqual(model.data(idx1, Qt.ItemDataRole.DisplayRole), "Store 1")
+
+        idx2_7 = model.index(1, 7)
+        self.assertIn("已售 2 件", str(model.data(idx2_7, Qt.ItemDataRole.DisplayRole)))
+        self.assertIsNotNone(model.data(idx2_7, Qt.ItemDataRole.BackgroundRole))
+        self.assertIsNotNone(model.data(idx2_7, Qt.ItemDataRole.ForegroundRole))
+
+        skipped = model.select_all_safe()
+        self.assertEqual(skipped, 1)
+        self.assertTrue(rec1.is_selected_for_delete)
+        self.assertFalse(rec2.is_selected_for_delete)
+
+        model.update_item_status("CBT1001", "已删除", True)
+        idx0_status = model.index(0, 9)
+        self.assertEqual(model.data(idx0_status, Qt.ItemDataRole.DisplayRole), "已删除")
+
+        # 再次安全全选时，已确认删除的商品（rec1）与有销量商品（rec2）均被安全跳过豁免
+        skipped_after_del = model.select_all_safe()
+        self.assertEqual(skipped_after_del, 2)
+        self.assertFalse(rec1.is_selected_for_delete)
+        self.assertFalse(rec2.is_selected_for_delete)
+
+        model.unselect_all()
+        self.assertFalse(rec1.is_selected_for_delete)
+        self.assertFalse(rec2.is_selected_for_delete)
+
+        model.clear()
+        self.assertEqual(model.rowCount(), 0)
+
+    def test_cleaner_table_model_upsert_and_reasons_merging(self) -> None:
+        from main_window import CLEANER_HEADERS, CleanerTableModel
+        from engine.item_cleaner import ScannedItemRecord
+
+        model = CleanerTableModel(CLEANER_HEADERS)
+        r1 = ScannedItemRecord(
+            item_id="ITEM1",
+            account_id="ACC1",
+            site_id="MLM",
+            title="商品1",
+            status="active",
+            score=50.0,
+            visits=0,
+            unmet_reasons=["刊登评分 50分 < 60分"],
+        )
+        model.upsert_records([r1])
+        self.assertEqual(model.rowCount(), 1)
+        self.assertEqual(model.records[0].unmet_reasons, ["刊登评分 50分 < 60分"])
+
+        # 第二次扫描命中 0 浏览量，单条更新合并原因
+        r1_scan2 = ScannedItemRecord(
+            item_id="ITEM1",
+            account_id="ACC1",
+            site_id="MLM",
+            title="商品1 (新标题)",
+            status="active",
+            score=55.0,
+            visits=0,
+            unmet_reasons=["0 浏览量"],
+        )
+        model.upsert_records([r1_scan2])
+        self.assertEqual(model.rowCount(), 1)  # 严格单条，不重复
+        self.assertEqual(model.records[0].unmet_reasons, ["刊登评分 50分 < 60分", "0 浏览量"])
+        self.assertEqual(model.records[0].score, 55.0)
+
+        # 标记为已删除后，再次扫描不会覆盖删除终态
+        model.update_item_status("ITEM1", "已删除", True)
+        self.assertEqual(model.records[0].status, "已删除")
+        self.assertFalse(model.records[0].is_selected_for_delete)
+
+        model.upsert_records([r1])
+        self.assertEqual(model.records[0].status, "已删除")
+        self.assertFalse(model.records[0].is_selected_for_delete)
+
+    def test_cleaner_clear_records_dialog_and_scan_no_prompt(self) -> None:
+        from engine.item_cleaner import ScannedItemRecord
+        r1 = ScannedItemRecord(
+            item_id="ITEM1",
+            account_id="ACC1",
+            site_id="MLM",
+            title="商品1",
+            status="active",
+        )
+        self.window.cleaner_records = [r1]
+        if self.window.cleaner_model:
+            self.window.cleaner_model.set_records([r1])
+
+        # 1. 点击清除记录时，弹窗二次确认；若选 No 则不清除
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No) as mock_q:
+            self.window._on_cleaner_clear_records()
+            mock_q.assert_called_once()
+            self.assertEqual(len(self.window.cleaner_records), 1)
+
+        # 2. 若选 Yes 则执行清除
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes) as mock_q:
+            self.window._on_cleaner_clear_records()
+            mock_q.assert_called_once()
+            self.assertEqual(len(self.window.cleaner_records), 0)
+
+        # 3. 扫描时若已有记录，不再弹出阻断弹窗，直接增量扫描
+        self.window.cleaner_records = [r1]
+        with patch.object(QMessageBox, "question") as mock_q:
+            # 停止正在进行的扫描测试避免进入线程
+            with patch.object(self.window, "_worker", create=True):
+                with patch.object(self.window.cleaner_engine, "scan_shop_items"):
+                    self.window._on_start_cleaner_scan()
+                    mock_q.assert_not_called()
+                    # 停止扫描还原状态
+                    self.window._on_cleaner_scan_finished()
+
+    def test_cleaner_wipe_store_checkbox_disables_filters(self) -> None:
+        self.assertFalse(self.window.cleaner_wipe_store_check.isChecked())
+        self.assertTrue(self.window.cleaner_visits_check.isEnabled())
+        self.assertTrue(self.window.cleaner_score_check.isEnabled())
+        self.assertTrue(self.window.cleaner_policy_check.isEnabled())
+        self.assertTrue(self.window.cleaner_grace_check.isEnabled())
+
+        # 勾选清店模式：常规过滤条件全部置灰禁用
+        self.window.cleaner_wipe_store_check.setChecked(True)
+        self.assertFalse(self.window.cleaner_visits_check.isEnabled())
+        self.assertFalse(self.window.cleaner_score_check.isEnabled())
+        self.assertFalse(self.window.cleaner_policy_check.isEnabled())
+        self.assertFalse(self.window.cleaner_grace_check.isEnabled())
+        self.assertIn("【清店模式】", self.window.cleaner_log_box.toPlainText())
+
+        # 取消勾选：常规过滤条件全部恢复可用
+        self.window.cleaner_wipe_store_check.setChecked(False)
+        self.assertTrue(self.window.cleaner_visits_check.isEnabled())
+        self.assertTrue(self.window.cleaner_score_check.isEnabled())
+        self.assertTrue(self.window.cleaner_policy_check.isEnabled())
+        self.assertTrue(self.window.cleaner_grace_check.isEnabled())
+        self.assertIn("【常规风控过滤模式】", self.window.cleaner_log_box.toPlainText())
+
+    def test_page_level_independent_log_boxes_and_routing(self) -> None:
+        self.assertIsNotNone(self.window.enrollment_log_box)
+        self.assertIsNotNone(self.window.activity_log_box)
+        self.assertIsNotNone(self.window.cleaner_log_box)
+        self.assertIs(self.window.log_box, self.window.enrollment_log_box)
+
+        # 1. 商品清理日志路由
+        cleaner_msg = "[商品清理] 正在分析店铺僵尸品"
+        self.window.log(cleaner_msg)
+        self.assertIn(cleaner_msg, self.window.cleaner_log_box.toPlainText())
+        self.assertNotIn(cleaner_msg, self.window.activity_log_box.toPlainText())
+        self.assertNotIn(cleaner_msg, self.window.enrollment_log_box.toPlainText())
+
+        # 2. 活动管理日志路由
+        activity_msg = "[活动管理] 正在重新读取活动"
+        self.window.log(activity_msg)
+        self.assertIn(activity_msg, self.window.activity_log_box.toPlainText())
+        self.assertNotIn(activity_msg, self.window.cleaner_log_box.toPlainText())
+        self.assertNotIn(activity_msg, self.window.enrollment_log_box.toPlainText())
+
+        # 3. 报名与通用执行日志路由
+        enrollment_msg = "批量更新完成：成功 10 件"
+        self.window.log(enrollment_msg)
+        self.assertIn(enrollment_msg, self.window.enrollment_log_box.toPlainText())
+        self.assertIn(enrollment_msg, self.window.log_box.toPlainText())
+        self.assertNotIn(enrollment_msg, self.window.cleaner_log_box.toPlainText())
+        self.assertNotIn(enrollment_msg, self.window.activity_log_box.toPlainText())
+
+    def test_ui_consistency_and_cleaner_controls_refinement(self) -> None:
+        # 1. 顶部导航与操作按钮尺寸与排版标准 (90x34)
+        for btn in self.window.nav_buttons:
+            self.assertEqual(btn.size().width(), 90)
+            self.assertEqual(btn.size().height(), 34)
+        self.assertEqual(self.window.settings_button.size().width(), 90)
+        self.assertEqual(self.window.settings_button.size().height(), 34)
+        self.assertEqual(self.window.settings_button.text(), "设  置")
+        self.assertEqual(self.window.query_button.size().width(), 90)
+        self.assertEqual(self.window.query_button.size().height(), 34)
+        self.assertEqual(self.window.query_button.text(), "查  询")
+        self.assertEqual(self.window.targeted_cancel_button.size().width(), 90)
+        self.assertEqual(self.window.targeted_cancel_button.size().height(), 34)
+
+        # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
+        self.assertTrue(self.window.statusBar().isHidden())
+        self.assertEqual(self.window.version_label.text(), "v2.0.79")
+
+        # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
+        self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
+        self.assertEqual(self.window.settings_page.save_button.size().width(), 100)
+        self.assertEqual(self.window.settings_page.save_button.size().height(), 32)
+        self.assertTrue(self.window.settings_page.back_button.isHidden())
+        self.assertEqual(self.window.settings_page.apps_table.horizontalHeaderItem(0).text(), "开发者应用 (App)")
+        self.assertEqual(self.window.settings_page.apps_table.horizontalHeaderItem(3).text(), "已绑定店铺")
+        self.assertEqual(self.window.settings_page.seller_discount.maximumHeight(), 34)
+        self.assertEqual(self.window.settings_page.read_concurrency.maximumHeight(), 34)
+
+        # 4. 按ID操作优化：无底部多余按键、自包含专属运行日志框
+        self.assertTrue(self.window.targeted_cancel_page.cancel_button.isHidden())
+        self.assertEqual(self.window.targeted_cancel_page.submit_button.height(), 34)
+        self.assertIsNotNone(self.window.targeted_cancel_page.log_box)
+        self.assertIs(self.window.targeted_log_box, self.window.targeted_cancel_page.log_box)
+
+        # 5. 查询界面优化：无底部多余按键、查询按钮规范、支持清空
+        self.assertTrue(self.window.query_page.back_button.isHidden())
+        self.assertEqual(self.window.query_page.search_button.text(), "查  询")
+        self.assertEqual(self.window.query_page.search_button.size().width(), 90)
+        self.assertEqual(self.window.query_page.search_button.size().height(), 34)
+        self.assertEqual(self.window.query_page.clear_button.text(), "清  空")
+        self.assertEqual(self.window.query_page.clear_button.size().height(), 34)
+
+        # 设置按钮支持再次点击切回工作台 (Toggle Navigation)
+        self.window.settings_button.click()
+        self.assertIs(self.window.view_stack.currentWidget(), self.window.settings_page)
+        self.window.settings_button.click()
+        self.assertIs(self.window.view_stack.currentWidget(), self.window.pages)
+
+        # 4. 活动管理按钮统一
+        self.assertEqual(self.window.activity_refresh_local_btn.height(), 32)
+        self.assertEqual(self.window.activity_reload_live_btn.height(), 32)
+        self.assertEqual(self.window.full_get_button.height(), 32)
+
+        # 5. 执行记录下拉框宽度与对齐
+        self.assertGreaterEqual(self.window.records_view_combo.minimumWidth(), 130)
+        self.assertEqual(self.window.records_refresh_button.height(), 32)
+
+        # 6. 商品清理按钮尺寸与清店横幅联动（长文案按钮拓宽防止汉字裁切）
+        self.assertEqual(self.window.cleaner_scan_btn.size().width(), 140)
+        self.assertEqual(self.window.cleaner_scan_btn.size().height(), 34)
+        self.assertEqual(self.window.cleaner_batch_delete_btn.size().width(), 110)
+        self.assertEqual(self.window.cleaner_batch_delete_btn.size().height(), 34)
+        self.assertEqual(self.window.cleaner_copy_zero_visits_btn.size().width(), 130)
+        self.assertEqual(self.window.cleaner_copy_zero_visits_btn.size().height(), 34)
+        self.assertEqual(self.window.cleaner_clear_draft_btn.size().width(), 110)
+        self.assertEqual(self.window.cleaner_clear_draft_btn.size().height(), 34)
+
+        # 切换到商品清理页面并测试动态横幅显隐
+        self.window.nav_buttons[2].click()
+        self.assertTrue(self.window.cleaner_wipe_notice.isHidden())
+        self.window.cleaner_wipe_store_check.setChecked(True)
+        self.assertFalse(self.window.cleaner_wipe_notice.isHidden())
+        self.window.cleaner_wipe_store_check.setChecked(False)
+        self.assertTrue(self.window.cleaner_wipe_notice.isHidden())
+
+    def test_settings_developer_apps_binding_and_alias_dynamic_sync(self) -> None:
+        accounts = [
+            Account("3332096437", "CNGUANGZHOULINGTANGMINB", "CBT", "广东店", client_id="3176806962822417"),
+            Account("2651442567", "CNHUBEISHENGRUIHESHANGM", "CBT", "湖北店", client_id="1817414235813121"),
+        ]
+        settings = {
+            "oauthApps": [
+                {"id": "3176806962822417", "name": "广东应用", "clientId": "3176806962822417", "clientSecretConfigured": True},
+                {"id": "9999999999999999", "name": "未绑定应用", "clientId": "9999999999999999", "clientSecretConfigured": False},
+            ],
+            "storeAliases": {"3332096437": "广东店", "2651442567": "湖北店"},
+            "operatingSites": {"3332096437": ["MLM"]},
+        }
+        operating_rows = [
+            {"account_id": "3332096437", "site_id": "MLM", "store_name": "广东店", "operating": True},
+            {"account_id": "3332096437", "site_id": "MLC", "store_name": "广东店", "operating": False},
+        ]
+        dialog = SettingsDialog(settings, accounts, operating_rows, "")
+        
+        # 1. 验证开发者应用绑定识别
+        self.assertEqual(dialog.apps_table.rowCount(), 2)
+        bound_cell_app1 = dialog.apps_table.item(0, 3).text()
+        self.assertIn("已绑定", bound_cell_app1)
+        self.assertIn("广东店", bound_cell_app1)
+        bound_cell_app2 = dialog.apps_table.item(1, 3).text()
+        self.assertIn("待登录授权", bound_cell_app2)
+        self.assertEqual(dialog.oauth_account_count_badge.text(), "已授权账号：2 个")
+
+        # 2. 验证右侧经营站点列表别名解析
+        site_texts = [dialog.site_list.item(i).text() for i in range(dialog.site_list.count())]
+        self.assertTrue(any("广东店 / 墨西哥站" in t for t in site_texts))
+        self.assertTrue(any("广东店 / 智利站" in t for t in site_texts))
+        self.assertFalse(any("CNGUANGZHOULINGTANGMINB" in t for t in site_texts))
+
+        # 3. 验证左侧表格动态修改后，右侧列表即时同步刷新
+        gd_row = next(r for r in range(dialog.store_table.rowCount()) if dialog.store_table.item(r, 1).data(Qt.ItemDataRole.UserRole) == "3332096437")
+        dialog.store_table.item(gd_row, 1).setText("广州旗舰店")
+        self.app.processEvents()
+
+        updated_site_texts = [dialog.site_list.item(i).text() for i in range(dialog.site_list.count())]
+        self.assertTrue(any("广州旗舰店 / 墨西哥站" in t for t in updated_site_texts))
+        self.assertFalse(any("广东店 / 墨西哥站" in t for t in updated_site_texts))
+
+        # 4. 验证 values() 完整保留修改后的别名
+        values = dialog.values()
+        self.assertEqual(values["storeAliases"]["3332096437"], "广州旗舰店")
+        self.assertEqual(values["storeAliases"]["2651442567"], "湖北店")
+
+    def test_settings_operating_sites_bulk_selection(self) -> None:
+        accounts = [
+            Account("3332096437", "", "CBT", "广东店"),
+            Account("2651442567", "", "CBT", "湖北店"),
+        ]
+        operating_rows = [
+            {"account_id": "3332096437", "site_id": "MLM", "operating": True},
+            {"account_id": "3332096437", "site_id": "MLC", "operating": False},
+            {"account_id": "2651442567", "site_id": "MLM", "operating": True},
+        ]
+        dialog = SettingsDialog({}, accounts, operating_rows, "")
+        self.assertTrue(hasattr(dialog, "select_all_sites_btn"))
+        self.assertTrue(hasattr(dialog, "select_none_sites_btn"))
+
+        # 点击全选
+        dialog.select_all_sites_btn.click()
+        self.app.processEvents()
+        for idx in range(dialog.site_list.count()):
+            self.assertEqual(dialog.site_list.item(idx).checkState(), Qt.CheckState.Checked)
+        vals_all = dialog.values()["operatingSites"]
+        self.assertEqual(len(vals_all.get("3332096437", [])), 2)
+        self.assertEqual(len(vals_all.get("2651442567", [])), 1)
+
+        # 点击全不选
+        dialog.select_none_sites_btn.click()
+        self.app.processEvents()
+        for idx in range(dialog.site_list.count()):
+            self.assertEqual(dialog.site_list.item(idx).checkState(), Qt.CheckState.Unchecked)
+        vals_none = dialog.values()["operatingSites"]
+        self.assertEqual(len(vals_none.get("3332096437", [])), 0)
+        self.assertEqual(len(vals_none.get("2651442567", [])), 0)
+
+    def test_item_query_dialog_log_viewer_integration(self) -> None:
+        from main_window import LogViewer
+        dialog = ItemQueryDialog(self.window)
+        dialog.show()
+        self.app.processEvents()
+
+        # 验证 log_box 与 status_box 统一性
+        self.assertIsInstance(dialog.log_box, LogViewer)
+        self.assertIs(dialog.status_box, dialog.log_box)
+
+        # 验证查询触发日志输出
+        dialog.item_input.setText("MLB7250501430")
+        dialog.search_button.click()
+        self.app.processEvents()
+        self.assertIn("正在查询商品 MLB7250501430", dialog.log_box.toPlainText())
+
+        # 验证结果渲染至日志框
+        dialog.show_result({
+            "item_id": "MLB7250501430",
+            "actions": [],
+            "items": [],
+            "price_cache": [{"price": 99.0, "currency_id": "BRL"}],
+        })
+        self.assertIn("最新价格快照", dialog.log_box.toPlainText())
+
+        # 验证清空日志
+        dialog._clear_logs()
+        self.assertEqual(dialog.log_box.toPlainText(), "")
+
+        # 验证初始列宽舒展且可交互
+        self.assertEqual(dialog.history_table.columnWidth(0), 150)
+        self.assertEqual(dialog.history_table.columnWidth(1), 140)
+        self.assertEqual(dialog.history_table.columnWidth(2), 220)
+        self.assertEqual(dialog.history_table.columnWidth(3), 80)
+        self.assertEqual(dialog.history_table.columnWidth(4), 80)
+        self.assertEqual(dialog.history_table.columnWidth(5), 90)
+        dialog.close()
+
+    def test_targeted_action_dialog_card_and_font_styling(self) -> None:
+        dialog = self.window.targeted_cancel_page
+        sections = dialog.findChildren(QFrame, "settingsSection")
+        self.assertGreaterEqual(len(sections), 1)
+        self.assertIn("13px", dialog.scope_label.styleSheet())
+        self.assertIn("13px", dialog.count_label.styleSheet())
+        self.assertIn("13px", dialog.note.styleSheet())
+        self.assertIn("13px", dialog.item_input.styleSheet())
+
+    def test_navigation_buttons_requested_order(self) -> None:
+        header = self.window.findChild(QFrame, "brandSurface")
+        self.assertIsNotNone(header)
+        buttons = [btn for btn in header.findChildren(QPushButton) if btn.objectName() == "nav"]
+        button_texts = [btn.text().strip() for btn in buttons]
+        expected_order = ["活动报名", "活动管理", "查  询", "按ID操作", "商品清理", "设  置"]
+        self.assertEqual(button_texts, expected_order)
+
 
 if __name__ == "__main__":
     unittest.main()
+

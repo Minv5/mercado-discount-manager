@@ -129,7 +129,14 @@ class MercadoClient:
                     # Parse JSON error if possible
                     try:
                         err_json = json.loads(raw)
-                        msg = err_json.get("message") or err_json.get("error") or raw
+                        causes = err_json.get("cause") or []
+                        if isinstance(causes, list) and causes:
+                            cause_msgs = [str(c.get("message") or "") for c in causes if isinstance(c, dict) and c.get("message")]
+                            detail = " | ".join(cause_msgs) if cause_msgs else ""
+                            base_msg = err_json.get("message") or err_json.get("error") or raw
+                            msg = f"{base_msg} ({detail})" if detail and detail != base_msg else base_msg
+                        else:
+                            msg = err_json.get("message") or err_json.get("error") or raw
                     except Exception:
                         msg = raw
                     raise RuntimeError(f"美客多 API 报错 ({status_code}): {msg}")
@@ -155,6 +162,35 @@ class MercadoClient:
         clean_id = item_id.strip()
         return self.request(account_id, "GET", f"/marketplace/items/{clean_id}")
 
+    def get_items_batch(
+        self,
+        account_id: str,
+        item_ids: list[str],
+        attributes: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """GET /items?ids=ID1,ID2... (up to 20 items per official limit) with optional attributes projection."""
+        if not item_ids:
+            return []
+        clean_ids = [str(i).strip() for i in item_ids if str(i).strip()][:20]
+        if not clean_ids:
+            return []
+        params: dict[str, Any] = {"ids": ",".join(clean_ids)}
+        if attributes:
+            params["attributes"] = ",".join(attributes)
+        try:
+            res = self.request(account_id, "GET", "/items", params=params)
+            if isinstance(res, list):
+                items = []
+                for entry in res:
+                    if isinstance(entry, dict) and entry.get("code") == 200 and isinstance(entry.get("body"), dict):
+                        items.append(entry["body"])
+                    elif isinstance(entry, dict) and "id" in entry:
+                        items.append(entry)
+                return items
+        except Exception:
+            pass
+        return []
+
     def get_seller_promotions(self, account_id: str, child_user_id: str) -> list[dict[str, Any]]:
         """GET /marketplace/seller-promotions/users/{child_user_id} - List all available promotions for site."""
         clean_uid = child_user_id.strip()
@@ -169,8 +205,11 @@ class MercadoClient:
         status: str = "candidate",
         page_size: int = 50,
         max_items: int | None = None,
+        **kwargs: Any,
     ) -> list[dict[str, Any]]:
         """GET /marketplace/seller-promotions/promotions/{promotion_id}/items with automatic pagination."""
+        if max_items is None and "limit" in kwargs:
+            max_items = kwargs["limit"]
         all_items: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         offset = 0
@@ -240,6 +279,20 @@ class MercadoClient:
                 break
 
         return all_items
+
+    def get_item_promotions(self, account_id: str, child_user_id: str, item_id: str) -> list[dict[str, Any]]:
+        """GET /marketplace/seller-promotions/items/{item_id}?user_id={child_user_id}&app_version=v2"""
+        data = self.request(
+            account_id,
+            "GET",
+            f"/marketplace/seller-promotions/items/{item_id.strip()}",
+            params={"user_id": child_user_id.strip(), "app_version": "v2"},
+        )
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("results") or []
+        return []
 
     def enroll_promotion_item(
         self,
@@ -313,3 +366,123 @@ class MercadoClient:
             f"/marketplace/seller-promotions/items/{item_id.strip()}",
             params=params,
         )
+
+    def get_item_visits(self, account_id: str, item_id: str) -> int:
+        """GET /visits/items?ids={id} - Get total visits for a single item (official limit: 1 item per request)."""
+        clean_id = str(item_id).strip()
+        if not clean_id:
+            return 0
+        try:
+            res = self.request(account_id, "GET", f"/visits/items?ids={clean_id}")
+            if isinstance(res, dict) and clean_id in res:
+                val = res[clean_id]
+                return int(val) if str(val).isdigit() or isinstance(val, (int, float)) else 0
+        except Exception:
+            pass
+        return 0
+
+    def get_items_visits(self, account_id: str, item_ids: list[str]) -> dict[str, int]:
+        """Get total visits for item IDs. Official API limits to 1 item per request."""
+        res_map: dict[str, int] = {}
+        for iid in item_ids:
+            clean_id = str(iid).strip()
+            if clean_id:
+                res_map[clean_id] = self.get_item_visits(account_id, clean_id)
+        return res_map
+
+    def get_item_visits_window(self, account_id: str, item_id: str, last_days: int = 30) -> int:
+        """GET /items/{id}/visits/time_window?last={N}&unit=day - Get visits within last N days."""
+        clean_id = str(item_id).strip()
+        days = min(max(1, int(last_days)), 150)
+        try:
+            res = self.request(account_id, "GET", f"/items/{clean_id}/visits/time_window", params={"last": days, "unit": "day"})
+            if isinstance(res, dict):
+                return int(res.get("total_visits") or 0)
+        except Exception:
+            pass
+        return 0
+
+    def get_item_performance(self, account_id: str, item_id: str) -> dict[str, Any]:
+        """GET /item/{id}/performance - Get listing quality score (0-100) and level wording."""
+        clean_id = str(item_id).strip()
+        try:
+            res = self.request(account_id, "GET", f"/item/{clean_id}/performance")
+            if isinstance(res, dict):
+                return res
+        except Exception as e:
+            return {"error": str(e)}
+        return {}
+
+    def search_user_items(
+        self,
+        account_id: str,
+        status: str | None = None,
+        sub_status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        search_type: str | None = None,
+        scroll_id: str | None = None,
+    ) -> dict[str, Any]:
+        """GET /users/{account_id}/items/search - Search listings owned by account."""
+        params: dict[str, Any] = {"limit": min(limit, 100)}
+        if search_type:
+            params["search_type"] = search_type
+        if scroll_id:
+            params["scroll_id"] = scroll_id
+        elif offset > 0:
+            params["offset"] = offset
+        if status:
+            params["status"] = status
+        if sub_status:
+            params["sub_status"] = sub_status
+        return self.request(account_id, "GET", f"/users/{account_id}/items/search", params=params)
+
+    def search_marketplace_items(
+        self,
+        account_id: str,
+        child_user_id: str,
+        status: str | None = None,
+        sub_status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        search_type: str | None = None,
+        scroll_id: str | None = None,
+    ) -> dict[str, Any]:
+        """GET /marketplace/users/{child_user_id}/items/search - Search listings owned by child marketplace user."""
+        params: dict[str, Any] = {"limit": min(limit, 100)}
+        if search_type:
+            params["search_type"] = search_type
+        if scroll_id:
+            params["scroll_id"] = scroll_id
+        elif offset > 0:
+            params["offset"] = offset
+        if status:
+            params["status"] = status
+        if sub_status:
+            params["sub_status"] = sub_status
+        return self.request(account_id, "GET", f"/marketplace/users/{child_user_id.strip()}/items/search", params=params)
+
+
+    def close_item(self, account_id: str, item_id: str) -> dict[str, Any]:
+        """Inactivate CBT cross-border listing via official /global/items/{id} endpoint."""
+        clean_id = str(item_id).strip()
+        return self.request(account_id, "PUT", f"/global/items/{clean_id}", body={"status": "paused"})
+
+    def delete_item(self, account_id: str, item_id: str) -> dict[str, Any]:
+        """Permanently delete CBT cross-border listing via official lifecycle protocol."""
+        clean_id = str(item_id).strip()
+        try:
+            return self.request(account_id, "PUT", f"/global/items/{clean_id}", body={"deleted": True})
+        except Exception as e:
+            err_str = str(e).lower()
+            if "deleted is not modifiable" in err_str or "status:active" in err_str:
+                self.request(account_id, "PUT", f"/global/items/{clean_id}", body={"status": "paused"})
+                return self.request(account_id, "PUT", f"/global/items/{clean_id}", body={"deleted": True})
+            if "404" in err_str and ("not a cbt item" in err_str or "not_found" in err_str or "not found" in err_str):
+                return {
+                    "id": clean_id,
+                    "status": "paused",
+                    "sub_status": ["forbidden", "deleted"],
+                    "already_deleted": True,
+                }
+            raise
