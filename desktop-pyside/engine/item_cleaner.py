@@ -1245,7 +1245,7 @@ class ItemCleanerEngine:
         store_display = store_name or account_id
         total = len(item_ids)
         log(f"[商品删除] --------------------------------------------------")
-        log(f"[商品删除] 【{store_display}】开始执行批量删除任务，目标商品总数: {total} 件")
+        log(f"[商品删除] 【{store_display}】开始执行 CBT 跨境自发货全局下架删除任务，目标商品总数: {total} 件")
         log(f"[商品删除] --------------------------------------------------")
 
         success_count = 0
@@ -1254,7 +1254,10 @@ class ItemCleanerEngine:
         successful_ids: list[str] = []
         del_lock = threading.Lock()
         processed_count = 0
-        rate_limiter = RateLimiter(max_qps=22.0)
+        rate_limiter = RateLimiter(max_qps=25.0)
+
+        start_time = time.monotonic()
+        last_log_time = start_time
 
         def _delete_single_item(item_id: str) -> tuple[str, bool, str]:
             if stop_event and stop_event.is_set():
@@ -1263,13 +1266,15 @@ class ItemCleanerEngine:
             success = False
             err_msg = ""
             try:
-                log(f"[商品删除] 【{store_display}】正在执行 CBT 跨境自发货全局下架删除 {item_id}")
+                if total <= 20:
+                    log(f"[商品删除] 【{store_display}】正在执行 CBT 跨境自发货全局下架删除 {item_id}")
                 res = self.client.delete_item(account_id, item_id)
                 success = True
-                if isinstance(res, dict) and res.get("already_deleted"):
-                    log(f"[商品删除] ✅ 【{store_display}】商品 {item_id} 在美客多官方平台已是彻底下架/删除状态，已自动同步")
-                else:
-                    log(f"[商品删除] ✅ 【{store_display}】商品 {item_id} 已成功从美客多平台下架删除")
+                if total <= 20:
+                    if isinstance(res, dict) and res.get("already_deleted"):
+                        log(f"[商品删除] ✅ 【{store_display}】商品 {item_id} 在美客多官方平台已是彻底下架/删除状态，已自动同步")
+                    else:
+                        log(f"[商品删除] ✅ 【{store_display}】商品 {item_id} 已成功从美客多平台下架删除")
             except Exception as e:
                 err_msg = str(e)
                 log(f"[商品删除] ❌ 【{store_display}】商品 {item_id} 下架删除失败: {err_msg}")
@@ -1277,7 +1282,7 @@ class ItemCleanerEngine:
             return item_id, success, err_msg
 
         if total > 0:
-            max_workers = min(12, max(1, total))
+            max_workers = min(18, max(1, total))
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_item = {executor.submit(_delete_single_item, iid): iid for iid in item_ids}
                 for future in concurrent.futures.as_completed(future_to_item):
@@ -1304,10 +1309,22 @@ class ItemCleanerEngine:
                             failed_count += 1
                             failures.append({"item_id": iid, "error": err})
 
+                        if total > 20:
+                            now_mono = time.monotonic()
+                            if cur_idx % 50 == 0 or (now_mono - last_log_time) >= 5.0 or cur_idx == total:
+                                last_log_time = now_mono
+                                elapsed = max(0.1, now_mono - start_time)
+                                speed = cur_idx / elapsed
+                                pct = (cur_idx / total) * 100.0
+                                log(f"[商品删除] 【{store_display}】删除进度: {cur_idx}/{total} ({pct:.1f}%) | 速率: {speed:.1f} 件/s")
+
                     if on_progress:
                         on_progress(cur_idx, total, f"删除 {iid}")
                     if on_item_deleted:
                         on_item_deleted(iid, succ, err)
+
+        if total > 20 and success_count > 0:
+            log(f"[商品删除] ✅ 【{store_display}】共 {success_count} 件商品已成功从美客多平台下架删除")
 
         if successful_ids:
             mark_cached_items_deleted(successful_ids)

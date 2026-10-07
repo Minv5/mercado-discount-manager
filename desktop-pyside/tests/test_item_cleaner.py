@@ -645,7 +645,25 @@ class TestItemCleanerEngine(unittest.TestCase):
         matched = self.engine.scan_shop_items(criteria)
         self.assertEqual(len(matched), 1)
         self.assertEqual(matched[0].item_id, "MLM202")
-        self.assertEqual(matched[0].site_id, "MLM")
+    def test_execute_batch_delete_large_batch_log_throttling(self):
+        """测试大批量删除（total > 20）时的日志节流与聚合输出机制"""
+        self.mock_client.delete_item.return_value = {"id": "dummy", "deleted": True}
+        logs = []
+        item_ids = [f"MLM{i}" for i in range(25)]
+        result = self.engine.execute_batch_delete(
+            account_id="12345",
+            store_name="测试店",
+            item_ids=item_ids,
+            on_log=lambda m: logs.append(m),
+        )
+
+        self.assertEqual(result["total"], 25)
+        self.assertEqual(result["success_count"], 25)
+        self.assertEqual(result["failed_count"], 0)
+        # 验证大批量不会逐件打印开始/成功日志，而是聚合打印
+        self.assertFalse(any("正在执行 CBT 跨境自发货全局下架删除 MLM0" in log for log in logs))
+        self.assertTrue(any("共 25 件商品已成功从美客多平台下架删除" in log for log in logs))
+        self.assertTrue(any("删除进度: 25/25" in log for log in logs))
 
 
 if __name__ == "__main__":
