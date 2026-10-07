@@ -158,11 +158,11 @@ def build() -> None:
     dest_bundle = dist_dir / app_bundle.name
     if dest_bundle.exists():
         shutil.rmtree(dest_bundle)
-    print(f"[*] Copying finalized bundle to {dest_bundle}...")
-    shutil.copytree(app_bundle, dest_bundle)
+    print(f"[*] Copying finalized bundle to {dest_bundle} (preserving symlinks)...")
+    shutil.copytree(app_bundle, dest_bundle, symlinks=True)
 
     # Write release-manifest.json
-    all_files = [p for p in dest_bundle.rglob("*") if p.is_file()]
+    all_files = [p for p in dest_bundle.rglob("*") if p.is_file() and not p.is_symlink()]
     manifest = {
         "schema_version": 1,
         "product": product,
@@ -196,14 +196,14 @@ def build() -> None:
         if apps_dir.exists():
             dest_apps = apps_dir / app_bundle.name
             print(f"[*] Updating {dest_apps}...")
-            subprocess.run(["rm", "-rf", str(dest_apps)], check=False)
-            subprocess.run(["cp", "-R", str(app_bundle), str(dest_apps)], check=False)
+            shutil.rmtree(dest_apps, ignore_errors=True)
+            shutil.copytree(app_bundle, dest_apps, symlinks=True)
             subprocess.run(["xattr", "-cr", str(dest_apps)], check=False)
         if desktop_dir_path.exists():
             dest_desktop = desktop_dir_path / app_bundle.name
             print(f"[*] Updating {dest_desktop}...")
-            subprocess.run(["rm", "-rf", str(dest_desktop)], check=False)
-            subprocess.run(["cp", "-R", str(app_bundle), str(dest_desktop)], check=False)
+            shutil.rmtree(dest_desktop, ignore_errors=True)
+            shutil.copytree(app_bundle, dest_desktop, symlinks=True)
         terminate_running_app()
         if desktop_dir_path.exists() and (desktop_dir_path / app_bundle.name).exists():
             print(f"[*] Launching updated application from Desktop: {desktop_dir_path / app_bundle.name}...")

@@ -1,6 +1,6 @@
 {
   "name": "mercado-discount-manager",
-  "version": "2.0.90",
+  "version": "2.0.91",
   "description": "美客多活动管家 (Mercado Libre Discount Manager - Native PySide6 Desktop)",
   "private": true,
   "scripts": {
