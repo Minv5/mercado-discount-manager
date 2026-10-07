@@ -204,8 +204,13 @@ def build() -> None:
             print(f"[*] Updating {dest_desktop}...")
             subprocess.run(["rm", "-rf", str(dest_desktop)], check=False)
             subprocess.run(["cp", "-R", str(app_bundle), str(dest_desktop)], check=False)
-            subprocess.run(["xattr", "-cr", str(dest_desktop)], check=False)
         terminate_running_app()
+        if desktop_dir_path.exists() and (desktop_dir_path / app_bundle.name).exists():
+            print(f"[*] Launching updated application from Desktop: {desktop_dir_path / app_bundle.name}...")
+            subprocess.run(["open", str(desktop_dir_path / app_bundle.name)], check=False)
+        elif apps_dir.exists() and (apps_dir / app_bundle.name).exists():
+            print(f"[*] Launching updated application from Applications: {apps_dir / app_bundle.name}...")
+            subprocess.run(["open", str(apps_dir / app_bundle.name)], check=False)
 
     # Clean tmp build
     shutil.rmtree(staging_dir, ignore_errors=True)

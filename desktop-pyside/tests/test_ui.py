@@ -2651,10 +2651,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.0.82")
+        self.assertEqual(product_version(), "2.0.85")
  
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.0.82")
+        self.assertEqual(self.window.version_label.text(), "v2.0.85")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2666,7 +2666,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.0.82")
+        self.assertEqual(self.window.version_label.text(), "v2.0.85")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -3106,7 +3106,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.0.82")
+        self.assertEqual(self.window.version_label.text(), "v2.0.85")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
@@ -3302,8 +3302,8 @@ class QtUiTests(unittest.TestCase):
 
     def test_update_dialog_ui_and_cancel(self) -> None:
         info = ReleaseInfo(
-            tag_name="v2.0.83",
-            version="2.0.83",
+            tag_name="v2.0.86",
+            version="2.0.86",
             release_notes="1. 修复偶发网络问题\n2. 增加自动更新引擎",
             is_newer=True,
             asset_name="mock.zip",
@@ -3311,7 +3311,7 @@ class QtUiTests(unittest.TestCase):
             asset_size=10485760,
             published_at="2026-10-07T00:00:00Z",
         )
-        dlg = UpdateDialog(info, "2.0.82", parent=self.window)
+        dlg = UpdateDialog(info, "2.0.85", parent=self.window)
         self.assertEqual(dlg.windowTitle(), "软件更新 - 美客多活动管家")
         self.assertIn("自动更新引擎", dlg.notes_edit.toPlainText())
         self.assertTrue(dlg.update_btn.isEnabled())
@@ -3326,8 +3326,8 @@ class QtUiTests(unittest.TestCase):
 
         # 触发发现新版本回调
         info = ReleaseInfo(
-            tag_name="v2.0.83",
-            version="2.0.83",
+            tag_name="v2.0.86",
+            version="2.0.86",
             release_notes="新版修复",
             is_newer=True,
             asset_name="mock.zip",
@@ -3337,13 +3337,53 @@ class QtUiTests(unittest.TestCase):
         )
         self.window._handle_update_check_result(info, manual=False)
         self.assertFalse(self.window.update_notice_btn.isHidden())
-        self.assertEqual(self.window.update_notice_btn.text(), "🚀 发现新版 v2.0.83")
+        self.assertEqual(self.window.update_notice_btn.text(), "🚀 发现新版 v2.0.86")
         self.assertEqual(self.window._latest_release_info, info)
 
         # 恢复初始隐藏状态以便后续测试
         self.window.update_notice_btn.setVisible(False)
         self.window._latest_release_info = None
         self.assertTrue(self.window.update_notice_btn.isHidden())
+
+    def test_cleaner_site_combo_behavior(self) -> None:
+        """测试商品清理页面的站点多选下拉复选框行为与联动"""
+        combo = self.window.cleaner_site_combo
+        self.assertIsNotNone(combo)
+
+        # 1. 灌入站点数据，默认保持全选
+        test_sites = [("墨西哥站 (MLM)", "MLM"), ("巴西站 (MLB)", "MLB"), ("智利站 (MLC)", "MLC")]
+        combo.set_items(test_sites)
+        self.assertEqual(combo.all_keys(), ["MLM", "MLB", "MLC"])
+        self.assertEqual(combo.checked_keys(), ["MLM", "MLB", "MLC"])
+        self.assertEqual(combo.display_text(), "全部站点 (3个)")
+
+        # 2. 模拟单独勾选部分站点
+        combo.set_checked_keys(["MLM", "MLB"])
+        self.assertEqual(combo.checked_keys(), ["MLM", "MLB"])
+        self.assertEqual(combo.display_text(), "墨西哥站、巴西站")
+
+        # 3. 模拟清空所有勾选
+        combo.set_checked_keys([])
+        self.assertEqual(combo.checked_keys(), [])
+        self.assertEqual(combo.display_text(), "⚠️ 未选择站点")
+
+        # 4. 模拟全选
+        combo.set_checked_keys(["MLM", "MLB", "MLC"])
+        self.assertEqual(combo.checked_keys(), ["MLM", "MLB", "MLC"])
+        self.assertEqual(combo.display_text(), "全部站点 (3个)")
+
+        # 5. 测试点击 line_edit 区域穿透触发 showPopup
+        from PySide6.QtGui import QMouseEvent
+        from PySide6.QtCore import QEvent, QPointF
+        press_event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(10, 10),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        handled = combo.eventFilter(combo._line_edit, press_event)
+        self.assertTrue(handled)
 
 
 if __name__ == "__main__":

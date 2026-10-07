@@ -571,6 +571,55 @@ class TestItemCleanerEngine(unittest.TestCase):
         self.assertEqual(r_active.status, "active")
         self.assertTrue(r_active.is_selected_for_delete)  # 真正待删除的正常勾选
 
+    def test_selected_site_ids_filtering(self):
+        """测试指定站点多选过滤：仅扫描和保留选定站点的商品，排除未勾选站点"""
+        self.mock_client.auth = MagicMock()
+        self.mock_client.auth.list_sites.return_value = [
+            {"account_id": "2651442567", "child_user_id": "2668031897", "site_id": "MLB"},
+            {"account_id": "2651442567", "child_user_id": "2668033839", "site_id": "MLM"},
+        ]
+
+        self.mock_client.search_user_items.return_value = {
+            "results": ["MLB101", "MLM202"],
+            "paging": {"total": 2},
+        }
+        self.mock_client.get_items_batch.return_value = [
+            {
+                "id": "MLB101",
+                "title": "巴西在售品",
+                "status": "active",
+                "sold_quantity": 0,
+                "site_id": "MLB",
+                "date_created": "2025-01-01T00:00:00.000Z",
+            },
+            {
+                "id": "MLM202",
+                "title": "墨西哥在售品",
+                "status": "active",
+                "sold_quantity": 0,
+                "site_id": "MLM",
+                "date_created": "2025-01-01T00:00:00.000Z",
+            },
+        ]
+        self.mock_client.get_items_visits.return_value = {"MLB101": 0, "MLM202": 0}
+
+        # 仅选择 MLM 站点
+        criteria = CleanerFilterCriteria(
+            account_id="2651442567",
+            store_name="多站点店铺",
+            selected_site_ids=["MLM"],
+            enable_visits_filter=True,
+            visits_mode="total",
+            visits_is_zero_only=True,
+            enable_score_filter=False,
+            enable_policy_filter=False,
+        )
+
+        matched = self.engine.scan_shop_items(criteria)
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0].item_id, "MLM202")
+        self.assertEqual(matched[0].site_id, "MLM")
+
 
 if __name__ == "__main__":
     unittest.main()

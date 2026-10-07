@@ -17,6 +17,7 @@ from engine.crypto import get_data_dir
 class CleanerFilterCriteria:
     account_id: str = ""
     store_name: str = ""
+    selected_site_ids: list[str] = field(default_factory=list) # 选定扫描的站点列表 (空列表表示不限制，扫描所有站点)
     # 组合判定模式: "and" (同时满足所有勾选条件，精准漏斗) 或 "or" (满足任一勾选条件)
     filter_mode: str = "and"
     # 新品冷启动保护期 (Grace Period): 上架未满 N 天自动豁免保护
@@ -335,6 +336,8 @@ class ItemCleanerEngine:
         for cs in child_sites:
             cuid = cs["child_user_id"]
             if cuid not in seen_child_uids:
+                if criteria.selected_site_ids and cs.get("site_id") not in criteria.selected_site_ids:
+                    continue
                 seen_child_uids.add(cuid)
                 unique_child_sites.append(cs)
 
@@ -455,6 +458,8 @@ class ItemCleanerEngine:
                     continue
                 sold = int(it.get("sold_quantity") or 0)
                 site_id = str(it.get("site_id") or ("CBT" if iid.startswith("CBT") else iid[:3]))
+                if criteria.selected_site_ids and site_id not in criteria.selected_site_ids:
+                    continue
                 title = str(it.get("title") or f"[{site_id}] 店铺商品 ({iid})")
                 date_created_raw = str(it.get("date_created") or "")
                 date_display, days_on_sale = parse_listing_age_days(date_created_raw)
@@ -1067,6 +1072,8 @@ class ItemCleanerEngine:
                 continue
             sold = int(it.get("sold_quantity") or 0)
             site_id = str(it.get("site_id") or default_site or ("CBT" if iid.startswith("CBT") else iid[:3]))
+            if criteria.selected_site_ids and site_id not in criteria.selected_site_ids:
+                continue
             title = str(it.get("title") or f"[{site_id}] 违规停用商品 ({iid})")
             date_created_raw = str(it.get("date_created") or "")
             date_display, days_on_sale = parse_listing_age_days(date_created_raw)

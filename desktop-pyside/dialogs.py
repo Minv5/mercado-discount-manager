@@ -1765,6 +1765,10 @@ class SettingsDialog(QDialog):
         store = resolved_alias or str(entry.get("store_name") or entry.get("storeName") or "当前店铺")
         if existing is not None:
             existing.setText(f"{store} / {site_name(site_id)}")
+            configured = self._initial_operating_sites.get(account_id)
+            if configured is not None and not self._site_selection_dirty:
+                checked = site_id in configured
+                existing.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
             return
         item = QListWidgetItem(f"{store} / {site_name(site_id)}")
         item.setData(Qt.ItemDataRole.UserRole, key)
@@ -2395,6 +2399,15 @@ class SettingsDialog(QDialog):
                 for account_id, site_ids in dict(settings.get("operatingSites") or {}).items()
                 if isinstance(site_ids, list)
             }
+            if hasattr(self, "site_list") and not self._site_selection_dirty:
+                for idx in range(self.site_list.count()):
+                    s_item = self.site_list.item(idx)
+                    data = s_item.data(Qt.ItemDataRole.UserRole)
+                    if data:
+                        a_id, s_id = str(data[0]), str(data[1]).upper()
+                        cfg = self._initial_operating_sites.get(a_id)
+                        if cfg is not None:
+                            s_item.setCheckState(Qt.CheckState.Checked if s_id in cfg else Qt.CheckState.Unchecked)
 
     def values(self) -> dict[str, Any]:
         aliases = dict(self._initial_aliases)
@@ -2420,6 +2433,8 @@ class SettingsDialog(QDialog):
                 operating.setdefault(str(account_id), [])
                 if item.checkState() == Qt.CheckState.Checked:
                     operating[str(account_id)].append(str(site_id))
+            self._initial_operating_sites = dict(operating)
+            self._site_selection_dirty = False
         return {
             "authDir": self.auth_dir.text().strip(),
             "outputDir": str(self.settings.get("outputDir") or ""),
