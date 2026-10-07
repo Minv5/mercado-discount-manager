@@ -16,8 +16,8 @@ from .pricing import calculate_deal_price, extract_item_net_proceeds
 
 
 class WebhookWorker:
-    DEFAULT_CLAIM_URL = "https://webhook.xingtupro1020.com/meli-callback/consumer/claim"
-    DEFAULT_ACK_URL = "https://webhook.xingtupro1020.com/meli-callback/consumer/ack"
+    DEFAULT_CLAIM_URL = ""
+    DEFAULT_ACK_URL = ""
 
     def __init__(
         self,
@@ -907,6 +907,8 @@ class WebhookWorker:
 
     def _claim_events(self) -> list[dict[str, Any]]:
         """Call claim endpoint with Bearer auth to retrieve a batch of pending notifications."""
+        if not self.claim_url:
+            return []
         secret = self._get_secret()
         headers = {
             "Content-Type": "application/json",
@@ -949,7 +951,7 @@ class WebhookWorker:
         error: str | None = None,
     ) -> None:
         """Send ack to remove the event from cloud queue."""
-        if not event_id or not lease_id:
+        if not self.ack_url or not event_id or not lease_id:
             return
         secret = self._get_secret()
         headers = {

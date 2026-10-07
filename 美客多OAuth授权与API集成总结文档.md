@@ -59,7 +59,7 @@ sequenceDiagram
 | :--- | :--- | :--- | :--- |
 | `response_type` | 是 | `code` | 固定为 code |
 | `client_id` | 是 | `3176806962822417` | 美客多开发者后台分配的 App ID |
-| `redirect_uri` | 是 | `https://xingtupro1020.com/oauth/callback/` | **必须与开发者后台登记的值完全全等一致**（特别注意包含 `/oauth/callback/` 路径，若缺少 `/oauth/` 将触发 `strictRedirectUriMismatch` 报错拦截） |
+| `redirect_uri` | 是 | `https://127.0.0.1/callback` | **必须与开发者后台登记的值完全全等一致**（特别注意区分末尾斜杠，若与后台登记不一致将触发 `strictRedirectUriMismatch` 报错拦截） |
 | `code_challenge` | 是 | `Base64URL(SHA256(verifier))` | PKCE 动态挑战码（防止授权码被拦截嗅探） |
 | `code_challenge_method` | 是 | `S256` | 固定算法 S256 |
 | `state` | 是 | `auth_1725518400_abc` | 随机字符串，用于校验回调防 CSRF 跨站攻击 |

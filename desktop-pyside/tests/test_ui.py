@@ -2204,20 +2204,12 @@ class QtUiTests(unittest.TestCase):
 
     def test_settings_callback_defaults_use_dedicated_webhook_subdomain(self) -> None:
         dialog = SettingsDialog({}, [], [], "")
-        self.assertEqual(
-            dialog.webhook_callback_url.text(),
-            "https://webhook.xingtupro1020.com/webhook/mercado-libre/",
-        )
-        self.assertEqual(
-            dialog.activity_callback_claim_url.text(),
-            "https://webhook.xingtupro1020.com/meli-callback/consumer/claim",
-        )
-        self.assertEqual(
-            dialog.activity_callback_ack_url.text(),
-            "https://webhook.xingtupro1020.com/meli-callback/consumer/ack",
-        )
+        self.assertEqual(dialog.webhook_callback_url.text(), "")
+        self.assertEqual(dialog.activity_callback_claim_url.text(), "")
+        self.assertEqual(dialog.activity_callback_ack_url.text(), "")
+        self.assertEqual(dialog.oauth_redirect_uri.text(), "")
         values = dialog.values()
-        self.assertNotIn("https://xingtupro1020.com/meli-callback/consumer/", str(values))
+        self.assertNotIn("xingtupro1020", str(values))
 
     def test_settings_auto_reprice_controls_default_and_roundtrip(self) -> None:
         dialog_default = SettingsDialog({}, [], [], "")
@@ -2651,10 +2643,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.0.91")
+        self.assertEqual(product_version(), "2.0.92")
  
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.0.91")
+        self.assertEqual(self.window.version_label.text(), "v2.0.92")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2666,7 +2658,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.0.91")
+        self.assertEqual(self.window.version_label.text(), "v2.0.92")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -3132,7 +3124,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.0.91")
+        self.assertEqual(self.window.version_label.text(), "v2.0.92")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
@@ -3337,7 +3329,7 @@ class QtUiTests(unittest.TestCase):
             asset_size=10485760,
             published_at="2026-10-07T00:00:00Z",
         )
-        dlg = UpdateDialog(info, "2.0.91", parent=self.window)
+        dlg = UpdateDialog(info, "2.0.92", parent=self.window)
         self.assertEqual(dlg.windowTitle(), "软件更新 - 美客多活动管家")
         self.assertIn("自动更新引擎", dlg.notes_edit.toPlainText())
         self.assertTrue(dlg.update_btn.isEnabled())
@@ -3352,8 +3344,8 @@ class QtUiTests(unittest.TestCase):
 
         # 触发发现新版本回调
         info = ReleaseInfo(
-            tag_name="v2.0.92",
-            version="2.0.92",
+            tag_name="v2.0.93",
+            version="2.0.93",
             release_notes="新版修复",
             is_newer=True,
             asset_name="mock.zip",
@@ -3363,7 +3355,7 @@ class QtUiTests(unittest.TestCase):
         )
         self.window._handle_update_check_result(info, manual=False)
         self.assertFalse(self.window.update_notice_btn.isHidden())
-        self.assertEqual(self.window.update_notice_btn.text(), "🚀 发现新版 v2.0.92")
+        self.assertEqual(self.window.update_notice_btn.text(), "🚀 发现新版 v2.0.93")
         self.assertEqual(self.window._latest_release_info, info)
 
         # 恢复初始隐藏状态以便后续测试

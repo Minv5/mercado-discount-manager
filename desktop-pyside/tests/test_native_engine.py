@@ -177,7 +177,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.91")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.92")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -527,7 +527,11 @@ class NativeEngineTests(unittest.TestCase):
         self.assertTrue(ref_res["ok"])
         self.assertEqual(ref_res["total_count"], 1)
 
-        oauth_start = bridge.handle_request("POST", "/api/oauth/start", body={"clientId": "test_app_id"})
+        missing_redirect = bridge.handle_request("POST", "/api/oauth/start", body={"clientId": "test_app_id"})
+        self.assertFalse(missing_redirect["ok"])
+        self.assertIn("Redirect URI", missing_redirect["error"])
+
+        oauth_start = bridge.handle_request("POST", "/api/oauth/start", body={"clientId": "test_app_id", "redirectUri": "https://127.0.0.1/callback"})
         self.assertTrue(oauth_start["ok"])
         self.assertIn("auth.mercadolibre.com.mx", oauth_start["authorizationUrl"])
         self.assertIn("test_app_id", oauth_start["authorizationUrl"])

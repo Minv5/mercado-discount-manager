@@ -138,7 +138,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.0.91",
+                "build_fingerprint": "native-python-v2.0.92",
             }
 
         # 2. Settings
@@ -425,7 +425,7 @@ class EngineBridge:
             payload = body or {}
             client_id = str(payload.get("clientId") or payload.get("client_id") or "").strip()
             client_secret = str(payload.get("clientSecret") or payload.get("client_secret") or "").strip()
-            redirect_uri = str(payload.get("redirectUri") or payload.get("redirect_uri") or "https://127.0.0.1/callback").strip()
+            redirect_uri = str(payload.get("redirectUri") or payload.get("redirect_uri") or "").strip()
             if not client_id or not client_secret:
                 conn = self.auth._get_connection()
                 try:
@@ -441,6 +441,8 @@ class EngineBridge:
 
             if not client_id:
                 return {"ok": False, "error": "请先在设置中填写美客多应用 Client ID"}
+            if not redirect_uri:
+                return {"ok": False, "error": "请先在设置中填写在美客多开发者后台登记的 Redirect URI 回调地址"}
 
             state = uuid.uuid4().hex
             self._oauth_states[state] = {
@@ -476,7 +478,9 @@ class EngineBridge:
             state_data = self._oauth_states.get(state) or {}
             client_id = state_data.get("client_id")
             client_secret = state_data.get("client_secret")
-            redirect_uri = state_data.get("redirect_uri") or "https://127.0.0.1/callback"
+            redirect_uri = state_data.get("redirect_uri") or ""
+            if not redirect_uri:
+                return {"ok": False, "error": "缺少 Redirect URI，请重新在设置中发起授权"}
 
             if not client_id or not client_secret:
                 conn = self.auth._get_connection()

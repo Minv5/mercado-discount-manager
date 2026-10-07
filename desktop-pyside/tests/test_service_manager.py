@@ -42,14 +42,14 @@ class ServiceManagerTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(env["MDM_ACTIVITY_CLAIM_URL"], DEFAULT_ACTIVITY_CALLBACK_CLAIM_URL)
-        self.assertEqual(env["MDM_ACTIVITY_CLAIM_ACK_URL"], DEFAULT_ACTIVITY_CALLBACK_ACK_URL)
+        self.assertNotIn("MDM_ACTIVITY_CLAIM_URL", env)
+        self.assertNotIn("MDM_ACTIVITY_CLAIM_ACK_URL", env)
 
     def test_webhook_env_uses_current_defaults_when_saved_endpoints_are_empty(self) -> None:
         env = self._apply_webhook_settings({"activityCallbackEnabled": True})
 
-        self.assertEqual(env["MDM_ACTIVITY_CLAIM_URL"], DEFAULT_ACTIVITY_CALLBACK_CLAIM_URL)
-        self.assertEqual(env["MDM_ACTIVITY_CLAIM_ACK_URL"], DEFAULT_ACTIVITY_CALLBACK_ACK_URL)
+        self.assertNotIn("MDM_ACTIVITY_CLAIM_URL", env)
+        self.assertNotIn("MDM_ACTIVITY_CLAIM_ACK_URL", env)
 
     def test_webhook_env_preserves_explicit_custom_claim_endpoints(self) -> None:
         env = self._apply_webhook_settings(

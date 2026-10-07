@@ -1347,7 +1347,7 @@ class AppEditDialog(QDialog):
         default_redirect = DEFAULT_OAUTH_REDIRECT_URI
         initial_redirect = migrate_oauth_redirect_uri(app.get("redirectUri")) if app else default_redirect
         self.redirect_edit = QLineEdit(initial_redirect)
-        self.redirect_edit.setPlaceholderText("通常保持默认回调地址即可")
+        self.redirect_edit.setPlaceholderText("例如: https://127.0.0.1/callback 或您的自定义回调网址")
 
         form.addRow("应用名称 / 备注", self.name_edit)
         form.addRow("美客多 Client ID", self.client_id_edit)
@@ -1372,6 +1372,9 @@ class AppEditDialog(QDialog):
             return
         name = self.name_edit.text().strip() or f"应用 {client_id[:6]}"
         redirect_uri = migrate_oauth_redirect_uri(self.redirect_edit.text().strip())
+        if not redirect_uri:
+            QMessageBox.warning(self, "应用凭据", "OAuth 回调地址不能为空，请填写在美客多后台登记的 Redirect URI。")
+            return
         new_secret = self.client_secret_edit.text()
 
         self.app_data["id"] = client_id
@@ -1930,8 +1933,9 @@ class SettingsDialog(QDialog):
         if bool(self.settings.get("oauthClientSecretConfigured")):
             self.oauth_client_secret.setPlaceholderText("已保存，留空不修改")
         self.oauth_redirect_uri = QLineEdit(migrate_oauth_redirect_uri(self.settings.get("oauthRedirectUri")))
+        self.oauth_redirect_uri.setPlaceholderText("例如: https://127.0.0.1/callback 或您的自定义回调网址")
         self.webhook_callback_url = QLineEdit(str(self.settings.get("webhookCallbackUrl") or DEFAULT_WEBHOOK_CALLBACK_URL))
-        self.webhook_callback_url.setPlaceholderText("请输入独立回调服务的公网通知地址")
+        self.webhook_callback_url.setPlaceholderText("选填：独立回调服务的公网通知地址")
 
         form.addRow("美客多应用 Client ID", self.oauth_client_id)
         form.addRow("美客多应用 Client Secret", self.oauth_client_secret)

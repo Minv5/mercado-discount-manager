@@ -4396,6 +4396,12 @@ class MainWindow(QMainWindow):
         client_id = dialog.oauth_client_id.text().strip()
         client_secret = dialog.oauth_client_secret.text().strip()
         redirect_uri = migrate_oauth_redirect_uri(dialog.oauth_redirect_uri.text().strip())
+        if not client_id:
+            QMessageBox.warning(dialog, "账号授权", "请先填写美客多应用 Client ID。")
+            return
+        if not redirect_uri:
+            QMessageBox.warning(dialog, "账号授权", "请先填写在美客多开发者后台登记的 OAuth 回调地址（Redirect URI）。")
+            return
         if client_id and not client_secret:
             for app in getattr(dialog, "oauth_apps", []):
                 if str(app.get("clientId") or "").strip() == client_id:
@@ -4404,12 +4410,10 @@ class MainWindow(QMainWindow):
                         client_secret = uncommitted_secret
                     break
         payload: dict[str, str] = {}
-        if client_id:
-            payload["clientId"] = client_id
+        payload["clientId"] = client_id
         if client_secret:
             payload["clientSecret"] = client_secret
-        if redirect_uri:
-            payload["redirectUri"] = redirect_uri
+        payload["redirectUri"] = redirect_uri
 
         def call_start() -> dict[str, Any]:
             if client_id:
@@ -4997,7 +5001,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.0.91"
+    return "2.0.92"
 
 
 def make_table(headers: list[str]) -> QTableWidget:
