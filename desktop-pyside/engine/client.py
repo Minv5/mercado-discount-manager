@@ -55,7 +55,7 @@ class MercadoClient:
         self._sem_lock = threading.Lock()
         parsed = urllib.parse.urlparse(self.API_BASE)
         self._host = parsed.netloc or "api.mercadolibre.com"
-        self._conn_pool = HTTPSConnectionPool(host=self._host, timeout=30, max_size=max(30, max_concurrency * 4))
+        self._conn_pool = HTTPSConnectionPool(host=self._host, timeout=30, max_size=max(36, max_concurrency * 4))
 
     def _get_semaphore(self, account_id: str) -> threading.Semaphore:
         clean_acc = str(account_id or "default").strip()

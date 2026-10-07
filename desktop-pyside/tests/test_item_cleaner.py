@@ -148,6 +148,33 @@ class TestItemCleanerEngine(unittest.TestCase):
         self.assertEqual(len(matched), 1)
         self.assertTrue(any("waiting_for_patch" in r for r in matched[0].unmet_reasons))
 
+    def test_policy_violation_with_sales_not_protected(self):
+        """测试已明确被平台下架/政策失效的商品，即使历史出过单，也不再触发保护，默认勾选待删除"""
+        criteria = CleanerFilterCriteria(
+            account_id="3408885754",
+            enable_policy_filter=True,
+        )
+
+        self.mock_client.search_user_items.return_value = {
+            "results": ["MLB_POLICY_SALES_999"],
+            "paging": {"total": 1},
+        }
+        self.mock_client.get_item_detail.return_value = {
+            "id": "MLB_POLICY_SALES_999",
+            "status": "closed",
+            "sub_status": ["forbidden"],
+            "sold_quantity": 3,
+            "title": "Banned Item with Past Sales",
+            "site_id": "MLB",
+        }
+
+        matched = self.engine.scan_shop_items(criteria)
+        self.assertEqual(len(matched), 1)
+        item = matched[0]
+        self.assertTrue(item.has_sales)
+        self.assertEqual(item.sold_quantity, 3)
+        self.assertTrue(item.is_selected_for_delete)
+
     def test_execute_batch_delete(self):
         """测试 CBT 跨境自发货全局下架删除执行流程"""
         self.mock_client.delete_item.return_value = {"deleted": True}

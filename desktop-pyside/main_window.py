@@ -101,6 +101,7 @@ from engine.item_cleaner import (
     clear_cleaner_draft,
     is_item_confirmed_deleted,
     load_cleaner_draft,
+    mark_cached_items_deleted,
     save_cleaner_draft,
 )
 from engine.client import MercadoClient
@@ -350,7 +351,11 @@ class CleanerTableModel(QAbstractTableModel):
             elif col == 6:
                 return str(rec.visits)
             elif col == 7:
-                return f"⚠️ 已售 {rec.sold_quantity} 件" if rec.has_sales else "0"
+                if rec.has_sales:
+                    if "在售" in rec.status or rec.status == "active":
+                        return f"⚠️ 已售 {rec.sold_quantity} 件 (在售保护)"
+                    return f"已售 {rec.sold_quantity} 件 (已下架)"
+                return "0"
             elif col == 8:
                 return f"{rec.date_created} ({rec.days_on_sale}天前)" if rec.date_created else "-"
             elif col == 9:
@@ -361,7 +366,9 @@ class CleanerTableModel(QAbstractTableModel):
 
         if role == Qt.ItemDataRole.ForegroundRole:
             if col == 7 and rec.has_sales:
-                return QBrush(QColor("#ff8a65"))
+                if "在售" in rec.status or rec.status == "active":
+                    return QBrush(QColor("#ff8a65"))
+                return QBrush(QColor("#C8C3B7"))
             if col == 9:
                 if rec.status == "已删除":
                     return QBrush(QColor("#188038"))
@@ -370,16 +377,53 @@ class CleanerTableModel(QAbstractTableModel):
             return None
 
         if role == Qt.ItemDataRole.BackgroundRole:
-            if rec.has_sales:
+            if rec.has_sales and ("在售" in rec.status or rec.status == "active"):
                 return QBrush(QColor("#2d2019"))
             return None
 
         if role == Qt.ItemDataRole.ToolTipRole:
-            if col == 7 and rec.has_sales:
-                return "该商品有真实销售历史，为核心资产，系统默认排除在批量删除之外！"
+            if col == 4:
+                return rec.title
+            elif col == 7 and rec.has_sales:
+                if "在售" in rec.status or rec.status == "active":
+                    return f"该商品为在售出单核心资产（已售 {rec.sold_quantity} 件），系统默认排除在批量删除之外！"
+                return f"该商品历史曾出单 {rec.sold_quantity} 件，但已被平台明确下架/封禁，默认纳入批量清理范围。"
+            elif col == 8:
+                return f"官方上架时间: {rec.date_created} (已在架 {rec.days_on_sale} 天)"
+            elif col == 9:
+                return f"当前状态: {rec.status}"
+            elif col == 10:
+                return ", ".join(rec.unmet_reasons)
             return None
 
         return None
+
+    def sort(self, column: int, order: Qt.SortOrder = Qt.SortOrder.AscendingOrder) -> None:
+        """支持点击表头对任意指标列进行原生升序/降序重排。"""
+        self.beginResetModel()
+        reverse = (order == Qt.SortOrder.DescendingOrder)
+        if column == 1:
+            self._records.sort(key=lambda r: (r.store_name or ""), reverse=reverse)
+        elif column == 2:
+            self._records.sort(key=lambda r: r.item_id, reverse=reverse)
+        elif column == 3:
+            self._records.sort(key=lambda r: r.site_id, reverse=reverse)
+        elif column == 4:
+            self._records.sort(key=lambda r: r.title, reverse=reverse)
+        elif column == 5:
+            self._records.sort(key=lambda r: (r.score if r.score is not None else -1), reverse=reverse)
+        elif column == 6:  # 浏览量 (整数数值排序)
+            self._records.sort(key=lambda r: r.visits, reverse=reverse)
+        elif column == 7:  # 销售量 (整数数值排序)
+            self._records.sort(key=lambda r: r.sold_quantity, reverse=reverse)
+        elif column == 8:  # 上架时间 (按上架天数数值排序)
+            self._records.sort(key=lambda r: (r.days_on_sale, r.date_created), reverse=reverse)
+        elif column == 9:  # 状态
+            self._records.sort(key=lambda r: r.status, reverse=reverse)
+        elif column == 10:  # 不达标原因
+            self._records.sort(key=lambda r: (", ".join(r.unmet_reasons)), reverse=reverse)
+        self._id_to_row = {r.item_id: idx for idx, r in enumerate(self._records)}
+        self.endResetModel()
 
     def setData(self, index: QModelIndex, value: Any, role: int = Qt.ItemDataRole.EditRole) -> bool:
         if not index.isValid() or not (0 <= index.row() < len(self._records)):
@@ -446,7 +490,8 @@ class CleanerTableModel(QAbstractTableModel):
                 else:
                     if rec.status:
                         old_rec.status = rec.status
-                    if old_rec.has_sales:
+                    is_active_sale = old_rec.has_sales and ("在售" in (rec.status or old_rec.status) or (rec.status or old_rec.status) == "active")
+                    if is_active_sale:
                         old_rec.is_selected_for_delete = False
                     elif rec.is_selected_for_delete:
                         old_rec.is_selected_for_delete = True
@@ -1138,39 +1183,17 @@ class MainWindow(QMainWindow):
         # Row 0: 浏览量过滤 + 刊登质量评分过滤
         self.cleaner_visits_check = QCheckBox("浏览量过滤:")
         self.cleaner_visits_check.setChecked(True)
+        self.cleaner_visits_check.setToolTip("开启后过滤上架至今总浏览量低于门槛的商品（结合上架时长门槛可精准筛选上架超期且无流量的商品）")
         grid.addWidget(self.cleaner_visits_check, 0, 0)
 
-        visits_h = QHBoxLayout()
-        visits_h.setSpacing(6)
-        visits_h.setContentsMargins(0, 0, 0, 0)
-        self.cleaner_visits_mode_combo = QComboBox()
-        self.cleaner_visits_mode_combo.setFixedHeight(32)
-        self.cleaner_visits_mode_combo.addItem("累计总浏览量 (全周期)", "total")
-        self.cleaner_visits_mode_combo.addItem("近 N 天动态窗口", "window")
-        self.cleaner_visits_days_spin = QSpinBox()
-        self.cleaner_visits_days_spin.setFixedHeight(32)
-        self.cleaner_visits_days_spin.setRange(1, 150)
-        self.cleaner_visits_days_spin.setValue(30)
-        self.cleaner_visits_days_spin.setSuffix(" 天")
-        self.cleaner_visits_days_spin.setVisible(False)
-        self.cleaner_visits_mode_combo.currentIndexChanged.connect(
-            lambda: (
-                self.cleaner_visits_days_spin.setVisible(self.cleaner_visits_mode_combo.currentData() == "window"),
-                self.cleaner_visits_days_spin.setEnabled(
-                    self.cleaner_visits_check.isChecked() and self.cleaner_visits_mode_combo.currentData() == "window"
-                ),
-            )
-        )
         self.cleaner_visits_threshold_combo = QComboBox()
         self.cleaner_visits_threshold_combo.setFixedHeight(32)
-        self.cleaner_visits_threshold_combo.addItem("等于 0 次 (绝对僵尸品)", 0)
-        self.cleaner_visits_threshold_combo.addItem("≤ 5 次", 5)
-        self.cleaner_visits_threshold_combo.addItem("≤ 10 次", 10)
-        self.cleaner_visits_threshold_combo.addItem("≤ 20 次", 20)
-        visits_h.addWidget(self.cleaner_visits_mode_combo)
-        visits_h.addWidget(self.cleaner_visits_days_spin)
-        visits_h.addWidget(self.cleaner_visits_threshold_combo)
-        grid.addLayout(visits_h, 0, 1)
+        self.cleaner_visits_threshold_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.cleaner_visits_threshold_combo.addItem("等于 0 次 (至今无流量)", 0)
+        self.cleaner_visits_threshold_combo.addItem("≤ 5 次 (几乎无流量)", 5)
+        self.cleaner_visits_threshold_combo.addItem("≤ 10 次 (极低流量)", 10)
+        self.cleaner_visits_threshold_combo.addItem("≤ 20 次 (低流量)", 20)
+        grid.addWidget(self.cleaner_visits_threshold_combo, 0, 1)
 
         self.cleaner_score_check = QCheckBox("刊登质量评分过滤:")
         self.cleaner_score_check.setChecked(True)
@@ -1239,32 +1262,34 @@ class MainWindow(QMainWindow):
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         table.setShowGrid(True)
+        table.setSortingEnabled(True)
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(32)
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         header = table.horizontalHeader()
-        header.setStretchLastSection(False)
+        header.setStretchLastSection(True)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         table.setColumnWidth(0, 48)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         table.setColumnWidth(1, 110)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         table.setColumnWidth(2, 130)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        table.setColumnWidth(3, 50)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        table.setColumnWidth(3, 70)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        table.setColumnWidth(4, 250)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(5, 120)
+        table.setColumnWidth(5, 110)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(6, 75)
+        table.setColumnWidth(6, 85)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(7, 100)
+        table.setColumnWidth(7, 120)
         header.setSectionResizeMode(8, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(8, 140)
+        table.setColumnWidth(8, 165)
         header.setSectionResizeMode(9, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(9, 110)
+        table.setColumnWidth(9, 115)
         header.setSectionResizeMode(10, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(10, 180)
+        table.setColumnWidth(10, 280)
 
         # 独立运行日志框与商品表格垂直分割
         log_frame = QFrame()
@@ -1321,8 +1346,6 @@ class MainWindow(QMainWindow):
         if getattr(self, "cleaner_wipe_store_check", None) and self.cleaner_wipe_store_check.isChecked():
             return
         v_enabled = self.cleaner_visits_check.isChecked()
-        self.cleaner_visits_mode_combo.setEnabled(v_enabled)
-        self.cleaner_visits_days_spin.setEnabled(v_enabled and self.cleaner_visits_mode_combo.currentData() == "window")
         self.cleaner_visits_threshold_combo.setEnabled(v_enabled)
 
         s_enabled = self.cleaner_score_check.isChecked()
@@ -1343,8 +1366,6 @@ class MainWindow(QMainWindow):
         if not disabled:
             self._sync_cleaner_filter_states()
         else:
-            self.cleaner_visits_mode_combo.setEnabled(False)
-            self.cleaner_visits_days_spin.setEnabled(False)
             self.cleaner_visits_threshold_combo.setEnabled(False)
             self.cleaner_score_spin.setEnabled(False)
             self.cleaner_grace_spin.setEnabled(False)
@@ -1445,13 +1466,26 @@ class MainWindow(QMainWindow):
 
         scan_limit = 100000
 
+        target_account_ids = {acc.account_id for acc in target_accounts}
+        is_all = (selected_key == "all")
+        if is_all or not self.cleaner_records:
+            self.cleaner_records.clear()
+            if hasattr(self, "cleaner_model") and self.cleaner_model is not None:
+                self.cleaner_model.clear()
+            clear_cleaner_draft()
+        else:
+            self.cleaner_records = [r for r in self.cleaner_records if r.account_id not in target_account_ids]
+            if hasattr(self, "cleaner_model") and self.cleaner_model is not None:
+                self.cleaner_model.set_records(self.cleaner_records)
+            save_cleaner_draft(self.cleaner_records)
+
         self.cleaner_scan_stop_event.clear()
         self.cleaner_is_scanning = True
         self.cleaner_scan_btn.setText("停止扫描")
         self.cleaner_scan_btn.setEnabled(True)
         self.cleaner_batch_delete_btn.setEnabled(False)
         self.cleaner_clear_draft_btn.setEnabled(False)
-        self.log("[商品扫描] 正在准备扫描分析...")
+        self.log("[商品扫描] 正在准备扫描分析（已重置目标店铺旧有记录，开启全新权威排查）...")
 
         def _worker():
             try:
@@ -1486,8 +1520,8 @@ class MainWindow(QMainWindow):
                         enable_grace_period=self.cleaner_grace_check.isChecked(),
                         grace_period_days=self.cleaner_grace_spin.value(),
                         enable_visits_filter=self.cleaner_visits_check.isChecked(),
-                        visits_mode=str(self.cleaner_visits_mode_combo.currentData() or "total"),
-                        visits_days=self.cleaner_visits_days_spin.value(),
+                        visits_mode="total",
+                        visits_days=30,
                         visits_is_zero_only=(self.cleaner_visits_threshold_combo.currentIndex() == 0),
                         visits_threshold=int(self.cleaner_visits_threshold_combo.currentData() or 0),
                         enable_score_filter=self.cleaner_score_check.isChecked(),
@@ -1639,13 +1673,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "商品清理", "当前未勾选任何待删除商品！")
             return
 
-        sold_selected = [r for r in selected_records if r.has_sales]
+        active_sold_selected = [r for r in selected_records if r.has_sales and ("在售" in r.status or r.status == "active")]
         already_del_selected = [r for r in selected_records if is_item_confirmed_deleted(r)]
         total_count = len(selected_records)
 
-        if sold_selected:
+        if active_sold_selected:
             msg = (
-                f"在选中的 {total_count} 件商品中，包含 {len(sold_selected)} 件【有真实销售出单历史】的商品！\n"
+                f"在选中的 {total_count} 件商品中，包含 {len(active_sold_selected)} 件【依然在售且有销售出单历史】的核心资产商品！\n"
                 f"出单商品一旦删除不可恢复，确认要删除这 {total_count} 件商品吗？"
             )
             reply = QMessageBox.warning(
@@ -1786,14 +1820,37 @@ class MainWindow(QMainWindow):
                     f"[商品删除] 全局合计: 成功下架 {total_succ:,} 件，直接跳过 {total_skipped:,} 件，删除失败 {total_fail:,} 件"
                 )
 
-                remaining_after = [r for r in self.cleaner_records if r.item_id not in deleted_ids]
-                prot_count = len(remaining_after)
-                if prot_count > 0:
+                # 精确分类统计：绝不可把已经处于删除终态的历史记录误统为“受保护商品”
+                all_current_records = list(self.cleaner_records)
+                confirmed_deleted_count = sum(
+                    1 for r in all_current_records
+                    if is_item_confirmed_deleted(r) or r.item_id in deleted_ids
+                )
+                actual_protected_recs = [
+                    r for r in all_current_records
+                    if not is_item_confirmed_deleted(r)
+                    and r.item_id not in deleted_ids
+                    and (
+                        (r.has_sales and ("在售" in r.status or r.status == "active"))
+                        or r.is_protected_new_item
+                    )
+                ]
+                actual_protected_count = len(actual_protected_recs)
+                unselected_pending_count = sum(
+                    1 for r in all_current_records
+                    if not is_item_confirmed_deleted(r)
+                    and r.item_id not in deleted_ids
+                    and r not in actual_protected_recs
+                )
+
+                if actual_protected_count > 0:
                     summary_lines.append(
-                        f"[商品删除] 本地草稿已同步更新，剩余 {prot_count:,} 件受保护商品安全留存（出单/新品保护）"
+                        f"[商品删除] 本地草稿已同步更新，剩余 {actual_protected_count:,} 件受保护商品安全留存（出单/新品保护）"
                     )
                 else:
-                    summary_lines.append("[商品删除] 本地待清理商品已全部删除完毕，草稿已清空")
+                    summary_lines.append(
+                        f"[商品删除] 本地草稿已同步更新，列表中当前包含 {confirmed_deleted_count:,} 件已删除终态记录（可随时点击「清除记录」清空）。"
+                    )
                 summary_lines.append(
                     "[商品删除] ============================================================"
                 )
@@ -1804,15 +1861,20 @@ class MainWindow(QMainWindow):
                     f"• 【{st['store_name']}】: 成功 {st['success']:,} 件，跳过 {st['skipped']:,} 件，失败 {st['failed']:,} 件"
                     for st in store_results
                 )
-                info_msg = (
-                    f"批量删除已全部执行完毕！\n\n"
-                    f"【各店铺分项明细】\n{dialog_details}\n\n"
-                    f"【全局合计】\n"
-                    f"成功下架删除: {total_succ:,} 件\n"
-                    f"直接跳过(已处于删除终态): {total_skipped:,} 件\n"
-                    f"删除失败: {total_fail:,} 件\n\n"
-                    f"剩余受保护商品: {prot_count:,} 件"
-                )
+                info_parts = [
+                    "批量删除已全部执行完毕！\n",
+                    f"【各店铺分项明细】\n{dialog_details}\n",
+                    "【全局合计】",
+                    f"成功下架删除: {total_succ:,} 件",
+                    f"直接跳过(已处于删除终态): {total_skipped:,} 件",
+                    f"删除失败: {total_fail:,} 件",
+                ]
+                if actual_protected_count > 0:
+                    info_parts.append(f"\n剩余受保护商品: {actual_protected_count:,} 件 (在售出单/新品保护)")
+                if unselected_pending_count > 0:
+                    info_parts.append(f"手动未勾选保留: {unselected_pending_count:,} 件")
+
+                info_msg = "\n".join(info_parts)
                 self.gui_dispatcher.dispatch(lambda msg=info_msg: QMessageBox.information(
                     self, "删除完成", msg
                 ))
@@ -1839,6 +1901,8 @@ class MainWindow(QMainWindow):
                                     sub_st.append("deleted")
                                 r.sub_status = sub_st
 
+                    if deleted_ids:
+                        mark_cached_items_deleted(list(deleted_ids))
                     save_cleaner_draft(self.cleaner_records)
                     self._update_cleaner_stats()
                     self.log(
@@ -4933,7 +4997,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.0.85"
+    return "2.0.89"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

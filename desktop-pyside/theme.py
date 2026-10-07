@@ -32,16 +32,21 @@ QFrame#surface, QFrame#brandSurface {{
 }}
 QFrame#brandSurface {{ background: {COLORS['secondary']}; }}
 QWidget#controlContent {{ background: transparent; border: 0; }}
-QFrame#controlSection, QFrame#settingsSection, QFrame#cleanerFilterSection {{
+QFrame#controlSection, QFrame#settingsSection {{
   background: {COLORS['table']};
   border: 1px solid {COLORS['gold']};
+  border-radius: 8px;
+}}
+QFrame#cleanerFilterSection {{
+  background: {COLORS['table']};
+  border: 1px solid #7D6B42;
   border-radius: 8px;
 }}
 QLabel {{ background: transparent; }}
 QLabel#brandTitle {{ font-size: 16pt; font-weight: 700; color: #F6F3EA; }}
 QLabel#brandSubtitle, QLabel#muted {{ color: {COLORS['muted']}; font-size: 13px; line-height: 1.4; }}
 QLabel#sectionTitle {{ font-size: 11pt; font-weight: 700; color: #F6F3EA; }}
-QComboBox, QSpinBox, QLineEdit, QDateEdit, QTextEdit, QListWidget, QTableWidget {{
+QComboBox, QSpinBox, QLineEdit, QDateEdit, QTextEdit, QListWidget, QTableWidget, QTableView {{
   background: {COLORS['input']};
   color: {COLORS['text']};
   border: 1px solid {COLORS['gold']};
@@ -113,13 +118,14 @@ QHeaderView::section {{
   padding: 8px;
   font-weight: 700;
 }}
-QTableWidget {{
+QTableWidget, QTableView {{
   gridline-color: {COLORS['gold']};
   alternate-background-color: {COLORS['card']};
-  border-radius: 0;
+  border: 1px solid {COLORS['gold']};
+  border-radius: 6px;
 }}
-QTableWidget::item {{ border: 0; padding: 6px; }}
-QTableWidget::item:selected {{ background: {COLORS['green']}; color: #F6F3EA; }}
+QTableWidget::item, QTableView::item {{ border: 0; padding: 6px; }}
+QTableWidget::item:selected, QTableView::item:selected {{ background: {COLORS['green']}; color: #F6F3EA; }}
 QLineEdit {{
   padding: 6px 10px;
   min-height: 24px;

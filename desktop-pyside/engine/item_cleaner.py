@@ -292,6 +292,35 @@ def save_cached_item_info(item_entries: list[dict[str, Any]]) -> None:
         pass
 
 
+def mark_cached_items_deleted(item_ids: list[str]) -> None:
+    """在本地 SQLite 缓存中将指定商品标记为已删除终态，避免后续扫描读取陈旧活跃缓存。"""
+    if not item_ids:
+        return
+    db_path = _get_db_path()
+    if not db_path.exists():
+        return
+    try:
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        sub_st = json.dumps(["deleted"])
+        with _open_cleaner_db(db_path, timeout=10) as conn:
+            cur = conn.cursor()
+            cur.executemany(
+                "UPDATE item_cleaner_info_cache SET status = 'closed', sub_status = ?, updated_at = ? WHERE item_id = ?",
+                [(sub_st, now_iso, iid) for iid in item_ids],
+            )
+            cur.executemany(
+                "DELETE FROM item_cleaner_visits_cache WHERE item_id = ?",
+                [(iid,) for iid in item_ids],
+            )
+            cur.executemany(
+                "DELETE FROM item_cleaner_score_cache WHERE item_id = ?",
+                [(iid,) for iid in item_ids],
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 class ItemCleanerEngine:
     def __init__(self, client: MercadoClient):
         self.client = client
@@ -385,33 +414,34 @@ class ItemCleanerEngine:
                     except Exception:
                         break
 
-            # 2. 快速抓取 CBT 母体全量商品
-            scroll_id = None
-            while len(wipe_item_ids) < criteria.max_scan_limit:
-                if stop_event and stop_event.is_set():
-                    break
-                try:
-                    res = self.client.search_user_items(
-                        account_id,
-                        limit=100,
-                        search_type="scan",
-                        scroll_id=scroll_id,
-                    )
-                    r_list = res.get("results") or []
-                    if not r_list:
+            # 2. 仅当未配置分站点且未指定特定分站点时，才抓取 CBT 母体全量商品
+            if not unique_child_sites and not criteria.selected_site_ids and len(wipe_item_ids) == 0:
+                scroll_id = None
+                while len(wipe_item_ids) < criteria.max_scan_limit:
+                    if stop_event and stop_event.is_set():
                         break
-                    for iid in r_list:
-                        if iid not in seen_wipe_ids:
-                            seen_wipe_ids.add(iid)
-                            wipe_item_ids.append(iid)
-                            if len(wipe_item_ids) >= criteria.max_scan_limit:
-                                break
-                    new_scroll = res.get("scroll_id")
-                    if not new_scroll or len(r_list) < 100:
+                    try:
+                        res = self.client.search_user_items(
+                            account_id,
+                            limit=100,
+                            search_type="scan",
+                            scroll_id=scroll_id,
+                        )
+                        r_list = res.get("results") or []
+                        if not r_list:
+                            break
+                        for iid in r_list:
+                            if iid not in seen_wipe_ids:
+                                seen_wipe_ids.add(iid)
+                                wipe_item_ids.append(iid)
+                                if len(wipe_item_ids) >= criteria.max_scan_limit:
+                                    break
+                        new_scroll = res.get("scroll_id")
+                        if not new_scroll or len(r_list) < 100:
+                            break
+                        scroll_id = new_scroll
+                    except Exception:
                         break
-                    scroll_id = new_scroll
-                except Exception:
-                    break
 
             total_found = len(wipe_item_ids)
             log(f"[商品扫描] 【{store_display}】清店全量检索完成，共锁定商品 {total_found:,} 件，正在整理详情...")
@@ -585,42 +615,43 @@ class ItemCleanerEngine:
                         except Exception:
                             break
 
-            # 1.2 CBT 母体账号违规与异常排查 (排除已彻底删除的 inactive 历史死品)
-            cbt_problem_statuses = ["not_yet_active", "under_review", "paused", "closed"]
-            for p_status in cbt_problem_statuses:
-                if stop_event and stop_event.is_set():
-                    break
-                scroll_id = None
-                status_fetched = 0
-                while status_fetched < criteria.max_scan_limit:
+            # 1.2 CBT 母体账号违规与异常排查 (仅在未限定特定分站点时排查母体，排除已彻底删除的 inactive 历史死品)
+            if not criteria.selected_site_ids:
+                cbt_problem_statuses = ["not_yet_active", "under_review", "paused", "closed"]
+                for p_status in cbt_problem_statuses:
                     if stop_event and stop_event.is_set():
                         break
-                    try:
-                        res = self.client.search_user_items(
-                            account_id,
-                            status=p_status,
-                            limit=100,
-                            search_type="scan",
-                            scroll_id=scroll_id,
-                        )
-                        r_list = res.get("results") or []
-                        if not r_list:
+                    scroll_id = None
+                    status_fetched = 0
+                    while status_fetched < criteria.max_scan_limit:
+                        if stop_event and stop_event.is_set():
                             break
-                        for iid in r_list:
-                            if iid not in policy_item_dict:
-                                policy_item_dict[iid] = {
-                                    "site_id": "CBT",
-                                    "sub_status": [],
-                                    "initial_status": p_status,
-                                    "is_policy": True,
-                                }
-                        status_fetched += len(r_list)
-                        new_scroll = res.get("scroll_id")
-                        if not new_scroll or len(r_list) < 100:
+                        try:
+                            res = self.client.search_user_items(
+                                account_id,
+                                status=p_status,
+                                limit=100,
+                                search_type="scan",
+                                scroll_id=scroll_id,
+                            )
+                            r_list = res.get("results") or []
+                            if not r_list:
+                                break
+                            for iid in r_list:
+                                if iid not in policy_item_dict:
+                                    policy_item_dict[iid] = {
+                                        "site_id": "CBT",
+                                        "sub_status": [],
+                                        "initial_status": p_status,
+                                        "is_policy": True,
+                                    }
+                            status_fetched += len(r_list)
+                            new_scroll = res.get("scroll_id")
+                            if not new_scroll or len(r_list) < 100:
+                                break
+                            scroll_id = new_scroll
+                        except Exception:
                             break
-                        scroll_id = new_scroll
-                    except Exception:
-                        break
 
             log(f"[商品扫描] 【{store_display}】已提取违规与待整改商品: {len(policy_item_dict):,} 件")
 
@@ -635,12 +666,15 @@ class ItemCleanerEngine:
             log(f"[商品扫描] 【{store_display}】正在检索在售商品 ID 列表")
             active_ids: list[str] = []
             seen_active_ids: set[str] = set()
+            item_site_map: dict[str, str] = {}
 
             # 2.1 从分站点检索在售商品
             for cs in unique_child_sites:
                 if stop_event and stop_event.is_set() or len(active_ids) >= criteria.max_scan_limit:
                     break
                 c_uid = cs["child_user_id"]
+                s_id = cs.get("site_id") or "分站"
+                site_active_count = 0
                 scroll_id = None
                 while len(active_ids) < criteria.max_scan_limit:
                     if stop_event and stop_event.is_set():
@@ -661,6 +695,8 @@ class ItemCleanerEngine:
                             if iid not in seen_active_ids:
                                 seen_active_ids.add(iid)
                                 active_ids.append(iid)
+                                item_site_map[iid] = s_id
+                                site_active_count += 1
                                 if len(active_ids) >= criteria.max_scan_limit:
                                     break
                         new_scroll = res.get("scroll_id")
@@ -669,9 +705,10 @@ class ItemCleanerEngine:
                         scroll_id = new_scroll
                     except Exception:
                         break
+                log(f"[商品扫描] 【{store_display} - {s_id}站】在售商品检索完成: 共 {site_active_count:,} 件")
 
-            # 2.2 若分站点未配置或未搜到，从母体检索在售商品
-            if len(active_ids) < criteria.max_scan_limit:
+            # 2.2 仅当分站点未检索到任何在售商品时，才从母体检索在售商品兜底
+            if len(active_ids) == 0:
                 scroll_id = None
                 while len(active_ids) < criteria.max_scan_limit:
                     if stop_event and stop_event.is_set():
@@ -691,6 +728,7 @@ class ItemCleanerEngine:
                             if iid not in seen_active_ids:
                                 seen_active_ids.add(iid)
                                 active_ids.append(iid)
+                                item_site_map[iid] = "CBT"
                                 if len(active_ids) >= criteria.max_scan_limit:
                                     break
                         new_scroll = res.get("scroll_id")
@@ -699,8 +737,10 @@ class ItemCleanerEngine:
                         scroll_id = new_scroll
                     except Exception:
                         break
+                if active_ids:
+                    log(f"[商品扫描] 【{store_display} - CBT母体】在售商品检索完成: 共 {len(active_ids):,} 件")
 
-            log(f"[商品扫描] 【{store_display}】在售商品获取完成: 共 {len(active_ids):,} 件")
+            log(f"[商品扫描] 【{store_display}】已选站点在售商品汇总: 共 {len(active_ids):,} 件")
 
             # 2.3 批量/并发拉取在售商品档案 (title, sold_quantity, date_created 等)
             if active_ids:
@@ -776,14 +816,19 @@ class ItemCleanerEngine:
                     if new_cached_entries:
                         save_cached_item_info(new_cached_entries)
 
-            # 2.4 筛选出真正需要进一步核验流量与评分的候选池（严格保护冷启动新品）
+            # 2.4 筛选出真正需要进一步核验流量与评分的候选池（严格保护冷启动新品与分站点过滤）
             eligible_pool: list[str] = []
             for iid in active_ids:
                 it = item_details_map.get(iid, {})
-                date_created_str = str(it.get("date_created") or "")
-                _, days_on_sale = parse_listing_age_days(date_created_str)
+                s_id = str(it.get("site_id") or item_site_map.get(iid) or ("CBT" if iid.startswith("CBT") else iid[:3]))
+
+                # 站点前置严格过滤：若不在选定站点列表中则直接跳过
+                if criteria.selected_site_ids and s_id not in criteria.selected_site_ids:
+                    continue
 
                 # 核心风控：上架时长门槛 / 新品保护 (未满指定天数则直接豁免保护)
+                date_created_str = str(it.get("date_created") or "")
+                _, days_on_sale = parse_listing_age_days(date_created_str)
                 if criteria.enable_grace_period and days_on_sale < criteria.grace_period_days:
                     new_items_protected_count += 1
                     continue
@@ -792,13 +837,20 @@ class ItemCleanerEngine:
 
             sold_items_count = sum(1 for iid in eligible_pool if int(item_details_map.get(iid, {}).get("sold_quantity") or 0) > 0)
             if sold_items_count > 0:
-                log(f"[商品扫描] 🛡️ 【{store_display}】发现历史出单商品 {sold_items_count} 件，已自动设为核心保护状态（禁止删除）")
+                log(f"[商品扫描] 🛡️ 【{store_display}】发现历史出单商品 {sold_items_count:,} 件，已自动设为核心保护状态（禁止删除）")
             if new_items_protected_count > 0:
-                log(f"[商品扫描] 🛡️ 【{store_display}】成功豁免未满 {criteria.grace_period_days} 天新品 {new_items_protected_count} 件")
+                log(f"[商品扫描] 🛡️ 【{store_display}】成功豁免未满 {criteria.grace_period_days} 天新品 {new_items_protected_count:,} 件")
 
-            log(f"[商品扫描] 【{store_display}】待核验流量与评分商品: {len(eligible_pool):,} 件")
+            # 汇总待核验商品的分站点分布
+            site_dist: dict[str, int] = {}
+            for iid in eligible_pool:
+                it = item_details_map.get(iid, {})
+                s = str(it.get("site_id") or item_site_map.get(iid) or ("CBT" if iid.startswith("CBT") else iid[:3]))
+                site_dist[s] = site_dist.get(s, 0) + 1
+            dist_desc = ", ".join(f"{s}: {c:,}件" for s, c in sorted(site_dist.items()))
+            log(f"[商品扫描] 【{store_display}】待核验流量与评分商品: 共 {len(eligible_pool):,} 件 ({dist_desc or '无'})")
 
-            # 2.5 真实浏览量核验 (单品官方契约 + 本地 SQLite 缓存 + 22 QPS 限流 Worker)
+            # 2.5 真实浏览量核验 (单品官方契约 + 本地 SQLite 缓存 + 32 QPS 并发 Worker)
             visits_map: dict[str, int] = {}
             if criteria.enable_visits_filter and eligible_pool:
                 cached_visits_count = 0
@@ -814,7 +866,7 @@ class ItemCleanerEngine:
                 log(f"[商品扫描] 【{store_display}】正在核验真实浏览量: 待联网核查 {len(need_fetch_visits_ids):,} 件（缓存命中 {cached_visits_count:,} 件）")
 
                 if need_fetch_visits_ids:
-                    rate_limiter = RateLimiter(max_qps=22.0)
+                    rate_limiter = RateLimiter(max_qps=32.0)
                     newly_fetched_visits: list[tuple[str, int]] = []
                     v_fetch_lock = threading.Lock()
                     v_done_counter = 0
@@ -857,7 +909,7 @@ class ItemCleanerEngine:
                                         f"速率: {speed:.1f} req/s | 剩余时间: {rem_str}"
                                     )
 
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, max(1, len(need_fetch_visits_ids)))) as v_executor:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, max(1, len(need_fetch_visits_ids)))) as v_executor:
                         v_futures = [v_executor.submit(_fetch_single_visit, iid) for iid in need_fetch_visits_ids]
                         concurrent.futures.wait(v_futures)
 
@@ -890,7 +942,7 @@ class ItemCleanerEngine:
                 )
 
                 if need_fetch_ids:
-                    rate_limiter = RateLimiter(max_qps=22.0)
+                    rate_limiter = RateLimiter(max_qps=32.0)
                     newly_fetched_scores: list[tuple[str, int, str]] = []
                     score_lock = threading.Lock()
                     done_counter = 0
@@ -936,7 +988,7 @@ class ItemCleanerEngine:
                                         f"速率: {speed:.1f} req/s | 剩余时间: {rem_str}"
                                     )
 
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(24, max(1, len(need_fetch_ids)))) as score_executor:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, max(1, len(need_fetch_ids)))) as score_executor:
                         score_futures = [score_executor.submit(_fetch_single_score, iid) for iid in need_fetch_ids]
                         concurrent.futures.wait(score_futures)
 
@@ -1079,7 +1131,6 @@ class ItemCleanerEngine:
             date_display, days_on_sale = parse_listing_age_days(date_created_raw)
 
             has_sales = (sold > 0)
-            is_selected = (not has_sales)
 
             is_policy_item = False
             reasons: list[str] = []
@@ -1130,6 +1181,11 @@ class ItemCleanerEngine:
                     if r not in reasons:
                         reasons.append(r)
 
+            # 核心风控保护：仅当商品依然在正常在售（status == 'active' 且非政策违规）时，出单记录才豁免保护（保持未勾选）；
+            # 若商品已被平台明确下架、停用、暂停、关闭或政策失效，则属于失效垃圾资产，即使历史曾出单也不再保护，默认勾选待删除
+            is_active_sale = (has_sales and not is_policy_item and status == "active")
+            is_selected = (not is_active_sale)
+
             score = cand.get("score") if cand else None
             level_wording = cand.get("level_wording") or "" if cand else ""
             visits = cand.get("visits") or 0 if cand else 0
@@ -1157,8 +1213,10 @@ class ItemCleanerEngine:
             if on_item_matched:
                 on_item_matched(rec)
 
-            if has_sales:
-                log(f"[商品扫描] ⚠️ 【{store_display}】商品 {iid} 命中规则: {', '.join(reasons)} | 检测到已出单 {sold} 件，触发风控保护（保持未勾选）")
+            if is_active_sale:
+                log(f"[商品扫描] 🛡️ 【{store_display}】在售商品 {iid} 检测到已出单 {sold} 件，触发经营资产保护（保持未勾选）")
+            elif has_sales:
+                log(f"[商品扫描] ⚠️ 【{store_display}】商品 {iid} 虽曾出单 {sold} 件但已被平台下架停用，纳入待清理: 【{status_wording}】 {', '.join(reasons)}")
             else:
                 log(f"[商品扫描] ❌ 【{store_display}】商品 {iid} 判定不合格: 【{status_wording}】 {', '.join(reasons)}")
 
@@ -1193,6 +1251,7 @@ class ItemCleanerEngine:
         success_count = 0
         failed_count = 0
         failures: list[dict[str, str]] = []
+        successful_ids: list[str] = []
         del_lock = threading.Lock()
         processed_count = 0
         rate_limiter = RateLimiter(max_qps=22.0)
@@ -1240,6 +1299,7 @@ class ItemCleanerEngine:
                     with del_lock:
                         if succ:
                             success_count += 1
+                            successful_ids.append(iid)
                         else:
                             failed_count += 1
                             failures.append({"item_id": iid, "error": err})
@@ -1248,6 +1308,9 @@ class ItemCleanerEngine:
                         on_progress(cur_idx, total, f"删除 {iid}")
                     if on_item_deleted:
                         on_item_deleted(iid, succ, err)
+
+        if successful_ids:
+            mark_cached_items_deleted(successful_ids)
 
         return {
             "account_id": account_id,
@@ -1346,8 +1409,8 @@ def load_cleaner_draft() -> list[ScannedItemRecord]:
             has_sales = bool(item.get("has_sales") or False)
             raw_selected = bool(item.get("is_selected_for_delete") or False)
             is_del = (st_raw in ("已删除", "已彻底删除") or "deleted" in sub_st)
-            # 已确认删除或有销量的商品，默认取消勾选，不进入删除队列
-            is_sel = raw_selected and not is_del and not has_sales
+            is_active_sale = (has_sales and ("在售" in st_raw or st_raw == "active"))
+            is_sel = raw_selected and not is_del and not is_active_sale
 
             rec = ScannedItemRecord(
                 item_id=str(item.get("item_id") or ""),
