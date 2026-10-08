@@ -8,23 +8,11 @@ DEFAULT_WEBHOOK_CALLBACK_URL = ""
 DEFAULT_ACTIVITY_CALLBACK_CLAIM_URL = ""
 DEFAULT_ACTIVITY_CALLBACK_ACK_URL = ""
 
-LEGACY_ACTIVITY_CALLBACK_CLAIM_URLS = frozenset({
-    "https://xingtupro1020.com/meli-callback/consumer/claim",
-    "https://webhook.xingtupro1020.com/meli-callback/consumer/claim",
-})
-LEGACY_ACTIVITY_CALLBACK_ACK_URLS = frozenset({
-    "https://xingtupro1020.com/meli-callback/consumer/ack",
-    "https://webhook.xingtupro1020.com/meli-callback/consumer/ack",
-})
+LEGACY_ACTIVITY_CALLBACK_CLAIM_URLS = frozenset()
+LEGACY_ACTIVITY_CALLBACK_ACK_URLS = frozenset()
 
 DEFAULT_OAUTH_REDIRECT_URI = ""
-LEGACY_OAUTH_REDIRECT_URIS = frozenset({
-    "https://xingtupro1020.com/oauth/callback/",
-    "https://xingtupro1020.com/callback/",
-    "https://xingtupro1020.com/callback",
-    "http://xingtupro1020.com/callback/",
-    "http://xingtupro1020.com/callback",
-})
+LEGACY_OAUTH_REDIRECT_URIS = frozenset()
 
 
 def migrate_callback_endpoint(
@@ -33,9 +21,7 @@ def migrate_callback_endpoint(
     legacy_values: Iterable[str] = (),
 ) -> str:
     candidate = str(value or "").strip()
-    if not candidate or candidate in legacy_values or "xingtupro1020.com" in candidate:
-        return fallback
-    return candidate
+    return candidate or fallback
 
 
 def migrate_oauth_redirect_uri(
@@ -43,7 +29,4 @@ def migrate_oauth_redirect_uri(
     fallback: str = DEFAULT_OAUTH_REDIRECT_URI,
 ) -> str:
     candidate = str(value or "").strip()
-    if not candidate or candidate in LEGACY_OAUTH_REDIRECT_URIS or "xingtupro1020.com" in candidate:
-        return fallback
-    return candidate
-
+    return candidate or fallback

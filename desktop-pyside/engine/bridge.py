@@ -53,6 +53,12 @@ class EngineBridge:
     def _init_webhook_from_settings(self) -> None:
         try:
             settings = self._read_settings()
+            claim_url = str(settings.get("activityCallbackClaimUrl") or "").strip()
+            ack_url = str(settings.get("activityCallbackAckUrl") or "").strip()
+            if claim_url:
+                self.webhook.claim_url = claim_url
+            if ack_url:
+                self.webhook.ack_url = ack_url
             if settings.get("autoRepriceOnWebhook", True):
                 discount = float(settings.get("sellerDefaultDiscount") or 28.0)
                 self.webhook.start(discount)
@@ -100,6 +106,13 @@ class EngineBridge:
         self.settings_file.parent.mkdir(parents=True, exist_ok=True)
         self.settings_file.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
 
+        claim_url = str(current.get("activityCallbackClaimUrl") or "").strip()
+        ack_url = str(current.get("activityCallbackAckUrl") or "").strip()
+        if claim_url:
+            self.webhook.claim_url = claim_url
+        if ack_url:
+            self.webhook.ack_url = ack_url
+
         auto_enabled = bool(current.get("autoRepriceOnWebhook", True))
         seller_disc = float(current.get("sellerDefaultDiscount") or 28.0)
         if auto_enabled and not self.webhook.is_running():
@@ -138,7 +151,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.0.92",
+                "build_fingerprint": "native-python-v2.0.95",
             }
 
         # 2. Settings

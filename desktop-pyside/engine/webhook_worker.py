@@ -908,6 +908,15 @@ class WebhookWorker:
     def _claim_events(self) -> list[dict[str, Any]]:
         """Call claim endpoint with Bearer auth to retrieve a batch of pending notifications."""
         if not self.claim_url:
+            try:
+                settings_path = get_data_dir() / "settings.json"
+                if settings_path.exists():
+                    st = json.loads(settings_path.read_text(encoding="utf-8"))
+                    self.claim_url = str(st.get("activityCallbackClaimUrl") or "").strip()
+                    self.ack_url = str(st.get("activityCallbackAckUrl") or "").strip()
+            except Exception:
+                pass
+        if not self.claim_url:
             return []
         secret = self._get_secret()
         headers = {

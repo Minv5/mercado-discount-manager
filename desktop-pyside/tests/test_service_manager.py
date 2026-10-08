@@ -37,13 +37,13 @@ class ServiceManagerTests(unittest.TestCase):
         env = self._apply_webhook_settings(
             {
                 "activityCallbackEnabled": True,
-                "activityCallbackClaimUrl": "https://xingtupro1020.com/meli-callback/consumer/claim",
-                "activityCallbackAckUrl": "https://xingtupro1020.com/meli-callback/consumer/ack",
+                "activityCallbackClaimUrl": "https://custom-webhook.example.com/consumer/claim",
+                "activityCallbackAckUrl": "https://custom-webhook.example.com/consumer/ack",
             }
         )
 
-        self.assertNotIn("MDM_ACTIVITY_CLAIM_URL", env)
-        self.assertNotIn("MDM_ACTIVITY_CLAIM_ACK_URL", env)
+        self.assertEqual(env["MDM_ACTIVITY_CLAIM_URL"], "https://custom-webhook.example.com/consumer/claim")
+        self.assertEqual(env["MDM_ACTIVITY_CLAIM_ACK_URL"], "https://custom-webhook.example.com/consumer/ack")
 
     def test_webhook_env_uses_current_defaults_when_saved_endpoints_are_empty(self) -> None:
         env = self._apply_webhook_settings({"activityCallbackEnabled": True})
