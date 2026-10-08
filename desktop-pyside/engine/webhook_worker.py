@@ -41,6 +41,7 @@ class WebhookWorker:
         self.processed_count = 0
         self._price_cache: dict[str, float] = {}
         self._net_cache: dict[str, float] = {}
+        self._shipping_cache: dict[str, float] = {}
         self._dim_cache: dict[str, tuple[str | None, str | None]] = {}
         self._item_locks: dict[str, threading.Lock] = {}
         self._item_locks_guard = threading.Lock()
@@ -55,8 +56,8 @@ class WebhookWorker:
                 self._item_locks[item_id] = lock
             return lock
 
-    def log(self, msg: str) -> None:
-        formatted = f"[Webhook 自动改价重报] {msg}"
+    def log(self, msg: str, tag: str | None = None) -> None:
+        formatted = f"[{tag}] {msg}" if tag else msg
         with self._logs_lock:
             self._logs.append(formatted)
             if len(self._logs) > 200:
@@ -412,6 +413,7 @@ class WebhookWorker:
                 if "404" in err_str or "not found" in err_str.lower():
                     self._price_cache.pop(item_id, None)
                     self._net_cache.pop(item_id, None)
+                    self._shipping_cache.pop(item_id, None)
                     self._dim_cache.pop(item_id, None)
                     return True
                 return False
@@ -419,6 +421,7 @@ class WebhookWorker:
             if not raw_item or not raw_item.get("id"):
                 self._price_cache.pop(item_id, None)
                 self._net_cache.pop(item_id, None)
+                self._shipping_cache.pop(item_id, None)
                 self._dim_cache.pop(item_id, None)
                 return True
 
@@ -435,18 +438,21 @@ class WebhookWorker:
             if status != "active":
                 self._price_cache.pop(item_id, None)
                 self._net_cache.pop(item_id, None)
+                self._shipping_cache.pop(item_id, None)
                 self._dim_cache.pop(item_id, None)
                 return True
 
             item_info = extract_item_net_proceeds(raw_item)
             current_price = float(item_info.price or 0.0)
             current_net = float(item_info.net_proceeds or 0.0)
+            current_shipping = float(item_info.shipping_cost or 0.0)
             official_orig = float(raw_item.get("original_price") or 0.0)
             dim_str, weight_str = self._extract_dimensions_and_weight(raw_item)
 
-            # 读取内存与 SQLite 历史快照（含卖家净回款 net_proceeds 与包装尺寸/重量）
+            # 读取内存与 SQLite 历史快照（含卖家净回款 net_proceeds、纯运费与包装尺寸/重量）
             cached_price = self._price_cache.get(item_id)
             cached_net = self._net_cache.get(item_id)
+            cached_shipping = self._shipping_cache.get(item_id)
             cached_dims = self._dim_cache.get(item_id)
             old_dim = cached_dims[0] if cached_dims else None
             old_weight = cached_dims[1] if cached_dims else None
@@ -468,12 +474,18 @@ class WebhookWorker:
                         parsed_raw = json.loads(raw_j)
                         if isinstance(parsed_raw, dict):
                             db_system = parsed_raw.get("pricing_system")
-                            if cached_net is None:
-                                net_obj = parsed_raw.get("net_proceeds") or {}
-                                if isinstance(net_obj, dict) and net_obj.get("additional_concepts"):
+                            net_obj = parsed_raw.get("net_proceeds") or {}
+                            if isinstance(net_obj, dict):
+                                if cached_net is None:
                                     net_amt = net_obj.get("amount")
                                     if net_amt is not None:
                                         cached_net = float(net_amt)
+                                if cached_shipping is None:
+                                    for concept in net_obj.get("additional_concepts") or []:
+                                        if str(concept.get("id") or "").lower() == "shipping_cost":
+                                            s_amt = concept.get("amount")
+                                            if s_amt is not None:
+                                                cached_shipping = float(s_amt)
                     except Exception:
                         pass
 
@@ -506,20 +518,52 @@ class WebhookWorker:
                     ):
                         change_type = "platform_shipping"
                         ref_old = official_orig if official_orig > 0 else (cached_price or current_price)
-                        change_desc = f"平台运费调整 (${ref_old:.2f} -> ${current_price:.2f})"
+                        if cached_shipping is None and official_orig > 0 and item_info.fee_rate > 0 and current_net > 0:
+                            calc_old_s = round(official_orig * (1 - item_info.fee_rate) - current_net, 2)
+                            if calc_old_s > 0:
+                                cached_shipping = calc_old_s
+
+                        if cached_shipping is not None and abs(cached_shipping - current_shipping) >= 0.01:
+                            ship_desc = f"平台运费调整 (${cached_shipping:.2f} -> ${current_shipping:.2f})"
+                        elif current_shipping > 0:
+                            ship_desc = f"平台运费变动 (最新 ${current_shipping:.2f})"
+                        else:
+                            ship_desc = "平台运费调整"
+
+                        if abs(ref_old - current_price) >= 0.01:
+                            price_desc = f"，售价更新 (${ref_old:.2f} -> ${current_price:.2f})"
+                        else:
+                            price_desc = ""
+                        change_desc = f"{ship_desc}{price_desc}"
             elif current_net > 0:
                 # 本地尚无 cached_net（首次接触或此前未存 raw_json）
                 if item_info.is_inconsistent and official_orig > 0:
                     if self._is_platform_only_shipping_change_on_old_cbt(account_id, raw_item):
                         change_type = "platform_shipping"
-                        change_desc = f"平台运费调整 (${official_orig:.2f} -> ${current_price:.2f})"
+                        if cached_shipping is None and item_info.fee_rate > 0:
+                            calc_old_s = round(official_orig * (1 - item_info.fee_rate) - current_net, 2)
+                            if calc_old_s > 0:
+                                cached_shipping = calc_old_s
+                        if cached_shipping is not None and abs(cached_shipping - current_shipping) >= 0.01:
+                            ship_desc = f"平台运费调整 (${cached_shipping:.2f} -> ${current_shipping:.2f})"
+                        elif current_shipping > 0:
+                            ship_desc = f"平台运费变动 (最新 ${current_shipping:.2f})"
+                        else:
+                            ship_desc = "平台运费调整"
+                        change_desc = f"{ship_desc}，售价更新 (${official_orig:.2f} -> ${current_price:.2f})"
                     else:
                         change_type = "seller_data"
                         change_desc = f"售价变动 (${official_orig:.2f} -> ${current_price:.2f})"
                 elif cached_price is not None and abs(cached_price - current_price) >= 0.01:
                     if (official_orig > 0 or db_system == "system1_discount") and self._is_platform_only_shipping_change_on_old_cbt(account_id, raw_item):
                         change_type = "platform_shipping"
-                        change_desc = f"平台运费调整 (${cached_price:.2f} -> ${current_price:.2f})"
+                        if cached_shipping is not None and abs(cached_shipping - current_shipping) >= 0.01:
+                            ship_desc = f"平台运费调整 (${cached_shipping:.2f} -> ${current_shipping:.2f})"
+                        elif current_shipping > 0:
+                            ship_desc = f"平台运费变动 (最新 ${current_shipping:.2f})"
+                        else:
+                            ship_desc = "平台运费调整"
+                        change_desc = f"{ship_desc}，售价更新 (${cached_price:.2f} -> ${current_price:.2f})"
                     elif not self._is_platform_only_shipping_change_on_old_cbt(account_id, raw_item):
                         change_type = "seller_data"
                         change_desc = f"售价变动 (${cached_price:.2f} -> ${current_price:.2f})"
@@ -527,6 +571,8 @@ class WebhookWorker:
                 # 非 CBT 净回款模式或单测 Mock 商品（仅含 price）
                 if cached_price is None:
                     self._price_cache[item_id] = current_price
+                    if current_shipping > 0:
+                        self._shipping_cache[item_id] = current_shipping
                     self._dim_cache[item_id] = (dim_str, weight_str)
                     self._save_db_snapshot(account_id, child_user_id, site_id, item_id, current_price, raw_item, dim_str, weight_str, db_system)
                     return True
@@ -539,6 +585,8 @@ class WebhookWorker:
                 self._price_cache[item_id] = current_price
                 if current_net > 0:
                     self._net_cache[item_id] = current_net
+                if current_shipping > 0:
+                    self._shipping_cache[item_id] = current_shipping
                 self._dim_cache[item_id] = (dim_str, weight_str)
                 self._save_db_snapshot(account_id, child_user_id, site_id, item_id, current_price, raw_item, dim_str, weight_str, db_system)
                 return True
@@ -578,6 +626,8 @@ class WebhookWorker:
                 self._price_cache[item_id] = current_price
                 if current_net > 0:
                     self._net_cache[item_id] = current_net
+                if current_shipping > 0:
+                    self._shipping_cache[item_id] = current_shipping
                 self._dim_cache[item_id] = (dim_str, weight_str)
                 self._save_db_snapshot(
                     account_id, child_user_id, site_id, item_id, current_price, raw_item, dim_str, weight_str,
@@ -587,7 +637,8 @@ class WebhookWorker:
                 if active_promos or official_orig > 0:
                     self.log(
                         f"【{store_name}】商品 {item_id} 检测到{change_desc}，"
-                        f"执行新定价策略：退出所有活动，不再报任何活动。"
+                        f"执行新定价策略：退出所有活动，不再报任何活动。",
+                        tag="自动退出",
                     )
                     for ap in active_promos:
                         p_id = ap["id"]
@@ -601,9 +652,9 @@ class WebhookWorker:
                                 )
                             else:
                                 self.client.cancel_promotion_item(account_id, child_user_id, item_id, p_id, p_type)
-                            self.log(f"【{store_name}】商品 {item_id}: 已退出活动 {p_id} ({p_type})。")
+                            self.log(f"【{store_name}】商品 {item_id}: 已退出活动 {p_id} ({p_type})。", tag="自动退出")
                         except Exception as cancel_err:
-                            self.log(f"【{store_name}】商品 {item_id}: 尝试退出活动 {p_id} 异常: {cancel_err}")
+                            self.log(f"【{store_name}】商品 {item_id}: 尝试退出活动 {p_id} 异常: {cancel_err}", tag="自动退出")
 
                 cbt_id = str(raw_item.get("cbt_item_id") or "").strip().upper()
             else:
@@ -616,21 +667,23 @@ class WebhookWorker:
 
         with self._get_item_lock(item_id):
 
-            # 分支 B：【体系 1（拉高价格再打折旧体系 -> 仅平台调整了运费）】退出旧锁死原价并按最新运费继续报回 30% 折扣
+            # 分支 B：【体系 1（仅平台调整了运费）】退出旧锁死原价并按最新运费继续报回折扣
             started_promos = [ap for ap in active_promos if ap.get("status") == "started"]
             target_promos = started_promos if started_promos else candidate_promos
             if not target_promos:
                 self._price_cache[item_id] = current_price
                 if current_net > 0:
                     self._net_cache[item_id] = current_net
+                if current_shipping > 0:
+                    self._shipping_cache[item_id] = current_shipping
                 self._dim_cache[item_id] = (dim_str, weight_str)
                 self._save_db_snapshot(account_id, child_user_id, site_id, item_id, current_price, raw_item, dim_str, weight_str, db_system)
                 return True
 
             discount = self._get_current_discount()
             self.log(
-                f"【{store_name}】商品 {item_id} 检测到{change_desc}（体系1商品），"
-                f"正在按最新运费重算并继续报回 {discount:.1f}% 折扣活动..."
+                f"【{store_name}】商品 {item_id} {change_desc}，退出旧活动",
+                tag="自动退出",
             )
 
             cancel_failed_ids: set[str] = set()
@@ -652,7 +705,7 @@ class WebhookWorker:
                         pass
                     else:
                         cancel_failed_ids.add(p_id)
-                        self.log(f"【{store_name}】商品 {item_id}: 退出旧活动 {p_id} 异常: {cancel_err}")
+                        self.log(f"【{store_name}】商品 {item_id}: 退出旧活动 {p_id} 异常: {cancel_err}", tag="自动退出")
 
             if started_promos and isinstance(self.client, MercadoClient):
                 time.sleep(1.0)
@@ -690,12 +743,12 @@ class WebhookWorker:
                 p_raw = ap.get("raw") or {}
 
                 if p_id in cancel_failed_ids and p_id not in current_candidate_ids:
-                    self.log(f"【{store_name}】商品 {item_id}: 旧活动 {p_id} 尚未完全退出，跳过本次重报以避免频控冲突。")
+                    self.log(f"【{store_name}】商品 {item_id}: 旧活动 {p_id} 尚未完全退出，跳过本次重报以避免频控冲突。", tag="自动退出")
                     continue
 
                 calc = calculate_deal_price(item_info, discount, p_raw, p_type)
                 if not calc.eligible or calc.deal_price <= 0:
-                    self.log(f"【{store_name}】商品 {item_id}: 活动 {p_id} 重算跳过 ({calc.skip_reason})。")
+                    self.log(f"【{store_name}】商品 {item_id}: 活动 {p_id} 重算跳过 ({calc.skip_reason})。", tag="自动报回")
                     continue
                 try:
                     offer_id = str(p_raw.get("offer_id") or "") or None
@@ -710,15 +763,16 @@ class WebhookWorker:
                         original_price=calc.original_price,
                     )
                     self.log(
-                        f"【{store_name}】商品 {item_id}: 已按新运费继续报回活动 {p_id} ({p_type})，"
-                        f"新活动价 ${calc.deal_price:.2f}。"
+                        f"【{store_name}】商品 {item_id}: 按新运费报回活动 {p_id} ({p_type})，"
+                        f"折后售价 ${calc.deal_price:.2f}。",
+                        tag="自动报回",
                     )
                 except Exception as enroll_err:
                     err_msg = str(enroll_err)
                     if "429" in err_msg or "rate_limited" in err_msg.lower():
-                        self.log(f"【{store_name}】商品 {item_id}: 重报回活动 {p_id} ({p_type}) 触发平台限流，将等待下次自动同步。")
+                        self.log(f"【{store_name}】商品 {item_id}: 重报回活动 {p_id} ({p_type}) 触发平台限流，将等待下次自动同步。", tag="自动报回")
                     else:
-                        self.log(f"【{store_name}】商品 {item_id}: 重报回活动 {p_id} ({p_type}) 失败: {enroll_err}")
+                        self.log(f"【{store_name}】商品 {item_id}: 重报回活动 {p_id} ({p_type}) 失败: {enroll_err}", tag="自动报回")
 
             # 报名完成后再次同步最新快照
             try:
@@ -731,6 +785,8 @@ class WebhookWorker:
             self._price_cache[item_id] = current_price
             if current_net > 0:
                 self._net_cache[item_id] = current_net
+            if current_shipping > 0:
+                self._shipping_cache[item_id] = current_shipping
             self._dim_cache[item_id] = (dim_str, weight_str)
             self._save_db_snapshot(
                 account_id, child_user_id, site_id, item_id, current_price, raw_item, dim_str, weight_str,
@@ -818,9 +874,9 @@ class WebhookWorker:
                                     )
                                 else:
                                     self.client.cancel_promotion_item(account_id, sib_user_id, sib_id, p_id, p_type)
-                                self.log(f"【{store_name}】商品 {sib_id}: 因同父商品 {cbt_id} 数据变动，已联动退出活动 {p_id} ({p_type})。")
+                                self.log(f"【{store_name}】商品 {sib_id}: 因同父商品 {cbt_id} 数据变动，已联动退出活动 {p_id} ({p_type})。", tag="自动退出")
                             except Exception as cancel_err:
-                                self.log(f"【{store_name}】商品 {sib_id}: 联动退出活动 {p_id} 异常: {cancel_err}")
+                                self.log(f"【{store_name}】商品 {sib_id}: 联动退出活动 {p_id} 异常: {cancel_err}", tag="自动退出")
                         try:
                             fresh_sib = self.client.get_item_detail(account_id, sib_id)
                             if isinstance(fresh_sib, dict) and fresh_sib.get("id"):
@@ -831,11 +887,14 @@ class WebhookWorker:
                 sib_info = extract_item_net_proceeds(sib_raw)
                 sib_price = float(sib_info.price or 0.0)
                 sib_net = float(sib_info.net_proceeds or 0.0)
+                sib_shipping = float(sib_info.shipping_cost or 0.0)
                 sib_dim, sib_weight = self._extract_dimensions_and_weight(sib_raw)
                 if sib_price > 0:
                     self._price_cache[sib_id] = sib_price
                 if sib_net > 0:
                     self._net_cache[sib_id] = sib_net
+                if sib_shipping > 0:
+                    self._shipping_cache[sib_id] = sib_shipping
                 self._dim_cache[sib_id] = (sib_dim, sib_weight)
                 self._save_db_snapshot(
                     account_id, sib_user_id, sib_site_id, sib_id, sib_price, sib_raw, sib_dim, sib_weight,

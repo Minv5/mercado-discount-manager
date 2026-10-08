@@ -177,7 +177,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.96")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.98")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -997,7 +997,7 @@ class NativeEngineTests(unittest.TestCase):
         worker._ack_event.assert_called_once_with("evt_sys1_ship", "lease_sys1_ship", ok=True)
         worker.client.cancel_promotion_item.assert_called_once()
         worker.client.enroll_promotion_item.assert_called_once()
-        self.assertTrue(any("已按新运费继续报回活动 C-MLM1477572" in line for line in worker._logs))
+        self.assertTrue(any("按新运费报回活动 C-MLM1477572" in line for line in worker._logs))
 
     def test_webhook_worker_system2_unenrolled_item_never_enrolls_on_shipping_change(self) -> None:
         """System 2 / newly uploaded 155% item (original_price=None): platform shipping change never triggers enrollment."""
@@ -1120,6 +1120,72 @@ class NativeEngineTests(unittest.TestCase):
             "3408885754", "3407227823", "MLM222222", "P-MLM17611046", "DEAL"
         )
         self.assertTrue(any("因同父商品 CBT999888 数据变动，已联动退出活动 P-MLM17611046" in line for line in worker._logs))
+
+    def test_webhook_worker_log_formatting_and_shipping_separation(self) -> None:
+        """Verify Webhook logs use [自动退出] and [自动报回], cleanly separate shipping cost from listing price, and omit internal terms."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker._price_cache["MLB7611962534"] = 30.63
+        worker._net_cache["MLB7611962534"] = 15.06
+        worker._shipping_cache["MLB7611962534"] = 11.35
+
+        worker.client.get_item_detail.return_value = {
+            "id": "MLB7611962534",
+            "site_id": "MLB",
+            "seller_id": 3407227825,
+            "status": "active",
+            "price": 28.63,
+            "original_price": 30.63,
+            "net_proceeds": {
+                "amount": 15.06,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 14.51},
+                    {"id": "sale_fee", "amount": 4.22},
+                ],
+                "currency_id": "USD",
+            },
+        }
+        worker.client.request.return_value = [
+            {"id": "P-MLB18061082", "type": "DEAL", "status": "started"}
+        ]
+        worker._ack_event = MagicMock()
+
+        event = {
+            "event_id": "evt_shipping_separate",
+            "lease_id": "lease_shipping_separate",
+            "topic": "marketplace_items",
+            "resource": "/marketplace/items/MLB7611962534",
+            "remote_user_id": "3408885754",
+        }
+        worker._process_single_event(event)
+        worker._ack_event.assert_called_once_with("evt_shipping_separate", "lease_shipping_separate", ok=True)
+        worker.client.cancel_promotion_item.assert_called_once()
+        worker.client.enroll_promotion_item.assert_called_once()
+
+        # Check logs
+        logs = worker._logs
+        self.assertEqual(len(logs), 2)
+        # 1. Tags must be [自动退出] and [自动报回]
+        exit_logs = [l for l in logs if l.startswith("[自动退出]")]
+        re_enroll_logs = [l for l in logs if l.startswith("[自动报回]")]
+        self.assertEqual(len(exit_logs), 1)
+        self.assertEqual(len(re_enroll_logs), 1)
+
+        # 2. Must clearly separate pure shipping cost from original listing price
+        self.assertTrue(any("平台运费调整 ($11.35 -> $14.51)" in l for l in exit_logs))
+        self.assertTrue(any("售价更新 ($30.63 -> $33.79)" in l for l in exit_logs))
+        self.assertTrue(any("退出旧活动" in l for l in exit_logs))
+
+        # 3. Must format deal price cleanly
+        self.assertTrue(any("按新运费报回活动 P-MLB18061082 (DEAL)，折后售价 $" in l for l in re_enroll_logs))
+
+        # 4. Strictly no internal terminology or old prefixes
+        for l in logs:
+            self.assertNotIn("体系1商品", l)
+            self.assertNotIn("[Webhook 自动改价重报]", l)
 
 
 if __name__ == "__main__":
