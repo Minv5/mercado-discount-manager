@@ -592,8 +592,15 @@ class WebhookWorker:
                     for ap in active_promos:
                         p_id = ap["id"]
                         p_type = ap["type"]
+                        p_raw = ap.get("raw") or {}
+                        offer_id = str(p_raw.get("offer_id") or ap.get("offer_id") or "").strip() or None
                         try:
-                            self.client.cancel_promotion_item(account_id, child_user_id, item_id, p_id, p_type)
+                            if offer_id:
+                                self.client.cancel_promotion_item(
+                                    account_id, child_user_id, item_id, p_id, p_type, offer_id=offer_id
+                                )
+                            else:
+                                self.client.cancel_promotion_item(account_id, child_user_id, item_id, p_id, p_type)
                             self.log(f"【{store_name}】商品 {item_id}: 已退出活动 {p_id} ({p_type})。")
                         except Exception as cancel_err:
                             self.log(f"【{store_name}】商品 {item_id}: 尝试退出活动 {p_id} 异常: {cancel_err}")
@@ -626,16 +633,29 @@ class WebhookWorker:
                 f"正在按最新运费重算并继续报回 {discount:.1f}% 折扣活动..."
             )
 
+            cancel_failed_ids: set[str] = set()
             for ap in started_promos:
                 p_id = ap["id"]
                 p_type = ap["type"]
+                p_raw = ap.get("raw") or {}
+                offer_id = str(p_raw.get("offer_id") or ap.get("offer_id") or "").strip() or None
                 try:
-                    self.client.cancel_promotion_item(account_id, child_user_id, item_id, p_id, p_type)
+                    if offer_id:
+                        self.client.cancel_promotion_item(
+                            account_id, child_user_id, item_id, p_id, p_type, offer_id=offer_id
+                        )
+                    else:
+                        self.client.cancel_promotion_item(account_id, child_user_id, item_id, p_id, p_type)
                 except Exception as cancel_err:
-                    self.log(f"【{store_name}】商品 {item_id}: 退出旧活动 {p_id} 异常: {cancel_err}")
+                    err_str = str(cancel_err)
+                    if "404" in err_str or "not found" in err_str.lower():
+                        pass
+                    else:
+                        cancel_failed_ids.add(p_id)
+                        self.log(f"【{store_name}】商品 {item_id}: 退出旧活动 {p_id} 异常: {cancel_err}")
 
             if started_promos and isinstance(self.client, MercadoClient):
-                time.sleep(0.8)
+                time.sleep(1.0)
 
             # 重新获取退出活动后的最新商品详情以刷新基准原价，并按之前的折扣重新报名回原活动
             try:
@@ -647,10 +667,32 @@ class WebhookWorker:
             except Exception:
                 pass
 
+            # 若存在退出异常的活动，查证其是否在美客多后台已转为 candidate；未转为 candidate 者跳过重报以防 429 冲突
+            current_candidate_ids: set[str] = set()
+            if cancel_failed_ids:
+                try:
+                    current_promos = self.client.request(
+                        account_id,
+                        "GET",
+                        f"/marketplace/seller-promotions/items/{item_id}",
+                        params={"app_version": "v2", "user_id": child_user_id},
+                    )
+                    if isinstance(current_promos, list):
+                        for cp in current_promos:
+                            if isinstance(cp, dict) and str(cp.get("status") or "").lower() == "candidate":
+                                current_candidate_ids.add(str(cp.get("id") or ""))
+                except Exception:
+                    pass
+
             for ap in target_promos:
                 p_id = ap["id"]
                 p_type = ap["type"]
                 p_raw = ap.get("raw") or {}
+
+                if p_id in cancel_failed_ids and p_id not in current_candidate_ids:
+                    self.log(f"【{store_name}】商品 {item_id}: 旧活动 {p_id} 尚未完全退出，跳过本次重报以避免频控冲突。")
+                    continue
+
                 calc = calculate_deal_price(item_info, discount, p_raw, p_type)
                 if not calc.eligible or calc.deal_price <= 0:
                     self.log(f"【{store_name}】商品 {item_id}: 活动 {p_id} 重算跳过 ({calc.skip_reason})。")
@@ -672,7 +714,11 @@ class WebhookWorker:
                         f"新活动价 ${calc.deal_price:.2f}。"
                     )
                 except Exception as enroll_err:
-                    self.log(f"【{store_name}】商品 {item_id}: 重报回活动 {p_id} ({p_type}) 失败: {enroll_err}")
+                    err_msg = str(enroll_err)
+                    if "429" in err_msg or "rate_limited" in err_msg.lower():
+                        self.log(f"【{store_name}】商品 {item_id}: 重报回活动 {p_id} ({p_type}) 触发平台限流，将等待下次自动同步。")
+                    else:
+                        self.log(f"【{store_name}】商品 {item_id}: 重报回活动 {p_id} ({p_type}) 失败: {enroll_err}")
 
             # 报名完成后再次同步最新快照
             try:
@@ -752,7 +798,11 @@ class WebhookWorker:
                             p_type = str(p.get("type") or "DEAL").upper()
                             p_status = str(p.get("status") or "").lower()
                             if p_status in ("started", "pending") and (p_id or p_type == "PRICE_DISCOUNT"):
-                                sib_promos.append({"id": p_id, "type": p_type})
+                                sib_promos.append({
+                                    "id": p_id,
+                                    "type": p_type,
+                                    "offer_id": str(p.get("offer_id") or "").strip() or None,
+                                })
                     except Exception:
                         pass
 
@@ -760,8 +810,14 @@ class WebhookWorker:
                         for ap in sib_promos:
                             p_id = ap["id"]
                             p_type = ap["type"]
+                            offer_id = ap.get("offer_id")
                             try:
-                                self.client.cancel_promotion_item(account_id, sib_user_id, sib_id, p_id, p_type)
+                                if offer_id:
+                                    self.client.cancel_promotion_item(
+                                        account_id, sib_user_id, sib_id, p_id, p_type, offer_id=offer_id
+                                    )
+                                else:
+                                    self.client.cancel_promotion_item(account_id, sib_user_id, sib_id, p_id, p_type)
                                 self.log(f"【{store_name}】商品 {sib_id}: 因同父商品 {cbt_id} 数据变动，已联动退出活动 {p_id} ({p_type})。")
                             except Exception as cancel_err:
                                 self.log(f"【{store_name}】商品 {sib_id}: 联动退出活动 {p_id} 异常: {cancel_err}")
