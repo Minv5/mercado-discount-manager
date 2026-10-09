@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .auth import AuthManager, OAuthInvalidGrantError
-from .client import MercadoClient
+from .client import MercadoClient, clean_error_message
 from .crypto import get_data_dir
 from .pricing import calculate_deal_price, extract_item_net_proceeds
 
@@ -278,7 +278,8 @@ class ActionExecutor:
                         report_progress(progress)
                     with activity_lock:
                         failed_items.append({"item_id": item_id, "promotion_id": p_id, "promotion_name": p_name, "site_id": s_id, "reason": str(err)})
-                    log(f"[{store_name}][{s_label}] 商品 {item_id} 退出活动失败: {err}")
+                    clean_err = clean_error_message(err)
+                    log(f"[{store_name}][{s_label}] 商品 {item_id} 退出活动失败: {clean_err}")
                     return "failed"
 
             # Step A: Authoritative Real-time GET /marketplace/items/{id} (带内存缓存避免跨活动重复抓取)
@@ -312,7 +313,8 @@ class ActionExecutor:
                     report_progress(progress)
                 with activity_lock:
                     failed_items.append({"item_id": item_id, "promotion_id": p_id, "promotion_name": p_name, "site_id": s_id, "reason": str(err)})
-                log(f"[{store_name}][{s_label}] 商品 {item_id} 抓取实时数据失败: {err}")
+                clean_err = clean_error_message(err)
+                log(f"[{store_name}][{s_label}] 商品 {item_id} 抓取实时数据失败: {clean_err}")
                 return "failed"
 
             # Step B: Pricing calculation with shipping protection & floor guard
@@ -394,7 +396,7 @@ class ActionExecutor:
                     log(f"[{store_name}][{s_label}] 商品 {item_id} 已在活动 [{p_name}] 中，自动跳过")
                     return "skipped"
                 else:
-                    reason = err_msg
+                    reason = clean_error_message(err_msg)
 
                 with progress_lock:
                     progress.failed += 1

@@ -10,10 +10,25 @@ _TECHNICAL_REASON_PATTERNS = (
 )
 
 
+try:
+    from engine.client import clean_error_message, format_clean_api_error
+except ImportError:
+    try:
+        from .engine.client import clean_error_message, format_clean_api_error
+    except ImportError:
+        clean_error_message = lambda x: str(x)
+        format_clean_api_error = lambda c, x: str(x)
+
+
 def business_reason_text(value: Any) -> str:
     raw = str(value or "").strip()
     if not raw:
         return ""
+    # Check clean API error mapping first
+    cleaned = clean_error_message(raw)
+    if cleaned != raw:
+        return cleaned
+
     token_only = re.compile(
         r"^(?:PROMOTION_ITEMS_(?:UNREADABLE|INCOMPLETE)|pending[_\s-]*relations?[_\s-]*present|"
         r"accounting[_\s-]*complete\s*[\"']?\s*[:=]\s*false|accounting_(?:incomplete|not_proven)|"

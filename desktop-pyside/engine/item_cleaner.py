@@ -1393,7 +1393,7 @@ def is_item_confirmed_deleted(rec: ScannedItemRecord) -> bool:
     if "deleted" in sub_st:
         return True
     st_lower = st.lower()
-    if "404" in st_lower and ("not a cbt item" in st_lower or "not_found" in st_lower or "not found" in st_lower):
+    if "404" in st_lower and ("not a cbt item" in st_lower or "非全球cbt" in st_lower or "not_found" in st_lower or "not found" in st_lower or "不存在" in st_lower):
         return True
     return False
 

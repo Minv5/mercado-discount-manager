@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import queue
+import re
 import ssl
 import threading
 import time
@@ -43,6 +44,92 @@ class HTTPSConnectionPool:
                 conn.close()
             except Exception:
                 pass
+
+
+def format_clean_api_error(status_code: int | None, raw_msg: str) -> str:
+    """Format technical Mercado Libre error into concise human-readable Chinese."""
+    text = str(raw_msg or "").strip()
+    code = int(status_code) if status_code is not None else 0
+    text_lower = text.lower()
+
+    # 1. 500 / internal error
+    if code == 500 or "oops! something went wrong" in text_lower or "internal_error" in text_lower or "internal server error" in text_lower:
+        return "平台服务繁忙，请稍后重试 (500)"
+
+    # 2. 502 / 503 / 504 / Gateway & Maintenance
+    if code in (502, 503, 504) or any(k in text_lower for k in ("bad gateway", "service unavailable", "gateway timeout")):
+        return f"平台网关超时/维护中 ({code or 503})"
+
+    # 3. 400 / 409 Activity Locked
+    if "lockedentityexception" in text_lower or "offer locked" in text_lower:
+        return "活动已锁定，平台禁止退出"
+
+    # 4. 400 Credibility
+    if "error_credibility_discounted_price" in text_lower or "price is not credible" in text_lower:
+        return "折后价未达近期成交价门槛"
+
+    # 5. 400 Eligibility
+    if "item_not_eligible" in text_lower:
+        return "未达活动受邀门槛"
+
+    # 6. Already in promotion
+    if "already in promotion" in text_lower or "already" in text_lower:
+        return "已在活动中(自动跳过)"
+
+    # 7. Required promotion_type
+    if "promotion_type is required" in text_lower:
+        return "缺少活动类型参数"
+
+    # 8. Active item not modifiable / deletable
+    if "deleted is not modifiable" in text_lower:
+        return "商品活跃/出单中，禁止删除"
+
+    # 9. 404 not CBT
+    if "not a cbt item" in text_lower:
+        return "非全球CBT商品 (404)"
+
+    # 10. 404 not found
+    if code == 404 or "not found" in text_lower or "not_found" in text_lower:
+        return "商品或活动不存在 (404)"
+
+    # 11. 403 User identification
+    if "can not identify the user" in text_lower or "cannot identify the user" in text_lower:
+        return "站点无权限或账号不匹配 (403)"
+
+    # 12. 403 Forbidden / Access denied
+    if code == 403 or "forbidden" in text_lower or "access_denied" in text_lower:
+        return "站点访问受限 (403)"
+
+    # 13. 401 Auth expired
+    if code == 401 or any(k in text_lower for k in ("invalid_grant", "consumer_auth_required", "expired_token")):
+        return "店铺授权已过期 (401)"
+
+    # 14. 429 Rate limit
+    if code == 429 or "too many requests" in text_lower or "rate_limit" in text_lower:
+        return "平台限流，降速排队中 (429)"
+
+    # 15. Network error
+    if any(k in text_lower for k in ("remotedisconnected", "connectionreset", "brokenpipe", "timeout", "socket hang up", "cannotsendrequest")):
+        return "网络超时或中断"
+
+    # Fallback: clean up noisy wrappers
+    clean = text
+    m = re.search(r"Errors?:\s*(?:[A-Z_]+\s*-\s*)?([^,}\]]+)", clean)
+    if m:
+        clean = m.group(1).strip()
+    if code > 0:
+        return f"美客多接口异常: {clean} ({code})"
+    return clean
+
+
+def clean_error_message(err: Any) -> str:
+    """Extract and format any exception or error string into clean human-readable text."""
+    if err is None:
+        return ""
+    err_str = str(err).strip()
+    code_match = re.search(r"\b(4\d\d|5\d\d)\b", err_str)
+    code = int(code_match.group(1)) if code_match else None
+    return format_clean_api_error(code, err_str)
 
 
 class MercadoClient:
@@ -139,7 +226,8 @@ class MercadoClient:
                             msg = err_json.get("message") or err_json.get("error") or raw
                     except Exception:
                         msg = raw
-                    raise RuntimeError(f"美客多 API 报错 ({status_code}): {msg}")
+                    clean_msg = format_clean_api_error(status_code, msg)
+                    raise RuntimeError(clean_msg)
 
                 except (http.client.RemoteDisconnected, http.client.CannotSendRequest,
                         BrokenPipeError, ConnectionResetError, urllib.error.URLError,

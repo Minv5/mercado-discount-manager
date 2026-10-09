@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .auth import AuthManager
-from .client import MercadoClient
+from .client import MercadoClient, clean_error_message
 from .crypto import get_data_dir
 from .pricing import calculate_deal_price, extract_item_net_proceeds
 
@@ -675,7 +675,8 @@ class WebhookWorker:
                                 self.client.cancel_promotion_item(account_id, child_user_id, item_id, p_id, p_type)
                             self.log(f"【{store_name}】商品 {item_id}: 已退出活动 {p_id} ({p_type})。", tag="自动退出")
                         except Exception as cancel_err:
-                            self.log(f"【{store_name}】商品 {item_id}: 尝试退出活动 {p_id} 异常: {cancel_err}", tag="自动退出")
+                            clean_err = clean_error_message(cancel_err)
+                            self.log(f"【{store_name}】商品 {item_id}: 尝试退出活动 {p_id} 异常: {clean_err}", tag="自动退出")
 
                 cbt_id = str(raw_item.get("cbt_item_id") or "").strip().upper()
             else:
@@ -726,7 +727,8 @@ class WebhookWorker:
                         pass
                     else:
                         cancel_failed_ids.add(p_id)
-                        self.log(f"【{store_name}】商品 {item_id}: 退出旧活动 {p_id} 异常: {cancel_err}", tag="自动退出")
+                        clean_err = clean_error_message(cancel_err)
+                        self.log(f"【{store_name}】商品 {item_id}: 退出旧活动 {p_id} 异常: {clean_err}", tag="自动退出")
 
             if started_promos and isinstance(self.client, MercadoClient):
                 time.sleep(1.0)
@@ -830,10 +832,7 @@ class WebhookWorker:
                     elif "ITEM_NOT_ELIGIBLE" in err_msg:
                         self.log(f"【{store_name}】商品 {item_id}: 失败，不满足活动准入条件", tag="自动报回")
                     else:
-                        clean_err = err_msg
-                        m = re.search(r"Errors?:\s*(?:[A-Z_]+\s*-\s*)?([^,}\]]+)", clean_err)
-                        if m:
-                            clean_err = m.group(1).strip()
+                        clean_err = clean_error_message(err_msg)
                         self.log(f"【{store_name}】商品 {item_id}: 失败，{clean_err}", tag="自动报回")
 
             # 报名完成后再次同步最新快照
@@ -938,7 +937,8 @@ class WebhookWorker:
                                     self.client.cancel_promotion_item(account_id, sib_user_id, sib_id, p_id, p_type)
                                 self.log(f"【{store_name}】商品 {sib_id}: 因同父商品 {cbt_id} 数据变动，已联动退出活动 {p_id} ({p_type})。", tag="自动退出")
                             except Exception as cancel_err:
-                                self.log(f"【{store_name}】商品 {sib_id}: 联动退出活动 {p_id} 异常: {cancel_err}", tag="自动退出")
+                                clean_err = clean_error_message(cancel_err)
+                                self.log(f"【{store_name}】商品 {sib_id}: 联动退出活动 {p_id} 异常: {clean_err}", tag="自动退出")
                         try:
                             fresh_sib = self.client.get_item_detail(account_id, sib_id)
                             if isinstance(fresh_sib, dict) and fresh_sib.get("id"):
