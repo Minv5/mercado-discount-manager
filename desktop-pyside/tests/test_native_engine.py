@@ -1,18 +1,22 @@
+import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core import Account
 from engine.auth import AuthManager
 from engine.bridge import EngineBridge
 from engine.crypto import decrypt_secret, encrypt_secret
 from engine.pricing import calculate_deal_price, extract_item_net_proceeds
+from engine.webhook_worker import WebhookWorker
 
 
 class NativeEngineTests(unittest.TestCase):
@@ -177,7 +181,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.0.98")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.1.01")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -1186,6 +1190,148 @@ class NativeEngineTests(unittest.TestCase):
         for l in logs:
             self.assertNotIn("体系1商品", l)
             self.assertNotIn("[Webhook 自动改价重报]", l)
+
+    def test_webhook_worker_credibility_error_concise_logging(self) -> None:
+        """Verify that ERROR_CREDIBILITY_DISCOUNTED_PRICE logs concise, human-readable reason."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker._price_cache["MLC4236736938"] = 15.00
+        worker._net_cache["MLC4236736938"] = 12.35
+        worker._shipping_cache["MLC4236736938"] = 1.20
+
+        worker.client.get_item_detail.return_value = {
+            "id": "MLC4236736938",
+            "site_id": "MLC",
+            "seller_id": 3407225955,
+            "status": "active",
+            "price": 17.04,
+            "original_price": 15.00,
+            "net_proceeds": {
+                "amount": 12.35,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 1.88},
+                    {"id": "sale_fee", "amount": 2.81},
+                ],
+                "currency_id": "USD",
+            },
+        }
+        worker.client.request.side_effect = [
+            # 1. get item promotions: started DEAL
+            [{"id": "P-MLC17951022", "type": "DEAL", "status": "started", "raw": {"suggested_discounted_price": 14.81}}],
+            # 2. cancel promotions: ok
+            {},
+        ]
+        worker.client.enroll_promotion_item.side_effect = RuntimeError(
+            "美客多 API 报错 (400): Errors: ERROR_CREDIBILITY_DISCOUNTED_PRICE - The discounted price is not credible."
+        )
+        worker._ack_event = MagicMock()
+
+        event = {
+            "event_id": "evt_cred_test",
+            "lease_id": "lease_cred_test",
+            "topic": "marketplace_items",
+            "resource": "/marketplace/items/MLC4236736938",
+            "remote_user_id": "3408885754",
+        }
+        worker._process_single_event(event)
+
+        # Check logs
+        enroll_fail_logs = [l for l in worker._logs if "失败，折扣价高于平台预期" in l]
+        self.assertEqual(len(enroll_fail_logs), 1)
+        self.assertIn("折后价 $", enroll_fail_logs[0])
+        self.assertIn("平台预期$14.81", enroll_fail_logs[0])
+        self.assertNotIn("ERROR_CREDIBILITY_DISCOUNTED_PRICE", enroll_fail_logs[0])
+        self.assertNotIn("The discounted price is not credible", enroll_fail_logs[0])
+
+    def test_webhook_extracts_dimensions_and_weight_from_variations(self) -> None:
+        """Verify that items with dimensions/weight only in variations are correctly extracted."""
+        worker = WebhookWorker(client=MagicMock())
+        item_with_variations = {
+            "id": "MLB4897041997",
+            "attributes": [
+                {"id": "BRAND", "value_name": "Genérico"},
+                {"id": "MODEL", "value_name": "Toy-01"},
+            ],
+            "variations": [
+                {
+                    "id": 205241801533,
+                    "attributes": [
+                        {"id": "PACKAGE_HEIGHT", "value_struct": {"number": 14, "unit": "cm"}},
+                        {"id": "PACKAGE_LENGTH", "value_struct": {"number": 16, "unit": "cm"}},
+                        {"id": "PACKAGE_WIDTH", "value_struct": {"number": 13, "unit": "cm"}},
+                        {"id": "PACKAGE_WEIGHT", "value_struct": {"number": 410, "unit": "g"}},
+                    ],
+                }
+            ],
+        }
+        dim_str, weight_str = worker._extract_dimensions_and_weight(item_with_variations)
+        self.assertIsNotNone(dim_str)
+        self.assertIsNotNone(weight_str)
+        assert dim_str is not None and weight_str is not None
+        dims = json.loads(dim_str)
+        self.assertEqual(dims["height"]["number"], 14)
+        self.assertEqual(dims["length"]["number"], 16)
+        self.assertEqual(dims["width"]["number"], 13)
+        weight = json.loads(weight_str)
+        self.assertEqual(weight["number"], 410)
+
+    @patch("time.sleep", return_value=None)
+    def test_webhook_enroll_retry_on_locked_entity_and_clean_log(self, _mock_sleep: MagicMock) -> None:
+        """Verify that encountering LockedEntityException retries with backoff and formats a clean log."""
+        worker = WebhookWorker(client=MagicMock())
+        worker._accounts = [Account("3332096437", "", "CBT", "广东店")]
+        worker._price_cache["MLB4897041997"] = 28.00
+        worker._net_cache["MLB4897041997"] = 12.58
+        worker._shipping_cache["MLB4897041997"] = 8.50
+
+        worker.client.get_item_detail.return_value = {
+            "id": "MLB4897041997",
+            "site_id": "MLB",
+            "seller_id": 3333531560,
+            "status": "active",
+            "price": 26.15,
+            "original_price": 28.00,
+            "net_proceeds": {
+                "amount": 12.58,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 10.30},
+                    {"id": "sale_fee", "amount": 3.27},
+                ],
+                "currency_id": "USD",
+            },
+        }
+        worker.client.request.side_effect = [
+            # 1. get item promotions: started DEAL
+            [{"id": "P-MLB18027202", "type": "DEAL", "status": "started", "raw": {}}],
+            # 2. cancel
+            {},
+        ]
+        # Always fail with LockedEntityException
+        worker.client.enroll_promotion_item.side_effect = RuntimeError(
+            "美客多 API 报错 (400): Errors: LockedEntityException: Offer Locked [MLB4897041997]"
+        )
+        worker._ack_event = MagicMock()
+
+        event = {
+            "event_id": "evt_lock_test",
+            "lease_id": "lease_lock_test",
+            "topic": "marketplace_items",
+            "resource": "/marketplace/items/MLB4897041997",
+            "remote_user_id": "3332096437",
+        }
+        worker._process_single_event(event)
+
+        # Verified retried 3 times (attempt 0, 1, 2)
+        self.assertEqual(worker.client.enroll_promotion_item.call_count, 3)
+
+        # Check clean log output
+        lock_logs = [l for l in worker._logs if "平台活动锁占用中" in l]
+        self.assertEqual(len(lock_logs), 1)
+        self.assertIn("商品 MLB4897041997: 失败，平台活动锁占用中（请稍后重试）", lock_logs[0])
+        self.assertNotIn("LockedEntityException", lock_logs[0])
 
 
 if __name__ == "__main__":

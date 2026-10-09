@@ -161,19 +161,40 @@ class WebhookWorker:
         return None
 
     def _extract_dimensions_and_weight(self, raw_item: dict[str, Any]) -> tuple[str | None, str | None]:
-        """Extract normalized dimensions and weight JSON strings from item detail."""
+        """Extract normalized dimensions and weight JSON strings from item detail (supporting root attributes and variations)."""
         attrs: dict[str, Any] = {}
-        for attr in raw_item.get("attributes") or []:
-            if not isinstance(attr, dict):
-                continue
-            aid = str(attr.get("id") or "").strip().upper()
-            if not aid:
-                continue
-            v_struct = attr.get("value_struct")
-            if isinstance(v_struct, dict) and v_struct.get("number") is not None:
-                attrs[aid] = {"number": v_struct.get("number"), "unit": v_struct.get("unit")}
-            elif attr.get("value_name") is not None:
-                attrs[aid] = str(attr.get("value_name")).strip()
+
+        def _collect_attrs(source_list: list[Any]) -> None:
+            for attr in source_list or []:
+                if not isinstance(attr, dict):
+                    continue
+                aid = str(attr.get("id") or "").strip().upper()
+                if not aid or aid in attrs:
+                    continue
+                v_struct = attr.get("value_struct")
+                if isinstance(v_struct, dict) and v_struct.get("number") is not None:
+                    attrs[aid] = {"number": v_struct.get("number"), "unit": v_struct.get("unit")}
+                elif attr.get("value_name") is not None:
+                    attrs[aid] = str(attr.get("value_name")).strip()
+
+        _collect_attrs(raw_item.get("attributes") or [])
+
+        dim_candidates = [
+            "SELLER_PACKAGE_HEIGHT", "PACKAGE_HEIGHT", "HEIGHT",
+            "SELLER_PACKAGE_WIDTH", "PACKAGE_WIDTH", "WIDTH",
+            "SELLER_PACKAGE_LENGTH", "PACKAGE_LENGTH", "LENGTH", "DEPTH",
+        ]
+        weight_candidates = ["SELLER_PACKAGE_WEIGHT", "PACKAGE_WEIGHT", "WEIGHT"]
+
+        has_dim = any(c in attrs for c in dim_candidates)
+        has_weight = any(c in attrs for c in weight_candidates)
+
+        if not (has_dim and has_weight):
+            for v in raw_item.get("variations") or []:
+                if isinstance(v, dict):
+                    _collect_attrs(v.get("attributes") or [])
+                    if any(c in attrs for c in dim_candidates) and any(c in attrs for c in weight_candidates):
+                        break
 
         dims: dict[str, Any] = {}
         for key, candidates in [
@@ -188,7 +209,7 @@ class WebhookWorker:
         dim_str = json.dumps(dims, sort_keys=True, ensure_ascii=False) if dims else None
 
         weight_val = None
-        for cand in ["SELLER_PACKAGE_WEIGHT", "PACKAGE_WEIGHT", "WEIGHT"]:
+        for cand in weight_candidates:
             if cand in attrs:
                 weight_val = attrs[cand]
                 break
@@ -750,29 +771,70 @@ class WebhookWorker:
                 if not calc.eligible or calc.deal_price <= 0:
                     self.log(f"【{store_name}】商品 {item_id}: 活动 {p_id} 重算跳过 ({calc.skip_reason})。", tag="自动报回")
                     continue
-                try:
-                    offer_id = str(p_raw.get("offer_id") or "") or None
-                    self.client.enroll_promotion_item(
-                        account_id=account_id,
-                        child_user_id=child_user_id,
-                        item_id=item_id,
-                        promotion_id=p_id,
-                        promotion_type=p_type,
-                        deal_price=calc.deal_price,
-                        offer_id=offer_id,
-                        original_price=calc.original_price,
-                    )
-                    self.log(
-                        f"【{store_name}】商品 {item_id}: 按新运费报回活动 {p_id} ({p_type})，"
-                        f"折后售价 ${calc.deal_price:.2f}。",
-                        tag="自动报回",
-                    )
-                except Exception as enroll_err:
-                    err_msg = str(enroll_err)
+                offer_id = str(p_raw.get("offer_id") or "") or None
+                enrolled_ok = False
+                last_enroll_err: Exception | None = None
+                for attempt in range(3):
+                    try:
+                        self.client.enroll_promotion_item(
+                            account_id=account_id,
+                            child_user_id=child_user_id,
+                            item_id=item_id,
+                            promotion_id=p_id,
+                            promotion_type=p_type,
+                            deal_price=calc.deal_price,
+                            offer_id=offer_id,
+                            original_price=calc.original_price,
+                        )
+                        self.log(
+                            f"【{store_name}】商品 {item_id}: 按新运费报回活动 {p_id} ({p_type})，"
+                            f"折后售价 ${calc.deal_price:.2f}。",
+                            tag="自动报回",
+                        )
+                        enrolled_ok = True
+                        break
+                    except Exception as enroll_err:
+                        last_enroll_err = enroll_err
+                        err_msg = str(enroll_err)
+                        if ("LockedEntityException" in err_msg or "Offer Locked" in err_msg) and attempt < 2:
+                            time.sleep(2.5)
+                            continue
+                        break
+
+                if not enrolled_ok and last_enroll_err is not None:
+                    err_msg = str(last_enroll_err)
                     if "429" in err_msg or "rate_limited" in err_msg.lower():
-                        self.log(f"【{store_name}】商品 {item_id}: 重报回活动 {p_id} ({p_type}) 触发平台限流，将等待下次自动同步。", tag="自动报回")
+                        self.log(f"【{store_name}】商品 {item_id}: 报回活动 {p_id} ({p_type}) 触发平台限流，等待下次同步。", tag="自动报回")
+                    elif "LockedEntityException" in err_msg or "Offer Locked" in err_msg:
+                        self.log(f"【{store_name}】商品 {item_id}: 失败，平台活动锁占用中（请稍后重试）", tag="自动报回")
+                    elif "ERROR_CREDIBILITY_DISCOUNTED_PRICE" in err_msg:
+                        sugg_p = float(p_raw.get("suggested_discounted_price") or (p_raw.get("raw") or {}).get("suggested_discounted_price") or 0.0)
+                        if sugg_p <= 0:
+                            try:
+                                cand_info = self.client.request(
+                                    account_id,
+                                    "GET",
+                                    f"/marketplace/seller-promotions/promotions/{p_id}/items",
+                                    params={"user_id": child_user_id, "item_id": item_id, "status": "candidate", "app_version": "v2"},
+                                )
+                                res_items = cand_info.get("results") if isinstance(cand_info, dict) else (cand_info if isinstance(cand_info, list) else [])
+                                if res_items and isinstance(res_items[0], dict):
+                                    sugg_p = float(res_items[0].get("suggested_discounted_price") or 0.0)
+                            except Exception:
+                                pass
+                        if sugg_p > 0:
+                            reason = f"失败，折扣价高于平台预期（折后价 ${calc.deal_price:.2f} ，平台预期${sugg_p:.2f} ）"
+                        else:
+                            reason = f"失败，折扣价高于平台预期（折后价 ${calc.deal_price:.2f} ）"
+                        self.log(f"【{store_name}】商品 {item_id}: {reason}", tag="自动报回")
+                    elif "ITEM_NOT_ELIGIBLE" in err_msg:
+                        self.log(f"【{store_name}】商品 {item_id}: 失败，不满足活动准入条件", tag="自动报回")
                     else:
-                        self.log(f"【{store_name}】商品 {item_id}: 重报回活动 {p_id} ({p_type}) 失败: {enroll_err}", tag="自动报回")
+                        clean_err = err_msg
+                        m = re.search(r"Errors?:\s*(?:[A-Z_]+\s*-\s*)?([^,}\]]+)", clean_err)
+                        if m:
+                            clean_err = m.group(1).strip()
+                        self.log(f"【{store_name}】商品 {item_id}: 失败，{clean_err}", tag="自动报回")
 
             # 报名完成后再次同步最新快照
             try:
