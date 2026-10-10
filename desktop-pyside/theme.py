@@ -11,6 +11,7 @@ COLORS = {
     "green_hover": "#356F45",
     "green_selected": "#203A2B",
     "gold": "#4E472F",
+    "gold_hover": "#6E5D2A",
     "gold_focus": "#8A7432",
     "text": "#E6E2D8",
     "muted": "#C8C3B7",
@@ -68,6 +69,9 @@ QSpinBox {{
   padding-top: 6px;
   padding-bottom: 6px;
   min-height: 22px;
+}}
+QComboBox:hover, QSpinBox:hover, QLineEdit:hover, QDateEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QListWidget:hover, QTableWidget:hover, QTableView:hover {{
+  border-color: {COLORS['gold_hover']};
 }}
 QComboBox:focus, QComboBox:on, QSpinBox:focus, QLineEdit:focus, QDateEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QListWidget:focus {{
   border-color: {COLORS['gold_focus']};
@@ -168,6 +172,9 @@ QTableWidget, QTableView {{
   alternate-background-color: {COLORS['card']};
   border: 1px solid {COLORS['gold']};
   border-radius: 6px;
+}}
+QTableWidget:hover, QTableView:hover {{
+  border-color: {COLORS['gold_hover']};
 }}
 QTableWidget:focus, QTableView:focus {{
   border-color: {COLORS['gold_focus']};

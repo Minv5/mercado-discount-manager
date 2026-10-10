@@ -2643,10 +2643,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.1.11")
+        self.assertEqual(product_version(), "2.1.12")
  
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.1.11")
+        self.assertEqual(self.window.version_label.text(), "v2.1.12")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2658,7 +2658,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.1.11")
+        self.assertEqual(self.window.version_label.text(), "v2.1.12")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -2679,6 +2679,10 @@ class QtUiTests(unittest.TestCase):
         self.assertIn("QWidget#controlContent", APP_QSS)
 
     def test_combobox_and_table_focus_and_highlight_rules(self) -> None:
+        self.assertIn("QComboBox:hover", APP_QSS)
+        self.assertIn("QTableWidget:hover", APP_QSS)
+        self.assertIn("QTableView:hover", APP_QSS)
+        self.assertIn(f"border-color: {COLORS['gold_hover']}", APP_QSS)
         self.assertIn("QComboBox:on", APP_QSS)
         self.assertIn("QTableWidget:focus", APP_QSS)
         self.assertIn("QTableView:focus", APP_QSS)
@@ -3151,7 +3155,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.1.11")
+        self.assertEqual(self.window.version_label.text(), "v2.1.12")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
@@ -3359,7 +3363,7 @@ class QtUiTests(unittest.TestCase):
             asset_size=10485760,
             published_at="2026-10-07T00:00:00Z",
         )
-        dlg = UpdateDialog(info, "2.1.11", parent=self.window)
+        dlg = UpdateDialog(info, "2.1.12", parent=self.window)
         self.assertEqual(dlg.windowTitle(), "软件更新 - 美客多活动管家")
         self.assertIn("自动更新引擎", dlg.notes_edit.toPlainText())
         self.assertTrue(dlg.update_btn.isEnabled())
