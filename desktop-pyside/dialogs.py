@@ -297,7 +297,7 @@ class MultiBatchHistoryDialog(QDialog):
         self.list_widget.setStyleSheet(
             "QListWidget { background: #18201C; border: 1px solid #4E472F; border-radius: 6px; padding: 4px; }"
             "QListWidget:hover { border-color: #6E5D2A; }"
-            "QListWidget:focus { border-color: #8A7432; }"
+            'QListWidget[focused="true"] { border-color: #8A7432; }'
             "QListWidget::item { padding: 8px 10px; border-bottom: 1px solid #2A3630; }"
             "QListWidget::item:hover { background: #233029; }"
         )
@@ -604,7 +604,7 @@ class TargetedCancelDialog(QDialog):
             "QPlainTextEdit:hover { "
             "border-color: #6E5D2A; "
             "} "
-            "QPlainTextEdit:focus { "
+            'QPlainTextEdit[focused="true"] { '
             "border-color: #8A7432; "
             "}"
         )

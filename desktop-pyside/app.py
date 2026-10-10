@@ -9,9 +9,17 @@ if os.name == "nt":
     os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
     os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QAbstractSpinBox,
+    QApplication,
+    QLineEdit,
+    QPlainTextEdit,
+    QTextEdit,
+    QWidget,
+)
 
 from api_client import ApiClient
 from diagnostics import diagnostic_event, install_runtime_diagnostics, install_windows_unhandled_exception_filter
@@ -20,10 +28,69 @@ from service_manager import NodeServiceManager
 from theme import APP_QSS
 
 
+class FocusVisibleFilter(QObject):
+    """全局焦点可见性事件过滤器（实现 W3C focus-visible 语义）：
+    彻底消除窗口初次呈现、页面切入或弹窗打开时由 Qt 底层默认赋予焦点产生的高光金边。
+    仅当用户产生主动交互时才呈现高光边框：
+    - 鼠标主动点击输入/表格控件 (MouseFocusReason / MouseButtonPress)；
+    - 键盘 Tab / Shift-Tab / 快捷键光标导航 (TabFocusReason / BacktabFocusReason / ShortcutFocusReason)；
+    - 键盘主动打字按键 (KeyPress)；
+    失焦或非用户主动赋焦（如 OtherFocusReason / ActiveWindowFocusReason）时边框保持 1px 基准暗金。
+    """
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._interactive_reasons = {
+            Qt.FocusReason.MouseFocusReason,
+            Qt.FocusReason.TabFocusReason,
+            Qt.FocusReason.BacktabFocusReason,
+            Qt.FocusReason.ShortcutFocusReason,
+        }
+
+    def _resolve_targets(self, widget: QWidget) -> list[QWidget]:
+        targets: list[QWidget] = []
+        if isinstance(widget, (QLineEdit, QAbstractSpinBox, QTextEdit, QPlainTextEdit, QAbstractItemView)):
+            targets.append(widget)
+        p = widget.parentWidget()
+        if p is not None and isinstance(p, (QAbstractSpinBox, QAbstractItemView)):
+            targets.append(p)
+        return targets
+
+    def _set_focused(self, widget: QWidget, focused: bool) -> None:
+        for target in self._resolve_targets(widget):
+            if target.property("focused") != focused:
+                target.setProperty("focused", focused)
+                style = target.style()
+                if style:
+                    style.unpolish(target)
+                    style.polish(target)
+
+    def eventFilter(self, obj: QObject, ev: QEvent) -> bool:
+        if not isinstance(obj, QWidget):
+            return False
+        ev_type = ev.type()
+        if ev_type == QEvent.Type.FocusIn:
+            reason = getattr(ev, "reason", lambda: None)()
+            if reason in self._interactive_reasons:
+                self._set_focused(obj, True)
+            else:
+                self._set_focused(obj, False)
+        elif ev_type == QEvent.Type.FocusOut:
+            self._set_focused(obj, False)
+        elif ev_type in (QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress):
+            self._set_focused(obj, True)
+        return False
+
+
 def create_application(argv: list[str] | None = None) -> QApplication:
     if os.name == "nt":
         QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
-    app = QApplication(argv if argv is not None else sys.argv)
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(argv if argv is not None else sys.argv)
+    focus_filter = FocusVisibleFilter(app)
+    app.installEventFilter(focus_filter)
+    app._focus_visible_filter = focus_filter
     install_windows_unhandled_exception_filter()
     app.setApplicationName("美客多活动管家")
     app.setOrganizationName("MercadoDiscountManager")

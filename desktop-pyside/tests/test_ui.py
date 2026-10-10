@@ -2643,10 +2643,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.1.15")
+        self.assertEqual(product_version(), "2.1.16")
  
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.1.15")
+        self.assertEqual(self.window.version_label.text(), "v2.1.16")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2658,7 +2658,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.1.15")
+        self.assertEqual(self.window.version_label.text(), "v2.1.16")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -2685,9 +2685,14 @@ class QtUiTests(unittest.TestCase):
         self.assertIn(f"border-color: {COLORS['gold_hover']}", APP_QSS)
         self.assertIn("QComboBox:on", APP_QSS)
         self.assertNotIn("QComboBox:focus", APP_QSS)
-        self.assertIn("QTableWidget:focus", APP_QSS)
-        self.assertIn("QTableView:focus", APP_QSS)
-        self.assertIn("QPlainTextEdit:focus", APP_QSS)
+        self.assertIn('QTableWidget[focused="true"]', APP_QSS)
+        self.assertIn('QTableView[focused="true"]', APP_QSS)
+        self.assertIn('QPlainTextEdit[focused="true"]', APP_QSS)
+        self.assertIn('QLineEdit[focused="true"]', APP_QSS)
+        self.assertNotIn("QTableWidget:focus", APP_QSS)
+        self.assertNotIn("QTableView:focus", APP_QSS)
+        self.assertNotIn("QPlainTextEdit:focus", APP_QSS)
+        self.assertNotIn("QLineEdit:focus", APP_QSS)
         self.assertIn(f"border-color: {COLORS['gold_focus']}", APP_QSS)
 
         for table in (
@@ -2696,6 +2701,19 @@ class QtUiTests(unittest.TestCase):
             self.window.cleaner_table,
         ):
             self.assertEqual(table.focusPolicy(), Qt.FocusPolicy.StrongFocus)
+
+    def test_focus_visible_filter_prevents_initial_golden_focus_and_activates_on_interaction(self) -> None:
+        dlg = ItemQueryDialog(None, None)
+        dlg.show()
+        self.app.processEvents()
+        self.assertIn(dlg.item_input.property("focused"), (False, None))
+
+        QTest.mouseClick(dlg.item_input, Qt.MouseButton.LeftButton)
+        self.assertTrue(dlg.item_input.property("focused"))
+
+        dlg.item_input.clearFocus()
+        self.assertFalse(dlg.item_input.property("focused"))
+        dlg.close()
 
     def test_discount_spin_text_and_buttons_fit_across_values_states_and_dpr(self) -> None:
         for spin in (self.window.seller_discount, self.window.official_discount):
@@ -3143,7 +3161,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.1.15")
+        self.assertEqual(self.window.version_label.text(), "v2.1.16")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
@@ -3351,7 +3369,7 @@ class QtUiTests(unittest.TestCase):
             asset_size=10485760,
             published_at="2026-10-07T00:00:00Z",
         )
-        dlg = UpdateDialog(info, "2.1.15", parent=self.window)
+        dlg = UpdateDialog(info, "2.1.16", parent=self.window)
         self.assertEqual(dlg.windowTitle(), "软件更新 - 美客多活动管家")
         self.assertIn("自动更新引擎", dlg.notes_edit.toPlainText())
         self.assertTrue(dlg.update_btn.isEnabled())

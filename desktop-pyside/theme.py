@@ -73,7 +73,7 @@ QSpinBox {{
 QComboBox:hover, QSpinBox:hover, QLineEdit:hover, QDateEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QListWidget:hover, QTableWidget:hover, QTableView:hover {{
   border-color: {COLORS['gold_hover']};
 }}
-QComboBox:on, QSpinBox:focus, QLineEdit:focus, QDateEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QListWidget:focus {{
+QComboBox:on, QSpinBox[focused="true"], QLineEdit[focused="true"], QDateEdit[focused="true"], QTextEdit[focused="true"], QPlainTextEdit[focused="true"], QListWidget[focused="true"] {{
   border-color: {COLORS['gold_focus']};
 }}
 QComboBox::drop-down {{
@@ -176,7 +176,7 @@ QTableWidget, QTableView {{
 QTableWidget:hover, QTableView:hover {{
   border-color: {COLORS['gold_hover']};
 }}
-QTableWidget:focus, QTableView:focus {{
+QTableWidget[focused="true"], QTableView[focused="true"] {{
   border-color: {COLORS['gold_focus']};
 }}
 QTableWidget::item, QTableView::item {{ border: 0; padding: 6px; }}
