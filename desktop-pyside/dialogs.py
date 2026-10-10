@@ -1555,7 +1555,7 @@ class SettingsDialog(QDialog):
         for field in (self.seller_discount, self.official_discount):
             field.setRange(1, 90)
             field.setSuffix(" %")
-            field.setFixedWidth(96)
+            field.setFixedWidth(120)
             field.setFixedHeight(32)
             field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.seller_discount.setValue(int(self.settings.get("sellerDefaultDiscount", 5)))
@@ -1566,7 +1566,7 @@ class SettingsDialog(QDialog):
             field.setRange(0, 90)
             field.setSpecialValueText("未设置")
             field.setSuffix(" %")
-            field.setFixedWidth(96)
+            field.setFixedWidth(120)
             field.setFixedHeight(32)
             field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.seller_max_discount.setValue(_bounded_int(self.settings.get("sellerMaxDiscount"), 0, 0, 90))
