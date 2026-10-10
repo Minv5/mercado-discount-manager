@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
 from PySide6.QtCore import QDate, QModelIndex, QObject, QSettings, QSignalBlocker, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeySequence, QPainter, QShortcut, QTextCursor
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeySequence, QPainter, QShortcut, QShowEvent, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -569,9 +569,6 @@ class TargetedCancelDialog(QDialog):
         self.multi_batch_btn = QPushButton("多选批次...")
         self.multi_batch_btn.clicked.connect(self._open_multi_batch_dialog)
 
-        # 功能分区空置留白，明确分隔录入工具组与清空重置按键
-        row2.addSpacing(16)
-
         self.clear_btn = QPushButton("清  空")
         self.clear_btn.setFixedWidth(68)
         self.clear_btn.setFixedHeight(32)
@@ -673,7 +670,16 @@ class TargetedCancelDialog(QDialog):
             self._readiness_timer.start()
         self._sync_submit_state()
         self._sync_item_count()
-        self.item_input.setFocus()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self.clear_initial_focus)
+
+    def clear_initial_focus(self) -> None:
+        focused = self.focusWidget()
+        if focused:
+            focused.clearFocus()
+        self.setFocus()
 
     def _refresh_history_combo(self) -> None:
         history = load_targeted_item_history()

@@ -59,16 +59,16 @@ QComboBox, QSpinBox, QLineEdit, QDateEdit, QTextEdit, QPlainTextEdit, QListWidge
 QComboBox {{
   padding-left: 10px;
   padding-right: 32px;
-  padding-top: 6px;
-  padding-bottom: 6px;
-  min-height: 22px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  min-height: 20px;
 }}
 QSpinBox {{
   padding-left: 8px;
   padding-right: 28px;
-  padding-top: 6px;
-  padding-bottom: 6px;
-  min-height: 22px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  min-height: 20px;
 }}
 QComboBox:hover, QSpinBox:hover, QLineEdit:hover, QDateEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QListWidget:hover, QTableWidget:hover, QTableView:hover {{
   border-color: {COLORS['gold_hover']};
