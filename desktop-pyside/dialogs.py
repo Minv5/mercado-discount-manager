@@ -296,6 +296,7 @@ class MultiBatchHistoryDialog(QDialog):
         self.list_widget = QListWidget()
         self.list_widget.setStyleSheet(
             "QListWidget { background: #18201C; border: 1px solid #4E472F; border-radius: 6px; padding: 4px; }"
+            "QListWidget:focus { border-color: #8A7432; }"
             "QListWidget::item { padding: 8px 10px; border-bottom: 1px solid #2A3630; }"
             "QListWidget::item:hover { background: #233029; }"
         )
@@ -501,6 +502,7 @@ class TargetedCancelDialog(QDialog):
         row1.addWidget(action_label)
 
         self.action_combo = QComboBox()
+        self.action_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.action_combo.addItem("报名活动", "enroll")
         self.action_combo.addItem("取消活动", "cancel")
         self.action_combo.addItem("刷新商品缓存", "refresh_cache")
@@ -554,6 +556,7 @@ class TargetedCancelDialog(QDialog):
         row2.addWidget(self.load_last_canceled_btn)
 
         self.history_combo = QComboBox()
+        self.history_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.history_combo.setFixedWidth(160)
         self.history_combo.setFixedHeight(32)
         self.history_combo.view().setMinimumWidth(200)
@@ -601,6 +604,9 @@ class TargetedCancelDialog(QDialog):
             "color: #E6E2D8; "
             "border: 1px solid #4E472F; "
             "border-radius: 6px; "
+            "} "
+            "QPlainTextEdit:focus { "
+            "border-color: #8A7432; "
             "}"
         )
         self.item_input.textChanged.connect(self._sync_item_count)
@@ -1941,6 +1947,7 @@ class SettingsDialog(QDialog):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self.app_selector = QComboBox()
+        self.app_selector.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.app_selector.currentIndexChanged.connect(self._on_app_selected)
         form.addRow("选择授权应用", self.app_selector)
 

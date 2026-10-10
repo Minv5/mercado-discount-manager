@@ -46,7 +46,7 @@ QLabel {{ background: transparent; }}
 QLabel#brandTitle {{ font-size: 16pt; font-weight: 700; color: #F6F3EA; }}
 QLabel#brandSubtitle, QLabel#muted {{ color: {COLORS['muted']}; font-size: 13px; line-height: 1.4; }}
 QLabel#sectionTitle {{ font-size: 11pt; font-weight: 700; color: #F6F3EA; }}
-QComboBox, QSpinBox, QLineEdit, QDateEdit, QTextEdit, QListWidget, QTableWidget, QTableView {{
+QComboBox, QSpinBox, QLineEdit, QDateEdit, QTextEdit, QPlainTextEdit, QListWidget, QTableWidget, QTableView {{
   background: {COLORS['input']};
   color: {COLORS['text']};
   border: 1px solid {COLORS['gold']};
@@ -69,7 +69,9 @@ QSpinBox {{
   padding-bottom: 6px;
   min-height: 22px;
 }}
-QComboBox:focus, QSpinBox:focus, QLineEdit:focus, QDateEdit:focus {{ border-color: {COLORS['gold_focus']}; }}
+QComboBox:focus, QComboBox:on, QSpinBox:focus, QLineEdit:focus, QDateEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QListWidget:focus {{
+  border-color: {COLORS['gold_focus']};
+}}
 QComboBox::drop-down {{
   subcontrol-origin: padding;
   subcontrol-position: top right;
@@ -85,7 +87,7 @@ QComboBox::down-arrow {{
 QComboBox QAbstractItemView {{
   background: {COLORS['card']};
   color: {COLORS['text']};
-  border: 1px solid {COLORS['gold']};
+  border: 1px solid {COLORS['gold_focus']};
   border-radius: 6px;
   outline: none;
   padding: 4px;
@@ -166,6 +168,9 @@ QTableWidget, QTableView {{
   alternate-background-color: {COLORS['card']};
   border: 1px solid {COLORS['gold']};
   border-radius: 6px;
+}}
+QTableWidget:focus, QTableView:focus {{
+  border-color: {COLORS['gold_focus']};
 }}
 QTableWidget::item, QTableView::item {{ border: 0; padding: 6px; }}
 QTableWidget::item:selected, QTableView::item:selected {{ background: {COLORS['green']}; color: #F6F3EA; }}

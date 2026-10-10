@@ -127,6 +127,7 @@ class CheckableComboBox(QComboBox):
 
     def __init__(self, parent: QWidget | None = None, placeholder: str = "全部站点") -> None:
         super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.placeholder = placeholder
         self._model = QStandardItemModel(self)
         self.setModel(self._model)
@@ -144,8 +145,10 @@ class CheckableComboBox(QComboBox):
     def eventFilter(self, obj: object, event: QEvent) -> bool:
         if obj == self._line_edit:
             if event.type() == QEvent.Type.MouseButtonPress:
+                self.setFocus()
                 return True
             if event.type() == QEvent.Type.MouseButtonRelease:
+                self.setFocus()
                 if self.view().isVisible():
                     self.hidePopup()
                 else:
@@ -932,9 +935,12 @@ class MainWindow(QMainWindow):
 
         scope_section, scope_layout = self._control_section("执行范围")
         self.mode_combo = QComboBox()
+        self.mode_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.mode_combo.addItems(["自动判断", "批量报活动", "批量更新", "批量取消"])
         self.store_combo = QComboBox()
+        self.store_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.site_combo = QComboBox()
+        self.site_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         scope_layout.addWidget(field_label("模式"))
         scope_layout.addWidget(self.mode_combo)
         scope_layout.addWidget(field_label("店铺"))
@@ -945,7 +951,9 @@ class MainWindow(QMainWindow):
 
         activity_section, activity_layout = self._control_section("活动参数")
         self.seller_combo = QComboBox()
+        self.seller_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.official_combo = QComboBox()
+        self.official_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.seller_discount = discount_spin(self.global_seller_discount)
         self.official_discount = discount_spin(self.global_official_discount)
         self.seller_discount.valueChanged.connect(self._on_discount_spin_changed)
@@ -1016,6 +1024,7 @@ class MainWindow(QMainWindow):
         top.addWidget(section_label("执行记录"))
         top.addStretch(1)
         self.records_view_combo = QComboBox()
+        self.records_view_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.records_view_combo.addItem("最近 20 条", "recent")
         self.records_view_combo.addItem("全部历史", "all")
         self.records_view_combo.setFixedWidth(130)
@@ -1154,6 +1163,7 @@ class MainWindow(QMainWindow):
 
         top_bar.addWidget(QLabel("选择店铺:"))
         self.cleaner_account_combo = QComboBox()
+        self.cleaner_account_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.cleaner_account_combo.setFixedWidth(240)
         self.cleaner_account_combo.setFixedHeight(32)
         self.cleaner_account_combo.addItem("全部店铺（合并分析所有店铺）", "all")
@@ -1188,6 +1198,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.cleaner_visits_check, 0, 0)
 
         self.cleaner_visits_threshold_combo = QComboBox()
+        self.cleaner_visits_threshold_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.cleaner_visits_threshold_combo.setFixedHeight(32)
         self.cleaner_visits_threshold_combo.setFixedWidth(210)
         self.cleaner_visits_threshold_combo.addItem("等于 0 次 (至今无流量)", 0)
@@ -1234,6 +1245,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("判定模式:"), 1, 2)
 
         self.cleaner_filter_mode_combo = QComboBox()
+        self.cleaner_filter_mode_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.cleaner_filter_mode_combo.setFixedHeight(32)
         self.cleaner_filter_mode_combo.setFixedWidth(172)
         self.cleaner_filter_mode_combo.addItem("全部满足 (AND)", "and")
@@ -5010,7 +5022,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.1.10"
+    return "2.1.11"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

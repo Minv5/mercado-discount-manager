@@ -47,18 +47,18 @@ class UpdaterEngineUnitTests(unittest.TestCase):
     def test_check_github_latest_release_matching_platform(self) -> None:
         is_mac = sys.platform == "darwin"
         mac_asset = {
-            "name": "MercadoDiscountManager-2.1.11-macOS-arm64-20261007.zip",
+            "name": "MercadoDiscountManager-2.1.12-macOS-arm64-20261007.zip",
             "browser_download_url": "https://github.com/mock/mac.zip",
             "size": 52428800,
         }
         win_asset = {
-            "name": "MercadoDiscountManager-2.1.11-Windows-x64-20261007.zip",
+            "name": "MercadoDiscountManager-2.1.12-Windows-x64-20261007.zip",
             "browser_download_url": "https://github.com/mock/win.zip",
             "size": 62914560,
         }
 
         mock_payload = {
-            "tag_name": "v2.1.11",
+            "tag_name": "v2.1.12",
             "body": "### 更新内容\n- 修复商品清理偶发问题\n- 自动更新功能上线",
             "published_at": "2026-10-07T00:00:00Z",
             "assets": [mac_asset, win_asset],
@@ -69,11 +69,11 @@ class UpdaterEngineUnitTests(unittest.TestCase):
         mock_resp.__enter__.return_value = mock_resp
 
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            info = check_github_latest_release("2.1.10")
+            info = check_github_latest_release("2.1.11")
 
         self.assertIsNotNone(info)
         assert info is not None
-        self.assertEqual(info.version, "2.1.11")
+        self.assertEqual(info.version, "2.1.12")
         self.assertTrue(info.is_newer)
         self.assertIn("自动更新功能上线", info.release_notes)
         if is_mac:
@@ -85,7 +85,7 @@ class UpdaterEngineUnitTests(unittest.TestCase):
 
     def test_check_github_latest_release_network_failure(self) -> None:
         with patch("urllib.request.urlopen", side_effect=OSError("Network error")):
-            info = check_github_latest_release("2.1.10")
+            info = check_github_latest_release("2.1.11")
         self.assertIsNone(info)
 
     def test_download_release_archive_success_and_callbacks(self) -> None:
