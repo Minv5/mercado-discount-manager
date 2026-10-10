@@ -1153,7 +1153,7 @@ class MainWindow(QMainWindow):
 
         top_bar.addWidget(QLabel("选择店铺:"))
         self.cleaner_account_combo = QComboBox()
-        self.cleaner_account_combo.setMinimumWidth(220)
+        self.cleaner_account_combo.setFixedWidth(240)
         self.cleaner_account_combo.setFixedHeight(32)
         self.cleaner_account_combo.addItem("全部店铺（合并分析所有店铺）", "all")
         self.cleaner_account_combo.currentIndexChanged.connect(self._refresh_cleaner_sites)
@@ -1162,7 +1162,7 @@ class MainWindow(QMainWindow):
 
         top_bar.addWidget(QLabel("选择站点:"))
         self.cleaner_site_combo = CheckableComboBox()
-        self.cleaner_site_combo.setMinimumWidth(200)
+        self.cleaner_site_combo.setFixedWidth(180)
         self.cleaner_site_combo.setFixedHeight(32)
         top_bar.addWidget(self.cleaner_site_combo)
         top_bar.addSpacing(12)
@@ -1188,7 +1188,7 @@ class MainWindow(QMainWindow):
 
         self.cleaner_visits_threshold_combo = QComboBox()
         self.cleaner_visits_threshold_combo.setFixedHeight(32)
-        self.cleaner_visits_threshold_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.cleaner_visits_threshold_combo.setFixedWidth(210)
         self.cleaner_visits_threshold_combo.addItem("等于 0 次 (至今无流量)", 0)
         self.cleaner_visits_threshold_combo.addItem("≤ 5 次 (几乎无流量)", 5)
         self.cleaner_visits_threshold_combo.addItem("≤ 10 次 (极低流量)", 10)
@@ -1201,6 +1201,7 @@ class MainWindow(QMainWindow):
 
         self.cleaner_score_spin = QSpinBox()
         self.cleaner_score_spin.setFixedHeight(32)
+        self.cleaner_score_spin.setFixedWidth(110)
         self.cleaner_score_spin.setRange(0, 100)
         self.cleaner_score_spin.setValue(60)
         self.cleaner_score_spin.setPrefix("低于 ")
@@ -1233,10 +1234,12 @@ class MainWindow(QMainWindow):
 
         self.cleaner_filter_mode_combo = QComboBox()
         self.cleaner_filter_mode_combo.setFixedHeight(32)
+        self.cleaner_filter_mode_combo.setFixedWidth(140)
         self.cleaner_filter_mode_combo.addItem("全部满足 (AND)", "and")
         self.cleaner_filter_mode_combo.addItem("任一满足 (OR)", "or")
         self.cleaner_filter_mode_combo.setCurrentIndex(0)
         grid.addWidget(self.cleaner_filter_mode_combo, 1, 3)
+        grid.setColumnStretch(4, 1)
 
         # 联动控制：勾选状态与子参数可用性同步
         self.cleaner_visits_check.toggled.connect(self._sync_cleaner_filter_states)
@@ -1291,26 +1294,15 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(10, QHeaderView.ResizeMode.Interactive)
         table.setColumnWidth(10, 280)
 
-        # 独立运行日志框与商品表格垂直分割
+        # 独立运行日志框与商品表格垂直分割（操作按钮整合至日志标题行右侧，消除底部留白）
         log_frame = QFrame()
         log_layout = QVBoxLayout(log_frame)
         log_layout.setContentsMargins(0, 4, 0, 0)
-        log_layout.setSpacing(4)
-        log_layout.addWidget(section_label("商品清理运行日志"))
-        self.cleaner_log_box = LogViewer()
-        self.cleaner_log_box.append_log_line(f"[{datetime.now():%H:%M:%S}] [商品清理] 风控与清理引擎就绪。支持常规风控筛选或清店模式。")
-        log_layout.addWidget(self.cleaner_log_box, 1)
+        log_layout.setSpacing(6)
 
-        cleaner_splitter = QSplitter(Qt.Orientation.Vertical)
-        cleaner_splitter.setChildrenCollapsible(False)
-        cleaner_splitter.addWidget(table)
-        cleaner_splitter.addWidget(log_frame)
-        cleaner_splitter.setSizes([350, 160])
-        layout.addWidget(cleaner_splitter, 1)
-
-        bottom_box = QVBoxLayout()
-        bottom_box.setSpacing(6)
-        action_bar = QHBoxLayout()
+        log_header_row = QHBoxLayout()
+        log_header_row.addWidget(section_label("商品清理运行日志"))
+        log_header_row.addStretch(1)
 
         self.cleaner_scan_btn = QPushButton("扫描待清理商品")
         self.cleaner_scan_btn.setFixedSize(140, 34)
@@ -1332,14 +1324,22 @@ class MainWindow(QMainWindow):
         self.cleaner_clear_draft_btn.setStyleSheet("font-weight: bold; padding: 6px 10px;")
         self.cleaner_clear_draft_btn.clicked.connect(self._on_cleaner_clear_records)
 
-        action_bar.addWidget(self.cleaner_scan_btn)
-        action_bar.addWidget(self.cleaner_batch_delete_btn)
-        action_bar.addWidget(self.cleaner_copy_zero_visits_btn)
-        action_bar.addWidget(self.cleaner_clear_draft_btn)
-        action_bar.addStretch(1)
-        bottom_box.addLayout(action_bar)
+        log_header_row.addWidget(self.cleaner_scan_btn)
+        log_header_row.addWidget(self.cleaner_batch_delete_btn)
+        log_header_row.addWidget(self.cleaner_copy_zero_visits_btn)
+        log_header_row.addWidget(self.cleaner_clear_draft_btn)
+        log_layout.addLayout(log_header_row)
 
-        layout.addLayout(bottom_box)
+        self.cleaner_log_box = LogViewer()
+        self.cleaner_log_box.append_log_line(f"[{datetime.now():%H:%M:%S}] [商品清理] 风控与清理引擎就绪。支持常规风控筛选或清店模式。")
+        log_layout.addWidget(self.cleaner_log_box, 1)
+
+        cleaner_splitter = QSplitter(Qt.Orientation.Vertical)
+        cleaner_splitter.setChildrenCollapsible(False)
+        cleaner_splitter.addWidget(table)
+        cleaner_splitter.addWidget(log_frame)
+        cleaner_splitter.setSizes([350, 180])
+        layout.addWidget(cleaner_splitter, 1)
         return surface, table
 
     def _sync_cleaner_filter_states(self) -> None:
@@ -5009,7 +5009,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.1.08"
+    return "2.1.09"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

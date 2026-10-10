@@ -39,7 +39,7 @@ QFrame#controlSection, QFrame#settingsSection {{
 }}
 QFrame#cleanerFilterSection {{
   background: {COLORS['table']};
-  border: 1px solid #7D6B42;
+  border: 1px solid {COLORS['gold']};
   border-radius: 8px;
 }}
 QLabel {{ background: transparent; }}
@@ -86,16 +86,59 @@ QComboBox QAbstractItemView {{
   background: {COLORS['card']};
   color: {COLORS['text']};
   border: 1px solid {COLORS['gold']};
+  border-radius: 6px;
   outline: none;
-  padding: 3px;
+  padding: 4px;
+}}
+QComboBox QAbstractItemView::item {{
+  min-height: 26px;
+  padding: 4px 8px;
+  border-radius: 4px;
+}}
+QComboBox QAbstractItemView::item:selected {{
+  background: {COLORS['green']};
+  color: #F6F3EA;
 }}
 QSpinBox::up-button, QSpinBox::down-button, QDateEdit::drop-down {{
-  background: {COLORS['input']};
+  background: transparent;
   border-left: 1px solid {COLORS['gold']};
   width: 24px;
 }}
+QSpinBox::up-button {{
+  subcontrol-origin: border;
+  subcontrol-position: top right;
+  border-top-right-radius: 5px;
+}}
+QSpinBox::down-button {{
+  subcontrol-origin: border;
+  subcontrol-position: bottom right;
+  border-bottom-right-radius: 5px;
+}}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover, QDateEdit::drop-down:hover {{
+  background: #26352C;
+}}
 QSpinBox::up-arrow {{ image: url("@CHEVRON_UP@"); width: 9px; height: 6px; }}
 QSpinBox::down-arrow, QDateEdit::down-arrow {{ image: url("@CHEVRON_DOWN@"); width: 9px; height: 6px; }}
+QMenu {{
+  background: {COLORS['card']};
+  color: {COLORS['text']};
+  border: 1px solid {COLORS['gold']};
+  border-radius: 6px;
+  padding: 4px;
+}}
+QMenu::item {{
+  padding: 6px 20px 6px 12px;
+  border-radius: 4px;
+}}
+QMenu::item:selected {{
+  background: {COLORS['green']};
+  color: #F6F3EA;
+}}
+QMenu::separator {{
+  height: 1px;
+  background: {COLORS['gold']};
+  margin: 4px 8px;
+}}
 QPushButton {{
   background: #232C24;
   color: #F6F3EA;

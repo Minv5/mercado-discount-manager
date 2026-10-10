@@ -281,7 +281,7 @@ class MultiBatchHistoryDialog(QDialog):
 
         quick_row = QHBoxLayout()
         quick_row.setSpacing(10)
-        self.select_all_btn = QPushButton("全选")
+        self.select_all_btn = QPushButton("全  选")
         self.select_all_btn.setFixedHeight(28)
         self.select_all_btn.clicked.connect(self._select_all)
         quick_row.addWidget(self.select_all_btn)
@@ -560,7 +560,7 @@ class TargetedCancelDialog(QDialog):
             "QComboBox { "
             "background: #232C24; "
             "color: #F6F3EA; "
-            "border: 1px solid #7D6B42; "
+            "border: 1px solid #4E472F; "
             "border-radius: 6px; "
             "padding: 0px 24px 0px 10px; "
             "min-height: 30px; "
@@ -587,7 +587,7 @@ class TargetedCancelDialog(QDialog):
         # 功能分区空置留白，明确分隔录入工具组与清空重置按键
         row2.addSpacing(16)
 
-        self.clear_btn = QPushButton("清空")
+        self.clear_btn = QPushButton("清  空")
         self.clear_btn.setFixedWidth(68)
         self.clear_btn.setFixedHeight(32)
         self.clear_btn.clicked.connect(self._clear_input)
@@ -899,8 +899,10 @@ class SellerCampaignCreateDialog(QDialog):
         help_text.setWordWrap(True)
         root.addWidget(help_text)
         select_row = QHBoxLayout()
-        select_all = QPushButton("全选")
+        select_all = QPushButton("全  选")
+        select_all.setFixedHeight(28)
         select_none = QPushButton("全不选")
+        select_none.setFixedHeight(28)
         select_all.clicked.connect(lambda: self._set_all_checked(True))
         select_none.clicked.connect(lambda: self._set_all_checked(False))
         select_row.addWidget(select_all)
@@ -1379,6 +1381,9 @@ class AppEditDialog(QDialog):
         self.redirect_edit = QLineEdit(initial_redirect)
         self.redirect_edit.setPlaceholderText("例如: https://127.0.0.1/callback 或您的自定义回调网址")
 
+        for edit in (self.name_edit, self.client_id_edit, self.client_secret_edit, self.redirect_edit):
+            edit.setFixedHeight(32)
+
         form.addRow("应用名称 / 备注", self.name_edit)
         form.addRow("美客多 Client ID", self.client_id_edit)
         form.addRow("美客多 Client Secret", self.client_secret_edit)
@@ -1386,9 +1391,9 @@ class AppEditDialog(QDialog):
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确  认")
         buttons.button(QDialogButtonBox.StandardButton.Ok).setObjectName("primary")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取  消")
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -1561,8 +1566,8 @@ class SettingsDialog(QDialog):
         for field in (self.seller_discount, self.official_discount):
             field.setRange(1, 90)
             field.setSuffix(" %")
-            field.setFixedWidth(140)
-            field.setFixedHeight(34)
+            field.setFixedWidth(96)
+            field.setFixedHeight(32)
             field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.seller_discount.setValue(int(self.settings.get("sellerDefaultDiscount", 5)))
         self.official_discount.setValue(int(self.settings.get("officialDefaultDiscount", 6)))
@@ -1572,8 +1577,8 @@ class SettingsDialog(QDialog):
             field.setRange(0, 90)
             field.setSpecialValueText("未设置")
             field.setSuffix(" %")
-            field.setFixedWidth(140)
-            field.setFixedHeight(34)
+            field.setFixedWidth(96)
+            field.setFixedHeight(32)
             field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.seller_max_discount.setValue(_bounded_int(self.settings.get("sellerMaxDiscount"), 0, 0, 90))
         self.official_max_discount.setValue(_bounded_int(self.settings.get("officialMaxDiscount"), 0, 0, 90))
@@ -1692,13 +1697,13 @@ class SettingsDialog(QDialog):
         right_header.addWidget(right_title)
         right_header.addStretch(1)
 
-        self.select_all_sites_btn = QPushButton("全 选")
-        self.select_all_sites_btn.setFixedHeight(26)
+        self.select_all_sites_btn = QPushButton("全  选")
+        self.select_all_sites_btn.setFixedHeight(28)
         self.select_all_sites_btn.setStyleSheet("padding: 2px 12px; font-size: 12px;")
         self.select_all_sites_btn.clicked.connect(lambda: self._set_all_sites_checked(True))
 
         self.select_none_sites_btn = QPushButton("全不选")
-        self.select_none_sites_btn.setFixedHeight(26)
+        self.select_none_sites_btn.setFixedHeight(28)
         self.select_none_sites_btn.setStyleSheet("padding: 2px 12px; font-size: 12px;")
         self.select_none_sites_btn.clicked.connect(lambda: self._set_all_sites_checked(False))
 
@@ -2317,6 +2322,7 @@ class SettingsDialog(QDialog):
         update_box_layout.addWidget(update_title)
         self.check_update_btn = QPushButton("检查新版本")
         self.check_update_btn.setFixedWidth(110)
+        self.check_update_btn.setFixedHeight(32)
         self.check_update_btn.clicked.connect(self.check_update_requested.emit)
         update_box_layout.addWidget(self.check_update_btn)
         update_box_layout.addStretch(1)
@@ -2567,11 +2573,11 @@ class AutoShutdownCountdownDialog(QDialog):
         layout.setSpacing(12)
 
         self.title_label = QLabel("任务已全部完成！")
-        self.title_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #1f2937;")
+        self.title_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #F6F3EA;")
         layout.addWidget(self.title_label)
 
         self.message_label = QLabel(f"系统将在 {self.remaining_seconds} 秒后自动关机...")
-        self.message_label.setStyleSheet("font-size: 13px; color: #4b5563;")
+        self.message_label.setStyleSheet("font-size: 13px; color: #C8C3B7;")
         layout.addWidget(self.message_label)
 
         btn_layout = QHBoxLayout()
@@ -2579,11 +2585,13 @@ class AutoShutdownCountdownDialog(QDialog):
         btn_layout.addStretch()
 
         self.cancel_btn = QPushButton("取消关机")
+        self.cancel_btn.setFixedHeight(32)
         self.cancel_btn.clicked.connect(self._on_cancel)
         btn_layout.addWidget(self.cancel_btn)
 
         self.shutdown_now_btn = QPushButton("立即关机")
-        self.shutdown_now_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold;")
+        self.shutdown_now_btn.setFixedHeight(32)
+        self.shutdown_now_btn.setStyleSheet("background-color: #EF4444; color: #FFFFFF; font-weight: bold; border-radius: 6px; padding: 0 16px;")
         self.shutdown_now_btn.clicked.connect(self._on_shutdown_now)
         btn_layout.addWidget(self.shutdown_now_btn)
 
@@ -2635,7 +2643,7 @@ class CopyZeroVisitIdsDialog(QDialog):
             f"共筛选出 {total_ids:,} 个 0 浏览待删除商品，已按 500 个一组切分为 {len(batches)} 个批次。\n"
             "直接点击任意一行即可一键复制该批次的所有 ID（纯空格隔开），可直接粘贴至 ERP 中执行删除。"
         )
-        header_label.setStyleSheet("color: #333; font-size: 13px; line-height: 1.4;")
+        header_label.setStyleSheet("color: #C8C3B7; font-size: 13px; line-height: 1.4;")
         layout.addWidget(header_label)
 
         self.table = QTableWidget(len(batches), 2)
@@ -2670,14 +2678,15 @@ class CopyZeroVisitIdsDialog(QDialog):
         layout.addWidget(self.table, 1)
 
         self.tip_label = QLabel("")
-        self.tip_label.setStyleSheet("color: #2e7d32; font-weight: bold; font-size: 13px;")
+        self.tip_label.setStyleSheet("color: #81C784; font-weight: bold; font-size: 13px;")
         layout.addWidget(self.tip_label)
 
         btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         btn_box.rejected.connect(self.reject)
         close_btn = btn_box.button(QDialogButtonBox.StandardButton.Close)
         if close_btn:
-            close_btn.setText("关闭")
+            close_btn.setText("关  闭")
+            close_btn.setFixedHeight(32)
         layout.addWidget(btn_box)
 
     def _on_row_clicked(self, row: int, _col: int):
@@ -2762,7 +2771,7 @@ class UpdateDialog(QDialog):
         notes = str(self.release_info.release_notes or "").strip() or "常规性能优化与问题修复。"
         self.notes_edit.setPlainText(notes)
         self.notes_edit.setStyleSheet(
-            "background: #141816; border: 1px solid #3E3827; border-radius: 6px; padding: 10px; color: #D8D4CA; font-size: 12px; line-height: 1.5;"
+            "background: #141816; border: 1px solid #4E472F; border-radius: 6px; padding: 10px; color: #D8D4CA; font-size: 12px; line-height: 1.5;"
         )
         layout.addWidget(self.notes_edit, 1)
 
@@ -2787,14 +2796,16 @@ class UpdateDialog(QDialog):
 
         self.cancel_btn = QPushButton("稍后提醒")
         self.cancel_btn.setFixedWidth(100)
+        self.cancel_btn.setFixedHeight(32)
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
         btn_layout.addWidget(self.cancel_btn)
 
         self.update_btn = QPushButton("立即更新并重启")
         self.update_btn.setObjectName("primary")
         self.update_btn.setMinimumWidth(150)
+        self.update_btn.setFixedHeight(32)
         self.update_btn.setStyleSheet(
-            "QPushButton { background: #10B981; color: #FFFFFF; font-weight: bold; border: 1px solid #059669; border-radius: 6px; padding: 7px 16px; }"
+            "QPushButton { background: #10B981; color: #FFFFFF; font-weight: bold; border: 1px solid #059669; border-radius: 6px; padding: 0 16px; }"
             "QPushButton:hover { background: #059669; }"
             "QPushButton:disabled { background: #233529; color: #66776C; border-color: #2D4234; }"
         )
