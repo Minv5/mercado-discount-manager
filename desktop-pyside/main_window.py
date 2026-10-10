@@ -3348,7 +3348,8 @@ class MainWindow(QMainWindow):
                 return
             self._update_nav_selection(getattr(self, "query_button", None))
             self.view_stack.setCurrentWidget(self.query_page)
-            self.query_page.item_input.setFocus()
+            if hasattr(self.query_page, "clear_initial_focus"):
+                QTimer.singleShot(0, self.query_page.clear_initial_focus)
 
     def _show_targeted_cancel_page(self) -> None:
         if hasattr(self, "view_stack") and hasattr(self, "targeted_cancel_page"):
@@ -5024,7 +5025,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.1.13"
+    return "2.1.14"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

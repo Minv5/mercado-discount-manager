@@ -1270,6 +1270,16 @@ class ItemQueryDialog(QDialog):
             root.addWidget(buttons)
             QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.reject)
 
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self.clear_initial_focus)
+
+    def clear_initial_focus(self) -> None:
+        focused = self.focusWidget()
+        if focused:
+            focused.clearFocus()
+        self.setFocus()
+
     def _clear_logs(self) -> None:
         self.log_box.clear()
 
@@ -1280,7 +1290,7 @@ class ItemQueryDialog(QDialog):
         if hasattr(self, "history_count_label"):
             self.history_count_label.setText("0 条记录")
         self.search_button.setEnabled(True)
-        self.item_input.setFocus()
+        self.clear_initial_focus()
 
     def _on_search(self) -> None:
         item_id = self.item_input.text().strip().upper()
