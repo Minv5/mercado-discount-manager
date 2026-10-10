@@ -656,8 +656,9 @@ class WebhookWorker:
                 )
 
                 if active_promos or official_orig > 0:
+                    s_tag = self._get_site_label(item_id)
                     self.log(
-                        f"【{store_name}】商品 {item_id} 检测到{change_desc}，"
+                        f"【{store_name}】{s_tag}商品 {item_id} 检测到{change_desc}，"
                         f"执行新定价策略：退出所有活动，不再报任何活动。",
                         tag="自动退出",
                     )
@@ -673,10 +674,10 @@ class WebhookWorker:
                                 )
                             else:
                                 self.client.cancel_promotion_item(account_id, child_user_id, item_id, p_id, p_type)
-                            self.log(f"【{store_name}】商品 {item_id}: 已退出活动 {p_id} ({p_type})。", tag="自动退出")
+                            self.log(f"【{store_name}】{s_tag}商品 {item_id}: 已退出活动 {p_id} ({p_type})。", tag="自动退出")
                         except Exception as cancel_err:
                             clean_err = clean_error_message(cancel_err)
-                            self.log(f"【{store_name}】商品 {item_id}: 尝试退出活动 {p_id} 异常: {clean_err}", tag="自动退出")
+                            self.log(f"【{store_name}】{s_tag}商品 {item_id}: 尝试退出活动 {p_id} 异常: {clean_err}", tag="自动退出")
 
                 cbt_id = str(raw_item.get("cbt_item_id") or "").strip().upper()
             else:
@@ -703,8 +704,9 @@ class WebhookWorker:
                 return True
 
             discount = self._get_current_discount()
+            s_tag = self._get_site_label(item_id)
             self.log(
-                f"【{store_name}】商品 {item_id} {change_desc}，退出旧活动",
+                f"【{store_name}】{s_tag}商品 {item_id} {change_desc}，退出旧活动",
                 tag="自动退出",
             )
 
@@ -728,7 +730,7 @@ class WebhookWorker:
                     else:
                         cancel_failed_ids.add(p_id)
                         clean_err = clean_error_message(cancel_err)
-                        self.log(f"【{store_name}】商品 {item_id}: 退出旧活动 {p_id} 异常: {clean_err}", tag="自动退出")
+                        self.log(f"【{store_name}】{s_tag}商品 {item_id}: 退出旧活动 {p_id} 异常: {clean_err}", tag="自动退出")
 
             if started_promos and isinstance(self.client, MercadoClient):
                 time.sleep(1.0)
@@ -765,13 +767,14 @@ class WebhookWorker:
                 p_type = ap["type"]
                 p_raw = ap.get("raw") or {}
 
+                s_tag = self._get_site_label(item_id)
                 if p_id in cancel_failed_ids and p_id not in current_candidate_ids:
-                    self.log(f"【{store_name}】商品 {item_id}: 旧活动 {p_id} 尚未完全退出，跳过本次重报以避免频控冲突。", tag="自动退出")
+                    self.log(f"【{store_name}】{s_tag}商品 {item_id}: 旧活动 {p_id} 尚未完全退出，跳过本次重报以避免频控冲突。", tag="自动退出")
                     continue
 
                 calc = calculate_deal_price(item_info, discount, p_raw, p_type)
                 if not calc.eligible or calc.deal_price <= 0:
-                    self.log(f"【{store_name}】商品 {item_id}: 活动 {p_id} 重算跳过 ({calc.skip_reason})。", tag="自动报回")
+                    self.log(f"【{store_name}】{s_tag}商品 {item_id}: 活动 {p_id} 重算跳过 ({calc.skip_reason})。", tag="自动报回")
                     continue
                 offer_id = str(p_raw.get("offer_id") or "") or None
                 enrolled_ok = False
@@ -789,7 +792,7 @@ class WebhookWorker:
                             original_price=calc.original_price,
                         )
                         self.log(
-                            f"【{store_name}】商品 {item_id}: 按新运费报回活动 {p_id} ({p_type})，"
+                            f"【{store_name}】{s_tag}商品 {item_id}: 按新运费报回活动 {p_id} ({p_type})，"
                             f"折后售价 ${calc.deal_price:.2f}。",
                             tag="自动报回",
                         )
@@ -806,9 +809,9 @@ class WebhookWorker:
                 if not enrolled_ok and last_enroll_err is not None:
                     err_msg = str(last_enroll_err)
                     if "429" in err_msg or "rate_limited" in err_msg.lower():
-                        self.log(f"【{store_name}】商品 {item_id}: 报回活动 {p_id} ({p_type}) 触发平台限流，等待下次同步。", tag="自动报回")
+                        self.log(f"【{store_name}】{s_tag}商品 {item_id}: 报回活动 {p_id} ({p_type}) 触发平台限流，等待下次同步。", tag="自动报回")
                     elif "LockedEntityException" in err_msg or "Offer Locked" in err_msg:
-                        self.log(f"【{store_name}】商品 {item_id}: 失败，平台活动锁占用中（请稍后重试）", tag="自动报回")
+                        self.log(f"【{store_name}】{s_tag}商品 {item_id}: 失败，平台活动锁占用中（请稍后重试）", tag="自动报回")
                     elif "ERROR_CREDIBILITY_DISCOUNTED_PRICE" in err_msg:
                         sugg_p = float(p_raw.get("suggested_discounted_price") or (p_raw.get("raw") or {}).get("suggested_discounted_price") or 0.0)
                         if sugg_p <= 0:
@@ -828,12 +831,12 @@ class WebhookWorker:
                             reason = f"失败，折扣价高于平台预期（折后价 ${calc.deal_price:.2f} ，平台预期${sugg_p:.2f} ）"
                         else:
                             reason = f"失败，折扣价高于平台预期（折后价 ${calc.deal_price:.2f} ）"
-                        self.log(f"【{store_name}】商品 {item_id}: {reason}", tag="自动报回")
+                        self.log(f"【{store_name}】{s_tag}商品 {item_id}: {reason}", tag="自动报回")
                     elif "ITEM_NOT_ELIGIBLE" in err_msg:
-                        self.log(f"【{store_name}】商品 {item_id}: 失败，不满足活动准入条件", tag="自动报回")
+                        self.log(f"【{store_name}】{s_tag}商品 {item_id}: 失败，不满足活动准入条件", tag="自动报回")
                     else:
                         clean_err = clean_error_message(err_msg)
-                        self.log(f"【{store_name}】商品 {item_id}: 失败，{clean_err}", tag="自动报回")
+                        self.log(f"【{store_name}】{s_tag}商品 {item_id}: 失败，{clean_err}", tag="自动报回")
 
             # 报名完成后再次同步最新快照
             try:
@@ -935,10 +938,12 @@ class WebhookWorker:
                                     )
                                 else:
                                     self.client.cancel_promotion_item(account_id, sib_user_id, sib_id, p_id, p_type)
-                                self.log(f"【{store_name}】商品 {sib_id}: 因同父商品 {cbt_id} 数据变动，已联动退出活动 {p_id} ({p_type})。", tag="自动退出")
+                                sib_site_tag = self._get_site_label(sib_id)
+                                self.log(f"【{store_name}】{sib_site_tag}商品 {sib_id}: 因同父商品 {cbt_id} 数据变动，已联动退出活动 {p_id} ({p_type})。", tag="自动退出")
                             except Exception as cancel_err:
                                 clean_err = clean_error_message(cancel_err)
-                                self.log(f"【{store_name}】商品 {sib_id}: 联动退出活动 {p_id} 异常: {clean_err}", tag="自动退出")
+                                sib_site_tag = self._get_site_label(sib_id)
+                                self.log(f"【{store_name}】{sib_site_tag}商品 {sib_id}: 联动退出活动 {p_id} 异常: {clean_err}", tag="自动退出")
                         try:
                             fresh_sib = self.client.get_item_detail(account_id, sib_id)
                             if isinstance(fresh_sib, dict) and fresh_sib.get("id"):
@@ -994,6 +999,22 @@ class WebhookWorker:
         except Exception:
             pass
         return f"店铺 {acc_str}"
+
+    @staticmethod
+    def _get_site_label(item_or_site: str) -> str:
+        code = str(item_or_site or "").strip()[:3].upper()
+        site_map = {
+            "MLB": "巴西站",
+            "MLM": "墨西哥站",
+            "MLA": "阿根廷站",
+            "MLC": "智利站",
+            "MCO": "哥伦比亚站",
+            "MLU": "乌拉圭站",
+            "MPE": "秘鲁站",
+            "MEC": "厄瓜多尔站",
+        }
+        name = site_map.get(code)
+        return f"【{name}】" if name else (f"【{code}站】" if code and code != "CBT" else "")
 
     def _resolve_route(self, remote_user_id: str, item_id: str) -> tuple[str | None, str | None, str | None]:
         """Match remote_user_id or item_id to account_id, child_user_id, site_id."""
