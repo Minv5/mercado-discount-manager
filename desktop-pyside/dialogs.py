@@ -537,13 +537,13 @@ class TargetedCancelDialog(QDialog):
         self.scope_label.setStyleSheet("color: #C8C3B7; font-size: 13px; line-height: 1.4;")
         row2.addWidget(self.scope_label, 1)
 
-        row2.addSpacing(10)
+        row2.addSpacing(12)
 
         self.count_label = QLabel("已输入：0 个商品")
         self.count_label.setStyleSheet("color: #C8C3B7; font-size: 13px; font-weight: 500;")
         row2.addWidget(self.count_label)
 
-        row2.addSpacing(6)
+        row2.addSpacing(12)
 
         last_canceled = get_last_canceled_batch()
         last_count_text = f" ({last_canceled['count']}个)" if last_canceled and last_canceled.get("count") else ""
@@ -554,36 +554,41 @@ class TargetedCancelDialog(QDialog):
         row2.addWidget(self.load_last_canceled_btn)
 
         self.history_combo = QComboBox()
+        self.history_combo.setFixedWidth(136)
         self.history_combo.setFixedHeight(32)
-        self.history_combo.setMinimumWidth(160)
         self.history_combo.setStyleSheet(
             "QComboBox { "
             "background: #232C24; "
             "color: #F6F3EA; "
             "border: 1px solid #7D6B42; "
             "border-radius: 6px; "
-            "padding: 6px 28px 6px 12px; "
+            "padding: 0px 24px 0px 10px; "
+            "min-height: 30px; "
+            "max-height: 30px; "
             "} "
             "QComboBox:hover { background: #26352C; } "
             "QComboBox::drop-down { "
             "subcontrol-origin: padding; "
-            "subcontrol-position: top right; "
-            "width: 24px; "
+            "subcontrol-position: center right; "
+            "width: 20px; "
             "border: none; "
             "background: transparent; "
             "} "
         )
-        self.history_combo.view().setMinimumWidth(240)
+        self.history_combo.view().setMinimumWidth(180)
         self._refresh_history_combo()
         self.history_combo.currentIndexChanged.connect(self._on_history_selected)
         row2.addWidget(self.history_combo)
 
+        # 保持多选批次引用以兼容测试与内部状态，功能已内聚在历史批次下拉菜单中
         self.multi_batch_btn = QPushButton("多选批次...")
-        self.multi_batch_btn.setFixedHeight(32)
         self.multi_batch_btn.clicked.connect(self._open_multi_batch_dialog)
-        row2.addWidget(self.multi_batch_btn)
+
+        # 功能分区空置留白，明确分隔录入工具组与清空重置按键
+        row2.addSpacing(16)
 
         self.clear_btn = QPushButton("清空")
+        self.clear_btn.setFixedWidth(68)
         self.clear_btn.setFixedHeight(32)
         self.clear_btn.clicked.connect(self._clear_input)
         row2.addWidget(self.clear_btn)
