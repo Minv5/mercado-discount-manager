@@ -45,8 +45,44 @@ class WebhookWorker:
         self._dim_cache: dict[str, tuple[str | None, str | None]] = {}
         self._item_locks: dict[str, threading.Lock] = {}
         self._item_locks_guard = threading.Lock()
+        self._recently_exited_promos: dict[tuple[str, str], float] = {}
+        self._recent_cbt_cascades: dict[str, float] = {}
+        self._exits_lock = threading.Lock()
         self._logs: list[str] = []
         self._logs_lock = threading.Lock()
+
+    def _is_recently_exited(self, item_id: str, promo_id: str, ttl_sec: float = 60.0) -> bool:
+        now = time.time()
+        with self._exits_lock:
+            ts = self._recently_exited_promos.get((item_id, promo_id))
+            if ts and (now - ts) < ttl_sec:
+                return True
+            if len(self._recently_exited_promos) > 500:
+                self._recently_exited_promos = {
+                    k: v for k, v in self._recently_exited_promos.items() if (now - v) < ttl_sec
+                }
+            return False
+
+    def _mark_recently_exited(self, item_id: str, promo_id: str) -> None:
+        with self._exits_lock:
+            self._recently_exited_promos[(item_id, promo_id)] = time.time()
+
+    def _unmark_recently_exited(self, item_id: str, promo_id: str) -> None:
+        with self._exits_lock:
+            self._recently_exited_promos.pop((item_id, promo_id), None)
+
+    def _should_cascade_cbt(self, cbt_id: str, cooldown_sec: float = 60.0) -> bool:
+        now = time.time()
+        with self._exits_lock:
+            last = self._recent_cbt_cascades.get(cbt_id)
+            if last and (now - last) < cooldown_sec:
+                return False
+            self._recent_cbt_cascades[cbt_id] = now
+            if len(self._recent_cbt_cascades) > 200:
+                self._recent_cbt_cascades = {
+                    k: v for k, v in self._recent_cbt_cascades.items() if (now - v) < cooldown_sec
+                }
+            return True
 
     def _get_item_lock(self, item_id: str) -> threading.Lock:
         with self._item_locks_guard:
@@ -391,14 +427,16 @@ class WebhookWorker:
                 return
 
             all_ok = True
+            seen_c_items: set[str] = set()
             for child_entry in cbt_children:
                 if not isinstance(child_entry, dict):
                     continue
                 c_item_id = str(child_entry.get("item_id") or child_entry.get("id") or "").strip().upper()
                 c_user_id = str(child_entry.get("user_id") or child_entry.get("seller_id") or "").strip()
                 c_site_id = str(child_entry.get("site_id") or c_item_id[:3]).strip().upper()
-                if not c_item_id:
+                if not c_item_id or c_item_id in seen_c_items:
                     continue
+                seen_c_items.add(c_item_id)
                 if not c_user_id:
                     _, c_user_id, c_site_id = self._resolve_route(account_id, c_item_id)
                 if c_user_id:
@@ -657,12 +695,14 @@ class WebhookWorker:
 
                 if active_promos or official_orig > 0:
                     s_tag = self._get_site_label(item_id)
-                    self.log(
-                        f"【{store_name}】{s_tag}商品 {item_id} 检测到{change_desc}，"
-                        f"执行新定价策略：退出所有活动，不再报任何活动。",
-                        tag="自动退出",
-                    )
-                    for ap in active_promos:
+                    to_cancel = [ap for ap in active_promos if not self._is_recently_exited(item_id, ap["id"])]
+                    if to_cancel or (official_orig > 0 and not active_promos):
+                        self.log(
+                            f"【{store_name}】{s_tag}商品 {item_id} 检测到{change_desc}，"
+                            f"执行新定价策略：退出所有活动，不再报任何活动。",
+                            tag="自动退出",
+                        )
+                    for ap in to_cancel:
                         p_id = ap["id"]
                         p_type = ap["type"]
                         p_raw = ap.get("raw") or {}
@@ -674,6 +714,7 @@ class WebhookWorker:
                                 )
                             else:
                                 self.client.cancel_promotion_item(account_id, child_user_id, item_id, p_id, p_type)
+                            self._mark_recently_exited(item_id, p_id)
                             self.log(f"【{store_name}】{s_tag}商品 {item_id}: 已退出活动 {p_id} ({p_type})。", tag="自动退出")
                         except Exception as cancel_err:
                             clean_err = clean_error_message(cancel_err)
@@ -714,6 +755,8 @@ class WebhookWorker:
             for ap in started_promos:
                 p_id = ap["id"]
                 p_type = ap["type"]
+                if self._is_recently_exited(item_id, p_id, ttl_sec=15.0):
+                    continue
                 p_raw = ap.get("raw") or {}
                 offer_id = str(p_raw.get("offer_id") or ap.get("offer_id") or "").strip() or None
                 try:
@@ -723,6 +766,7 @@ class WebhookWorker:
                         )
                     else:
                         self.client.cancel_promotion_item(account_id, child_user_id, item_id, p_id, p_type)
+                    self._mark_recently_exited(item_id, p_id)
                 except Exception as cancel_err:
                     err_str = str(cancel_err)
                     if "404" in err_str or "not found" in err_str.lower():
@@ -797,6 +841,7 @@ class WebhookWorker:
                             tag="自动报回",
                         )
                         enrolled_ok = True
+                        self._unmark_recently_exited(item_id, p_id)
                         break
                     except Exception as enroll_err:
                         last_enroll_err = enroll_err
@@ -862,6 +907,8 @@ class WebhookWorker:
         """When any child item under a global CBT parent triggers System 2 (seller data modification),
         cascade promotion exit and system2_155 snapshot marking to all sibling site items of the same CBT parent.
         """
+        if not self._should_cascade_cbt(cbt_id):
+            return
         try:
             raw_cbt = self.client.get_item_detail(account_id, cbt_id)
         except Exception:
@@ -874,12 +921,14 @@ class WebhookWorker:
             return
 
         store_name = self._get_store_alias(account_id)
+        seen_sibs: set[str] = set()
         for child_entry in cbt_children:
             if not isinstance(child_entry, dict):
                 continue
             sib_id = str(child_entry.get("item_id") or child_entry.get("id") or "").strip().upper()
-            if not sib_id or sib_id == trigger_item_id:
+            if not sib_id or sib_id == trigger_item_id or sib_id in seen_sibs:
                 continue
+            seen_sibs.add(sib_id)
 
             with self._get_item_lock(sib_id):
                 try:
@@ -918,11 +967,12 @@ class WebhookWorker:
                             p_type = str(p.get("type") or "DEAL").upper()
                             p_status = str(p.get("status") or "").lower()
                             if p_status in ("started", "pending") and (p_id or p_type == "PRICE_DISCOUNT"):
-                                sib_promos.append({
-                                    "id": p_id,
-                                    "type": p_type,
-                                    "offer_id": str(p.get("offer_id") or "").strip() or None,
-                                })
+                                if not self._is_recently_exited(sib_id, p_id):
+                                    sib_promos.append({
+                                        "id": p_id,
+                                        "type": p_type,
+                                        "offer_id": str(p.get("offer_id") or "").strip() or None,
+                                    })
                     except Exception:
                         pass
 
@@ -938,6 +988,7 @@ class WebhookWorker:
                                     )
                                 else:
                                     self.client.cancel_promotion_item(account_id, sib_user_id, sib_id, p_id, p_type)
+                                self._mark_recently_exited(sib_id, p_id)
                                 sib_site_tag = self._get_site_label(sib_id)
                                 self.log(f"【{store_name}】{sib_site_tag}商品 {sib_id}: 因同父商品 {cbt_id} 数据变动，已联动退出活动 {p_id} ({p_type})。", tag="自动退出")
                             except Exception as cancel_err:

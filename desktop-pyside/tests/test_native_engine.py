@@ -181,7 +181,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.1.03")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.1.04")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -1124,6 +1124,42 @@ class NativeEngineTests(unittest.TestCase):
             "3408885754", "3407227823", "MLM222222", "P-MLM17611046", "DEAL"
         )
         self.assertTrue(any("因同父商品 CBT999888 数据变动，已联动退出活动 P-MLM17611046" in line for line in worker._logs))
+
+    def test_webhook_worker_deduplication_and_cascade_debouncing(self) -> None:
+        """Verify Webhook deduplicates multiple variations of the same CBT sibling item,
+        debounces CBT cascades within cooldown, and prevents duplicate promo exit logs.
+        """
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        def fake_detail(acc: str, it_id: str) -> dict:
+            if it_id == "CBT555":
+                return {
+                    "id": "CBT555",
+                    "marketplace_items": [
+                        {"item_id": "MLB200", "user_id": "111", "site_id": "MLB"},
+                        {"item_id": "MLB200", "user_id": "111", "site_id": "MLB"},  # duplicate variation
+                    ],
+                }
+            if it_id == "MLB200":
+                return {"id": "MLB200", "status": "active", "seller_id": "111", "site_id": "MLB"}
+            return {}
+
+        worker.client.get_item_detail.side_effect = fake_detail
+        worker.client.request.return_value = [
+            {"id": "P-MLB999", "type": "DEAL", "status": "started"}
+        ]
+        worker._cascade_cbt_system2_exit("acc1", "CBT555", trigger_item_id="MLC100")
+        # Should only call cancel_promotion_item ONCE despite MLB200 appearing twice in marketplace_items
+        worker.client.cancel_promotion_item.assert_called_once_with(
+            "acc1", "111", "MLB200", "P-MLB999", "DEAL"
+        )
+        # Calling cascade again immediately for the same CBT555 should be debounced
+        worker.client.cancel_promotion_item.reset_mock()
+        worker._cascade_cbt_system2_exit("acc1", "CBT555", trigger_item_id="MLC100")
+        worker.client.cancel_promotion_item.assert_not_called()
 
     def test_webhook_worker_log_formatting_and_shipping_separation(self) -> None:
         """Verify Webhook logs use [自动退出] and [自动报回], cleanly separate shipping cost from listing price, and omit internal terms."""
