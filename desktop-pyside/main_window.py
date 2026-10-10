@@ -1016,12 +1016,13 @@ class MainWindow(QMainWindow):
         top.addWidget(section_label("执行记录"))
         top.addStretch(1)
         self.records_view_combo = QComboBox()
-        self.records_view_combo.addItem("最近20", "recent")
+        self.records_view_combo.addItem("最近 20 条", "recent")
         self.records_view_combo.addItem("全部历史", "all")
         self.records_view_combo.setFixedWidth(130)
         self.records_view_combo.setFixedHeight(32)
         self.records_view_combo.currentIndexChanged.connect(self._records_view_changed)
-        self.records_refresh_button = QPushButton("刷新")
+        self.records_refresh_button = QPushButton("刷  新")
+        self.records_refresh_button.setFixedWidth(68)
         self.records_refresh_button.setFixedHeight(32)
         self.records_refresh_button.clicked.connect(self.refresh_records)
         QWidget.setTabOrder(self.records_view_combo, self.records_refresh_button)
@@ -1201,7 +1202,7 @@ class MainWindow(QMainWindow):
 
         self.cleaner_score_spin = QSpinBox()
         self.cleaner_score_spin.setFixedHeight(32)
-        self.cleaner_score_spin.setFixedWidth(110)
+        self.cleaner_score_spin.setFixedWidth(136)
         self.cleaner_score_spin.setRange(0, 100)
         self.cleaner_score_spin.setValue(60)
         self.cleaner_score_spin.setPrefix("低于 ")
@@ -1234,7 +1235,7 @@ class MainWindow(QMainWindow):
 
         self.cleaner_filter_mode_combo = QComboBox()
         self.cleaner_filter_mode_combo.setFixedHeight(32)
-        self.cleaner_filter_mode_combo.setFixedWidth(140)
+        self.cleaner_filter_mode_combo.setFixedWidth(172)
         self.cleaner_filter_mode_combo.addItem("全部满足 (AND)", "and")
         self.cleaner_filter_mode_combo.addItem("任一满足 (OR)", "or")
         self.cleaner_filter_mode_combo.setCurrentIndex(0)
@@ -5009,7 +5010,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.1.09"
+    return "2.1.10"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

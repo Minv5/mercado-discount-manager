@@ -2643,10 +2643,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.1.09")
+        self.assertEqual(product_version(), "2.1.10")
  
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.1.09")
+        self.assertEqual(self.window.version_label.text(), "v2.1.10")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2658,7 +2658,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.1.09")
+        self.assertEqual(self.window.version_label.text(), "v2.1.10")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -3124,7 +3124,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.1.09")
+        self.assertEqual(self.window.version_label.text(), "v2.1.10")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
@@ -3138,17 +3138,18 @@ class QtUiTests(unittest.TestCase):
 
         # 4. 按ID操作优化：无底部多余按键、自包含专属运行日志框
         self.assertTrue(self.window.targeted_cancel_page.cancel_button.isHidden())
-        self.assertEqual(self.window.targeted_cancel_page.submit_button.height(), 34)
+        self.assertEqual(self.window.targeted_cancel_page.submit_button.height(), 32)
         self.assertIsNotNone(self.window.targeted_cancel_page.log_box)
         self.assertIs(self.window.targeted_log_box, self.window.targeted_cancel_page.log_box)
 
         # 5. 查询界面优化：无底部多余按键、查询按钮规范、支持清空
         self.assertTrue(self.window.query_page.back_button.isHidden())
         self.assertEqual(self.window.query_page.search_button.text(), "查  询")
-        self.assertEqual(self.window.query_page.search_button.size().width(), 90)
-        self.assertEqual(self.window.query_page.search_button.size().height(), 34)
+        self.assertEqual(self.window.query_page.search_button.size().width(), 88)
+        self.assertEqual(self.window.query_page.search_button.size().height(), 32)
         self.assertEqual(self.window.query_page.clear_button.text(), "清  空")
-        self.assertEqual(self.window.query_page.clear_button.size().height(), 34)
+        self.assertEqual(self.window.query_page.clear_button.size().width(), 88)
+        self.assertEqual(self.window.query_page.clear_button.size().height(), 32)
 
         # 设置按钮支持再次点击切回工作台 (Toggle Navigation)
         self.window.settings_button.click()
@@ -3163,6 +3164,8 @@ class QtUiTests(unittest.TestCase):
 
         # 5. 执行记录下拉框宽度与对齐
         self.assertGreaterEqual(self.window.records_view_combo.minimumWidth(), 130)
+        self.assertEqual(self.window.records_refresh_button.text(), "刷  新")
+        self.assertEqual(self.window.records_refresh_button.width(), 68)
         self.assertEqual(self.window.records_refresh_button.height(), 32)
 
         # 6. 商品清理按钮尺寸与清店横幅联动（长文案按钮拓宽防止汉字裁切）
@@ -3329,7 +3332,7 @@ class QtUiTests(unittest.TestCase):
             asset_size=10485760,
             published_at="2026-10-07T00:00:00Z",
         )
-        dlg = UpdateDialog(info, "2.1.09", parent=self.window)
+        dlg = UpdateDialog(info, "2.1.10", parent=self.window)
         self.assertEqual(dlg.windowTitle(), "软件更新 - 美客多活动管家")
         self.assertIn("自动更新引擎", dlg.notes_edit.toPlainText())
         self.assertTrue(dlg.update_btn.isEnabled())

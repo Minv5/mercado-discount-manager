@@ -504,7 +504,7 @@ class TargetedCancelDialog(QDialog):
         self.action_combo.addItem("报名活动", "enroll")
         self.action_combo.addItem("取消活动", "cancel")
         self.action_combo.addItem("刷新商品缓存", "refresh_cache")
-        self.action_combo.setFixedHeight(34)
+        self.action_combo.setFixedHeight(32)
         self.action_combo.setMinimumWidth(130)
         self.action_combo.currentIndexChanged.connect(self._sync_submit_state)
         row1.addWidget(self.action_combo)
@@ -520,7 +520,7 @@ class TargetedCancelDialog(QDialog):
 
         self.submit_button = QPushButton("开始核对并报名")
         self.submit_button.setObjectName("primary")
-        self.submit_button.setFixedHeight(34)
+        self.submit_button.setFixedHeight(32)
         self.submit_button.setMinimumWidth(140)
         self.submit_button.setStyleSheet("font-weight: bold; font-size: 13px;")
         self.submit_button.clicked.connect(self._validate_and_accept)
@@ -554,28 +554,9 @@ class TargetedCancelDialog(QDialog):
         row2.addWidget(self.load_last_canceled_btn)
 
         self.history_combo = QComboBox()
-        self.history_combo.setFixedWidth(136)
+        self.history_combo.setFixedWidth(160)
         self.history_combo.setFixedHeight(32)
-        self.history_combo.setStyleSheet(
-            "QComboBox { "
-            "background: #232C24; "
-            "color: #F6F3EA; "
-            "border: 1px solid #4E472F; "
-            "border-radius: 6px; "
-            "padding: 0px 24px 0px 10px; "
-            "min-height: 30px; "
-            "max-height: 30px; "
-            "} "
-            "QComboBox:hover { background: #26352C; } "
-            "QComboBox::drop-down { "
-            "subcontrol-origin: padding; "
-            "subcontrol-position: center right; "
-            "width: 20px; "
-            "border: none; "
-            "background: transparent; "
-            "} "
-        )
-        self.history_combo.view().setMinimumWidth(180)
+        self.history_combo.view().setMinimumWidth(200)
         self._refresh_history_combo()
         self.history_combo.currentIndexChanged.connect(self._on_history_selected)
         row2.addWidget(self.history_combo)
@@ -653,8 +634,8 @@ class TargetedCancelDialog(QDialog):
         log_title = QLabel("按ID操作运行日志")
         log_title.setObjectName("sectionTitle")
         clear_log_btn = QPushButton("清空日志")
-        clear_log_btn.setFixedHeight(28)
-        clear_log_btn.setStyleSheet("padding: 2px 12px; font-size: 12px;")
+        clear_log_btn.setFixedHeight(32)
+        clear_log_btn.setStyleSheet("padding: 0 12px; font-size: 12px;")
         clear_log_btn.clicked.connect(lambda: self.log_box.clear())
         log_header.addWidget(log_title)
         log_header.addStretch(1)
@@ -682,6 +663,7 @@ class TargetedCancelDialog(QDialog):
             self._readiness_timer.start()
         self._sync_submit_state()
         self._sync_item_count()
+        self.item_input.setFocus()
 
     def _refresh_history_combo(self) -> None:
         history = load_targeted_item_history()
@@ -1165,19 +1147,23 @@ class ItemQueryDialog(QDialog):
         search_row.setSpacing(8)
         self.item_input = QLineEdit()
         self.item_input.setPlaceholderText("输入商品 ID，如 MLB7258072116（按回车或点击查询）")
-        self.item_input.setFixedHeight(34)
-        self.item_input.setStyleSheet("font-family: Menlo, Monaco, Consolas, monospace; font-size: 10.5pt;")
+        self.item_input.setFixedHeight(32)
+        self.item_input.setStyleSheet(
+            "font-family: Menlo, Monaco, Consolas, monospace; "
+            "font-size: 10pt; "
+            "padding: 0 10px;"
+        )
         self.item_input.returnPressed.connect(self._on_search)
         search_row.addWidget(self.item_input, 1)
 
         self.search_button = QPushButton("查  询")
         self.search_button.setObjectName("primary")
-        self.search_button.setFixedSize(90, 34)
+        self.search_button.setFixedSize(88, 32)
         self.search_button.clicked.connect(self._on_search)
         search_row.addWidget(self.search_button)
 
         self.clear_button = QPushButton("清  空")
-        self.clear_button.setFixedSize(80, 34)
+        self.clear_button.setFixedSize(88, 32)
         self.clear_button.clicked.connect(self._clear_search)
         search_row.addWidget(self.clear_button)
         card_layout.addLayout(search_row)
@@ -1239,8 +1225,8 @@ class ItemQueryDialog(QDialog):
         log_title = QLabel("价格查询运行日志")
         log_title.setObjectName("sectionTitle")
         clear_log_btn = QPushButton("清空日志")
-        clear_log_btn.setFixedHeight(28)
-        clear_log_btn.setStyleSheet("padding: 2px 12px; font-size: 12px;")
+        clear_log_btn.setFixedHeight(32)
+        clear_log_btn.setStyleSheet("padding: 0 12px; font-size: 12px;")
         clear_log_btn.clicked.connect(self._clear_logs)
         log_header.addWidget(log_title)
         log_header.addStretch(1)
