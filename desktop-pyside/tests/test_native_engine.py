@@ -181,7 +181,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.1.04")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.1.05")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -1160,6 +1160,27 @@ class NativeEngineTests(unittest.TestCase):
         worker.client.cancel_promotion_item.reset_mock()
         worker._cascade_cbt_system2_exit("acc1", "CBT555", trigger_item_id="MLC100")
         worker.client.cancel_promotion_item.assert_not_called()
+
+    def test_webhook_worker_displays_promotion_name_in_logs(self) -> None:
+        """Verify Webhook logs display human-readable promotion names 【Super Hot Sale】 when present in promotion data."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker._dim_cache["MLB333"] = ('{"length": 10}', '1.0')
+        worker.client.get_item_detail.return_value = {
+            "id": "MLB333",
+            "status": "active",
+            "seller_id": "111",
+            "site_id": "MLB",
+            "attributes": [{"id": "PACKAGE_LENGTH", "value_name": "20 cm", "value_struct": {"number": 20, "unit": "cm"}}],
+        }
+        worker.client.request.return_value = [
+            {"id": "P-MLB8888", "name": "Super Hot Sale", "type": "DEAL", "status": "started"}
+        ]
+        worker._process_marketplace_item("acc1", "111", "MLB", "MLB333")
+        self.assertTrue(any("已退出活动 【Super Hot Sale】 (DEAL)" in line for line in worker._logs))
 
     def test_webhook_worker_log_formatting_and_shipping_separation(self) -> None:
         """Verify Webhook logs use [自动退出] and [自动报回], cleanly separate shipping cost from listing price, and omit internal terms."""
