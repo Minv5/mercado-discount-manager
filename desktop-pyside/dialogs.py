@@ -556,6 +556,23 @@ class TargetedCancelDialog(QDialog):
         self.history_combo = QComboBox()
         self.history_combo.setFixedHeight(32)
         self.history_combo.setMinimumWidth(160)
+        self.history_combo.setStyleSheet(
+            "QComboBox { "
+            "background: #232C24; "
+            "color: #F6F3EA; "
+            "border: 1px solid #7D6B42; "
+            "border-radius: 6px; "
+            "padding: 6px 28px 6px 12px; "
+            "} "
+            "QComboBox:hover { background: #26352C; } "
+            "QComboBox::drop-down { "
+            "subcontrol-origin: padding; "
+            "subcontrol-position: top right; "
+            "width: 24px; "
+            "border: none; "
+            "background: transparent; "
+            "} "
+        )
         self.history_combo.view().setMinimumWidth(240)
         self._refresh_history_combo()
         self.history_combo.currentIndexChanged.connect(self._on_history_selected)

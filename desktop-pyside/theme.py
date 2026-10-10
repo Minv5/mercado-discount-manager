@@ -73,11 +73,9 @@ QComboBox:focus, QSpinBox:focus, QLineEdit:focus, QDateEdit:focus {{ border-colo
 QComboBox::drop-down {{
   subcontrol-origin: padding;
   subcontrol-position: top right;
-  width: 30px;
-  border-left: 1px solid {COLORS['gold']};
-  border-top-right-radius: 6px;
-  border-bottom-right-radius: 6px;
-  background: {COLORS['input']};
+  width: 26px;
+  border-left: none;
+  background: transparent;
 }}
 QComboBox::down-arrow {{
   image: url("@CHEVRON_DOWN@");

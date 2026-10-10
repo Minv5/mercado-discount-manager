@@ -92,7 +92,15 @@ def promotion_display_name(row: dict[str, Any]) -> str:
         value = str(row.get(key) or "").strip()
         if value:
             return value
-    return str(row.get("promotion_id") or "").strip()
+    p_id = str(row.get("id") or row.get("promotion_id") or "").strip()
+    p_type = str(row.get("type") or row.get("promotion_type") or "").strip().upper()
+    if p_type == "LIGHTNING":
+        return f"今日闪购 / 限时秒杀 ({p_id})" if p_id else "今日闪购 / 限时秒杀"
+    if p_type == "SMART":
+        return f"智能折扣 ({p_id})" if p_id else "智能折扣"
+    if p_type in ("CUSTOM", "PRICE_DISCOUNT", "SELLER_CAMPAIGN"):
+        return f"单品折扣 / 自建活动 ({p_id})" if p_id else "自建活动"
+    return p_id or "未命名活动"
 
 
 def promotion_bucket(promotion_type: str) -> str:
