@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
 from PySide6.QtCore import QDate, QModelIndex, QObject, QSettings, QSignalBlocker, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeySequence, QPainter, QShortcut, QShowEvent, QTextCursor
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeySequence, QPainter, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -503,7 +503,6 @@ class TargetedCancelDialog(QDialog):
         row1.addWidget(action_label)
 
         self.action_combo = QComboBox()
-        self.action_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.action_combo.addItem("报名活动", "enroll")
         self.action_combo.addItem("取消活动", "cancel")
         self.action_combo.addItem("刷新商品缓存", "refresh_cache")
@@ -557,7 +556,6 @@ class TargetedCancelDialog(QDialog):
         row2.addWidget(self.load_last_canceled_btn)
 
         self.history_combo = QComboBox()
-        self.history_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.history_combo.setFixedWidth(160)
         self.history_combo.setFixedHeight(32)
         self.history_combo.view().setMinimumWidth(200)
@@ -670,16 +668,6 @@ class TargetedCancelDialog(QDialog):
             self._readiness_timer.start()
         self._sync_submit_state()
         self._sync_item_count()
-
-    def showEvent(self, event: QShowEvent) -> None:
-        super().showEvent(event)
-        QTimer.singleShot(0, self.clear_initial_focus)
-
-    def clear_initial_focus(self) -> None:
-        focused = self.focusWidget()
-        if focused:
-            focused.clearFocus()
-        self.setFocus()
 
     def _refresh_history_combo(self) -> None:
         history = load_targeted_item_history()
@@ -1270,16 +1258,6 @@ class ItemQueryDialog(QDialog):
             root.addWidget(buttons)
             QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.reject)
 
-    def showEvent(self, event: QShowEvent) -> None:
-        super().showEvent(event)
-        QTimer.singleShot(0, self.clear_initial_focus)
-
-    def clear_initial_focus(self) -> None:
-        focused = self.focusWidget()
-        if focused:
-            focused.clearFocus()
-        self.setFocus()
-
     def _clear_logs(self) -> None:
         self.log_box.clear()
 
@@ -1290,7 +1268,6 @@ class ItemQueryDialog(QDialog):
         if hasattr(self, "history_count_label"):
             self.history_count_label.setText("0 条记录")
         self.search_button.setEnabled(True)
-        self.clear_initial_focus()
 
     def _on_search(self) -> None:
         item_id = self.item_input.text().strip().upper()
@@ -1967,7 +1944,6 @@ class SettingsDialog(QDialog):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self.app_selector = QComboBox()
-        self.app_selector.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.app_selector.currentIndexChanged.connect(self._on_app_selected)
         form.addRow("选择授权应用", self.app_selector)
 
