@@ -151,7 +151,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.1.05",
+                "build_fingerprint": "native-python-v2.1.06",
             }
 
         # 2. Settings
@@ -179,19 +179,24 @@ class EngineBridge:
             account_id = parts[3]
             site_id = query.get("siteId", [""])[0]
             sites = self.auth.list_sites(account_id)
-            if site_id:
-                matched = [s for s in sites if s["site_id"] == site_id]
-                c_uid = matched[0]["child_user_id"] if matched else (sites[0]["child_user_id"] if sites else "")
-            else:
-                c_uid = sites[0]["child_user_id"] if sites else ""
-
-            if c_uid:
-                try:
-                    promos = self.client.get_seller_promotions(account_id, c_uid)
-                    return {"promotions": promos}
-                except Exception:
-                    return {"promotions": []}
-            return {"promotions": []}
+            target_sites = [s for s in sites if s.get("site_id") == site_id] if site_id else sites
+            all_promos = []
+            for s in target_sites:
+                c_uid = s.get("child_user_id")
+                s_id = s.get("site_id", "")
+                if c_uid:
+                    try:
+                        promos = self.client.get_seller_promotions(account_id, c_uid)
+                        for p in promos:
+                            promo_dict = dict(p)
+                            if not promo_dict.get("site_id"):
+                                promo_dict["site_id"] = s_id
+                            if not promo_dict.get("promotion_type"):
+                                promo_dict["promotion_type"] = promo_dict.get("type", "DEAL")
+                            all_promos.append(promo_dict)
+                    except Exception:
+                        pass
+            return {"promotions": all_promos}
 
         if route.startswith("/api/accounts/") and route.endswith("/promotions/fetch") and method == "POST":
             account_id = route.split("/")[3]

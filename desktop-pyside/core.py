@@ -65,7 +65,14 @@ def action_label(action: str) -> str:
 
 def site_name(site_id: str) -> str:
     key = str(site_id or "").strip().upper()
-    return SITE_NAMES.get(key, key or "未知站点")
+    if not key:
+        return "未知站点"
+    if key in SITE_NAMES:
+        return SITE_NAMES[key]
+    for code, name in SITE_NAMES.items():
+        if code in key:
+            return name
+    return key or "未知站点"
 
 
 def account_from_json(row: dict[str, Any]) -> Account:
@@ -90,9 +97,9 @@ def promotion_display_name(row: dict[str, Any]) -> str:
 
 def promotion_bucket(promotion_type: str) -> str:
     value = str(promotion_type or "").upper()
-    if value == "SELLER_CAMPAIGN":
+    if value in ("SELLER_CAMPAIGN", "CUSTOM", "PRICE_DISCOUNT"):
         return "seller"
-    if value == "DEAL":
+    if value in ("DEAL", "MARKETPLACE_CAMPAIGN"):
         return "official"
     if value == "SMART":
         return "smart"

@@ -75,6 +75,8 @@ QComboBox::drop-down {{
   subcontrol-position: top right;
   width: 30px;
   border-left: 1px solid {COLORS['gold']};
+  border-top-right-radius: 6px;
+  border-bottom-right-radius: 6px;
   background: {COLORS['input']};
 }}
 QComboBox::down-arrow {{
@@ -100,7 +102,7 @@ QPushButton {{
   background: #232C24;
   color: #F6F3EA;
   border: 1px solid {COLORS['gold']};
-  border-radius: 7px;
+  border-radius: 6px;
   padding: 7px 14px;
 }}
 QPushButton:hover {{ background: #26352C; }}

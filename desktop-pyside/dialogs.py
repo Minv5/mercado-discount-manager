@@ -530,27 +530,31 @@ class TargetedCancelDialog(QDialog):
 
         # 第二行：核对范围 + 历史批次快速工具栏
         row2 = QHBoxLayout()
-        row2.setSpacing(10)
+        row2.setSpacing(8)
 
         self.scope_label = QLabel(f"核对范围：{scope_text}")
         self.scope_label.setWordWrap(True)
         self.scope_label.setStyleSheet("color: #C8C3B7; font-size: 13px; line-height: 1.4;")
         row2.addWidget(self.scope_label, 1)
 
+        row2.addSpacing(10)
+
         self.count_label = QLabel("已输入：0 个商品")
-        self.count_label.setStyleSheet("color: #C8C3B7; font-size: 13px;")
+        self.count_label.setStyleSheet("color: #C8C3B7; font-size: 13px; font-weight: 500;")
         row2.addWidget(self.count_label)
+
+        row2.addSpacing(6)
 
         last_canceled = get_last_canceled_batch()
         last_count_text = f" ({last_canceled['count']}个)" if last_canceled and last_canceled.get("count") else ""
         self.load_last_canceled_btn = QPushButton(f"载入上次取消{last_count_text}")
-        self.load_last_canceled_btn.setFixedHeight(30)
+        self.load_last_canceled_btn.setFixedHeight(32)
         self.load_last_canceled_btn.setEnabled(bool(last_canceled and last_canceled.get("item_ids")))
         self.load_last_canceled_btn.clicked.connect(self._load_last_canceled_items)
         row2.addWidget(self.load_last_canceled_btn)
 
         self.history_combo = QComboBox()
-        self.history_combo.setFixedHeight(30)
+        self.history_combo.setFixedHeight(32)
         self.history_combo.setMinimumWidth(160)
         self.history_combo.view().setMinimumWidth(240)
         self._refresh_history_combo()
@@ -558,12 +562,12 @@ class TargetedCancelDialog(QDialog):
         row2.addWidget(self.history_combo)
 
         self.multi_batch_btn = QPushButton("多选批次...")
-        self.multi_batch_btn.setFixedHeight(30)
+        self.multi_batch_btn.setFixedHeight(32)
         self.multi_batch_btn.clicked.connect(self._open_multi_batch_dialog)
         row2.addWidget(self.multi_batch_btn)
 
         self.clear_btn = QPushButton("清空")
-        self.clear_btn.setFixedHeight(30)
+        self.clear_btn.setFixedHeight(32)
         self.clear_btn.clicked.connect(self._clear_input)
         row2.addWidget(self.clear_btn)
 
@@ -583,7 +587,7 @@ class TargetedCancelDialog(QDialog):
         font = QFont("Menlo", 12)
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.item_input.setFont(font)
-        self.item_input.setPlaceholderText("每行一个商品 ID，例如：\nMLB4730089499\nMLM5615657734")
+        self.item_input.setPlaceholderText("每行一个商品 ID，例如：\nMLB1234567890\nMLM1234567890")
         self.item_input.setStyleSheet(
             "QPlainTextEdit { "
             "padding: 10px 12px; "
@@ -1007,12 +1011,16 @@ def _item_action_status_text(value: object) -> str:
 
 
 def _item_promotion_type_text(value: object) -> str:
+    key = str(value or "").strip().upper()
     return {
         "SELLER_CAMPAIGN": "自建活动",
+        "CUSTOM": "自建活动",
+        "PRICE_DISCOUNT": "单品折扣",
         "DEAL": "官方活动",
+        "MARKETPLACE_CAMPAIGN": "官方活动",
         "SMART": "SMART",
         "LIGHTNING": "限时活动",
-    }.get(str(value or "").upper(), str(value or "其它活动"))
+    }.get(key, key or "其它活动")
 
 
 def _item_platform_status_text(value: object) -> str:

@@ -2795,7 +2795,8 @@ class MainWindow(QMainWindow):
             bucket = "seller" if combo is self.seller_combo else "official"
             choices: dict[str, str] = {}
             for promotion in self.promotions:
-                if promotion_bucket(str(promotion.get("promotion_type") or "")) != bucket:
+                p_type = str(promotion.get("promotion_type") or promotion.get("type") or "")
+                if promotion_bucket(p_type) != bucket:
                     continue
                 display = promotion_display_name(promotion)
                 key = normalize_activity_name(display)
@@ -3221,10 +3222,18 @@ class MainWindow(QMainWindow):
             row = self.activity_table.rowCount()
             self.activity_table.insertRow(row)
             account = account_map.get(str(promotion.get("account_id") or ""))
+            s_id = str(promotion.get("site_id") or "").strip()
+            if not s_id:
+                p_id = str(promotion.get("id") or promotion.get("promotion_id") or "").upper()
+                for code in ("MLB", "MLM", "MLC", "MCO", "MLA", "MLU", "MPE", "MEC"):
+                    if code in p_id:
+                        s_id = code
+                        break
+            p_type = str(promotion.get("promotion_type") or promotion.get("type") or "").strip()
             values = [
                 account.store_name if account else "当前店铺",
-                site_name(str(promotion.get("site_id") or "")),
-                promotion_type_text(str(promotion.get("promotion_type") or "")),
+                site_name(s_id),
+                promotion_type_text(p_type),
                 promotion_display_name(promotion),
                 status_text(str(promotion.get("status") or "")),
                 str(promotion.get("total") or promotion.get("items_total") or 0),
@@ -4185,13 +4194,14 @@ class MainWindow(QMainWindow):
         if not account_ids:
             QMessageBox.information(self, "按商品 ID 操作活动", "当前店铺没有可用授权账号。")
             return
-        store_names = {account_id: self._store_for_account(account_id) for account_id in account_ids}
-        store_text = "、".join(store_names.values())
+        store_text = self.selected_store_text()
         site_text = self.site_combo.currentText() or "全部站点"
+        seller_text = self.seller_combo.currentText() or "全部自建活动"
+        official_text = self.official_combo.currentText() or "全部官方活动"
         locked_seller_discount = int(self.seller_discount.value())
         locked_official_discount = int(self.official_discount.value())
         dialog = TargetedCancelDialog(
-            f"店铺={store_text}；站点={site_text}；自建活动={self.seller_combo.currentText() or '全部'}；官方活动={self.official_combo.currentText() or '全部'}",
+            f"店铺={store_text}；站点={site_text}；自建活动={seller_text}；官方活动={official_text}",
             self,
             submission_ready=self._can_start_targeted_cancel,
             seller_discount=locked_seller_discount,
@@ -4312,12 +4322,10 @@ class MainWindow(QMainWindow):
         self._run_item_query(self.query_page, item_id)
 
     def _sync_targeted_cancel_page_scope(self) -> None:
-        account_ids = self.selected_account_ids()
-        store_names = {account_id: self._store_for_account(account_id) for account_id in account_ids}
-        store_text = "、".join(store_names.values()) if store_names else "未选择店铺"
+        store_text = self.selected_store_text()
         site_text = self.site_combo.currentText() or "全部站点"
-        seller_text = self.seller_combo.currentText() or "全部"
-        official_text = self.official_combo.currentText() or "全部"
+        seller_text = self.seller_combo.currentText() or "全部自建活动"
+        official_text = self.official_combo.currentText() or "全部官方活动"
         locked_seller_discount = int(self.seller_discount.value())
         locked_official_discount = int(self.official_discount.value())
         scope_text = f"店铺={store_text}；站点={site_text}；自建活动={seller_text}；官方活动={official_text}"
@@ -5001,7 +5009,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.1.05"
+    return "2.1.06"
 
 
 def make_table(headers: list[str]) -> QTableWidget:
@@ -5486,12 +5494,16 @@ def execution_result_text(result: dict[str, Any], action: str) -> str:
 
 
 def promotion_type_text(value: str) -> str:
+    key = str(value or "").strip().upper()
     return {
         "SELLER_CAMPAIGN": "自建活动",
+        "CUSTOM": "自建活动",
+        "PRICE_DISCOUNT": "单品折扣",
         "DEAL": "官方活动",
+        "MARKETPLACE_CAMPAIGN": "官方活动",
         "SMART": "SMART",
         "LIGHTNING": "限时活动",
-    }.get(value.upper(), value or "其它活动")
+    }.get(key, key or "其它活动")
 
 
 def status_text(value: str) -> str:
