@@ -915,7 +915,6 @@ class SellerCampaignCreateDialog(QDialog):
         self.name_edit = QLineEdit("95")
         self.name_edit.setFixedHeight(32)
         self.name_edit.setFixedWidth(160)
-        self.name_edit.setStyleSheet("padding: 3px 8px;")
         self.start_edit = QDateEdit(QDate.currentDate())
         self.start_edit.setFixedHeight(32)
         self.start_edit.setFixedWidth(160)
