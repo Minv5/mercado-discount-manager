@@ -195,7 +195,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.1.24",
+                "build_fingerprint": "native-python-v2.1.25",
             }
 
         # 2. Settings
@@ -603,7 +603,7 @@ class EngineBridge:
             req = urllib.request.Request(
                 url,
                 data=data,
-                headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+                headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "MercadoDiscountManager/2.0"},
                 method="POST",
             )
             try:

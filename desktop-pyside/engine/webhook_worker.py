@@ -1165,15 +1165,21 @@ class WebhookWorker:
 
     def _claim_events(self) -> list[dict[str, Any]]:
         """Call claim endpoint with Bearer auth to retrieve a batch of pending notifications."""
-        if not self.claim_url:
-            try:
-                settings_path = get_data_dir() / "settings.json"
-                if settings_path.exists():
+        try:
+            settings_path = get_data_dir() / "settings.json"
+            if settings_path.exists():
+                mtime = settings_path.stat().st_mtime
+                if not self.claim_url or not self.ack_url or mtime != getattr(self, "_settings_mtime", 0):
                     st = json.loads(settings_path.read_text(encoding="utf-8"))
-                    self.claim_url = str(st.get("activityCallbackClaimUrl") or "").strip()
-                    self.ack_url = str(st.get("activityCallbackAckUrl") or "").strip()
-            except Exception:
-                pass
+                    c_url = str(st.get("activityCallbackClaimUrl") or "").strip()
+                    a_url = str(st.get("activityCallbackAckUrl") or "").strip()
+                    if c_url:
+                        self.claim_url = c_url
+                    if a_url:
+                        self.ack_url = a_url
+                    self._settings_mtime = mtime
+        except Exception:
+            pass
         if not self.claim_url:
             return []
         secret = self._get_secret()
@@ -1218,12 +1224,21 @@ class WebhookWorker:
         error: str | None = None,
     ) -> None:
         """Send ack to remove the event from cloud queue."""
+        if not self.ack_url:
+            try:
+                settings_path = get_data_dir() / "settings.json"
+                if settings_path.exists():
+                    st = json.loads(settings_path.read_text(encoding="utf-8"))
+                    self.ack_url = str(st.get("activityCallbackAckUrl") or "").strip()
+            except Exception:
+                pass
         if not self.ack_url or not event_id or not lease_id:
             return
         secret = self._get_secret()
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": "MercadoDiscountManager/2.0",
         }
         if secret:
             headers["Authorization"] = f"Bearer {secret}"

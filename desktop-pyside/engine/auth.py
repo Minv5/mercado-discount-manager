@@ -433,6 +433,7 @@ class AuthManager:
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "MercadoDiscountManager/2.0",
         }
         body_params = {
             "grant_type": "refresh_token",
