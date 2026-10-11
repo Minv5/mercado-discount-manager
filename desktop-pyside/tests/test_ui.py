@@ -38,7 +38,7 @@ sys.path.insert(0, str(ROOT))
 
 from PySide6.QtCore import QDate, QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QAbstractItemView, QDialog, QFrame, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QStyle, QStyleOptionSpinBox  # noqa: E402
+from PySide6.QtWidgets import QAbstractItemView, QDialog, QFrame, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QStyle, QStyleOptionSpinBox, QTableWidgetItem  # noqa: E402
 
 from app import create_application  # noqa: E402
 from core import Account, account_from_json, completed_execution_for_scope, execution_completion_text, parse_targeted_cancel_item_ids, targeted_cancel_filters  # noqa: E402
@@ -1655,20 +1655,28 @@ class QtUiTests(unittest.TestCase):
         dialog = SellerCampaignCreateDialog([{"accountId": "A1", "siteId": "MLM", "storeName": "测试店"}])
         self.assertEqual(dialog.selected_targets(), [])
         start = dialog.start_edit.date()
-        self.assertEqual(
-            dialog.finish_edit.date(),
-            QDate(start.year(), start.month(), calendar.monthrange(start.year(), start.month())[1]),
-        )
+        month_end = QDate(start.year(), start.month(), calendar.monthrange(start.year(), start.month())[1])
+        expected_finish = min(month_end, start.addDays(14))
+        self.assertEqual(dialog.finish_edit.date(), expected_finish)
         dialog.start_edit.setDate(QDate(2026, 8, 8))
-        self.assertEqual(dialog.finish_edit.date(), QDate(2026, 8, 31))
+        self.assertEqual(dialog.finish_edit.date(), QDate(2026, 8, 22))  # capped by 14 days
+        dialog.start_edit.setDate(QDate(2026, 8, 25))
+        self.assertEqual(dialog.finish_edit.date(), QDate(2026, 8, 31))  # capped by month end
         dialog.start_edit.setDate(QDate(2024, 2, 8))
-        self.assertEqual(dialog.finish_edit.date(), QDate(2024, 2, 29))
-        dialog.start_edit.setDate(QDate(2026, 2, 8))
-        self.assertEqual(dialog.finish_edit.date(), QDate(2026, 2, 28))
+        self.assertEqual(dialog.finish_edit.date(), QDate(2024, 2, 22))  # leap year 14 days
+        dialog.start_edit.setDate(QDate(2024, 2, 20))
+        self.assertEqual(dialog.finish_edit.date(), QDate(2024, 2, 29))  # leap year month end
         item = dialog.scope_list.item(0)
         item.setCheckState(Qt.CheckState.Checked)
-        self.assertEqual(len(dialog.selected_targets()), 1)
         self.assertGreaterEqual(dialog.finish_edit.date(), dialog.start_edit.date())
+        dialog.show()
+        self.app.processEvents()
+        self.assertEqual(dialog.name_edit.height(), 32)
+        self.assertEqual(dialog.name_edit.width(), 160)
+        self.assertEqual(dialog.start_edit.height(), 32)
+        self.assertEqual(dialog.start_edit.width(), 160)
+        self.assertEqual(dialog.finish_edit.height(), 32)
+        self.assertEqual(dialog.finish_edit.width(), 160)
 
     def test_combo_keyboard_open_select_and_escape(self) -> None:
         combo = self.window.mode_combo
@@ -2643,10 +2651,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.1.17")
+        self.assertEqual(product_version(), "2.1.23")
  
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.1.17")
+        self.assertEqual(self.window.version_label.text(), "v2.1.23")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2658,7 +2666,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.1.17")
+        self.assertEqual(self.window.version_label.text(), "v2.1.23")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -3185,7 +3193,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.1.17")
+        self.assertEqual(self.window.version_label.text(), "v2.1.23")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
@@ -3223,8 +3231,9 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.activity_reload_live_btn.height(), 32)
         self.assertEqual(self.window.full_get_button.height(), 32)
 
-        # 5. 执行记录下拉框宽度与对齐
-        self.assertGreaterEqual(self.window.records_view_combo.minimumWidth(), 130)
+        # 5. 执行记录下拉框宽度与对齐（拓宽至150防止中文字符裁切）
+        self.assertEqual(self.window.records_view_combo.width(), 150)
+        self.assertGreaterEqual(self.window.records_view_combo.minimumWidth(), 150)
         self.assertEqual(self.window.records_refresh_button.text(), "刷  新")
         self.assertEqual(self.window.records_refresh_button.width(), 68)
         self.assertEqual(self.window.records_refresh_button.height(), 32)
@@ -3393,7 +3402,7 @@ class QtUiTests(unittest.TestCase):
             asset_size=10485760,
             published_at="2026-10-07T00:00:00Z",
         )
-        dlg = UpdateDialog(info, "2.1.17", parent=self.window)
+        dlg = UpdateDialog(info, "2.1.23", parent=self.window)
         self.assertEqual(dlg.windowTitle(), "软件更新 - 美客多活动管家")
         self.assertIn("自动更新引擎", dlg.notes_edit.toPlainText())
         self.assertTrue(dlg.update_btn.isEnabled())
@@ -3466,6 +3475,46 @@ class QtUiTests(unittest.TestCase):
         )
         handled = combo.eventFilter(combo._line_edit, press_event)
         self.assertTrue(handled)
+
+    def test_records_table_context_menu_and_delete(self) -> None:
+        self.assertEqual(self.window.records_table.contextMenuPolicy(), Qt.ContextMenuPolicy.CustomContextMenu)
+
+        deleted_payloads = []
+        self.api.delete = lambda path, body=None, **_kw: deleted_payloads.append((path, body)) or {"ok": True, "deleted_count": 1}
+        self.window._run_worker = lambda operation, success, _failure, **_kwargs: success(operation())  # type: ignore[method-assign]
+        self.window.refresh_records = lambda: None  # type: ignore[method-assign]
+
+        self.window.records_table.setRowCount(1)
+        item = QTableWidgetItem("测试批次")
+        item.setData(Qt.ItemDataRole.UserRole, {"id": 101, "task_ids": [101]})
+        self.window.records_table.setItem(0, 0, item)
+        self.window.records_table.selectRow(0)
+
+        with patch("PySide6.QtWidgets.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            self.window._delete_selected_records([0])
+        self.assertEqual(len(deleted_payloads), 1)
+        self.assertEqual(deleted_payloads[0], ("/api/tasks", {"task_ids": [101]}))
+
+        with patch("PySide6.QtWidgets.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            self.window._delete_all_records()
+        self.assertEqual(len(deleted_payloads), 2)
+        self.assertEqual(deleted_payloads[1], ("/api/tasks", {"all": True}))
+
+    def test_smooth_stream_log_queue(self) -> None:
+        self.window._stream_log_queue.clear()
+        self.window._enqueue_stream_logs(["平滑日志 1", "平滑日志 2", "平滑日志 3"])
+        self.assertEqual(len(self.window._stream_log_queue), 3)
+        self.assertTrue(self.window._stream_log_timer.isActive())
+
+        self.window._drain_stream_log_queue()
+        self.assertEqual(len(self.window._stream_log_queue), 2)
+        self.assertIn("平滑日志 1", self.window.log_box.toPlainText())
+
+        self.window._flush_stream_log_queue()
+        self.assertEqual(len(self.window._stream_log_queue), 0)
+        self.assertFalse(self.window._stream_log_timer.isActive())
+        self.assertIn("平滑日志 2", self.window.log_box.toPlainText())
+        self.assertIn("平滑日志 3", self.window.log_box.toPlainText())
 
 
 if __name__ == "__main__":

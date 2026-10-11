@@ -50,7 +50,11 @@ def format_clean_api_error(status_code: int | None, raw_msg: str) -> str:
     """Format technical Mercado Libre error into concise human-readable Chinese."""
     text = str(raw_msg or "").strip()
     code = int(status_code) if status_code is not None else 0
-    text_lower = text.lower()
+
+    # 预处理：剥离重复的前缀与后缀，防止多层捕获重复叠加
+    clean = re.sub(r"^(?:美客多接口异常:\s*|美客多 API 报错\s*(?:\(\d+\))?:\s*)+", "", text).strip()
+    clean = re.sub(r"(?:\s*\(\d+\))+\s*$", "", clean).strip()
+    text_lower = clean.lower()
 
     # 1. 500 / internal error
     if code == 500 or "oops! something went wrong" in text_lower or "internal_error" in text_lower or "internal server error" in text_lower:
@@ -64,59 +68,89 @@ def format_clean_api_error(status_code: int | None, raw_msg: str) -> str:
     if "lockedentityexception" in text_lower or "offer locked" in text_lower:
         return "活动已锁定，平台禁止退出"
 
-    # 4. 400 Credibility
+    # 4. 400 Minimum Discount Percent
+    if "minimum_discount_percent" in text_lower or "discount final price must be more than" in text_lower:
+        return "折扣幅度未达平台最低门槛(至少5%)"
+
+    # 5. 400 Item status not allowed
+    if "item status is not allowed (closed)" in text_lower or "status is not allowed (closed)" in text_lower:
+        return "商品已下架关闭(禁止提报)"
+    if "item status is not allowed (under_review)" in text_lower or "status is not allowed (under_review)" in text_lower:
+        return "商品审核中(禁止提报)"
+    if "item status is not allowed" in text_lower or "status is not allowed" in text_lower:
+        return "商品当前状态禁止提报"
+
+    # 6. 400 User not allowed to create promotion (如 Full 仓履约子账号)
+    if "user is not allowed to create this type of promotion" in text_lower:
+        return "该子账号受限，无权自建此类型活动(已跳过)"
+
+    # 7. 400 Credibility
+    if "error_credibility_original_price" in text_lower or "original price is not credible" in text_lower:
+        return "原价未达平台公信力门槛"
     if "error_credibility_discounted_price" in text_lower or "price is not credible" in text_lower:
         return "折后价未达近期成交价门槛"
+    if "rest_client_error" in text_lower and "credibility" in text_lower:
+        return "平台公信力校验接口超时/异常"
 
-    # 5. 400 Eligibility
+    # 8. 400 Eligibility
     if "item_not_eligible" in text_lower:
         return "未达活动受邀门槛"
 
-    # 6. Already in promotion
+    # 9. Already in promotion
     if "already in promotion" in text_lower or "already" in text_lower:
         return "已在活动中(自动跳过)"
 
-    # 7. Required promotion_type
+    # 10. Required promotion_type
     if "promotion_type is required" in text_lower:
         return "缺少活动类型参数"
 
-    # 8. Active item not modifiable / deletable
+    # 11. Active item not modifiable / deletable
     if "deleted is not modifiable" in text_lower:
         return "商品活跃/出单中，禁止删除"
 
-    # 9. 404 not CBT
+    # 12. 404 not CBT
     if "not a cbt item" in text_lower:
         return "非全球CBT商品 (404)"
 
-    # 10. 404 not found
+    # 13. 404 not found
     if code == 404 or "not found" in text_lower or "not_found" in text_lower:
         return "商品或活动不存在 (404)"
 
-    # 11. 403 User identification
+    # 14. 403 User identification
     if "can not identify the user" in text_lower or "cannot identify the user" in text_lower:
         return "站点无权限或账号不匹配 (403)"
 
-    # 12. 403 Forbidden / Access denied
+    # 15. 403 Forbidden / Access denied
     if code == 403 or "forbidden" in text_lower or "access_denied" in text_lower:
         return "站点访问受限 (403)"
 
-    # 13. 401 Auth expired
+    # 16. 401 Auth expired
     if code == 401 or any(k in text_lower for k in ("invalid_grant", "consumer_auth_required", "expired_token")):
         return "店铺授权已过期 (401)"
 
-    # 14. 429 Rate limit
+    # 17. 429 Rate limit
     if code == 429 or "too many requests" in text_lower or "rate_limit" in text_lower:
         return "平台限流，降速排队中 (429)"
 
-    # 15. Network error
+    # 18. 422 Seller blocked
+    if code == 422 or "seller is temporarily blocked" in text_lower:
+        return "卖家账号此操作暂被平台限制 (422)"
+
+    # 19. 409 Repeated failures
+    if "this request has failed too many times" in text_lower:
+        return "多次重复提报失败，平台已暂时拦截 (409)"
+
+    # 20. Network error
     if any(k in text_lower for k in ("remotedisconnected", "connectionreset", "brokenpipe", "timeout", "socket hang up", "cannotsendrequest")):
         return "网络超时或中断"
 
-    # Fallback: clean up noisy wrappers
-    clean = text
-    m = re.search(r"Errors?:\s*(?:[A-Z_]+\s*-\s*)?([^,}\]]+)", clean)
-    if m:
-        clean = m.group(1).strip()
+    # Fallback: clean up noisy wrappers without truncating error description
+    sub_clean = re.sub(r"^Errors?:\s*", "", clean).strip()
+    sub_clean = re.sub(r"^[A-Z_]+\s*-\s*", "", sub_clean).strip()
+    sub_clean = re.sub(r"^\[[A-Z0-9_-]+\]\s*-\s*", "", sub_clean).strip()
+    sub_clean = sub_clean.strip("[]").strip()
+    if sub_clean:
+        clean = sub_clean
     if code > 0:
         return f"美客多接口异常: {clean} ({code})"
     return clean
@@ -159,6 +193,7 @@ class MercadoClient:
         params: dict[str, Any] | None = None,
         body: dict[str, Any] | None = None,
         max_retries: int = 3,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Make an authenticated request to Mercado Libre API with Keep-Alive connection reuse, 429 retry and token auto-refresh."""
         token_info = self.auth.get_token(account_id)
@@ -177,6 +212,8 @@ class MercadoClient:
             "version": "v2",
             "Connection": "keep-alive",
         }
+        if extra_headers:
+            headers.update(extra_headers)
 
         data = None
         if body is not None:
@@ -284,6 +321,36 @@ class MercadoClient:
         clean_uid = child_user_id.strip()
         data = self.request(account_id, "GET", f"/marketplace/seller-promotions/users/{clean_uid}", params={"app_version": "v2"})
         return data.get("results") or []
+
+    def create_seller_campaign(
+        self,
+        account_id: str,
+        child_user_id: str,
+        name: str,
+        start_date: str,
+        finish_date: str,
+        sub_type: str = "FLEXIBLE_PERCENTAGE",
+    ) -> dict[str, Any]:
+        """POST /marketplace/seller-promotions/seller-campaign/{child_user_id} - Create seller campaign."""
+        clean_uid = str(child_user_id).strip()
+        body = {
+            "promotion_type": "SELLER_CAMPAIGN",
+            "name": str(name).strip(),
+            "sub_type": str(sub_type).strip(),
+            "start_date": str(start_date).strip(),
+            "finish_date": str(finish_date).strip(),
+        }
+        extra_headers = {
+            "X-Caller-Id": str(account_id),
+            "X-Client-Id": str(account_id),
+        }
+        return self.request(
+            account_id=account_id,
+            method="POST",
+            path=f"/marketplace/seller-promotions/seller-campaign/{clean_uid}",
+            body=body,
+            extra_headers=extra_headers,
+        )
 
     def get_promotion_items(
         self,

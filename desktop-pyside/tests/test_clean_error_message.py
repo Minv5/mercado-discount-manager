@@ -76,6 +76,22 @@ class TestCleanErrorMessage(unittest.TestCase):
         err = "Oops! Something went wrong..."
         self.assertEqual(business_reason_text(err), "平台服务繁忙，请稍后重试 (500)")
 
+    def test_minimum_discount_percent(self):
+        err = "Errors: MINIMUM_DISCOUNT_PERCENT - [MCO4432330438] - Discount final Price must be more than 5 Percent of initial Price"
+        self.assertEqual(clean_error_message(err), "折扣幅度未达平台最低门槛(至少5%)")
+
+    def test_item_status_not_allowed(self):
+        self.assertEqual(clean_error_message("Item status is not allowed (closed)"), "商品已下架关闭(禁止提报)")
+        self.assertEqual(clean_error_message("Item status is not allowed (under_review)"), "商品审核中(禁止提报)")
+
+    def test_user_not_allowed_to_create_promotion(self):
+        err = "User is not allowed to create this type of promotion (400)"
+        self.assertEqual(clean_error_message(err), "该子账号受限，无权自建此类型活动(已跳过)")
+
+    def test_deduplicate_error_wrappers(self):
+        err = "美客多接口异常: 美客多接口异常: [MLM6295128442 (400) (400)"
+        self.assertEqual(clean_error_message(err), "美客多接口异常: MLM6295128442 (400)")
+
 
 if __name__ == "__main__":
     unittest.main()

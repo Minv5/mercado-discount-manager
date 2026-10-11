@@ -15,10 +15,54 @@ from pathlib import Path
 from typing import Any
 
 from .auth import AuthManager, OAuthInvalidGrantError
-from .client import MercadoClient
+from .client import MercadoClient, clean_error_message
 from .crypto import decrypt_secret, encrypt_secret, get_data_dir
-from .executor import ActionExecutor, ExecutionProgress
+from .executor import ActionExecutor, ExecutionProgress, SITE_NAMES
 from .webhook_worker import WebhookWorker
+
+
+def validate_seller_campaign_input(input_data: dict[str, Any]) -> list[str]:
+    """Validate seller campaign creation parameters with official single-month constraint."""
+    errors = []
+    name = str(input_data.get("name") or "").strip()
+    if not name:
+        errors.append("缺少自建活动名称 name")
+
+    start_raw = str(input_data.get("startDate") or input_data.get("start_date") or "").strip()
+    finish_raw = str(input_data.get("finishDate") or input_data.get("finish_date") or "").strip()
+    if not start_raw:
+        errors.append("缺少开始日期 start_date")
+    if not finish_raw:
+        errors.append("缺少结束日期 finish_date")
+
+    start_dt = None
+    finish_dt = None
+    if start_raw:
+        try:
+            start_dt = datetime.datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+        except Exception:
+            errors.append("开始日期格式无效")
+    if finish_raw:
+        try:
+            finish_dt = datetime.datetime.fromisoformat(finish_raw.replace("Z", "+00:00"))
+        except Exception:
+            errors.append("结束日期格式无效")
+
+    if start_dt and finish_dt:
+        if finish_dt <= start_dt:
+            errors.append("结束日期必须晚于开始日期")
+
+        effective_finish = finish_dt
+        if finish_dt.day == 1 and finish_dt.hour == 0 and finish_dt.minute == 0 and finish_dt.second == 0:
+            effective_finish = finish_dt - datetime.timedelta(seconds=1)
+
+        if (effective_finish.year, effective_finish.month) != (start_dt.year, start_dt.month):
+            errors.append("结束日期不能超过开始日期所在月份的最后一天")
+
+        if (effective_finish.date() - start_dt.date()).days > 14:
+            errors.append("自建活动持续时间不能超过 14 天")
+
+    return errors
 
 
 class EngineBridge:
@@ -151,7 +195,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.1.17",
+                "build_fingerprint": "native-python-v2.1.23",
             }
 
         # 2. Settings
@@ -239,6 +283,21 @@ class EngineBridge:
 
         # 8. Tasks History
         if route == "/api/tasks":
+            if method.upper() == "DELETE":
+                payload = body or {}
+                task_ids = payload.get("task_ids") or payload.get("taskIds")
+                delete_all = bool(payload.get("all") or payload.get("deleteAll"))
+                if not task_ids and not delete_all:
+                    query_ids = query.get("task_ids") or query.get("taskIds") or []
+                    task_ids = []
+                    for q in query_ids:
+                        for v in q.split(","):
+                            v = v.strip()
+                            if v.isdigit():
+                                task_ids.append(int(v))
+                    delete_all = bool(query.get("all") or query.get("deleteAll"))
+                count = self.executor.delete_tasks(task_ids=task_ids, delete_all=delete_all)
+                return {"ok": True, "deleted_count": count}
             limit = int(query.get("limit", [50])[0])
             tasks = self.executor.list_tasks(limit)
             return {"tasks": tasks}
@@ -310,15 +369,28 @@ class EngineBridge:
             try:
                 cur = conn.cursor()
                 cur.execute("""
-                    SELECT * FROM promo_action_results
-                    WHERE item_id = ?
-                    ORDER BY id DESC
+                    SELECT r.*, c.name AS campaign_name
+                    FROM promo_action_results r
+                    LEFT JOIN promo_campaigns c
+                      ON r.account_id = c.account_id
+                     AND r.promotion_id = c.promotion_id
+                    WHERE r.item_id = ?
+                    ORDER BY r.id DESC
                     LIMIT 50
                 """, (item_id,))
                 rows = [dict(r) for r in cur.fetchall()]
                 for r in rows:
                     acc_id = str(r.get("account_id") or "")
                     r["account_name"] = self.executor._get_store_alias(acc_id)
+                    p_name = r.get("campaign_name")
+                    p_type = str(r.get("promotion_type") or "").upper()
+                    p_id = str(r.get("promotion_id") or "")
+                    if p_type == "PRICE_DISCOUNT" or p_id == "PRICE_DISCOUNT":
+                        r["promotion_name"] = "自建活动（单品折扣）"
+                    elif p_id == "ALL":
+                        r["promotion_name"] = "全店铺活动"
+                    elif p_name:
+                        r["promotion_name"] = p_name
                     actions.append(r)
 
                 cur.execute("""
@@ -368,10 +440,14 @@ class EngineBridge:
                             promos = self.client.get_item_promotions(acc_id, c_uid, item_id)
                             for pr in promos:
                                 p_id = str(pr.get("id") or "")
-                                p_name = str(pr.get("name") or p_id)
+                                p_name = str(pr.get("name") or "")
                                 p_type = str(pr.get("type") or "")
                                 p_status = str(pr.get("status") or "")
                                 p_price = pr.get("price") if pr.get("price") is not None else live_p
+                                if p_type.upper() == "PRICE_DISCOUNT" or p_id == "PRICE_DISCOUNT":
+                                    p_name = "自建活动（单品折扣）"
+                                elif not p_name:
+                                    p_name = p_id
                                 items.append({
                                     "promotion_id": p_id,
                                     "promotion_name": p_name,
@@ -724,25 +800,149 @@ class EngineBridge:
         if route == "/api/execution/submissions/prepare" and method == "POST":
             prepare_id = f"prep_{uuid.uuid4().hex[:12]}"
             payload = body or {}
+            resolved_action = payload.get("action") or "enroll"
+            if resolved_action == "auto":
+                resolved_action = "enroll"
+
+            account_ids = payload.get("accountIds") or payload.get("account_ids") or []
+            filters = payload.get("filters") or {}
+            req_site_id = payload.get("site_id") or payload.get("siteId") or filters.get("siteId") or filters.get("site_id") or ""
+            exclude_seller = bool(filters.get("excludeSeller"))
+
+            confirmed_absent = []
+            existing_targets = []
+            review_targets = []
+
+            if resolved_action == "enroll" and not exclude_seller:
+                settings_file = self.executor.db_path.parent / "settings.json"
+                op_sites_by_acc: dict[str, set[str]] = {}
+                if settings_file.exists():
+                    try:
+                        s_data = json.loads(settings_file.read_text(encoding="utf-8"))
+                        op_raw = s_data.get("operatingSites") or {}
+                        for a_id, sites_val in op_raw.items():
+                            if isinstance(sites_val, (list, set, tuple)):
+                                op_sites_by_acc[str(a_id)] = {str(x).strip().upper() for x in sites_val if str(x).strip()}
+                    except Exception:
+                        pass
+
+                for acc_id in account_ids:
+                    str_acc_id = str(acc_id)
+                    store_name = self.executor._get_store_alias(str_acc_id)
+                    all_sites = self.auth.list_sites(str_acc_id)
+                    if req_site_id:
+                        matched_sites = [s for s in all_sites if s.get("site_id") == req_site_id]
+                    else:
+                        acc_op_sites = op_sites_by_acc.get(str_acc_id)
+                        if acc_op_sites:
+                            matched_sites = [s for s in all_sites if str(s.get("site_id", "")).upper() in acc_op_sites]
+                        else:
+                            matched_sites = all_sites
+
+                    for site in matched_sites:
+                        c_uid = str(site.get("child_user_id") or "")
+                        s_id = str(site.get("site_id") or "")
+                        s_name = SITE_NAMES.get(s_id, s_id)
+                        target_info = {
+                            "account_id": str_acc_id,
+                            "accountId": str_acc_id,
+                            "child_user_id": c_uid,
+                            "childUserId": c_uid,
+                            "site_id": s_id,
+                            "siteId": s_id,
+                            "store_name": store_name,
+                            "storeName": store_name,
+                            "site_name": s_name,
+                            "siteName": s_name,
+                        }
+
+                        has_seller = False
+                        try:
+                            promos = self.client.get_seller_promotions(str_acc_id, c_uid)
+                            for pr in promos:
+                                p_type = str(pr.get("type") or pr.get("promotion_type") or "").upper()
+                                p_id = str(pr.get("id") or pr.get("promotion_id") or "")
+                                p_status = str(pr.get("status") or "").lower()
+                                if (p_type == "SELLER_CAMPAIGN" or p_id.upper().startswith("C-")) and p_status not in ("finished", "closed", "expired", "inactive"):
+                                    has_seller = True
+                                    break
+                            if has_seller:
+                                target_info["hasSellerCampaign"] = True
+                                target_info["detection_status"] = "existing"
+                                existing_targets.append(target_info)
+                            else:
+                                target_info["hasSellerCampaign"] = False
+                                target_info["detection_status"] = "confirmed_absent"
+                                confirmed_absent.append(target_info)
+                        except Exception:
+                            conn = self.executor._get_conn()
+                            try:
+                                cur = conn.cursor()
+                                cur.execute("""
+                                    SELECT promotion_id FROM promo_campaigns
+                                    WHERE account_id = ? AND child_user_id = ?
+                                      AND (promotion_type = 'SELLER_CAMPAIGN' OR promotion_id LIKE 'C-%')
+                                      AND status NOT IN ('finished', 'closed', 'expired', 'inactive')
+                                """, (str_acc_id, c_uid))
+                                db_rows = cur.fetchall()
+                                if db_rows:
+                                    target_info["hasSellerCampaign"] = True
+                                    target_info["detection_status"] = "existing"
+                                    existing_targets.append(target_info)
+                                else:
+                                    target_info["hasSellerCampaign"] = False
+                                    target_info["detection_status"] = "confirmed_absent"
+                                    confirmed_absent.append(target_info)
+                            finally:
+                                conn.close()
+
             prep_data = {
                 "prepare_id": prepare_id,
                 "state": "prepared",
                 "confirmation_token": f"tok_{uuid.uuid4().hex[:8]}",
-                "resolved_action": payload.get("action") or "enroll",
+                "resolved_action": resolved_action,
                 "payload": payload,
+                "seller_detection": {
+                    "confirmed_absent": confirmed_absent,
+                    "existing": existing_targets,
+                    "needs_manual_review": review_targets,
+                    "visibility_unknown": review_targets,
+                },
                 "created_at": datetime.datetime.now().isoformat(),
             }
             self._prepares[prepare_id] = prep_data
             return {"ok": True, "prepare": prep_data}
 
-        # 14. Query Submission Status
-        if route.startswith("/api/execution/submissions/") and not route.endswith("/commit") and not route.endswith("/cancel"):
+        # 14. Save Seller Campaign Input
+        if route.startswith("/api/execution/submissions/") and route.endswith("/seller-input") and method == "POST":
+            prepare_id = route.split("/")[-2]
+            prep_data = self._prepares.get(prepare_id)
+            if not prep_data:
+                return {"error": "未找到准备记录", "status": 404}
+            values = body or {}
+            val_errors = validate_seller_campaign_input(values)
+            selected_targets = values.get("selected_targets") or values.get("targetSelections") or []
+            seller_input = {
+                "name": str(values.get("name") or "95").strip(),
+                "startDate": values.get("startDate") or values.get("start_date") or "",
+                "finishDate": values.get("finishDate") or values.get("finish_date") or "",
+                "start_date": values.get("startDate") or values.get("start_date") or "",
+                "finish_date": values.get("finishDate") or values.get("finish_date") or "",
+                "selected_targets": selected_targets,
+                "targetSelections": selected_targets,
+                "validation_errors": val_errors,
+            }
+            prep_data["seller_input"] = seller_input
+            return {"ok": True, "prepare": prep_data}
+
+        # 15. Query Submission Status
+        if route.startswith("/api/execution/submissions/") and not route.endswith("/commit") and not route.endswith("/cancel") and not route.endswith("/seller-input"):
             prepare_id = route.split("/")[-1]
             if prepare_id in self._prepares:
                 return {"ok": True, "prepare": self._prepares[prepare_id]}
             return {"ok": False, "prepare": None}
 
-        # 15. Submissions Commit (Start background execution)
+        # 16. Submissions Commit (Start background execution)
         if route.startswith("/api/execution/submissions/") and route.endswith("/commit") and method == "POST":
             prepare_id = route.split("/")[-2]
             prep_data = self._prepares.get(prepare_id)
@@ -771,10 +971,14 @@ class EngineBridge:
             self._groups[group_id] = group_data
             self._group_cancel_flags[group_id] = False
 
+            worker_payload = dict(prep_data["payload"])
+            if "seller_input" in prep_data:
+                worker_payload["seller_input"] = prep_data["seller_input"]
+
             # Launch in background thread
             thread = threading.Thread(
                 target=self._run_group_worker,
-                args=(group_id, prep_data["payload"]),
+                args=(group_id, worker_payload),
                 daemon=True,
                 name=f"Executor-{group_id}",
             )
@@ -946,6 +1150,89 @@ class EngineBridge:
                     # 限制内存中只保留最新 200 条，杜绝数小时累积数万条导致 2.7MB 轮询负载与内存膨胀
                     if len(logs) > 200:
                         child["user_logs"] = logs[-200:]
+
+        # Create seller campaigns if requested by user in preparation phase
+        seller_input = payload.get("seller_input") or {}
+        selected_targets = seller_input.get("selected_targets") or seller_input.get("targetSelections") or []
+        if selected_targets and not self._group_cancel_flags.get(group_id):
+            camp_name = str(seller_input.get("name") or "95").strip()
+            s_date = str(seller_input.get("startDate") or seller_input.get("start_date") or "").strip()
+            f_date = str(seller_input.get("finishDate") or seller_input.get("finish_date") or "").strip()
+            # Ensure Mercado Libre local format YYYY-MM-DDTHH:MM:SS (strictly without Z or UTC offset)
+            if s_date:
+                s_date = s_date.rstrip("Z").split(".")[0]
+                if "+" in s_date[10:]:
+                    s_date = s_date.split("+")[0]
+                if "-" in s_date[10:]:
+                    s_date = s_date[:19]
+                if "T" not in s_date:
+                    s_date = f"{s_date}T00:00:00"
+            if f_date:
+                f_date = f_date.rstrip("Z").split(".")[0]
+                if "+" in f_date[10:]:
+                    f_date = f_date.split("+")[0]
+                if "-" in f_date[10:]:
+                    f_date = f_date[:19]
+                if "T" not in f_date:
+                    f_date = f"{f_date}T00:00:00"
+
+            for target in selected_targets:
+                if self._group_cancel_flags.get(group_id):
+                    break
+                t_acc = str(target.get("accountId") or target.get("account_id") or "")
+                t_uid = str(target.get("childUserId") or target.get("child_user_id") or "")
+                t_site = str(target.get("siteId") or target.get("site_id") or "")
+                t_sname = SITE_NAMES.get(t_site, t_site)
+                t_store = self.executor._get_store_alias(t_acc)
+                log_for_store(t_acc, f"[{t_store}][{t_sname}] 正在创建自建活动 [{camp_name}] (子账号: {t_uid})...")
+                try:
+                    create_res = self.client.create_seller_campaign(
+                        account_id=t_acc,
+                        child_user_id=t_uid,
+                        name=camp_name,
+                        start_date=s_date,
+                        finish_date=f_date,
+                        sub_type="FLEXIBLE_PERCENTAGE",
+                    )
+                    created_id = str(
+                        create_res.get("id")
+                        or create_res.get("promotion_id")
+                        or (create_res.get("promotion") or {}).get("id")
+                        or (create_res.get("promotion") or {}).get("promotion_id")
+                        or ""
+                    )
+                    log_for_store(t_acc, f"[{t_store}][{t_sname}] 自建活动创建成功: [{camp_name}] (ID: {created_id or '已确认'})")
+                    if created_id:
+                        conn = self.executor._get_conn()
+                        try:
+                            cur = conn.cursor()
+                            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            cur.execute("""
+                                INSERT INTO promo_campaigns (
+                                    account_id, promotion_id, promotion_type, child_user_id, site_id,
+                                    name, status, start_date, finish_date, raw_json, updated_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(account_id, child_user_id, site_id, promotion_id, promotion_type)
+                                DO UPDATE SET
+                                    name = excluded.name,
+                                    status = excluded.status,
+                                    start_date = excluded.start_date,
+                                    finish_date = excluded.finish_date,
+                                    raw_json = excluded.raw_json,
+                                    updated_at = excluded.updated_at
+                            """, (
+                                t_acc, created_id, "SELLER_CAMPAIGN", t_uid, t_site,
+                                camp_name, "started", s_date, f_date, json.dumps(create_res, ensure_ascii=False), now_iso
+                            ))
+                            conn.commit()
+                        finally:
+                            conn.close()
+                except Exception as err:
+                    err_msg = clean_error_message(err)
+                    if "User is not allowed to create this type of promotion" in str(err) or "该子账号受限" in err_msg or "无权自建此类型活动" in err_msg:
+                        log_for_store(t_acc, f"[{t_store}][{t_sname}] 子账号 ({t_uid}) 无权创建自建活动（官方限制），已自动跳过")
+                    else:
+                        log_for_store(t_acc, f"[{t_store}][{t_sname}] 创建自建活动失败: {err_msg}")
 
         def run_store(acc_id: str):
             nonlocal total_success, total_failed, total_skipped, total_items

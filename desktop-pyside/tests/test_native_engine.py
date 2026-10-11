@@ -13,10 +13,11 @@ if str(ROOT) not in sys.path:
 
 from core import Account
 from engine.auth import AuthManager
-from engine.bridge import EngineBridge
+from engine.bridge import EngineBridge, validate_seller_campaign_input
 from engine.crypto import decrypt_secret, encrypt_secret
 from engine.pricing import calculate_deal_price, extract_item_net_proceeds
 from engine.webhook_worker import WebhookWorker
+from dialogs import render_item_status_text
 
 
 class NativeEngineTests(unittest.TestCase):
@@ -181,7 +182,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.1.17")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.1.23")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -1389,6 +1390,222 @@ class NativeEngineTests(unittest.TestCase):
         self.assertEqual(len(lock_logs), 1)
         self.assertIn("商品 MLB4897041997: 失败，平台活动锁占用中（请稍后重试）", lock_logs[0])
         self.assertNotIn("LockedEntityException", lock_logs[0])
+
+    def test_validate_seller_campaign_input(self) -> None:
+        # 1. Valid input (<= 14 days and same month)
+        valid_input = {
+            "name": "95",
+            "startDate": "2026-10-11T00:00:00",
+            "finishDate": "2026-10-25T23:59:59",
+        }
+        self.assertEqual(validate_seller_campaign_input(valid_input), [])
+
+        # 2. Valid with midnight (e.g. 2026-10-25T00:00:00)
+        valid_midnight = {
+            "name": "95",
+            "startDate": "2026-10-11T00:00:00",
+            "finishDate": "2026-10-25T00:00:00",
+        }
+        self.assertEqual(validate_seller_campaign_input(valid_midnight), [])
+
+        # 3. Missing name
+        no_name = {
+            "name": "",
+            "startDate": "2026-10-11T00:00:00",
+            "finishDate": "2026-10-25T23:59:59",
+        }
+        self.assertIn("缺少自建活动名称 name", validate_seller_campaign_input(no_name))
+
+        # 4. Finish before start
+        inverted = {
+            "name": "95",
+            "startDate": "2026-10-20T00:00:00",
+            "finishDate": "2026-10-10T00:00:00",
+        }
+        self.assertIn("结束日期必须晚于开始日期", validate_seller_campaign_input(inverted))
+
+        # 5. Cross natural month (cannot exceed month end)
+        cross_month = {
+            "name": "95",
+            "startDate": "2026-10-28T00:00:00",
+            "finishDate": "2026-11-05T00:00:00",
+        }
+        self.assertIn("结束日期不能超过开始日期所在月份的最后一天", validate_seller_campaign_input(cross_month))
+
+        # 6. Exceeds 14 days
+        exceeds_14 = {
+            "name": "95",
+            "startDate": "2026-10-11T00:00:00",
+            "finishDate": "2026-10-27T00:00:00",
+        }
+        self.assertIn("自建活动持续时间不能超过 14 天", validate_seller_campaign_input(exceeds_14))
+
+    def test_client_create_seller_campaign(self) -> None:
+        bridge = EngineBridge.get_instance()
+        with patch.object(bridge.client, "request", return_value={"id": "C-MLB999888", "promotion_type": "SELLER_CAMPAIGN"}) as mock_req:
+            res = bridge.client.create_seller_campaign(
+                account_id="2651442567",
+                child_user_id="3333531550",
+                name="95折特惠",
+                start_date="2026-10-11T00:00:00",
+                finish_date="2026-10-25T00:00:00",
+                sub_type="FLEXIBLE_PERCENTAGE",
+            )
+            self.assertEqual(res["id"], "C-MLB999888")
+            mock_req.assert_called_once()
+            call_kwargs = mock_req.call_args[1]
+            self.assertEqual(call_kwargs["account_id"], "2651442567")
+            self.assertEqual(call_kwargs["method"], "POST")
+            self.assertEqual(call_kwargs["path"], "/marketplace/seller-promotions/seller-campaign/3333531550")
+            self.assertEqual(call_kwargs["body"]["promotion_type"], "SELLER_CAMPAIGN")
+            self.assertEqual(call_kwargs["body"]["name"], "95折特惠")
+            self.assertEqual(call_kwargs["body"]["sub_type"], "FLEXIBLE_PERCENTAGE")
+            self.assertEqual(call_kwargs["extra_headers"]["X-Caller-Id"], "2651442567")
+            self.assertEqual(call_kwargs["extra_headers"]["X-Client-Id"], "2651442567")
+
+    def test_bridge_prepare_detects_seller_campaign_absence(self) -> None:
+        bridge = EngineBridge.get_instance()
+        # Mock client to return no seller campaign for site
+        with patch.object(bridge.client, "get_seller_promotions", return_value=[{"id": "P-100", "type": "DEAL", "status": "started"}]):
+            res = bridge.handle_request("POST", "/api/execution/submissions/prepare", {
+                "action": "enroll",
+                "accountIds": ["2651442567"],
+                "site_id": "MLB",
+            })
+            self.assertTrue(res.get("ok"))
+            prep = res.get("prepare", {})
+            seller_det = prep.get("seller_detection", {})
+            confirmed_absent = seller_det.get("confirmed_absent", [])
+            self.assertTrue(len(confirmed_absent) > 0)
+            target = confirmed_absent[0]
+            self.assertEqual(target.get("account_id"), "2651442567")
+            self.assertEqual(target.get("site_id"), "MLB")
+            self.assertFalse(target.get("hasSellerCampaign"))
+
+        # When action is cancel, confirmed_absent should be empty
+        cancel_res = bridge.handle_request("POST", "/api/execution/submissions/prepare", {
+            "action": "cancel",
+            "accountIds": ["2651442567"],
+            "site_id": "MLB",
+        })
+        cancel_prep = cancel_res.get("prepare", {})
+        self.assertEqual(cancel_prep.get("seller_detection", {}).get("confirmed_absent", []), [])
+
+    def test_bridge_seller_input_endpoint(self) -> None:
+        bridge = EngineBridge.get_instance()
+        prep_res = bridge.handle_request("POST", "/api/execution/submissions/prepare", {
+            "action": "enroll",
+            "accountIds": ["2651442567"],
+            "site_id": "MLB",
+        })
+        prep_id = prep_res["prepare"]["prepare_id"]
+
+        # Valid input save
+        save_res = bridge.handle_request("POST", f"/api/execution/submissions/{prep_id}/seller-input", {
+            "name": "95",
+            "startDate": "2026-10-11T00:00:00",
+            "finishDate": "2026-10-20T23:59:59",
+            "targetSelections": [{"accountId": "2651442567", "childUserId": "123", "siteId": "MLB"}],
+        })
+        self.assertTrue(save_res.get("ok"))
+        seller_input = save_res["prepare"]["seller_input"]
+        self.assertEqual(seller_input["name"], "95")
+        self.assertEqual(len(seller_input["selected_targets"]), 1)
+        self.assertEqual(seller_input["validation_errors"], [])
+
+        # Invalid date error check (exceeding 14 days or across month)
+        err_res = bridge.handle_request("POST", f"/api/execution/submissions/{prep_id}/seller-input", {
+            "name": "95",
+            "startDate": "2026-10-11T00:00:00",
+            "finishDate": "2026-10-31T23:59:59",
+        })
+        self.assertIn("自建活动持续时间不能超过 14 天", err_res["prepare"]["seller_input"]["validation_errors"])
+
+    def test_item_status_and_dialog_unified_activity_names(self) -> None:
+        bridge = EngineBridge.get_instance()
+        conn = bridge.executor._get_conn()
+        try:
+            # Insert a campaign into promo_campaigns
+            conn.execute("""
+                INSERT OR REPLACE INTO promo_campaigns
+                (account_id, promotion_id, promotion_type, child_user_id, site_id, name, status, raw_json, updated_at)
+                VALUES ('2651442567', 'P-MLB18049186', 'DEAL', '3333531550', 'MLB', 'Vem fazer Compritta', 'started', '{}', '2026-10-11T00:00:00')
+            """)
+            # Insert a promo_action_result
+            conn.execute("""
+                INSERT INTO promo_tasks (id, account_id, promotion_id, promotion_type, action, mode, status, created_at, updated_at)
+                VALUES (99991, '2651442567', 'P-MLB18049186', 'DEAL', 'enroll', 'real', 'completed', '2026-10-11 12:00:00', '2026-10-11 12:00:00')
+            """)
+            conn.execute("""
+                INSERT INTO promo_action_results (task_id, account_id, promotion_id, promotion_type, item_id, action, mode, status, deal_price, created_at)
+                VALUES (99991, '2651442567', 'P-MLB18049186', 'DEAL', 'MLB999000111', 'enroll', 'real', 'success', 89.9, '2026-10-11 12:00:00')
+            """)
+            conn.execute("""
+                INSERT INTO promo_action_results (task_id, account_id, promotion_id, promotion_type, item_id, action, mode, status, deal_price, created_at)
+                VALUES (99991, '2651442567', 'PRICE_DISCOUNT', 'PRICE_DISCOUNT', 'MLB999000111', 'enroll', 'real', 'success', 79.9, '2026-10-11 11:00:00')
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch.object(bridge.client, "get_item_detail", return_value={"id": "MLB999000111", "price": 99.0, "currency_id": "BRL"}), \
+             patch.object(bridge.client, "get_item_promotions", return_value=[{"id": "PRICE_DISCOUNT", "type": "PRICE_DISCOUNT", "status": "started"}]):
+            res = bridge.handle_request("GET", "/api/items/MLB999000111/status")
+            self.assertTrue(res.get("ok"))
+            actions = res.get("actions", [])
+            self.assertTrue(len(actions) >= 2)
+            # Row 0: PRICE_DISCOUNT -> 自建活动（单品折扣）
+            self.assertEqual(actions[0]["promotion_name"], "自建活动（单品折扣）")
+            # Row 1: P-MLB18049186 joined with promo_campaigns -> Vem fazer Compritta
+            self.assertEqual(actions[1]["promotion_name"], "Vem fazer Compritta")
+
+            # Check render_item_status_text formatting
+            items = res.get("items", [])
+            rendered = render_item_status_text("MLB999000111", actions, items, [])
+            # Must NOT contain double dash - -
+            self.assertNotIn("- -", rendered)
+            # Must contain 自建活动（单品折扣）
+            self.assertIn("自建活动（单品折扣）", rendered)
+            # Latest action must be formatted nicely
+            self.assertIn("最近一次操作：报名　自建活动（单品折扣）", rendered)
+
+    def test_delete_tasks_and_api_route(self) -> None:
+        bridge = EngineBridge()
+        conn = bridge.executor._get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT OR REPLACE INTO promo_tasks (
+                    id, account_id, promotion_id, promotion_type, action, mode, status, created_at, updated_at
+                )
+                VALUES (88881, '2651442567', 'ALL', 'BATCH', 'enroll', 'real', 'completed', '2026-10-11', '2026-10-11'),
+                       (88882, '2651442567', 'ALL', 'BATCH', 'cancel', 'real', 'completed', '2026-10-11', '2026-10-11')
+            """)
+            cur.execute("""
+                INSERT OR REPLACE INTO promo_action_results (id, task_id, account_id, promotion_id, promotion_type, item_id, action, mode, status, created_at)
+                VALUES (888801, 88881, '2651442567', 'P1', 'BATCH', 'MLB1', 'enroll', 'real', 'success', '2026-10-11'),
+                       (888802, 88882, '2651442567', 'P2', 'BATCH', 'MLB2', 'cancel', 'real', 'success', '2026-10-11')
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Delete by task_ids
+        res = bridge.handle_request("DELETE", "/api/tasks", {"task_ids": [88881]})
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(res.get("deleted_count"), 1)
+
+        conn = bridge.executor._get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM promo_tasks WHERE id = 88881")
+            self.assertEqual(cur.fetchone()[0], 0)
+            cur.execute("SELECT COUNT(*) FROM promo_action_results WHERE task_id = 88881")
+            self.assertEqual(cur.fetchone()[0], 0)
+            cur.execute("SELECT COUNT(*) FROM promo_tasks WHERE id = 88882")
+            self.assertEqual(cur.fetchone()[0], 1)
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

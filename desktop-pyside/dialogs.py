@@ -447,6 +447,8 @@ class LogViewer(QTextEdit):
                     prune_cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
                     prune_cursor.movePosition(QTextCursor.MoveOperation.NextBlock, QTextCursor.MoveMode.KeepAnchor)
                 prune_cursor.removeSelectedText()
+            self.setTextCursor(cursor)
+            self.ensureCursorVisible()
             scrollbar.setValue(scrollbar.maximum())
 
 
@@ -886,9 +888,11 @@ class SellerCampaignCreateDialog(QDialog):
         root.addWidget(help_text)
         select_row = QHBoxLayout()
         select_all = QPushButton("全  选")
-        select_all.setFixedHeight(28)
+        select_all.setFixedHeight(32)
+        select_all.setFixedWidth(76)
         select_none = QPushButton("全不选")
-        select_none.setFixedHeight(28)
+        select_none.setFixedHeight(32)
+        select_none.setFixedWidth(76)
         select_all.clicked.connect(lambda: self._set_all_checked(True))
         select_none.clicked.connect(lambda: self._set_all_checked(False))
         select_row.addWidget(select_all)
@@ -907,34 +911,50 @@ class SellerCampaignCreateDialog(QDialog):
         root.addWidget(self.scope_list, 1)
 
         form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         self.name_edit = QLineEdit("95")
+        self.name_edit.setFixedHeight(32)
+        self.name_edit.setFixedWidth(160)
+        self.name_edit.setStyleSheet("padding: 3px 8px;")
         self.start_edit = QDateEdit(QDate.currentDate())
+        self.start_edit.setFixedHeight(32)
+        self.start_edit.setFixedWidth(160)
         self.finish_edit = QDateEdit()
+        self.finish_edit.setFixedHeight(32)
+        self.finish_edit.setFixedWidth(160)
         self.start_edit.setCalendarPopup(True)
         self.finish_edit.setCalendarPopup(True)
         self.start_edit.setDisplayFormat("yyyy-MM-dd")
         self.finish_edit.setDisplayFormat("yyyy-MM-dd")
         self.start_edit.dateChanged.connect(self._sync_finish_range)
         self._sync_finish_range(self.start_edit.date())
-        form.addRow("自建活动名", self.name_edit)
+        form.addRow("活动名称", self.name_edit)
         form.addRow("开始日期", self.start_edit)
         form.addRow("结束日期", self.finish_edit)
         root.addLayout(form)
-        note = QLabel("只创建 SELLER_CAMPAIGN 自建活动；确认后创建所选目标，并继续进入最终执行确认。")
+        note = QLabel("提示：系统将为所选店铺站点自动创建该自建活动，创建成功后继续提交商品报名。")
         note.setObjectName("muted")
         note.setWordWrap(True)
         root.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认创建并继续")
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setObjectName("primary")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok_btn.setText("确认创建并继续")
+        ok_btn.setObjectName("primary")
+        ok_btn.setFixedHeight(32)
+        ok_btn.setMinimumWidth(140)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        cancel_btn.setText("取  消")
+        cancel_btn.setFixedHeight(32)
+        cancel_btn.setFixedWidth(88)
         buttons.accepted.connect(self._validate)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
     def _sync_finish_range(self, value: QDate) -> None:
         last_day = calendar.monthrange(value.year(), value.month())[1]
-        maximum = QDate(value.year(), value.month(), last_day)
+        month_max = QDate(value.year(), value.month(), last_day)
+        max_14_days = value.addDays(14)
+        maximum = month_max if month_max < max_14_days else max_14_days
         self.finish_edit.setMinimumDate(value)
         self.finish_edit.setMaximumDate(maximum)
         self.finish_edit.setDate(maximum)
@@ -946,7 +966,7 @@ class SellerCampaignCreateDialog(QDialog):
 
     def _validate(self) -> None:
         if not self.name_edit.text().strip():
-            QMessageBox.information(self, "创建自建活动", "请输入自建活动名。")
+            QMessageBox.information(self, "创建自建活动", "请输入活动名称。")
             return
         self.accept()
 
@@ -960,7 +980,7 @@ class SellerCampaignCreateDialog(QDialog):
 
     def values(self) -> dict[str, Any]:
         start = self.start_edit.date().toPython()
-        finish = self.finish_edit.date().toPython() + timedelta(days=1)
+        finish = self.finish_edit.date().toPython()
         return {
             "name": self.name_edit.text().strip(),
             "startDate": start.isoformat() + "T00:00:00",
@@ -1065,13 +1085,25 @@ def render_item_status_text(
             item_status = raw.get("status") or relation.get("cached_status")
             price = raw.get("price") if raw.get("price") is not None else relation.get("price")
             original = raw.get("original_price") if raw.get("original_price") is not None else relation.get("original_price")
-            promo_label = relation.get("promotion_name") or relation.get("promotion_id") or "-"
+            promo_name = str(relation.get("promotion_name") or "").strip()
+            promo_id = str(relation.get("promotion_id") or "").strip()
+            promo_type = str(relation.get("promotion_type") or "").strip().upper()
+            type_text = _item_promotion_type_text(relation.get("promotion_type"))
+
+            if promo_type == "PRICE_DISCOUNT" or promo_id == "PRICE_DISCOUNT" or type_text == "单品折扣":
+                prefix = "- 自建活动（单品折扣）"
+            else:
+                if promo_name and promo_id and promo_name != promo_id:
+                    label = f"{promo_name} ({promo_id})"
+                else:
+                    label = promo_name or promo_id or "-"
+                prefix = f"- {label}（{type_text}）"
+
             price_text = "未报名" if str(item_status or "").lower() == "candidate" else (price if price is not None else "-")
             base_price = original if original is not None else (price if price is not None else "-")
             lines.append(
-                "- {promotion}（{promotion_type}）：{status}｜活动价：{price}｜折扣基准：{base} {currency}".format(
-                    promotion=promo_label,
-                    promotion_type=_item_promotion_type_text(relation.get("promotion_type")),
+                "{prefix}：{status}｜活动价：{price}｜折扣基准：{base} {currency}".format(
+                    prefix=prefix,
                     status=_item_platform_status_text(item_status),
                     price=price_text,
                     base=base_price,
@@ -1095,10 +1127,22 @@ def render_item_status_text(
         lines.append("快照账号：{}　时间：{}".format(pc.get("account_name") or pc.get("account_id") or "-", _local_time(pc.get("updated_at"))))
     if actions:
         latest = actions[0]
+        latest_p_name = str(latest.get("promotion_name") or "").strip()
+        latest_p_id = str(latest.get("promotion_id") or "").strip()
+        latest_p_type = str(latest.get("promotion_type") or "").strip().upper()
+        if latest_p_type == "PRICE_DISCOUNT" or latest_p_id == "PRICE_DISCOUNT":
+            latest_promo_label = "自建活动（单品折扣）"
+        elif latest_p_id == "ALL":
+            latest_promo_label = "全店铺活动"
+        elif latest_p_name and latest_p_id and latest_p_name != latest_p_id:
+            latest_promo_label = f"{latest_p_name} ({latest_p_id})"
+        else:
+            latest_promo_label = latest_p_name or latest_p_id or "-"
+
         lines.append("")
         lines.append("最近一次操作：{action}　{promotion}".format(
             action=_item_action_text(latest.get("action")),
-            promotion=latest.get("promotion_name") or latest.get("promotion_id") or "-",
+            promotion=latest_promo_label,
         ))
         lines.append("结果：{status}　时间：{time}".format(
             status=_item_action_status_text(latest.get("status")),
@@ -1315,10 +1359,22 @@ class ItemQueryDialog(QDialog):
         table = self.history_table
         table.setRowCount(len(actions))
         for row, record in enumerate(actions):
+            promo_name = str(record.get("promotion_name") or "").strip()
+            promo_id = str(record.get("promotion_id") or "").strip()
+            promo_type = str(record.get("promotion_type") or "").strip().upper()
+            if promo_type == "PRICE_DISCOUNT" or promo_id == "PRICE_DISCOUNT":
+                display_promo = "自建活动（单品折扣）"
+            elif promo_id == "ALL":
+                display_promo = "全店铺活动"
+            elif promo_name and promo_id and promo_name != promo_id:
+                display_promo = f"{promo_name} ({promo_id})"
+            else:
+                display_promo = promo_name or promo_id or "-"
+
             cells = [
                 _local_time(record.get("created_at")),
                 str(record.get("account_name") or record.get("account_id") or ""),
-                str(record.get("promotion_name") or record.get("promotion_id") or ""),
+                display_promo,
                 _item_action_text(record.get("action")),
                 _item_action_status_text(record.get("status")),
                 str(record.get("deal_price") if record.get("deal_price") is not None else "-"),

@@ -134,6 +134,30 @@ class ActionExecutor:
         finally:
             conn.close()
 
+    def delete_tasks(self, task_ids: list[int] | None = None, delete_all: bool = False) -> int:
+        """Delete tasks and cascading action results from local SQLite database."""
+        conn = self._get_conn()
+        try:
+            cur = conn.cursor()
+            if delete_all:
+                cur.execute("DELETE FROM promo_action_results")
+                cur.execute("DELETE FROM promo_tasks")
+                deleted = cur.rowcount
+                conn.commit()
+                return deleted
+            if task_ids:
+                clean_ids = [int(tid) for tid in task_ids if tid is not None and str(tid).isdigit()]
+                if clean_ids:
+                    placeholders = ",".join("?" for _ in clean_ids)
+                    cur.execute(f"DELETE FROM promo_action_results WHERE task_id IN ({placeholders})", clean_ids)
+                    cur.execute(f"DELETE FROM promo_tasks WHERE id IN ({placeholders})", clean_ids)
+                    deleted = cur.rowcount
+                    conn.commit()
+                    return deleted
+            return 0
+        finally:
+            conn.close()
+
     def run_execution(
         self,
         account_id: str,
@@ -426,6 +450,36 @@ class ActionExecutor:
                 log(f"[{store_name}][{site_label}] 读取活动列表失败: {err}")
                 return
 
+            # Merge active local SELLER_CAMPAIGN from database if not present in remote promotions
+            known_ids = {str(p.get("id") or p.get("promotion_id") or "") for p in (promotions or [])}
+            try:
+                conn_c = self._get_conn()
+                try:
+                    cur_c = conn_c.cursor()
+                    cur_c.execute("""
+                        SELECT promotion_id, promotion_type, name, status
+                        FROM promo_campaigns
+                        WHERE account_id = ? AND child_user_id = ?
+                          AND promotion_type = 'SELLER_CAMPAIGN'
+                          AND status NOT IN ('finished', 'closed', 'expired', 'inactive')
+                    """, (str(account_id), str(c_uid)))
+                    for c_row in cur_c.fetchall():
+                        c_pid = str(c_row["promotion_id"] or "")
+                        if c_pid and c_pid not in known_ids:
+                            promotions.append({
+                                "id": c_pid,
+                                "promotion_id": c_pid,
+                                "type": "SELLER_CAMPAIGN",
+                                "promotion_type": "SELLER_CAMPAIGN",
+                                "name": c_row["name"] or c_pid,
+                                "status": c_row["status"] or "started",
+                            })
+                            known_ids.add(c_pid)
+                finally:
+                    conn_c.close()
+            except Exception:
+                pass
+
             if not promotions:
                 if action == "cancel":
                     log(f"[{store_name}][{site_label}] (子账号: {c_uid}) 当前无活动需要退出。")
@@ -609,6 +663,7 @@ class ActionExecutor:
                 store_name=store_name,
                 activity_details=activity_details,
                 failed_items=failed_items,
+                success_items=[r for r in all_results if r.get("status") == "success"],
                 elapsed_seconds=round(elapsed_sec, 1),
                 duration_text=duration_text,
                 task_id=task_db_id,
@@ -769,6 +824,7 @@ class ActionExecutor:
         store_name: str = "",
         activity_details: list[dict[str, Any]] | None = None,
         failed_items: list[dict[str, Any]] | None = None,
+        success_items: list[dict[str, Any]] | None = None,
         elapsed_seconds: float = 0.0,
         duration_text: str = "",
         task_id: int | None = None,
@@ -871,6 +927,29 @@ class ActionExecutor:
                                 "failed",
                                 item.get("reason") or "",
                                 item.get("reason") or "",
+                                now_str,
+                            ))
+                        except Exception:
+                            pass
+
+                if success_items and task_id:
+                    for item in success_items:
+                        try:
+                            cur.execute("""
+                                INSERT INTO promo_action_results (
+                                    task_id, account_id, promotion_id, promotion_type,
+                                    item_id, action, mode, status, deal_price, created_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                task_id,
+                                str(account_id),
+                                item.get("promotion_id") or "ALL",
+                                "BATCH",
+                                item.get("item_id") or "",
+                                action,
+                                "real",
+                                "success",
+                                item.get("deal_price"),
                                 now_str,
                             ))
                         except Exception:

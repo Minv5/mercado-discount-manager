@@ -182,8 +182,8 @@ QTableWidget[focused="true"], QTableView[focused="true"] {{
 QTableWidget::item, QTableView::item {{ border: 0; padding: 6px; }}
 QTableWidget::item:selected, QTableView::item:selected {{ background: {COLORS['green']}; color: #F6F3EA; }}
 QLineEdit {{
-  padding: 6px 10px;
-  min-height: 24px;
+  padding: 3px 8px;
+  min-height: 20px;
 }}
 QTabWidget::pane {{
   border: 1px solid {COLORS['gold']};

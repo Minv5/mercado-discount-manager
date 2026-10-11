@@ -8,12 +8,13 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
-from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QSignalBlocker, QSize, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QPoint, QSignalBlocker, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QBrush, QCloseEvent, QColor, QDesktopServices, QIcon, QStandardItem, QStandardItemModel, QTextCursor
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -690,6 +692,10 @@ class MainWindow(QMainWindow):
         self.auto_reprice_timer = QTimer(self)
         self.auto_reprice_timer.setInterval(5000)
         self.auto_reprice_timer.timeout.connect(self._poll_auto_reprice)
+        self._stream_log_queue: deque[str] = deque()
+        self._stream_log_timer = QTimer(self)
+        self._stream_log_timer.setInterval(35)
+        self._stream_log_timer.timeout.connect(self._drain_stream_log_queue)
         if auto_start:
             QTimer.singleShot(0, self.startup)
             QTimer.singleShot(3000, lambda: self._check_update_async(manual=False))
@@ -839,7 +845,7 @@ class MainWindow(QMainWindow):
         title_row.addWidget(self.update_notice_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         title_row.addStretch(1)
 
-        subtitle = QLabel("批量管理美客多促销与折扣活动")
+        subtitle = QLabel("多店铺促销提报 · 智能监控 · 商品清理")
         subtitle.setObjectName("brandSubtitle")
         brand_text.addLayout(title_row)
         brand_text.addWidget(subtitle)
@@ -1018,7 +1024,7 @@ class MainWindow(QMainWindow):
         self.records_view_combo = QComboBox()
         self.records_view_combo.addItem("最近 20 条", "recent")
         self.records_view_combo.addItem("全部历史", "all")
-        self.records_view_combo.setFixedWidth(130)
+        self.records_view_combo.setFixedWidth(150)
         self.records_view_combo.setFixedHeight(32)
         self.records_view_combo.currentIndexChanged.connect(self._records_view_changed)
         self.records_refresh_button = QPushButton("刷  新")
@@ -1048,6 +1054,8 @@ class MainWindow(QMainWindow):
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         table.itemDoubleClicked.connect(lambda _item: self._show_task_details())
         table.itemSelectionChanged.connect(self._show_selected_summary)
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(self._show_records_context_menu)
         top_layout.addWidget(table, 1)
 
         # 独立运行日志框
@@ -3376,6 +3384,100 @@ class MainWindow(QMainWindow):
             lambda error: QMessageBox.warning(self, "批次详情", product_error(error)),
         )
 
+    def _show_records_context_menu(self, pos: QPoint) -> None:
+        menu = QMenu(self.records_table)
+        clicked_row = self.records_table.rowAt(pos.y())
+        selected_rows = sorted({idx.row() for idx in self.records_table.selectionModel().selectedRows()})
+        if clicked_row >= 0 and clicked_row not in selected_rows:
+            selected_rows = [clicked_row]
+            self.records_table.selectRow(clicked_row)
+
+        details_action = None
+        delete_selected_action = None
+        if selected_rows:
+            details_action = menu.addAction("查看批次详情")
+            delete_selected_action = menu.addAction(f"删除所选记录 ({len(selected_rows)} 条)")
+            menu.addSeparator()
+
+        delete_all_action = menu.addAction("清空全部历史记录")
+
+        action = menu.exec(self.records_table.viewport().mapToGlobal(pos))
+        if action is None:
+            return
+
+        if details_action and action == details_action:
+            self._show_task_details()
+        elif delete_selected_action and action == delete_selected_action:
+            self._delete_selected_records(selected_rows)
+        elif action == delete_all_action:
+            self._delete_all_records()
+
+    def _delete_selected_records(self, rows: list[int]) -> None:
+        task_ids = []
+        for r in rows:
+            item = self.records_table.item(r, 0)
+            if item:
+                task = dict(item.data(Qt.ItemDataRole.UserRole) or {})
+                ids = task.get("task_ids") or [task.get("id")]
+                for val in ids:
+                    if val is not None:
+                        try:
+                            task_ids.append(int(val))
+                        except (ValueError, TypeError):
+                            pass
+        if not task_ids:
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定要删除所选的 {len(rows)} 条执行记录吗？\n删除后不可恢复。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        def do_delete() -> dict[str, Any]:
+            return self.api.delete("/api/tasks", {"task_ids": task_ids})
+
+        def on_done(res: dict[str, Any]) -> None:
+            deleted = int(res.get("deleted_count") or len(task_ids))
+            self.log(f"已删除 {deleted} 条执行记录。")
+            self.refresh_records()
+
+        self._run_worker(
+            do_delete,
+            on_done,
+            lambda err: QMessageBox.warning(self, "删除失败", f"删除执行记录失败: {product_error(err)}"),
+        )
+
+    def _delete_all_records(self) -> None:
+        if self.records_table.rowCount() == 0:
+            QMessageBox.information(self, "提示", "当前没有可清空的执行记录。")
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认清空",
+            "确定要清空全部历史执行记录吗？\n清空后将无法恢复历史批次明细。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        def do_delete() -> dict[str, Any]:
+            return self.api.delete("/api/tasks", {"all": True})
+
+        def on_done(res: dict[str, Any]) -> None:
+            self.log("已清空全部历史执行记录。")
+            self.refresh_records()
+
+        self._run_worker(
+            do_delete,
+            on_done,
+            lambda err: QMessageBox.warning(self, "清空失败", f"清空执行记录失败: {product_error(err)}"),
+        )
+
     def _show_selected_summary(self) -> None:
         row = self.records_table.currentRow()
         if row < 0 or not self.records_table.item(row, 0):
@@ -3899,7 +4001,7 @@ class MainWindow(QMainWindow):
         self.job_log_seen = {str(child.get("job_id") or ""): set() for child in group.get("children") or []}
         self.poll_failure_count = 0
         self.commit_recovery_poll_count = 0
-        self.poll_timer.setInterval(900)
+        self.poll_timer.setInterval(250)
         self._set_execution_busy(True)
         self.poll_timer.start()
         self._poll_group()
@@ -4674,6 +4776,35 @@ class MainWindow(QMainWindow):
             failed,
         )
 
+    def _enqueue_stream_logs(self, messages: list[str]) -> None:
+        if not messages:
+            return
+        self._stream_log_queue.extend(messages)
+        if not self._stream_log_timer.isActive():
+            self._stream_log_timer.start()
+
+    def _drain_stream_log_queue(self) -> None:
+        if not self._stream_log_queue:
+            self._stream_log_timer.stop()
+            return
+        count = 1
+        q_len = len(self._stream_log_queue)
+        if q_len > 40:
+            count = 4
+        elif q_len > 20:
+            count = 2
+        for _ in range(min(count, q_len)):
+            msg = self._stream_log_queue.popleft()
+            self.log(msg)
+        if not self._stream_log_queue:
+            self._stream_log_timer.stop()
+
+    def _flush_stream_log_queue(self) -> None:
+        if self._stream_log_timer.isActive():
+            self._stream_log_timer.stop()
+        while self._stream_log_queue:
+            self.log(self._stream_log_queue.popleft())
+
     def log(self, message: str) -> None:
         formatted = f"[{datetime.now():%H:%M:%S}] {message}"
         cleaner_tags = ("[商品清理]", "[商品扫描]", "[清店]", "[商品删除]")
@@ -5009,7 +5140,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.1.17"
+    return "2.1.23"
 
 
 def make_table(headers: list[str]) -> QTableWidget:

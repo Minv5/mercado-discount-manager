@@ -46,6 +46,9 @@ class ApiClient:
     def post(self, path: str, body: dict[str, Any] | None = None, *, timeout: float | None = None, timeout_message: str | None = None) -> dict[str, Any]:
         return self.request("POST", path, body or {}, timeout=timeout, timeout_message=timeout_message)
 
+    def delete(self, path: str, body: dict[str, Any] | None = None, *, timeout: float | None = None, timeout_message: str | None = None) -> dict[str, Any]:
+        return self.request("DELETE", path, body or {}, timeout=timeout, timeout_message=timeout_message)
+
     def request(
         self,
         method: str,
