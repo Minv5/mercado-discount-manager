@@ -291,7 +291,7 @@ class AuthManager:
         try:
             cur = conn.cursor()
             cur.execute("""
-                SELECT account_id, child_user_id, site_id
+                SELECT account_id, child_user_id, site_id, logistic_type
                 FROM marketplace_sites
                 WHERE account_id = ?
                 ORDER BY site_id, child_user_id
@@ -302,6 +302,7 @@ class AuthManager:
                     "account_id": r["account_id"],
                     "child_user_id": r["child_user_id"],
                     "site_id": r["site_id"],
+                    "logistic_type": r["logistic_type"],
                 }
                 for r in rows
             ]

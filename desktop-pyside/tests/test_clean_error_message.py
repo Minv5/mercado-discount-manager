@@ -92,6 +92,45 @@ class TestCleanErrorMessage(unittest.TestCase):
         err = "美客多接口异常: 美客多接口异常: [MLM6295128442 (400) (400)"
         self.assertEqual(clean_error_message(err), "美客多接口异常: MLM6295128442 (400)")
 
+    def test_price_greater_than_actual_offer(self):
+        err = "美客多接口异常: The new offer price is greater than actual offer (400)"
+        self.assertEqual(clean_error_message(err), "新折扣价高于当前活动生效价(禁止涨价)")
+        err2 = "Errors: PRICE_GT_CURRENT - The new offer price is greater than actual offer"
+        self.assertEqual(clean_error_message(err2), "新折扣价高于当前活动生效价(禁止涨价)")
+
+    def test_deal_price_must_be_lower(self):
+        err = "New deal_price must be lower than current deal_price (400)"
+        self.assertEqual(clean_error_message(err), "秒杀价必须低于当前生效价(禁止涨价)")
+
+    def test_item_condition_must_be_new(self):
+        err = "The item condition must be new (400)"
+        self.assertEqual(clean_error_message(err), "商品非全新成色(二手/翻新禁止参与)")
+
+    def test_item_prices_data_unavailable(self):
+        err = "Item prices data is unavailable for item: MLM123 (400)"
+        self.assertEqual(clean_error_message(err), "平台价格数据同步中或缺失 (400)")
+
+    def test_no_offers_found(self):
+        err = "No offers found for item (400)"
+        self.assertEqual(clean_error_message(err), "商品无有效报价或未上架 (400)")
+
+    def test_invalid_promotion_type(self):
+        err = "Invalid promotion type (400)"
+        self.assertEqual(clean_error_message(err), "活动类型不支持或无效 (400)")
+
+    def test_error_getting_item_408(self):
+        err = "Error getting item (408)"
+        self.assertEqual(clean_error_message(err), "商品详情读取超时 (408)")
+
+    def test_urlopen_timed_out_and_connection_refused(self):
+        self.assertEqual(clean_error_message("<urlopen error timed out>"), "网络超时或中断")
+        self.assertEqual(clean_error_message("<urlopen error [Errno 61] Connection refused>"), "网络超时或中断")
+
+    def test_promotion_deadline_400(self):
+        self.assertEqual(clean_error_message("美客多接口异常: 2026-10-13T02:00Z (400)"), "已过活动提报截止时间")
+        self.assertEqual(format_clean_api_error(400, "Errors: [DEADLINE_EXCEEDED] - 2026-10-13T02:00Z"), "已过活动提报截止时间")
+
 
 if __name__ == "__main__":
     unittest.main()
+

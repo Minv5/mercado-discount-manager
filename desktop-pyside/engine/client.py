@@ -54,6 +54,7 @@ def format_clean_api_error(status_code: int | None, raw_msg: str) -> str:
     # 预处理：剥离重复的前缀与后缀，防止多层捕获重复叠加
     clean = re.sub(r"^(?:美客多接口异常:\s*|美客多 API 报错\s*(?:\(\d+\))?:\s*)+", "", text).strip()
     clean = re.sub(r"(?:\s*\(\d+\))+\s*$", "", clean).strip()
+    clean = re.sub(r"^\[([A-Z0-9_-]+)$", r"\1", clean).strip()
     text_lower = clean.lower()
 
     # 1. 500 / internal error
@@ -91,6 +92,39 @@ def format_clean_api_error(status_code: int | None, raw_msg: str) -> str:
         return "折后价未达近期成交价门槛"
     if "rest_client_error" in text_lower and "credibility" in text_lower:
         return "平台公信力校验接口超时/异常"
+
+    # 7.1 400 Price Greater Than Current / Disallowed Price Increase
+    if "price_gt_current" in text_lower or "new offer price is greater than actual offer" in text_lower:
+        return "新折扣价高于当前活动生效价(禁止涨价)"
+    if "new deal_price must be lower than current deal_price" in text_lower:
+        return "秒杀价必须低于当前生效价(禁止涨价)"
+
+    # 7.2 400 Condition must be new
+    if "item condition must be new" in text_lower or "condition must be new" in text_lower:
+        return "商品非全新成色(二手/翻新禁止参与)"
+
+    # 7.3 400 Item prices data unavailable
+    if "item prices data is unavailable" in text_lower:
+        return "平台价格数据同步中或缺失 (400)"
+
+    # 7.4 400 No offers found
+    if "no offers found for item" in text_lower:
+        return "商品无有效报价或未上架 (400)"
+
+    # 7.5 400 Invalid promotion type
+    if "invalid promotion type" in text_lower:
+        return "活动类型不支持或无效 (400)"
+
+    # 7.6 408 Error getting item
+    if code == 408 or "error getting item" in text_lower:
+        return "商品详情读取超时 (408)"
+
+    # 7.7 400 Promotion deadline / finish_date
+    if (
+        any(k in text_lower for k in ("deadline", "finish_date", "already finished", "promotion has ended"))
+        or (code == 400 and re.search(r"\b202\d-\d{2}-\d{2}t\d{2}:\d{2}", text_lower))
+    ):
+        return "已过活动提报截止时间"
 
     # 8. 400 Eligibility
     if "item_not_eligible" in text_lower:
@@ -141,16 +175,33 @@ def format_clean_api_error(status_code: int | None, raw_msg: str) -> str:
         return "多次重复提报失败，平台已暂时拦截 (409)"
 
     # 20. Network error
-    if any(k in text_lower for k in ("remotedisconnected", "connectionreset", "brokenpipe", "timeout", "socket hang up", "cannotsendrequest")):
+    if any(
+        k in text_lower
+        for k in (
+            "remotedisconnected",
+            "connectionreset",
+            "brokenpipe",
+            "timeout",
+            "timed out",
+            "socket hang up",
+            "cannotsendrequest",
+            "connection refused",
+            "no route to host",
+            "unreachable",
+            "host is down",
+        )
+    ):
         return "网络超时或中断"
 
     # Fallback: clean up noisy wrappers without truncating error description
-    sub_clean = re.sub(r"^Errors?:\s*", "", clean).strip()
-    sub_clean = re.sub(r"^[A-Z_]+\s*-\s*", "", sub_clean).strip()
+    no_err_prefix = re.sub(r"^Errors?:\s*", "", clean).strip()
+    sub_clean = re.sub(r"^[A-Z_]+\s*-\s*", "", no_err_prefix).strip()
     sub_clean = re.sub(r"^\[[A-Z0-9_-]+\]\s*-\s*", "", sub_clean).strip()
     sub_clean = sub_clean.strip("[]").strip()
-    if sub_clean:
+    if sub_clean and not re.fullmatch(r"(?:(?:CBT|MLM|MLB|MCO|MLC|MLA)\d+|202\d-\d{2}-\d{2}T[\d:.Z+-]+)", sub_clean, re.IGNORECASE):
         clean = sub_clean
+    elif no_err_prefix:
+        clean = no_err_prefix
     if code > 0:
         return f"美客多接口异常: {clean} ({code})"
     return clean
@@ -247,6 +298,12 @@ class MercadoClient:
                     # Handle Rate Limit (429) & Capacity Constraints (409) -> exponential backoff
                     if status_code in (409, 429) and attempt < max_retries - 1:
                         sleep_time = (2 ** attempt) * 1.5
+                        time.sleep(sleep_time)
+                        continue
+
+                    # Handle Server Glitches (500, 502, 503, 504) -> exponential backoff retry
+                    if status_code in (500, 502, 503, 504) and attempt < max_retries - 1:
+                        sleep_time = (2 ** attempt) * 0.8
                         time.sleep(sleep_time)
                         continue
 

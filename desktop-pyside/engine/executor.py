@@ -668,6 +668,8 @@ class ActionExecutor:
                 duration_text=duration_text,
                 task_id=task_db_id,
             )
+            if item_details_cache and action in ("enroll", "update"):
+                self._flush_item_price_cache(account_id, item_details_cache)
 
         return {
             "status": progress.status,
@@ -960,3 +962,82 @@ class ActionExecutor:
                 time.sleep(0.5 * (retry + 1))
             finally:
                 conn.close()
+
+    def _flush_item_price_cache(
+        self,
+        account_id: str,
+        item_details_cache: dict[str, dict[str, Any]],
+    ) -> None:
+        """Batch-persist real-time item snapshots fetched during enroll/update into SQLite item_price_cache."""
+        if not isinstance(self.client, MercadoClient) or not item_details_cache:
+            return
+        try:
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            rows_to_upsert: list[tuple[Any, ...]] = []
+            for item_id, raw_item in list(item_details_cache.items()):
+                if not isinstance(raw_item, dict) or not raw_item.get("id"):
+                    continue
+                item_info = extract_item_net_proceeds(raw_item)
+                base_price = float(item_info.price or 0.0)
+                if base_price <= 0:
+                    continue
+                child_user_id = str(raw_item.get("seller_id") or "").strip()
+                site_id = str(raw_item.get("site_id") or item_id[:3]).strip().upper()
+                curr_id = str(raw_item.get("currency_id") or "USD")
+                status = str(raw_item.get("status") or "active").lower()
+                avail_qty = float(raw_item.get("available_quantity") or 0)
+                src_rev = str(raw_item.get("last_updated") or now_iso)
+                raw_payload: dict[str, Any] = {
+                    "net_proceeds": raw_item.get("net_proceeds"),
+                    "shipping": raw_item.get("shipping"),
+                    "last_updated": raw_item.get("last_updated"),
+                    "cbt_item_id": raw_item.get("cbt_item_id"),
+                    "pricing_system": "system1_discount",
+                }
+                raw_str = json.dumps(raw_payload, ensure_ascii=False)
+                rows_to_upsert.append((
+                    str(account_id),
+                    child_user_id,
+                    site_id,
+                    str(item_id),
+                    base_price,
+                    base_price,
+                    curr_id,
+                    status,
+                    avail_qty,
+                    src_rev,
+                    now_iso,
+                    raw_str,
+                    now_iso,
+                ))
+            if not rows_to_upsert:
+                return
+            conn = self._get_conn()
+            try:
+                conn.executemany(
+                    """
+                    INSERT INTO item_price_cache
+                      (account_id, child_user_id, site_id, item_id, price, original_price,
+                       currency_id, status, available_quantity,
+                       source_revision, observed_at, confirmed, raw_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(account_id, child_user_id, site_id, item_id) DO UPDATE SET
+                      price = excluded.price,
+                      original_price = excluded.original_price,
+                      currency_id = excluded.currency_id,
+                      status = excluded.status,
+                      available_quantity = excluded.available_quantity,
+                      source_revision = excluded.source_revision,
+                      observed_at = excluded.observed_at,
+                      confirmed = 1,
+                      raw_json = excluded.raw_json,
+                      updated_at = excluded.updated_at
+                    """,
+                    rows_to_upsert,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
+

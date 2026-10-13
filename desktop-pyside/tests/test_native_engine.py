@@ -182,7 +182,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.1.25")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.1.33")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -1181,7 +1181,7 @@ class NativeEngineTests(unittest.TestCase):
             {"id": "P-MLB8888", "name": "Super Hot Sale", "type": "DEAL", "status": "started"}
         ]
         worker._process_marketplace_item("acc1", "111", "MLB", "MLB333")
-        self.assertTrue(any("已退出活动 【Super Hot Sale】 (DEAL)" in line for line in worker._logs))
+        self.assertTrue(any("已退出活动 【Super Hot Sale】。" in line for line in worker._logs))
 
     def test_webhook_worker_log_formatting_and_shipping_separation(self) -> None:
         """Verify Webhook logs use [自动退出] and [自动报回], cleanly separate shipping cost from listing price, and omit internal terms."""
@@ -1241,8 +1241,9 @@ class NativeEngineTests(unittest.TestCase):
         self.assertTrue(any("售价更新 ($30.63 -> $33.79)" in l for l in exit_logs))
         self.assertTrue(any("退出旧活动" in l for l in exit_logs))
 
-        # 3. Must format deal price cleanly
-        self.assertTrue(any("按新运费报回活动 P-MLB18061082 (DEAL)，折后售价 $" in l for l in re_enroll_logs))
+        # 3. Must format deal price cleanly without trailing English promotion type
+        self.assertTrue(any("按新运费报回活动 P-MLB18061082，折后售价 $" in l for l in re_enroll_logs))
+        self.assertFalse(any("(DEAL)" in l for l in re_enroll_logs))
 
         # 4. Strictly no internal terminology or old prefixes
         for l in logs:
@@ -1391,6 +1392,163 @@ class NativeEngineTests(unittest.TestCase):
         self.assertIn("商品 MLB4897041997: 失败，平台活动锁占用中（请稍后重试）", lock_logs[0])
         self.assertNotIn("LockedEntityException", lock_logs[0])
 
+    def test_webhook_platform_shipping_detected_for_unpromoted_item(self) -> None:
+        """Verify that items without active promotions also detect shipping changes and log baseline updates."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker(client=MagicMock())
+        worker._accounts = [Account("3332096437", "", "CBT", "广东店")]
+        worker._price_cache["MLM5826762560"] = 22.19
+        worker._net_cache["MLM5826762560"] = 12.42
+        worker._shipping_cache["MLM5826762560"] = 7.00
+
+        # Item is active, but not in any promotions (original_price is None/not present)
+        worker.client.get_item_detail.return_value = {
+            "id": "MLM5826762560",
+            "site_id": "MLM",
+            "seller_id": 2668034127,
+            "status": "active",
+            "price": 24.50,
+            "net_proceeds": {
+                "amount": 12.42,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 9.31},
+                    {"id": "sale_fee", "amount": 2.77},
+                ],
+                "currency_id": "USD",
+            },
+        }
+        # Promotions query returns empty
+        worker.client.request.return_value = []
+        worker._ack_event = MagicMock()
+
+        event = {
+            "event_id": "evt_ship_test_1",
+            "lease_id": "lease_ship_test_1",
+            "topic": "marketplace_items",
+            "resource": "/marketplace/items/MLM5826762560",
+            "remote_user_id": "2651442567",
+        }
+        worker._process_single_event(event)
+
+        # Shipping cache must be updated
+        self.assertEqual(worker._shipping_cache["MLM5826762560"], 9.31)
+
+        # Must log platform shipping change with [运费更新] tag and price update
+        ship_logs = [l for l in worker._logs if l.startswith("[运费更新]")]
+        self.assertEqual(len(ship_logs), 1)
+        self.assertIn("平台运费调整 ($7.00 -> $9.31)", ship_logs[0])
+        self.assertIn("售价更新 ($22.19 -> $24.50)", ship_logs[0])
+        self.assertIn("当前暂无可报活动，已更新最新运费基线", ship_logs[0])
+
+    def test_webhook_stale_cache_does_not_exit_already_synced_active_promo(self) -> None:
+        """Verify that if an item in an active promotion already has original_price matching current breakdown,
+        a stale local shipping cache silently syncs without redundant exit/re-enroll."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker(client=MagicMock())
+        worker._accounts = [Account("2651442567", "", "CBT", "湖北店")]
+        worker._price_cache["MLM6295103910"] = 16.51
+        worker._net_cache["MLM6295103910"] = 10.05
+        worker._shipping_cache["MLM6295103910"] = 3.85
+
+        # Active promotion was already updated at 00:34 to original_price=21.01 (10.05 + 7.70 + 3.26 = 21.01)
+        worker.client.get_item_detail.return_value = {
+            "id": "MLM6295103910",
+            "site_id": "MLM",
+            "seller_id": 2668034127,
+            "status": "active",
+            "price": 19.70,
+            "original_price": 21.01,
+            "net_proceeds": {
+                "amount": 10.05,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 7.70},
+                    {"id": "sale_fee", "amount": 3.26},
+                ],
+                "currency_id": "USD",
+            },
+        }
+        worker._ack_event = MagicMock()
+
+        event = {
+            "event_id": "evt_stale_sync",
+            "lease_id": "lease_stale_sync",
+            "topic": "marketplace_items",
+            "resource": "/marketplace/items/MLM6295103910",
+            "remote_user_id": "2651442567",
+        }
+        worker._process_single_event(event)
+
+        # Cache must be silently updated to 21.01 and 7.70 without cancelling promotions
+        self.assertEqual(worker._price_cache["MLM6295103910"], 21.01)
+        self.assertEqual(worker._shipping_cache["MLM6295103910"], 7.70)
+        worker.client.cancel_promotion_item.assert_not_called()
+        worker.client.enroll_promotion_item.assert_not_called()
+        self.assertEqual(len(worker._logs), 0)
+
+    def test_webhook_shipping_old_cost_derivation_and_reenroll_debounce(self) -> None:
+        """Real case MLB7586029946: when local cached_shipping already equals new shipping ($19.84) while
+        active promo original_price is locked at $125.09, derive old shipping ($13.96 -> $19.84) and debounce
+        duplicate events within 60s when platform original_price lags."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker(client=MagicMock())
+        worker._accounts = [Account("3408885754", "", "CBT", "湖南店")]
+        # Local cache already recorded shipping_cost=19.84 while active promo is still locked at 125.09
+        worker._price_cache["MLB7586029946"] = 131.81
+        worker._net_cache["MLB7586029946"] = 95.49
+        worker._shipping_cache["MLB7586029946"] = 19.84
+
+        worker.client.get_item_detail.return_value = {
+            "id": "MLB7586029946",
+            "site_id": "MLB",
+            "seller_id": 3407227825,
+            "status": "active",
+            "price": 119.81,
+            "original_price": 125.09,
+            "net_proceeds": {
+                "amount": 95.49,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 19.84},
+                    {"id": "sale_fee", "amount": 16.48},
+                ],
+                "currency_id": "USD",
+            },
+        }
+        worker.client.request.return_value = [
+            {"id": "C-MLB5402231", "name": "95", "type": "SELLER_CAMPAIGN", "status": "started"}
+        ]
+        worker._ack_event = MagicMock()
+
+        ev1 = {
+            "event_id": "evt_7586_1",
+            "lease_id": "lease_7586_1",
+            "topic": "marketplace_items",
+            "resource": "/marketplace/items/MLB7586029946",
+            "remote_user_id": "3408885754",
+        }
+        ev2 = {
+            "event_id": "evt_7586_2",
+            "lease_id": "lease_7586_2",
+            "topic": "marketplace_items",
+            "resource": "/marketplace/items/MLB7586029946",
+            "remote_user_id": "3408885754",
+        }
+        worker._process_single_event(ev1)
+        # Second event arrives immediately while platform API still returns original_price=125.09
+        worker._process_single_event(ev2)
+
+        # Must only exit and re-enroll ONCE (debounced on second event)
+        worker.client.cancel_promotion_item.assert_called_once()
+        worker.client.enroll_promotion_item.assert_called_once()
+        self.assertEqual(len(worker._logs), 2)
+        self.assertIn("平台运费调整 ($13.96 -> $19.84)，售价更新 ($125.09 -> $131.81)，退出旧活动", worker._logs[0])
+        self.assertIn("按新运费报回活动 【95】", worker._logs[1])
+
     def test_validate_seller_campaign_input(self) -> None:
         # 1. Valid input (<= 14 days and same month)
         valid_input = {
@@ -1490,6 +1648,32 @@ class NativeEngineTests(unittest.TestCase):
         })
         cancel_prep = cancel_res.get("prepare", {})
         self.assertEqual(cancel_prep.get("seller_detection", {}).get("confirmed_absent", []), [])
+
+    def test_bridge_prepare_ignores_fulfillment_sites_for_seller_campaign(self) -> None:
+        bridge = EngineBridge.get_instance()
+        mock_sites = [
+            {"site_id": "MLM", "child_user_id": "111", "logistic_type": "fulfillment"},
+            {"site_id": "MLM", "child_user_id": "222", "logistic_type": "remote"},
+        ]
+        with patch.object(bridge.auth, "list_sites", return_value=mock_sites):
+            def mock_get_promos(acc_id: str, child_uid: str):
+                if child_uid == "222":
+                    return [{"id": "C-MLM100", "type": "SELLER_CAMPAIGN", "status": "started"}]
+                return []
+
+            with patch.object(bridge.client, "get_seller_promotions", side_effect=mock_get_promos):
+                res = bridge.handle_request("POST", "/api/execution/submissions/prepare", {
+                    "action": "enroll",
+                    "accountIds": ["2651442567"],
+                    "site_id": "MLM",
+                })
+                self.assertTrue(res.get("ok"))
+                prep = res.get("prepare", {})
+                seller_det = prep.get("seller_detection", {})
+                self.assertEqual(seller_det.get("confirmed_absent", []), [])
+                existing = seller_det.get("existing", [])
+                self.assertEqual(len(existing), 1)
+                self.assertEqual(existing[0].get("child_user_id"), "222")
 
     def test_bridge_seller_input_endpoint(self) -> None:
         bridge = EngineBridge.get_instance()

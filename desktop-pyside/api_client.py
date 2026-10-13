@@ -36,7 +36,7 @@ class ApiClient:
         if self.bridge is None and self.base_url.rstrip("/") == "http://127.0.0.1:28758":
             try:
                 from engine.bridge import EngineBridge
-                self.bridge = EngineBridge()
+                self.bridge = EngineBridge.get_instance()
             except Exception:
                 self.bridge = None
 

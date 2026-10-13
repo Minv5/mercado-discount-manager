@@ -405,51 +405,51 @@ class MultiBatchHistoryDialog(QDialog):
         self.accept()
 
 
-class LogViewer(QTextEdit):
+class LogViewer(QPlainTextEdit):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setReadOnly(True)
+        self.setMaximumBlockCount(1000)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.auto_scroll = True
+        self.is_hovered = False
         self.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
 
     def _on_scroll_changed(self, value: int) -> None:
         scrollbar = self.verticalScrollBar()
-        if scrollbar.isSliderDown() or value < (scrollbar.maximum() - 15):
+        if scrollbar.isSliderDown() or (scrollbar.maximum() > 0 and value < (scrollbar.maximum() - 15)):
             self.auto_scroll = False
-        elif value >= (scrollbar.maximum() - 5):
+        elif scrollbar.maximum() > 0 and value >= (scrollbar.maximum() - 5):
             self.auto_scroll = True
+
+    def enterEvent(self, event) -> None:
+        self.is_hovered = True
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.is_hovered = False
+        super().leaveEvent(event)
 
     def wheelEvent(self, event) -> None:
         if event.angleDelta().y() > 0:
             self.auto_scroll = False
+        elif event.angleDelta().y() < 0:
+            scrollbar = self.verticalScrollBar()
+            if scrollbar.maximum() > 0 and scrollbar.value() >= (scrollbar.maximum() - 5):
+                self.auto_scroll = True
         super().wheelEvent(event)
 
     def append_log_line(self, line: str) -> None:
         scrollbar = self.verticalScrollBar()
-        was_at_bottom = self.auto_scroll and not scrollbar.isSliderDown()
+        was_at_bottom = self.auto_scroll and not scrollbar.isSliderDown() and not self.is_hovered
+        prev_value = scrollbar.value()
 
-        cursor = QTextCursor(self.document())
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        if self.document().isEmpty():
-            cursor.insertText(line)
-        else:
-            cursor.insertBlock()
-            cursor.insertText(line)
+        self.appendPlainText(line)
 
-        # 仅在吸底状态下安全修剪超出 1000 行的旧记录；用户向上翻阅时绝对不削减，防止视口跳动
         if was_at_bottom:
-            excess = self.document().blockCount() - 1000
-            if excess > 0:
-                prune_cursor = QTextCursor(self.document())
-                prune_cursor.movePosition(QTextCursor.MoveOperation.Start)
-                for _ in range(excess):
-                    prune_cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
-                    prune_cursor.movePosition(QTextCursor.MoveOperation.NextBlock, QTextCursor.MoveMode.KeepAnchor)
-                prune_cursor.removeSelectedText()
-            self.setTextCursor(cursor)
-            self.ensureCursorVisible()
             scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(prev_value)
 
 
 class TargetedCancelDialog(QDialog):

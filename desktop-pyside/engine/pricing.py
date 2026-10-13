@@ -74,8 +74,10 @@ def extract_item_net_proceeds(item: dict[str, Any]) -> ItemNetProceeds:
     else:
         base_price = float(item.get("price") or 0.0)
 
-    # Fee rate derived from the official breakdown: sale_fee / base_price
-    if official_original > 0 and sale_fee > 0:
+    # Fee rate derived from the official breakdown: sale_fee / breakdown_sum
+    if raw_amount > 0 and breakdown_sum > 0 and sale_fee > 0:
+        fee_rate = round(sale_fee / breakdown_sum, 6)
+    elif official_original > 0 and sale_fee > 0:
         fee_rate = round(sale_fee / official_original, 6)
     elif base_price > 0 and sale_fee > 0:
         fee_rate = round(sale_fee / base_price, 6)

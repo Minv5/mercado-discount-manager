@@ -195,7 +195,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.1.25",
+                "build_fingerprint": "native-python-v2.1.33",
             }
 
         # 2. Settings
@@ -840,6 +840,9 @@ class EngineBridge:
                             matched_sites = all_sites
 
                     for site in matched_sites:
+                        # 排除美客多官方明确禁止自建活动的 fulfillment (Full 仓) 子账号
+                        if str(site.get("logistic_type") or "").strip().lower() == "fulfillment":
+                            continue
                         c_uid = str(site.get("child_user_id") or "")
                         s_id = str(site.get("site_id") or "")
                         s_name = SITE_NAMES.get(s_id, s_id)
