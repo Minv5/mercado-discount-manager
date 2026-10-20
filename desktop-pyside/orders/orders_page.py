@@ -515,340 +515,203 @@ class OrdersFetchWorker(QThread):
             self.fetch_finished.emit()
 
 
-class OrderContactBuyerDialog(QDialog):
-    """Modern modal dialog allowing sellers to view post-sale message history and send messages to buyers directly from an order."""
+ATTR_NAME_DICT: dict[str, str] = {
+    "color": "颜色",
+    "cor": "颜色",
+    "colour": "颜色",
+    "talla": "尺码",
+    "tamanho": "尺码",
+    "size": "尺码",
+    "tamaño": "尺寸",
+    "tamano": "尺寸",
+    "modelo": "型号",
+    "model": "型号",
+    "material": "材质",
+    "longitud": "长度",
+    "comprimento": "长度",
+    "length": "长度",
+    "voltaje": "电压",
+    "voltagem": "电压",
+    "voltage": "电压",
+    "ancho": "宽度",
+    "largura": "宽度",
+    "width": "宽度",
+    "alto": "高度",
+    "altura": "高度",
+    "height": "高度",
+    "capacidad": "容量",
+    "capacidade": "容量",
+    "capacity": "容量",
+    "cantidad": "数量",
+    "quantidade": "数量",
+    "quantity": "数量",
+    "sabor": "口味",
+    "flavor": "口味",
+    "diseño": "款式",
+    "diseno": "款式",
+    "desenho": "款式",
+    "tipo": "类型",
+    "type": "类型",
+    "estilo": "风格",
+    "style": "风格",
+    "peso": "重量",
+    "weight": "重量",
+}
 
-    def __init__(
-        self,
-        order: OrderModel,
-        client: MercadoClient,
-        auth_mgr: AuthManager,
-        parent: QWidget | None = None,
-    ):
-        super().__init__(parent)
-        self.order = order
-        self.client = client
-        self.auth_mgr = auth_mgr
-        self.setWindowTitle(f"联系买家 - 订单 {order.order_id}")
-        self.resize(640, 580)
-        self.setMinimumSize(540, 480)
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #171D1A;
-                color: #F6F3EA;
-            }
-        """)
+ATTR_VAL_DICT: dict[str, str] = {
+    "negro": "黑色",
+    "preto": "黑色",
+    "black": "黑色",
+    "blanco": "白色",
+    "branco": "白色",
+    "white": "白色",
+    "rojo": "红色",
+    "vermelho": "红色",
+    "red": "红色",
+    "azul": "蓝色",
+    "blue": "蓝色",
+    "verde": "绿色",
+    "green": "绿色",
+    "amarillo": "黄色",
+    "amarelo": "黄色",
+    "yellow": "黄色",
+    "naranja": "橙色",
+    "laranja": "橙色",
+    "orange": "橙色",
+    "rosa": "粉色",
+    "rosado": "粉色",
+    "cor-de-rosa": "粉色",
+    "pink": "粉色",
+    "dorado": "金色",
+    "dourado": "金色",
+    "oro": "金色",
+    "gold": "金色",
+    "plateado": "银色",
+    "prata": "银色",
+    "plata": "银色",
+    "silver": "银色",
+    "gris": "灰色",
+    "cinza": "灰色",
+    "grey": "灰色",
+    "gray": "灰色",
+    "café": "棕色",
+    "cafe": "棕色",
+    "marrón": "棕色",
+    "marron": "棕色",
+    "castanho": "棕色",
+    "brown": "棕色",
+    "morado": "紫色",
+    "púrpura": "紫色",
+    "purpura": "紫色",
+    "roxo": "紫色",
+    "violeta": "紫色",
+    "purple": "紫色",
+    "beige": "米色",
+    "beje": "米色",
+    "transparente": "透明",
+    "clear": "透明",
+    "multicolor": "彩色",
+    "colorido": "彩色",
+    "azul marino": "深蓝",
+    "azul-marinho": "深蓝",
+    "navy": "深蓝",
+    "azul cielo": "天蓝",
+    "azul celeste": "天蓝",
+    "azul-claro": "浅蓝",
+    "light blue": "浅蓝",
+    "verde militar": "军绿",
+    "verde oliva": "军绿",
+    "army green": "军绿",
+    "verde claro": "浅绿",
+    "light green": "浅绿",
+    "verde oscuro": "深绿",
+    "verde-escuro": "深绿",
+    "dark green": "深绿",
+    "rojo oscuro": "酒红",
+    "vinho": "酒红",
+    "bordô": "酒红",
+    "bordo": "酒红",
+    "burgundy": "酒红",
+    "gris oscuro": "深灰",
+    "cinza escuro": "深灰",
+    "chumbo": "深灰",
+    "dark gray": "深灰",
+    "gris claro": "浅灰",
+    "cinza claro": "浅灰",
+    "light gray": "浅灰",
+    "chico": "小号",
+    "pequeno": "小号",
+    "small": "小号",
+    "mediano": "中号",
+    "médio": "中号",
+    "medio": "中号",
+    "medium": "中号",
+    "grande": "大号",
+    "large": "大号",
+    "extra grande": "加大号",
+    "extra chico": "加小号",
+    "extra pequeno": "加小号",
+    "único": "均码",
+    "unico": "均码",
+    "talla única": "均码",
+    "tamanho único": "均码",
+    "one size": "均码",
+}
 
-        # Determine target language based on site:
-        # MLB is Brazil -> Portuguese ("pt"), MLM/MLC/MCO/MLA/MLU/MPE are Spanish ("es")
-        self.target_lang = "pt" if (order.site_id or "").upper() == "MLB" else "es"
-        self.target_lang_name = "葡萄牙语 (巴西)" if self.target_lang == "pt" else "西班牙语"
+_ATTR_CACHE: dict[str, str] = {}
 
-        self._build_ui()
-        QTimer.singleShot(60, self._load_conversation_history)
 
-    def _build_ui(self) -> None:
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(14, 14, 14, 14)
-        main_layout.setSpacing(10)
+COMMON_DIRECT_KEEP = {"xs", "s", "m", "l", "xl", "xxl", "xxxl", "p", "g", "gg", "xg", "xgg", "u"}
 
-        # 1. Top Banner
-        top_frame = QFrame()
-        top_frame.setStyleSheet("""
-            background: #1C2420;
-            border: 1px solid #4E472F;
-            border-radius: 8px;
-            padding: 4px;
-        """)
-        top_lay = QVBoxLayout(top_frame)
-        top_lay.setContentsMargins(10, 8, 10, 8)
-        top_lay.setSpacing(6)
 
-        t_row1 = QHBoxLayout()
-        st_lbl = QLabel(f"<b>店铺:</b> {self.order.store_name}  ·  <b>站点:</b> {self.order.site_id}")
-        st_lbl.setStyleSheet("color: #E6E2D8; font-size: 12px;")
-        t_row1.addWidget(st_lbl)
-        t_row1.addStretch()
-        oid_lbl = QLabel(f"订单号: {self.order.order_id}")
-        oid_lbl.setStyleSheet("color: #D4AF37; font-size: 12px; font-weight: 600;")
-        t_row1.addWidget(oid_lbl)
-        top_lay.addLayout(t_row1)
+def translate_variation_attributes(raw_attrs: str) -> str:
+    """Translate e-commerce variation attributes (e.g. 'Color: Naranja; Talla: M') to Chinese ('颜色: 橙色; 尺码: M')."""
+    clean = str(raw_attrs or "").strip()
+    if not clean:
+        return ""
+    if clean in _ATTR_CACHE:
+        return _ATTR_CACHE[clean]
 
-        t_row2 = QHBoxLayout()
-        buyer_n = self.order.buyer_nickname or "买家"
-        rec_n = self.order.shipping.receiver_name or self.order.buyer_full_name or ""
-        buyer_text = f"<b>买家昵称:</b> {buyer_n}"
-        if rec_n:
-            buyer_text += f" (收件人: {rec_n})"
-        b_lbl = QLabel(buyer_text)
-        b_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
-        t_row2.addWidget(b_lbl)
-        t_row2.addStretch()
-        lang_chip = QLabel(f"🌐 站点语言: {self.target_lang_name}")
-        lang_chip.setStyleSheet("color: #34D399; font-size: 11px; background: rgba(52, 211, 153, 0.12); border: 1px solid rgba(52, 211, 153, 0.3); border-radius: 3px; padding: 1px 6px;")
-        t_row2.addWidget(lang_chip)
-        top_lay.addLayout(t_row2)
-
-        main_layout.addWidget(top_frame)
-
-        # 2. Conversation History
-        history_box = QFrame()
-        history_box.setStyleSheet("""
-            background: #121614;
-            border: 1px solid #2D3830;
-            border-radius: 8px;
-        """)
-        history_box_layout = QVBoxLayout(history_box)
-        history_box_layout.setContentsMargins(10, 10, 10, 10)
-        history_box_layout.setSpacing(8)
-
-        h_title_row = QHBoxLayout()
-        h_title = QLabel("💬 会话历史记录")
-        h_title.setStyleSheet("color: #F6F3EA; font-size: 12px; font-weight: bold;")
-        h_title_row.addWidget(h_title)
-        h_title_row.addStretch()
-        self.status_msg_lbl = QLabel("正在拉取会话消息...")
-        self.status_msg_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
-        h_title_row.addWidget(self.status_msg_lbl)
-        history_box_layout.addLayout(h_title_row)
-
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-        self.msg_container = QWidget()
-        self.msg_container.setStyleSheet("background: transparent;")
-        self.msg_layout = QVBoxLayout(self.msg_container)
-        self.msg_layout.setContentsMargins(4, 4, 4, 4)
-        self.msg_layout.setSpacing(8)
-        self.msg_layout.addStretch(1)
-        self.scroll_area.setWidget(self.msg_container)
-        history_box_layout.addWidget(self.scroll_area, 1)
-
-        main_layout.addWidget(history_box, 1)
-
-        # 3. Message Compose Box
-        compose_frame = QFrame()
-        compose_frame.setStyleSheet("""
-            background: #1C2420;
-            border: 1px solid #4E472F;
-            border-radius: 8px;
-            padding: 4px;
-        """)
-        c_layout = QVBoxLayout(compose_frame)
-        c_layout.setContentsMargins(8, 8, 8, 8)
-        c_layout.setSpacing(8)
-
-        self.input_edit = QTextEdit()
-        self.input_edit.setPlaceholderText("输入要发送给买家的消息（支持输入中文，点击下方按钮一键翻译为对应外语）...")
-        self.input_edit.setMaximumHeight(85)
-        self.input_edit.setStyleSheet("""
-            QTextEdit {
-                background: #121614;
-                color: #F6F3EA;
-                border: 1px solid #333D35;
-                border-radius: 6px;
-                padding: 6px;
-                font-size: 12px;
-            }
-            QTextEdit:focus {
-                border-color: #D4AF37;
-            }
-        """)
-        c_layout.addWidget(self.input_edit)
-
-        # Action Buttons Row
-        act_row = QHBoxLayout()
-        act_row.setSpacing(8)
-
-        self.translate_btn = QPushButton(f"🌐 一键翻译为{self.target_lang_name.split()[0]}")
-        self.translate_btn.setStyleSheet("""
-            QPushButton {
-                background: #1E3A2B;
-                color: #A7F3D0;
-                border: 1px solid #059669;
-                border-radius: 4px;
-                padding: 5px 12px;
-                font-size: 11px;
-                font-weight: 600;
-            }
-            QPushButton:hover { background: #047857; color: #FFFFFF; }
-            QPushButton:pressed { background: #065F46; }
-            QPushButton:disabled { background: #1C221D; color: #78716C; border-color: #333D35; }
-        """)
-        self.translate_btn.clicked.connect(self._on_translate_clicked)
-        act_row.addWidget(self.translate_btn)
-
-        act_row.addStretch()
-
-        self.send_btn = QPushButton("🚀 发送消息")
-        self.send_btn.setStyleSheet("""
-            QPushButton {
-                background: #D4AF37;
-                color: #121614;
-                border: none;
-                border-radius: 4px;
-                padding: 6px 18px;
-                font-size: 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background: #E5C158; }
-            QPushButton:pressed { background: #B3922D; }
-            QPushButton:disabled { background: #2B332B; color: #78716C; }
-        """)
-        self.send_btn.clicked.connect(self._on_send_clicked)
-        act_row.addWidget(self.send_btn)
-
-        c_layout.addLayout(act_row)
-        main_layout.addWidget(compose_frame)
-
-    def _load_conversation_history(self) -> None:
-        def _fetch():
-            try:
-                pid = self.order.pack_id or self.order.order_id
-                res = self.client.get_pack_messages(self.order.account_id, pid)
-                raw_msgs = res.get("messages") or []
-                return raw_msgs, None
-            except Exception as e:
-                return [], str(e)
-
-        def _worker():
-            msgs, err = _fetch()
-            QTimer.singleShot(0, lambda: self._on_history_loaded(msgs, err))
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_history_loaded(self, msgs: list, err: str | None) -> None:
-        if err or not msgs:
-            self.status_msg_lbl.setText("暂无历史私信记录")
-            empty_lbl = QLabel("暂无历史售后私信记录。\n您可以在下方输入消息直接向买家发起沟通。")
-            empty_lbl.setStyleSheet("color: #78716C; font-size: 12px; padding: 25px; line-height: 1.6;")
-            empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.msg_layout.insertWidget(0, empty_lbl)
-            return
-
-        self.status_msg_lbl.setText(f"共 {len(msgs)} 条消息")
-        sorted_msgs = list(reversed(msgs))
-        for m in sorted_msgs:
-            if not isinstance(m, dict):
-                continue
-            from_info = m.get("from") or {}
-            from_uid = str(from_info.get("user_id") or "")
-            is_seller = (from_uid == str(self.order.account_id)) or (str(from_info.get("role") or "").lower() == "seller")
-            text_info = m.get("text") or {}
-            if isinstance(text_info, dict):
-                content = str(text_info.get("plain") or "")
+    pairs = [p.strip() for p in clean.split(";") if p.strip()]
+    translated_pairs = []
+    for pair in pairs:
+        if ":" in pair:
+            k, v = pair.split(":", 1)
+            k_clean = k.strip()
+            v_clean = v.strip()
+            k_zh = ATTR_NAME_DICT.get(k_clean.lower(), k_clean)
+            v_low = v_clean.lower()
+            if v_low in COMMON_DIRECT_KEEP or re.match(r"^[\d\.\-\+xX/]+(\s*(cm|mm|m|g|kg|ml|l|v|w|hz|oz|in))?$", v_clean, re.I):
+                v_zh = v_clean
             else:
-                content = str(text_info or "")
-
-            date_str = str(m.get("message_date", {}).get("created") or m.get("date") or "")
-            date_fmt = format_order_date(date_str) if date_str else ""
-
-            self._append_message_bubble(is_seller=is_seller, content=content, date_fmt=date_fmt)
-
-    def _append_message_bubble(self, is_seller: bool, content: str, date_fmt: str) -> None:
-        bubble_row = QHBoxLayout()
-        bubble_row.setContentsMargins(0, 0, 0, 0)
-
-        card = QFrame()
-        card_lay = QVBoxLayout(card)
-        card_lay.setContentsMargins(10, 7, 10, 7)
-        card_lay.setSpacing(4)
-
-        sender_label = "我 (卖家)" if is_seller else (self.order.buyer_nickname or "买家")
-        hdr_lbl = QLabel(f"<b>{sender_label}</b>  <span style='color: #78716C; font-size: 10px;'>{date_fmt}</span>")
-        hdr_lbl.setStyleSheet("font-size: 11px;")
-
-        txt_lbl = QLabel(content)
-        txt_lbl.setWordWrap(True)
-        txt_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        txt_lbl.setStyleSheet("font-size: 12px; color: #F6F3EA;")
-
-        card_lay.addWidget(hdr_lbl)
-        card_lay.addWidget(txt_lbl)
-
-        if is_seller:
-            card.setStyleSheet("""
-                QFrame {
-                    background: #1E3A2B;
-                    border: 1px solid #2D6A4F;
-                    border-radius: 8px;
-                    max-width: 440px;
-                }
-            """)
-            bubble_row.addStretch(1)
-            bubble_row.addWidget(card)
+                v_zh = ATTR_VAL_DICT.get(v_low, None)
+                if not v_zh:
+                    v_norm = v_low.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+                    v_zh = ATTR_VAL_DICT.get(v_norm, None)
+                if not v_zh:
+                    try:
+                        res = translate_text(v_clean, target_lang="zh", timeout=2.0)
+                        v_zh = res if res else v_clean
+                    except Exception:
+                        v_zh = v_clean
+            translated_pairs.append(f"{k_zh}: {v_zh}")
         else:
-            card.setStyleSheet("""
-                QFrame {
-                    background: #232B25;
-                    border: 1px solid #3E4B40;
-                    border-radius: 8px;
-                    max-width: 440px;
-                }
-            """)
-            bubble_row.addWidget(card)
-            bubble_row.addStretch(1)
+            p_low = pair.lower()
+            if p_low in COMMON_DIRECT_KEEP or re.match(r"^[\d\.\-\+xX/]+(\s*(cm|mm|m|g|kg|ml|l|v|w|hz|oz|in))?$", pair, re.I):
+                val_zh = pair
+            else:
+                val_zh = ATTR_VAL_DICT.get(p_low)
+                if not val_zh:
+                    try:
+                        res = translate_text(pair, target_lang="zh", timeout=2.0)
+                        val_zh = res if res else pair
+                    except Exception:
+                        val_zh = pair
+            translated_pairs.append(val_zh)
 
-        self.msg_layout.insertLayout(self.msg_layout.count() - 1, bubble_row)
-        QTimer.singleShot(50, lambda: self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum()))
-
-    def _on_translate_clicked(self) -> None:
-        text = self.input_edit.toPlainText().strip()
-        if not text:
-            return
-        self.translate_btn.setEnabled(False)
-        self.translate_btn.setText("正在翻译...")
-
-        def _do_trans():
-            try:
-                res = translate_text(text, target_lang=self.target_lang)
-                QTimer.singleShot(0, lambda: self._on_translated(res))
-            except Exception as e:
-                QTimer.singleShot(0, lambda: self._on_translated_error(str(e)))
-
-        threading.Thread(target=_do_trans, daemon=True).start()
-
-    def _on_translated(self, res: str) -> None:
-        self.translate_btn.setEnabled(True)
-        self.translate_btn.setText(f"🌐 一键翻译为{self.target_lang_name.split()[0]}")
-        if res:
-            self.input_edit.setPlainText(res)
-
-    def _on_translated_error(self, err: str) -> None:
-        self.translate_btn.setEnabled(True)
-        self.translate_btn.setText(f"🌐 一键翻译为{self.target_lang_name.split()[0]}")
-        QMessageBox.warning(self, "翻译失败", f"翻译服务暂不可用: {err}")
-
-    def _on_send_clicked(self) -> None:
-        text = self.input_edit.toPlainText().strip()
-        if not text:
-            QMessageBox.information(self, "提示", "请输入要发送的消息内容")
-            return
-        self.send_btn.setEnabled(False)
-        self.send_btn.setText("正在发送...")
-
-        def _do_send():
-            try:
-                pid = self.order.pack_id or self.order.order_id
-                self.client.send_pack_message(self.order.account_id, pid, text)
-                QTimer.singleShot(0, lambda: self._on_send_success(text))
-            except Exception as e:
-                QTimer.singleShot(0, lambda: self._on_send_failed(str(e)))
-
-        threading.Thread(target=_do_send, daemon=True).start()
-
-    def _on_send_success(self, sent_text: str) -> None:
-        self.send_btn.setEnabled(True)
-        self.send_btn.setText("🚀 发送消息")
-        self.input_edit.clear()
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        self._append_message_bubble(is_seller=True, content=sent_text, date_fmt=now_str)
-        QMessageBox.information(self, "发送成功", "私信已成功发送给买家！")
-
-    def _on_send_failed(self, err: str) -> None:
-        self.send_btn.setEnabled(True)
-        self.send_btn.setText("🚀 发送消息")
-        QMessageBox.critical(self, "发送失败", f"向买家发送消息失败: {err}")
+    result = "; ".join(translated_pairs)
+    _ATTR_CACHE[clean] = result
+    return result
 
 
 class OrdersPage(QWidget):
@@ -866,6 +729,7 @@ class OrdersPage(QWidget):
     """
 
     oauthExpired = Signal(str, str)
+    contactBuyerRequested = Signal(object)
 
     def __init__(self, client: MercadoClient, auth_mgr: AuthManager, parent: QWidget | None = None):
         super().__init__(parent)
@@ -1474,7 +1338,8 @@ class OrdersPage(QWidget):
             QPushButton:disabled { background: #1C221D; color: #78716C; border-color: #333D35; }
         """)
         self.btn_contact_buyer.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_contact_buyer.clicked.connect(self._open_contact_buyer_dialog)
+        self.btn_contact_buyer.setToolTip("跳转至客服售后中心并与该买家发起/查看私信")
+        self.btn_contact_buyer.clicked.connect(self._on_contact_buyer_clicked)
         addr_hdr.addWidget(self.btn_contact_buyer)
         addr_layout.addLayout(addr_hdr)
 
@@ -1856,7 +1721,8 @@ class OrdersPage(QWidget):
         row3.addWidget(qty_lbl)
 
         if var_attrs:
-            var_chip = ElidedLabel(f"🎨 {var_attrs}")
+            zh_var_attrs = translate_variation_attributes(var_attrs)
+            var_chip = ElidedLabel(f"🎨 {zh_var_attrs}")
             var_chip.setStyleSheet("""
                 QLabel {
                     color: #60A5FA;
@@ -1874,11 +1740,15 @@ class OrdersPage(QWidget):
             """)
             var_chip.setMinimumWidth(0)
             var_chip.setCursor(Qt.CursorShape.PointingHandCursor)
-            var_chip.setToolTip(f"规格属性: {var_attrs} (点击复制)")
-            var_chip.mousePressEvent = lambda e, v=var_attrs: copy_pure_text(v) if e.button() == Qt.MouseButton.LeftButton else None
+            tooltip_text = f"规格属性: {zh_var_attrs}"
+            if zh_var_attrs != var_attrs:
+                tooltip_text += f"\n原规格: {var_attrs}"
+            tooltip_text += " (点击复制中文规格，右键复制)"
+            var_chip.setToolTip(tooltip_text)
+            var_chip.mousePressEvent = lambda e, v=zh_var_attrs: copy_pure_text(v) if e.button() == Qt.MouseButton.LeftButton else None
             var_chip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             var_chip.customContextMenuRequested.connect(
-                lambda pos, v=var_attrs, w=var_chip: show_pure_copy_menu(w, pos, lambda: v)
+                lambda pos, v=zh_var_attrs, w=var_chip: show_pure_copy_menu(w, pos, lambda: v)
             )
             row3.addWidget(var_chip)
         else:
@@ -1974,12 +1844,11 @@ class OrdersPage(QWidget):
             return
         self._do_print_shipment_labels([self._current_order])
 
-    def _open_contact_buyer_dialog(self) -> None:
+    def _on_contact_buyer_clicked(self) -> None:
         if not self._current_order:
             QMessageBox.warning(self, "提示", "请先选择需要联系买家的订单。")
             return
-        dlg = OrderContactBuyerDialog(self._current_order, self.client, self.auth_mgr, parent=self)
-        dlg.exec()
+        self.contactBuyerRequested.emit(self._current_order)
 
     def _print_selected_labels(self) -> None:
         if not self._selected_order_ids:
@@ -2182,7 +2051,8 @@ class OrdersPage(QWidget):
                 meta_h.addWidget(s_lbl)
 
             if it.variation_attributes:
-                v_lbl = QLabel(f"🎨 {it.variation_attributes}")
+                zh_va = translate_variation_attributes(it.variation_attributes)
+                v_lbl = QLabel(f"🎨 {zh_va}")
                 v_lbl.setStyleSheet("""
                     QLabel {
                         color: #60A5FA;
@@ -2199,10 +2069,14 @@ class OrdersPage(QWidget):
                     }
                 """)
                 v_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-                v_lbl.setToolTip(f"规格属性: {it.variation_attributes} (点击复制)")
-                v_lbl.mousePressEvent = lambda e, va=it.variation_attributes: copy_pure_text(va) if e.button() == Qt.MouseButton.LeftButton else None
+                det_tip = f"规格属性: {zh_va}"
+                if zh_va != it.variation_attributes:
+                    det_tip += f"\n原规格: {it.variation_attributes}"
+                det_tip += " (点击复制中文规格，右键复制)"
+                v_lbl.setToolTip(det_tip)
+                v_lbl.mousePressEvent = lambda e, va=zh_va: copy_pure_text(va) if e.button() == Qt.MouseButton.LeftButton else None
                 v_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-                v_lbl.customContextMenuRequested.connect(lambda pos, va=it.variation_attributes, w=v_lbl: show_pure_copy_menu(w, pos, lambda: va))
+                v_lbl.customContextMenuRequested.connect(lambda pos, va=zh_va, w=v_lbl: show_pure_copy_menu(w, pos, lambda: va))
                 meta_h.addWidget(v_lbl)
             else:
                 v_lbl = QLabel("标准单品")
@@ -2464,7 +2338,7 @@ class OrdersPage(QWidget):
                         primary_item.item_id,
                         primary_item.title,
                         primary_item.sku,
-                        primary_item.variation_attributes,
+                        translate_variation_attributes(primary_item.variation_attributes),
                         o.total_quantity,
                         primary_item.unit_price,
                         o.total_amount,

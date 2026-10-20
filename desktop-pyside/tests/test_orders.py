@@ -46,7 +46,7 @@ from orders.models import (
     OrderItemModel,
     ShippingInfoModel,
 )
-from orders.orders_page import OrdersPage, OrdersFetchWorker, copy_pure_text, OrderContactBuyerDialog
+from orders.orders_page import OrdersPage, OrdersFetchWorker, copy_pure_text, translate_variation_attributes
 
 
 class TestOrderModels(unittest.TestCase):
@@ -1049,10 +1049,18 @@ class TestOrdersPageUI(unittest.TestCase):
         labels = [lbl.text() for lbl in self.page.items_container.findChildren(QLabel)]
         self.assertIn("标准单品", labels)
 
-    def test_contact_buyer_dialog_and_messaging_execution(self) -> None:
-        """Verify OrderContactBuyerDialog language resolution, history rendering, and messaging."""
-        # 1. Mexico order -> Spanish
-        ord_mx = OrderModel(
+    def test_translate_variation_attributes(self) -> None:
+        """Verify variation attributes are translated to Chinese seamlessly."""
+        self.assertEqual(translate_variation_attributes("Color: Naranja"), "颜色: 橙色")
+        self.assertEqual(translate_variation_attributes("Cor: Laranja; Tamanho: G"), "颜色: 橙色; 尺码: G")
+        self.assertEqual(translate_variation_attributes("Color: Negro; Talla: M"), "颜色: 黑色; 尺码: M")
+        self.assertEqual(translate_variation_attributes("Talla: Grande"), "尺码: 大号")
+        self.assertEqual(translate_variation_attributes("Talla: 38"), "尺码: 38")
+        self.assertEqual(translate_variation_attributes(""), "")
+
+    def test_contact_buyer_requested_signal(self) -> None:
+        """Verify clicking '💬 联系买家' emits contactBuyerRequested signal with current order."""
+        ord_test = OrderModel(
             order_id="2000019082949204",
             pack_id="pack_123",
             account_id="2651442567",
@@ -1060,47 +1068,44 @@ class TestOrdersPageUI(unittest.TestCase):
             site_id="MLM",
             buyer_nickname="BUYER_MX",
         )
-        dlg_mx = OrderContactBuyerDialog(ord_mx, self.mock_client, self.mock_auth, parent=self.page)
-        self.assertEqual(dlg_mx.target_lang, "es")
-        self.assertIn("西班牙语", dlg_mx.target_lang_name)
-        dlg_mx.deleteLater()
+        self.page._current_order = ord_test
 
-        # 2. Brazil order -> Portuguese
-        ord_br = OrderModel(
-            order_id="2000019082949205",
-            pack_id="pack_456",
+        received_orders = []
+        self.page.contactBuyerRequested.connect(lambda o: received_orders.append(o))
+
+        self.page._on_contact_buyer_clicked()
+        self.assertEqual(len(received_orders), 1)
+        self.assertEqual(received_orders[0].order_id, "2000019082949204")
+
+    def test_service_center_open_order_conversation(self) -> None:
+        """Verify ServiceCenterPage.open_order_conversation switches to 'message' tab and creates/focuses session."""
+        from service_center.service_center_page import ServiceCenterPage
+        sc_page = ServiceCenterPage(self.mock_client, self.mock_auth)
+
+        ord_target = OrderModel(
+            order_id="20000999888",
+            pack_id="pack_999",
             account_id="2651442567",
-            store_name="巴西店",
-            site_id="MLB",
-            buyer_nickname="BUYER_BR",
+            store_name="湖北测试店",
+            site_id="MLM",
+            buyer_nickname="TEST_BUYER_LINK",
+            items=[OrderItemModel(item_id="MLM999", title="测试产品", sku="SKU-999")],
         )
-        dlg_br = OrderContactBuyerDialog(ord_br, self.mock_client, self.mock_auth, parent=self.page)
-        self.assertEqual(dlg_br.target_lang, "pt")
-        self.assertIn("葡萄牙语", dlg_br.target_lang_name)
 
-        # 3. Test _on_history_loaded renders bubbles
-        mock_msgs = [
-            {
-                "id": "m1",
-                "from": {"user_id": "999", "role": "buyer"},
-                "text": {"plain": "Olá, tudo bem?"},
-                "message_date": {"created": "2026-10-21T01:00:00Z"},
-            },
-            {
-                "id": "m2",
-                "from": {"user_id": "2651442567", "role": "seller"},
-                "text": {"plain": "Olá! Seu pedido já está sendo preparado."},
-                "message_date": {"created": "2026-10-21T01:10:00Z"},
-            },
-        ]
-        dlg_br._on_history_loaded(mock_msgs, None)
-        self.assertIn("共 2 条消息", dlg_br.status_msg_lbl.text())
+        sc_page.open_order_conversation(ord_target)
 
-        # 4. Test sending message calls client.send_pack_message
-        dlg_br.input_edit.setPlainText("Muito obrigado!")
-        dlg_br._on_send_clicked()
-        self.mock_client.send_pack_message.assert_called_with("2651442567", "pack_456", "Muito obrigado!")
-        dlg_br.deleteLater()
+        # Tab should be 'message'
+        self.assertEqual(sc_page._active_tab, "message")
+        self.assertTrue(sc_page.tab_btn_messages.isChecked())
+
+        # Current session should match this order
+        self.assertIsNotNone(sc_page._current_session)
+        self.assertEqual(sc_page._current_session.order_id, "20000999888")
+        self.assertEqual(sc_page._current_session.session_type, "message")
+        self.assertEqual(sc_page._current_session.buyer_nickname, "TEST_BUYER_LINK")
+
+        sc_page.stop()
+        sc_page.deleteLater()
 
     def test_contact_buyer_button_in_page_drawer(self) -> None:
         """Verify that '💬 联系买家' button exists and is active on selected orders."""

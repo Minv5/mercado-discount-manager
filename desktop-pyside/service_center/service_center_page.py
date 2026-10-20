@@ -2783,6 +2783,117 @@ class ServiceCenterPage(QFrame):
         """Refresh store filter dropdown when account authorizations update."""
         populate_store_combo(self.store_combo, auth_mgr=self.auth, all_label="全部店铺", all_value="all")
 
+    def open_order_conversation(self, order: Any) -> None:
+        """Navigate to After-sales Messages tab and open or create the conversation for the given order."""
+        if not order:
+            return
+
+        order_id = str(getattr(order, "order_id", "") or "").strip()
+        pack_id = str(getattr(order, "pack_id", "") or "").strip() or order_id
+        account_id = str(getattr(order, "account_id", "") or "").strip()
+        site_id = str(getattr(order, "site_id", "") or "").strip()
+        store_name = str(getattr(order, "store_name", "") or "").strip()
+        buyer_nickname = str(getattr(order, "buyer_nickname", "") or "买家").strip()
+        buyer_id = str(getattr(order, "buyer_id", "") or "").strip()
+
+        # 1. Switch to 'message' tab (售后私信)
+        self._switch_tab("message")
+
+        # 2. Reset filters so this session won't be hidden
+        if self._active_store_filter != "all" and self._active_store_filter != account_id:
+            idx = self.store_combo.findData("all")
+            if idx >= 0:
+                self.store_combo.setCurrentIndex(idx)
+                self._active_store_filter = "all"
+
+        if self._active_site_filter != "all" and self._active_site_filter != site_id:
+            idx = self.site_combo.findData("all")
+            if idx >= 0:
+                self.site_combo.setCurrentIndex(idx)
+                self._active_site_filter = "all"
+
+        if self._active_status_filter != "all":
+            idx = self.status_combo.findData("all")
+            if idx >= 0:
+                self.status_combo.setCurrentIndex(idx)
+                self._active_status_filter = "all"
+
+        if hasattr(self, "search_edit") and self.search_edit.text():
+            self.search_edit.clear()
+
+        # 3. Locate existing session
+        target_session: ServiceSession | None = None
+        for s in self._all_sessions:
+            if s.session_type == "message":
+                if (order_id and s.order_id == order_id) or (pack_id and (s.pack_id == pack_id or s.id == f"m_{pack_id}")):
+                    target_session = s
+                    break
+
+        # 4. If not found, create a synthesized message session for this order
+        if not target_session:
+            primary_item = getattr(order, "primary_item", None)
+            item_id = primary_item.item_id if primary_item else ""
+            item_title = primary_item.title if primary_item else ""
+            item_thumb = primary_item.thumbnail if primary_item else ""
+            sku = primary_item.sku if primary_item else ""
+            variation_id = primary_item.variation_id if primary_item else ""
+            tot_amt = getattr(order, "total_amount", 0.0)
+            curr = getattr(order, "currency_id", "USD")
+
+            sess_id = f"m_{pack_id}"
+            created_at = getattr(order, "date_created", "") or datetime.now(timezone.utc).isoformat()
+            updated_at = getattr(order, "date_closed", "") or created_at
+
+            target_session = ServiceSession(
+                id=sess_id,
+                session_type="message",
+                account_id=account_id,
+                account_name=store_name or account_id,
+                site_id=site_id,
+                buyer_id=buyer_id,
+                buyer_nickname=buyer_nickname,
+                item_id=item_id,
+                item_title=item_title,
+                item_thumbnail=item_thumb,
+                item_price=f"{curr} {tot_amt:.2f}" if tot_amt > 0 else "",
+                item_permalink="",
+                sku=sku,
+                variation_id=variation_id,
+                order_id=order_id,
+                pack_id=pack_id,
+                status="unread",
+                stage="",
+                created_at=created_at,
+                updated_at=updated_at,
+                summary=f"订单 {order_id} 售后私信",
+                summary_translated=f"订单 {order_id} 售后私信",
+                deadline=None,
+                can_reply=True,
+                is_unread=False,
+                messages=[],
+            )
+            self._all_sessions.insert(0, target_session)
+            self._update_tab_counts()
+            save_sessions_snapshot(self._all_sessions)
+
+        # 5. Refresh view and select item
+        self._apply_filter(preserve_selection=False)
+
+        found_row = -1
+        for row in range(self.session_list.count()):
+            item = self.session_list.item(row)
+            if item and item.data(Qt.ItemDataRole.UserRole) == target_session.id:
+                found_row = row
+                break
+
+        if found_row >= 0:
+            self.session_list.setCurrentRow(found_row)
+        self._display_session_detail(target_session)
+
+        # Focus reply input
+        if hasattr(self, "reply_input"):
+            QTimer.singleShot(150, lambda: self.reply_input.setFocus())
+
     def stop(self) -> None:
         """Gracefully stop all background worker threads before destruction."""
         if hasattr(self, "_poll_timer") and self._poll_timer.isActive():

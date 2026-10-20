@@ -606,6 +606,7 @@ class MainWindow(QMainWindow):
         # 4: 订单管理页面
         self.orders_page = OrdersPage(cs_client, cs_auth, parent=self)
         self.orders_page.oauthExpired.connect(self.handle_oauth_expired)
+        self.orders_page.contactBuyerRequested.connect(self._on_contact_buyer_requested)
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self.enrollment_page)
@@ -3200,6 +3201,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, "orders_page"):
             self.orders_page.select_order(order_id)
 
+    def _on_contact_buyer_requested(self, order: Any) -> None:
+        """Switch to Service Center page and open after-sales chat for this order."""
+        self._show_page(3)
+        if hasattr(self, "service_center_page"):
+            self.service_center_page.open_order_conversation(order)
+
     def _on_service_center_unread_count_changed(self, count: int) -> None:
         if hasattr(self, "service_center_btn"):
             self.service_center_btn.setText("客服售后")
@@ -5111,7 +5118,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.10"
+    return "2.2.11"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.
