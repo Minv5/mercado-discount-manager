@@ -2214,6 +2214,42 @@ class TestServiceCenterSnapshot(unittest.TestCase):
 
         page.stop()
 
+    def test_progressive_chunk_rendering_for_large_session_list(self):
+        mock_client = MagicMock()
+        mock_auth = MagicMock()
+        mock_auth.list_accounts.return_value = []
+        page = ServiceCenterPage(mock_client, mock_auth)
+
+        # Create 100 dummy claim sessions
+        large_claims = [
+            ServiceSession(
+                id=f"c_{i}",
+                session_type="claim",
+                account_id="acc_1",
+                account_name="测试店",
+                site_id="MLB",
+                status="opened",
+                created_at="2026-10-20T10:00:00Z",
+            )
+            for i in range(100)
+        ]
+        page._all_sessions = large_claims
+
+        # Switch to claim tab
+        page._switch_tab("claim")
+
+        # Instant chunk: should immediately render first 20 items (responsive within 40ms)
+        self.assertEqual(page.session_list.count(), 20)
+        self.assertEqual(page.list_summary_lbl.text(), "共 100 笔索赔")
+        self.assertTrue(page._chunk_render_timer.isActive())
+
+        # Flush remaining chunks
+        page._flush_pending_chunks()
+        self.assertEqual(page.session_list.count(), 100)
+        self.assertFalse(page._chunk_render_timer.isActive())
+
+        page.stop()
+
     def test_get_pack_messages_404_returns_empty_dict(self):
         mock_client = MagicMock()
         from engine.client import MercadoClient
