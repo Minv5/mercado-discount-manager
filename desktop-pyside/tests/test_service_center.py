@@ -228,10 +228,17 @@ class TestServiceCenterPage(unittest.TestCase):
         self.assertFalse(self.page.reply_dock.isEnabled())
 
     def test_switch_tab(self):
+        self.assertTrue(self.page.session_list.uniformItemSizes())
         self.page._switch_tab("claim")
         self.assertEqual(self.page._active_tab, "claim")
         self.assertTrue(self.page.tab_btn_claims.isChecked())
         self.assertFalse(self.page.tab_btn_questions.isChecked())
+
+        # Redundant switch to same tab should return early without re-clearing if items exist
+        with patch.object(self.page, "_apply_filter") as mock_filter:
+            self.page._switch_tab("claim")
+            if self.page.session_list.count() > 0:
+                mock_filter.assert_not_called()
 
         self.page._switch_tab("message")
         self.assertEqual(self.page._active_tab, "message")

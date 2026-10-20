@@ -121,16 +121,17 @@ def load_image_async(
         callback(get_placeholder_pixmap(target_size, "📦", radius=radius))
         return
 
-    # 1. Local file path check
-    local_p = Path(clean_url)
+    # 1. Local file path check (skip filesystem stat for remote URLs)
     is_local_file = False
-    try:
-        if local_p.is_file():
-            is_local_file = True
-    except Exception:
-        is_local_file = False
+    if not clean_url.startswith(("http://", "https://", "data:")):
+        local_p = Path(clean_url)
+        try:
+            if local_p.is_file():
+                is_local_file = True
+        except Exception:
+            is_local_file = False
 
-    if not is_local_file and not clean_url.startswith("http"):
+    if not is_local_file and not clean_url.startswith(("http://", "https://")):
         callback(get_placeholder_pixmap(target_size, "📦", radius=radius))
         return
 

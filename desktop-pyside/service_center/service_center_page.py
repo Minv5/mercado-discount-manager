@@ -109,6 +109,18 @@ CLAIM_STAGE_NAMES: dict[str, str] = {
     "none": "已结案",
 }
 
+# Pre-compiled style constants for session list cards to eliminate stylesheet parsing overhead
+CARD_STYLE_GOLD = "background: rgba(245, 158, 11, 0.16); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px;"
+CARD_STYLE_GREEN = "background: rgba(16, 185, 129, 0.14); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.30); font-size: 11px; font-weight: 500; border-radius: 4px;"
+CARD_STYLE_GRAY = "background: rgba(100, 116, 139, 0.16); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.28); font-size: 11px; font-weight: 500; border-radius: 4px;"
+CARD_STYLE_RED = "background: rgba(239, 68, 68, 0.16); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px;"
+CARD_PILL_STYLE = "background: rgba(78, 71, 47, 0.5); color: #E6E2D8; font-size: 11px; font-weight: 500; padding: 2px 6px; border-radius: 3px;"
+CARD_TIME_STYLE = "color: #8C867A; font-size: 11px;"
+CARD_BUYER_STYLE = "color: #FFFFFF; font-size: 13px; font-weight: bold;"
+CARD_THUMB_STYLE = "background: rgba(20, 24, 22, 0.7); border: 1px solid rgba(78, 71, 47, 0.5); border-radius: 6px;"
+CARD_SNIP_CLAIM_STYLE = "color: #E2E8F0; font-size: 11px;"
+CARD_SNIP_NORMAL_STYLE = "color: #C8C3B7; font-size: 12px;"
+
 
 def format_message_date(date_val: Any) -> str:
     """Format diverse Mercado message dates into clean Beijing time 'YYYY-MM-DD HH:MM:SS' string."""
@@ -2066,6 +2078,7 @@ class ServiceCenterPage(QFrame):
         """)
         self.session_list.currentItemChanged.connect(self._on_session_selected)
         self.session_list.itemClicked.connect(self._on_session_clicked)
+        self.session_list.setUniformItemSizes(True)
         self.session_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.session_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         layout.addWidget(self.session_list, 1)
@@ -2807,6 +2820,8 @@ class ServiceCenterPage(QFrame):
             self.list_summary_lbl.setText(unit)
 
     def _switch_tab(self, tab_id: str) -> None:
+        if getattr(self, "_active_tab", None) == tab_id and self.session_list.count() > 0:
+            return
         self._active_tab = tab_id
         self.tab_btn_questions.setChecked(tab_id == "question")
         self.tab_btn_claims.setChecked(tab_id == "claim")
@@ -2980,7 +2995,6 @@ class ServiceCenterPage(QFrame):
     def _apply_filter(self, preserve_selection: bool = False) -> None:
         selected_session_id = self._current_session.id if (preserve_selection and self._current_session) else None
         query = self.search_edit.text().strip().lower()
-        self.session_list.clear()
 
         filtered = [
             s for s in self._all_sessions
@@ -3024,26 +3038,35 @@ class ServiceCenterPage(QFrame):
 
         filtered.sort(key=_sort_key, reverse=True)
 
-        # Populate list widget
+        # Batch update session_list with update & signal freezing to eliminate layout churn & freezing
+        self.session_list.blockSignals(True)
+        self.session_list.setUpdatesEnabled(False)
         target_row = -1
-        for row_idx, s in enumerate(filtered):
-            item = QListWidgetItem()
-            item.setData(Qt.ItemDataRole.UserRole, s.id)
+        try:
+            self.session_list.clear()
+            for row_idx, s in enumerate(filtered):
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, s.id)
 
-            card_widget = self._create_session_item_widget(s)
-            item.setSizeHint(QSize(0, 88))
+                card_widget = self._create_session_item_widget(s)
+                item.setSizeHint(QSize(0, 88))
 
-            self.session_list.addItem(item)
-            self.session_list.setItemWidget(item, card_widget)
-            if selected_session_id and s.id == selected_session_id:
-                target_row = row_idx
+                self.session_list.addItem(item)
+                self.session_list.setItemWidget(item, card_widget)
+                if selected_session_id and s.id == selected_session_id:
+                    target_row = row_idx
 
-        if self.session_list.count() > 0:
-            select_idx = target_row if target_row >= 0 else 0
-            self.session_list.blockSignals(True)
-            self.session_list.setCurrentRow(select_idx)
+            if self.session_list.count() > 0:
+                select_idx = target_row if target_row >= 0 else 0
+                self.session_list.setCurrentRow(select_idx)
+                target_sess = filtered[select_idx]
+            else:
+                target_sess = None
+        finally:
+            self.session_list.setUpdatesEnabled(True)
             self.session_list.blockSignals(False)
-            target_sess = filtered[select_idx]
+
+        if target_sess:
             if not selected_session_id or target_sess.id != self._displayed_session_id:
                 self._display_session_detail(target_sess)
         else:
@@ -3064,7 +3087,7 @@ class ServiceCenterPage(QFrame):
         thumb_lbl = QLabel()
         thumb_lbl.setFixedSize(48, 48)
         thumb_lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        thumb_lbl.setStyleSheet("background: rgba(20, 24, 22, 0.7); border: 1px solid rgba(78, 71, 47, 0.5); border-radius: 6px;")
+        thumb_lbl.setStyleSheet(CARD_THUMB_STYLE)
         thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         thumb_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         load_image_async(
@@ -3086,7 +3109,7 @@ class ServiceCenterPage(QFrame):
         site_flag = SITE_FLAGS.get(session.site_id, "🌐")
         pill_text = f"{site_flag} {session.account_name} · {session.site_id}"
         pill_lbl = QLabel(pill_text)
-        pill_lbl.setStyleSheet("background: rgba(78, 71, 47, 0.5); color: #E6E2D8; font-size: 11px; font-weight: 500; padding: 2px 6px; border-radius: 3px;")
+        pill_lbl.setStyleSheet(CARD_PILL_STYLE)
         top_row.addWidget(pill_lbl)
 
         top_row.addStretch()
@@ -3094,7 +3117,7 @@ class ServiceCenterPage(QFrame):
         if session.created_at:
             time_str = format_message_date(session.created_at)[:16]
             time_lbl = QLabel(time_str)
-            time_lbl.setStyleSheet("color: #8C867A; font-size: 11px;")
+            time_lbl.setStyleSheet(CARD_TIME_STYLE)
             top_row.addWidget(time_lbl)
 
         right_col.addLayout(top_row)
@@ -3104,50 +3127,47 @@ class ServiceCenterPage(QFrame):
         mid_row.setSpacing(6)
         buyer_lbl = QLabel(f"<b>{session.buyer_nickname}</b>")
         buyer_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        buyer_lbl.setStyleSheet("color: #FFFFFF; font-size: 13px; font-weight: bold;")
+        buyer_lbl.setStyleSheet(CARD_BUYER_STYLE)
         mid_row.addWidget(buyer_lbl)
         mid_row.addStretch()
 
         badge = None
         rep_badge = None
-        style_gold = "background: rgba(245, 158, 11, 0.16); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px;"
-        style_green = "background: rgba(16, 185, 129, 0.14); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.30); font-size: 11px; font-weight: 500; border-radius: 4px;"
-        style_gray = "background: rgba(100, 116, 139, 0.16); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.28); font-size: 11px; font-weight: 500; border-radius: 4px;"
 
         if session.session_type == "claim":
             if session.affects_reputation == "affected":
                 rep_badge = QLabel("影响信誉: 是")
-                rep_badge.setStyleSheet("background: rgba(239, 68, 68, 0.16); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px;")
+                rep_badge.setStyleSheet(CARD_STYLE_RED)
             elif session.affects_reputation == "not_affected":
                 rep_badge = QLabel("影响信誉: 否")
-                rep_badge.setStyleSheet("background: rgba(16, 185, 129, 0.14); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.30); font-size: 11px; font-weight: 500; border-radius: 4px;")
+                rep_badge.setStyleSheet(CARD_STYLE_GREEN)
 
             if session.status == "closed":
                 badge = QLabel("● 已结案")
-                badge.setStyleSheet(style_gray)
+                badge.setStyleSheet(CARD_STYLE_GRAY)
             else:
                 badge = QLabel("● 索赔中")
-                badge.setStyleSheet(style_gold)
+                badge.setStyleSheet(CARD_STYLE_GOLD)
         elif session.session_type == "question":
             if session.status == "answered":
                 badge = QLabel("● 已回复")
-                badge.setStyleSheet(style_gray)
+                badge.setStyleSheet(CARD_STYLE_GRAY)
             else:
                 badge = QLabel("● 待回复")
-                badge.setStyleSheet(style_gold)
+                badge.setStyleSheet(CARD_STYLE_GOLD)
         elif session.session_type == "message":
             if session.status == "blocked" or not session.can_reply:
                 badge = QLabel("● 不可回复")
-                badge.setStyleSheet(style_gray)
+                badge.setStyleSheet(CARD_STYLE_GRAY)
             elif session.status in ("new_message", "unanswered") or (session.is_unread and session.status != "unread"):
                 badge = QLabel("● 待回复")
-                badge.setStyleSheet(style_gold)
+                badge.setStyleSheet(CARD_STYLE_GOLD)
             elif session.status == "unread":
                 badge = QLabel("● 未读")
-                badge.setStyleSheet(style_gold)
+                badge.setStyleSheet(CARD_STYLE_GOLD)
             else:
                 badge = QLabel("● 已读")
-                badge.setStyleSheet(style_green)
+                badge.setStyleSheet(CARD_STYLE_GREEN)
 
         if rep_badge:
             rep_badge.setFixedSize(76, 22)
@@ -3165,12 +3185,12 @@ class ServiceCenterPage(QFrame):
             stage_cn = CLAIM_STAGE_NAMES.get(session.stage, session.stage)
             oid_str = session.order_id or "无关联订单"
             snip_lbl = QLabel(f"订单: <b>{oid_str}</b> · {stage_cn}")
-            snip_lbl.setStyleSheet("color: #E2E8F0; font-size: 11px;")
+            snip_lbl.setStyleSheet(CARD_SNIP_CLAIM_STYLE)
         else:
             display_text = session.item_title if (session.item_title and not session.item_title.startswith("商品 ")) else session.summary
             snip = display_text[:60] + ("..." if len(display_text) > 60 else "")
             snip_lbl = QLabel(snip)
-            snip_lbl.setStyleSheet("color: #C8C3B7; font-size: 12px;")
+            snip_lbl.setStyleSheet(CARD_SNIP_NORMAL_STYLE)
         right_col.addWidget(snip_lbl)
 
         layout.addLayout(right_col, 1)
@@ -3183,6 +3203,8 @@ class ServiceCenterPage(QFrame):
                     self.session_list.setCurrentRow(r)
                     break
         widget.mousePressEvent = _on_card_mouse_press
+
+        return widget
 
         return widget
 
@@ -3557,10 +3579,14 @@ class ServiceCenterPage(QFrame):
         self._clear_chat_bubbles()
 
         if session.messages:
-            for msg in session.messages:
-                bubble = self._create_chat_bubble(msg)
-                self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble, 0, Qt.AlignmentFlag.AlignTop)
-            self._displayed_messages_count = len(session.messages)
+            self.chat_scroll.setUpdatesEnabled(False)
+            try:
+                for msg in session.messages:
+                    bubble = self._create_chat_bubble(msg)
+                    self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble, 0, Qt.AlignmentFlag.AlignTop)
+                self._displayed_messages_count = len(session.messages)
+            finally:
+                self.chat_scroll.setUpdatesEnabled(True)
             QTimer.singleShot(50, self._scroll_chat_to_bottom)
 
             # Silently fetch latest messages in background to ensure mediator proposals & new replies are seamlessly updated
