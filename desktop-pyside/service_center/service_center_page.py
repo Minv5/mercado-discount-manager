@@ -445,15 +445,28 @@ class FetchConversationMessagesWorker(SafeWorkerBase):
                     raw_trans = str(rm.get("translated_message") or "")
                     text_trans = clean_message_text(raw_trans) if raw_trans else ""
 
-                    if is_mediator and not any('\u4e00' <= c <= '\u9fff' for c in text_trans):
-                        try:
-                            candidate_text = text_trans or text
-                            if candidate_text:
-                                zh = translate_text(candidate_text, target_lang="zh", timeout=3.5)
-                                if zh:
-                                    text_trans = f"{zh} [原文: {candidate_text}]"
-                        except Exception:
-                            pass
+                    # Auto-translate to Chinese if not in Chinese or if text_trans is identical to raw text
+                    needs_zh_trans = (
+                        not text_trans
+                        or text_trans.strip().lower() == text.strip().lower()
+                        or not any('\u4e00' <= c <= '\u9fff' for c in text_trans)
+                    )
+                    if needs_zh_trans and text:
+                        if not any('\u4e00' <= c <= '\u9fff' for c in text):
+                            try:
+                                candidate = text_trans if (text_trans and text_trans.strip().lower() != text.strip().lower()) else text
+                                zh = translate_text(candidate, target_lang="zh", timeout=3.0)
+                                if zh and zh.strip().lower() != text.strip().lower():
+                                    text_trans = zh
+                                elif text_trans.strip().lower() == text.strip().lower():
+                                    text_trans = ""
+                            except Exception:
+                                if text_trans.strip().lower() == text.strip().lower():
+                                    text_trans = ""
+                        else:
+                            text_trans = ""
+                    elif text_trans.strip().lower() == text.strip().lower():
+                        text_trans = ""
 
                     att_urls: list[str] = []
                     attachments = rm.get("attachments") or []
@@ -650,12 +663,39 @@ class FetchConversationMessagesWorker(SafeWorkerBase):
                             is_read = True
                             read_date = format_message_date(read_val)
 
+                    # Extract / auto-translate text for message
+                    raw_trans = str(rm.get("translated_message") or "")
+                    text_trans = clean_message_text(raw_trans) if raw_trans else ""
+
+                    needs_zh_trans = (
+                        not text_trans
+                        or text_trans.strip().lower() == text.strip().lower()
+                        or not any('\u4e00' <= c <= '\u9fff' for c in text_trans)
+                    )
+                    if needs_zh_trans and text:
+                        if not any('\u4e00' <= c <= '\u9fff' for c in text):
+                            try:
+                                candidate = text_trans if (text_trans and text_trans.strip().lower() != text.strip().lower()) else text
+                                zh = translate_text(candidate, target_lang="zh", timeout=3.0)
+                                if zh and zh.strip().lower() != text.strip().lower():
+                                    text_trans = zh
+                                elif text_trans.strip().lower() == text.strip().lower():
+                                    text_trans = ""
+                            except Exception:
+                                if text_trans.strip().lower() == text.strip().lower():
+                                    text_trans = ""
+                        else:
+                            text_trans = ""
+                    elif text_trans.strip().lower() == text.strip().lower():
+                        text_trans = ""
+
                     messages.append(
                         ServiceMessage(
                             id=m_id,
                             sender_role="seller" if is_seller else "buyer",
                             sender_name=s_name,
                             text=text,
+                            text_translated=text_trans,
                             created_at=created_at,
                             attachments=att_urls,
                             is_seller=is_seller,
@@ -3542,9 +3582,9 @@ class ServiceCenterPage(QFrame):
             else:
                 loading_msg = ServiceMessage(
                     id=f"loading_{session.id}",
-                    sender_role="mediator",
+                    sender_role="system",
                     sender_name="系统提示",
-                    text="⏳ 正在加载历史对话记录与凭证图片，请稍候...",
+                    text="⏳ 正在加载历史对话记录，请稍候...",
                     created_at=session.created_at,
                     is_seller=False,
                 )
@@ -3587,9 +3627,27 @@ class ServiceCenterPage(QFrame):
                 self.refresh_chat_btn.setText("⟳ 刷新消息")
 
         worker.finished.connect(self._on_messages_loaded)
+        worker.error.connect(self._on_messages_fetch_error)
         worker.finished.connect(lambda *_: _cleanup())
         worker.error.connect(lambda *_: _cleanup())
         worker.start()
+
+    def _on_messages_fetch_error(self, session_id: str, err: str) -> None:
+        if not self._current_session or self._current_session.id != session_id:
+            return
+        if not self._current_session.messages:
+            self._clear_chat_bubbles()
+            hint_msg = ServiceMessage(
+                id=f"hint_{session_id}",
+                sender_role="system",
+                sender_name="系统提示",
+                text="💬 当前订单暂无历史私信。您可以在下方直接向买家发起私信。",
+                created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                is_seller=False,
+            )
+            bubble = self._create_chat_bubble(hint_msg)
+            self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble, 0, Qt.AlignmentFlag.AlignTop)
+            self._displayed_messages_count = 1
 
     def _on_messages_loaded(
         self,
@@ -3610,6 +3668,8 @@ class ServiceCenterPage(QFrame):
         if detected_buyer_name and (not self._current_session.buyer_nickname or self._current_session.buyer_nickname == "买家"):
             self._current_session.buyer_nickname = detected_buyer_name
 
+        self._clear_chat_bubbles()
+
         if messages:
             self._current_session.messages = messages
             if self._current_session.session_type == "message" and not self._current_session.blocked_reason:
@@ -3622,56 +3682,80 @@ class ServiceCenterPage(QFrame):
                     self._current_session.is_unread = True
                 self._update_tab_counts()
 
-            self._clear_chat_bubbles()
             for msg in messages:
                 bubble = self._create_chat_bubble(msg)
                 self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble, 0, Qt.AlignmentFlag.AlignTop)
             self._displayed_messages_count = len(messages)
+        else:
+            self._current_session.messages = []
+            self._displayed_messages_count = 1
+            if self._current_session.session_type == "message":
+                hint_msg = ServiceMessage(
+                    id=f"hint_{self._current_session.id}",
+                    sender_role="system",
+                    sender_name="系统提示",
+                    text="💬 当前订单暂无历史私信记录。您可以在下方直接输入内容向买家发送消息。",
+                    created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    is_seller=False,
+                )
+                bubble = self._create_chat_bubble(hint_msg)
+                self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble, 0, Qt.AlignmentFlag.AlignTop)
+            elif self._current_session.session_type == "claim":
+                hint_msg = ServiceMessage(
+                    id=f"hint_{self._current_session.id}",
+                    sender_role="system",
+                    sender_name="系统提示",
+                    text="📋 当前索赔暂无历史调解沟通记录。",
+                    created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    is_seller=False,
+                )
+                bubble = self._create_chat_bubble(hint_msg)
+                self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble, 0, Qt.AlignmentFlag.AlignTop)
 
-            meta_parts = [
-                f"{self._current_session.site_display}",
-                f"店铺: <b>{self._current_session.account_name}</b>",
-                f"买家: <b>{self._current_session.buyer_nickname}</b>",
-            ]
-            if self._current_session.item_price:
-                meta_parts.append(f"价格: <b>{self._current_session.item_price}</b>")
-            if self._current_session.sku:
-                meta_parts.append(f"SKU: <code>{self._current_session.sku}</code>")
-            self.context_meta_lbl.setText(" · ".join(meta_parts))
+        meta_parts = [
+            f"{self._current_session.site_display}",
+            f"店铺: <b>{self._current_session.account_name}</b>",
+            f"买家: <b>{self._current_session.buyer_nickname}</b>",
+        ]
+        if self._current_session.item_price:
+            meta_parts.append(f"价格: <b>{self._current_session.item_price}</b>")
+        if self._current_session.sku:
+            meta_parts.append(f"SKU: <code>{self._current_session.sku}</code>")
+        self.context_meta_lbl.setText(" · ".join(meta_parts))
 
-            if self._current_session.session_type == "claim":
-                has_rep = bool(self._current_session.affects_reputation)
-                if has_rep:
-                    if self._current_session.affects_reputation == "affected":
-                        self.chip_rep_lbl.setText("信誉影响: <b style='color: #F87171;'>影响信誉 ⚠️</b>")
-                    elif self._current_session.affects_reputation == "not_affected":
-                        self.chip_rep_lbl.setText("信誉影响: <b style='color: #34D399;'>不影响信誉 🛡️</b>")
-                    else:
-                        self.chip_rep_lbl.setText(f"信誉影响: <b>{self._current_session.affects_reputation}</b>")
-                    self.chip_rep_lbl.show()
+        if self._current_session.session_type == "claim":
+            has_rep = bool(self._current_session.affects_reputation)
+            if has_rep:
+                if self._current_session.affects_reputation == "affected":
+                    self.chip_rep_lbl.setText("信誉影响: <b style='color: #F87171;'>影响信誉 ⚠️</b>")
+                elif self._current_session.affects_reputation == "not_affected":
+                    self.chip_rep_lbl.setText("信誉影响: <b style='color: #34D399;'>不影响信誉 🛡️</b>")
                 else:
-                    self.chip_rep_lbl.hide()
-                has_item = bool(self._current_session.item_id or self._current_session.item_url)
-                has_order = bool(self._current_session.order_id)
-                has_pack = bool(self._current_session.pack_id and self._current_session.pack_id != self._current_session.order_id)
-                has_stage = bool(self._current_session.stage)
-                self.sep_stage_rep.setVisible((has_item or has_order or has_pack or has_stage) and has_rep)
+                    self.chip_rep_lbl.setText(f"信誉影响: <b>{self._current_session.affects_reputation}</b>")
+                self.chip_rep_lbl.show()
+            else:
+                self.chip_rep_lbl.hide()
+            has_item = bool(self._current_session.item_id or self._current_session.item_url)
+            has_order = bool(self._current_session.order_id)
+            has_pack = bool(self._current_session.pack_id and self._current_session.pack_id != self._current_session.order_id)
+            has_stage = bool(self._current_session.stage)
+            self.sep_stage_rep.setVisible((has_item or has_order or has_pack or has_stage) and has_rep)
 
-            # Refresh thumbnail in case an alternate non-conflicting picture was selected
-            load_image_async(
-                self._current_session.item_thumbnail,
-                QSize(56, 56),
-                self.context_thumb_lbl.setPixmap,
-                radius=6,
-            )
-            curr_row = self.session_list.currentRow()
-            if curr_row >= 0:
-                curr_item = self.session_list.item(curr_row)
-                if curr_item:
-                    card = self._create_session_item_widget(self._current_session)
-                    self.session_list.setItemWidget(curr_item, card)
+        # Refresh thumbnail in case an alternate non-conflicting picture was selected
+        load_image_async(
+            self._current_session.item_thumbnail,
+            QSize(56, 56),
+            self.context_thumb_lbl.setPixmap,
+            radius=6,
+        )
+        curr_row = self.session_list.currentRow()
+        if curr_row >= 0:
+            curr_item = self.session_list.item(curr_row)
+            if curr_item:
+                card = self._create_session_item_widget(self._current_session)
+                self.session_list.setItemWidget(curr_item, card)
 
-            QTimer.singleShot(50, self._scroll_chat_to_bottom)
+        QTimer.singleShot(50, self._scroll_chat_to_bottom)
 
     def _scroll_chat_to_bottom(self) -> None:
         try:
@@ -3695,6 +3779,7 @@ class ServiceCenterPage(QFrame):
 
         # Sender header
         is_mediator = (msg.sender_role == "mediator")
+        is_system = (msg.sender_role == "system")
         if is_mediator:
             notice_lbl = QLabel("⚖️ 平台仲裁调解专员通知")
             notice_lbl.setStyleSheet("color: #FBBF24; font-size: 11px; font-weight: bold; padding-bottom: 2px;")
@@ -3711,6 +3796,9 @@ class ServiceCenterPage(QFrame):
 
         if is_mediator:
             hdr_lbl = QLabel(f"<b>美客多官方调解员</b> · <span style='color: #FCD34D;'>平台官方仲裁</span> · <span style='color: #A8A29E;'>{msg.created_at[:16].replace('T', ' ')}</span>")
+        elif is_system:
+            time_part = f" · <span style='color: #78716C;'>{msg.created_at[:16].replace('T', ' ')}</span>" if msg.created_at else ""
+            hdr_lbl = QLabel(f"<b>系统提示</b>{time_part}")
         else:
             hdr_lbl = QLabel(f"<b>{msg.sender_name}</b> · <span style='color: #777266;'>{msg.created_at[:16].replace('T', ' ')}</span>{read_badge}")
         hdr_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -3749,14 +3837,18 @@ class ServiceCenterPage(QFrame):
             att_box.addStretch()
             b_layout.addLayout(att_box)
 
-        # Translated snippet if available
-        if msg.text_translated:
-            trans_lbl = QLabel(f"<i>译: {msg.text_translated}</i>")
+        # Translated snippet if available (clean sans-serif typography, no italics)
+        has_valid_trans = (
+            bool(msg.text_translated)
+            and msg.text_translated.strip().lower() != msg.text.strip().lower()
+        )
+        if has_valid_trans:
+            trans_lbl = QLabel(f"译: {msg.text_translated}")
             trans_lbl.setWordWrap(True)
             trans_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             trans_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             trans_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-            trans_lbl.setStyleSheet("color: #C8C3B7; font-size: 11px;")
+            trans_lbl.setStyleSheet("color: #C8C3B7; font-size: 11px; line-height: 1.4; font-style: normal;")
             trans_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             trans_lbl.customContextMenuRequested.connect(
                 lambda pos, target=trans_lbl, m=msg: self._show_chat_context_menu(pos, target, m)
@@ -3797,6 +3889,20 @@ class ServiceCenterPage(QFrame):
             """)
             c_layout.addWidget(bubble_frame, 0, Qt.AlignmentFlag.AlignTop)
             c_layout.addStretch(1)
+        elif is_system:
+            # Centered neutral system notice
+            c_layout.addStretch(1)
+            bubble_frame.setObjectName("systemBubble")
+            bubble_frame.setStyleSheet("""
+                QFrame#systemBubble {
+                    background-color: #161C19;
+                    border: 1px dashed #3D4A41;
+                    border-radius: 8px;
+                }
+                QFrame#systemBubble QLabel { color: #A8A29E; background: transparent; border: none; padding: 0; }
+            """)
+            c_layout.addWidget(bubble_frame, 0, Qt.AlignmentFlag.AlignTop)
+            c_layout.addStretch(1)
         else:
             # Left-aligned buyer message (dark slate)
             bubble_frame.setObjectName("buyerBubble")
@@ -3820,7 +3926,7 @@ class ServiceCenterPage(QFrame):
             time_str = msg.created_at[:16].replace("T", " ") if msg.created_at else ""
             parts.append(f"[{msg.sender_name} {time_str}]".strip())
         parts.append(msg.text)
-        if msg.text_translated:
+        if msg.text_translated and msg.text_translated.strip().lower() != msg.text.strip().lower():
             parts.append(f"(译: {msg.text_translated})")
         return "\n".join(parts)
 
@@ -3874,15 +3980,18 @@ class ServiceCenterPage(QFrame):
         self._last_context_menu = menu
 
     def _show_chat_context_menu(self, pos: QPoint, source_widget: QWidget, msg: ServiceMessage | None = None) -> None:
-        """Right-click copy: single-item context menu [复制] on message bubble or container."""
+        """Right-click menu on message bubble: [复制] / [🌐 翻译为中文] / [复制全部]."""
         if not self._current_session:
             return
 
         menu = QMenu(source_widget)
 
         if msg is not None:
-            act = menu.addAction("复制")
-            act.triggered.connect(lambda: self._copy_single_message(msg, include_header=False))
+            act_copy = menu.addAction("复制")
+            act_copy.triggered.connect(lambda: self._copy_single_message(msg, include_header=False))
+
+            act_trans = menu.addAction("🌐 翻译为中文")
+            act_trans.triggered.connect(lambda: self._translate_single_message(msg))
         else:
             act = menu.addAction("复制全部")
             act.triggered.connect(self._copy_all_messages)
@@ -3890,6 +3999,26 @@ class ServiceCenterPage(QFrame):
         global_pos = source_widget.mapToGlobal(pos)
         self._last_context_menu = menu
         menu.popup(global_pos)
+
+    def _translate_single_message(self, msg: ServiceMessage) -> None:
+        """Translate a single message to Chinese on demand."""
+        if not msg or not msg.text:
+            return
+
+        def _do_trans():
+            try:
+                zh = translate_text(msg.text, target_lang="zh", timeout=3.5)
+                if zh and zh.strip().lower() != msg.text.strip().lower():
+                    msg.text_translated = zh
+                    if self._current_session:
+                        save_sessions_snapshot(self._all_sessions)
+                    QTimer.singleShot(0, lambda: self._display_session_detail(self._current_session, force_rebuild=True))
+                else:
+                    QTimer.singleShot(0, lambda: QToolTip.showText(QCursor.pos(), "已是中文或无需翻译", self))
+            except Exception as e:
+                QTimer.singleShot(0, lambda: QToolTip.showText(QCursor.pos(), f"翻译失败: {e}", self))
+
+        threading.Thread(target=_do_trans, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Translation & Template Handling

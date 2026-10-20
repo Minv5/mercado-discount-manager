@@ -2128,6 +2128,93 @@ class TestServiceCenterSnapshot(unittest.TestCase):
 
         page.stop()
 
+    def test_chat_bubble_typography_and_duplicate_suppression(self):
+        mock_client = MagicMock()
+        mock_auth = MagicMock()
+        mock_auth.list_accounts.return_value = []
+        page = ServiceCenterPage(mock_client, mock_auth)
+
+        # 1. Duplicate translation suppression: "aceptar" vs "aceptar"
+        dup_msg = ServiceMessage(
+            id="m_dup",
+            sender_role="seller",
+            sender_name="卖家",
+            text="aceptar",
+            text_translated="aceptar",
+            created_at="2026-10-21 01:24:00",
+            is_seller=True,
+        )
+        bubble_dup = page._create_chat_bubble(dup_msg)
+        labels_dup = [lbl.text() for lbl in bubble_dup.findChildren(QLabel)]
+        self.assertFalse(any("译:" in txt for txt in labels_dup), "相同原词绝不展示 '译: aceptar'")
+
+        # 2. Valid translation typography: no <i> tags, clean sans-serif text
+        trans_msg = ServiceMessage(
+            id="m_trans",
+            sender_role="buyer",
+            sender_name="买家",
+            text="Hola, cuándo llega mi paquete?",
+            text_translated="你好，我的包裹什么时候到达？",
+            created_at="2026-10-21 01:25:00",
+            is_seller=False,
+        )
+        bubble_trans = page._create_chat_bubble(trans_msg)
+        labels_trans = [lbl.text() for lbl in bubble_trans.findChildren(QLabel)]
+        self.assertTrue(any("译: 你好，我的包裹什么时候到达？" in txt for txt in labels_trans))
+        self.assertFalse(any("<i>" in txt for txt in labels_trans), "中文译文绝对禁止使用 <i> 标签导致字体变异")
+
+        # 3. System message formatting: clean neutral frame
+        sys_msg = ServiceMessage(
+            id="m_sys",
+            sender_role="system",
+            sender_name="系统提示",
+            text="⏳ 正在加载历史对话记录，请稍候...",
+            created_at="2026-10-21 01:26:00",
+            is_seller=False,
+        )
+        bubble_sys = page._create_chat_bubble(sys_msg)
+        frames_sys = bubble_sys.findChildren(QFrame)
+        self.assertTrue(any(f.objectName() == "systemBubble" for f in frames_sys))
+        labels_sys = [lbl.text() for lbl in bubble_sys.findChildren(QLabel)]
+        self.assertFalse(any("平台仲裁调解专员通知" in txt for txt in labels_sys))
+        self.assertFalse(any("美客多官方调解员" in txt for txt in labels_sys))
+
+        page.stop()
+
+    def test_post_sale_empty_messages_shows_friendly_hint(self):
+        mock_client = MagicMock()
+        mock_auth = MagicMock()
+        mock_auth.list_accounts.return_value = []
+        page = ServiceCenterPage(mock_client, mock_auth)
+
+        msg_sess = ServiceSession(
+            id="m_pack_100",
+            session_type="message",
+            account_id="acc_1",
+            account_name="测试店铺",
+            site_id="MLM",
+            order_id="2000019082949204",
+            pack_id="2000015622052975",
+        )
+        page._current_session = msg_sess
+        page._on_messages_loaded("m_pack_100", [])
+
+        # Should render empty hint, not arbitration
+        bubbles = page.chat_container.findChildren(QLabel)
+        all_text = " ".join(b.text() for b in bubbles)
+        self.assertIn("暂无历史私信", all_text)
+        self.assertNotIn("平台仲裁调解专员通知", all_text)
+
+        page.stop()
+
+    def test_get_pack_messages_404_returns_empty_dict(self):
+        mock_client = MagicMock()
+        from engine.client import MercadoClient
+        client = MercadoClient(MagicMock())
+        with patch.object(client, "request", side_effect=Exception("HTTP 404: Not Found")):
+            res = client.get_pack_messages("acc_1", "pack_123")
+            self.assertEqual(res, {"messages": [], "paging": {"total": 0}})
+
 
 if __name__ == "__main__":
     unittest.main()

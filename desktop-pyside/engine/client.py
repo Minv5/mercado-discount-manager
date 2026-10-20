@@ -1002,6 +1002,8 @@ class MercadoClient:
                         return self.request(account_id, "GET", f"/marketplace/messages/packs/{real_pack}", params={"tag": "post_sale"})
                 except Exception:
                     pass
+            if "not_found" in err_str.lower() or "not found" in err_str.lower() or "404" in err_str:
+                return {"messages": [], "paging": {"total": 0}}
             raise
 
     def upload_pack_attachment(
