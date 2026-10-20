@@ -9,8 +9,8 @@ import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
-from PySide6.QtCore import QDate, QModelIndex, QObject, QSettings, QSignalBlocker, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeySequence, QPainter, QShortcut, QTextCursor
+from PySide6.QtCore import QDate, QEvent, QModelIndex, QObject, QSettings, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QKeySequence, QPainter, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -53,6 +53,7 @@ from callback_endpoints import (
     DEFAULT_WEBHOOK_CALLBACK_URL,
     migrate_oauth_redirect_uri,
 )
+from ui_common import copy_pure_text, make_table
 from core import Account, parse_targeted_cancel_item_ids, site_name
 from reason_text import business_reason_text
 
@@ -406,6 +407,8 @@ class MultiBatchHistoryDialog(QDialog):
 
 
 class LogViewer(QPlainTextEdit):
+    """只读滚动日志窗口，支持智能自动吸底跟读与悬停/上翻视口绝对冻结。"""
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setReadOnly(True)
@@ -413,13 +416,54 @@ class LogViewer(QPlainTextEdit):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.auto_scroll = True
         self.is_hovered = False
+        self._is_appending = False
+
+        # 开启鼠标追踪，并在内部视口 (viewport) 与滚动条上安装事件过滤器以可靠捕获悬停与离开事件
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        self.viewport().installEventFilter(self)
+        self.verticalScrollBar().installEventFilter(self)
+
         self.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
 
+    def is_viewport_or_mouse_hovered(self) -> bool:
+        """综合判定是否处于悬停保护状态：
+        1. 显式事件标记 self.is_hovered
+        2. 物理光标碰撞：检查鼠标当前在全局屏幕的物理位置是否落在本控件实际矩形范围内
+        """
+        if self.is_hovered:
+            return True
+        try:
+            if self.isVisible():
+                pos = self.mapFromGlobal(QCursor.pos())
+                if self.rect().contains(pos):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched in (self.viewport(), self.verticalScrollBar(), self):
+            event_type = event.type()
+            if event_type in (QEvent.Type.Enter, QEvent.Type.HoverEnter):
+                self.is_hovered = True
+            elif event_type in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
+                self.is_hovered = False
+        return super().eventFilter(watched, event)
+
     def _on_scroll_changed(self, value: int) -> None:
+        # 文本追加期间忽略底层自动滚屏产生的信号，防止冲刷用户的手动滚动状态
+        if self._is_appending:
+            return
         scrollbar = self.verticalScrollBar()
-        if scrollbar.isSliderDown() or (scrollbar.maximum() > 0 and value < (scrollbar.maximum() - 15)):
+        max_val = scrollbar.maximum()
+        if max_val <= 0:
+            return
+        # 只要滚动条脱离最底部（哪怕只差 1 个单位），或正按住滑块，立即暂停自动吸底
+        if scrollbar.isSliderDown() or value < max_val:
             self.auto_scroll = False
-        elif scrollbar.maximum() > 0 and value >= (scrollbar.maximum() - 5):
+        elif value >= max_val:
+            # 只有当用户确实手动将滚动条拉至最底端时，才恢复自动吸底
             self.auto_scroll = True
 
     def enterEvent(self, event) -> None:
@@ -431,20 +475,36 @@ class LogViewer(QPlainTextEdit):
         super().leaveEvent(event)
 
     def wheelEvent(self, event) -> None:
+        # 滚轮向上滚动：用户明确查看历史日志，立即暂停自动吸底
         if event.angleDelta().y() > 0:
             self.auto_scroll = False
         elif event.angleDelta().y() < 0:
             scrollbar = self.verticalScrollBar()
-            if scrollbar.maximum() > 0 and scrollbar.value() >= (scrollbar.maximum() - 5):
+            if scrollbar.maximum() > 0 and scrollbar.value() >= scrollbar.maximum():
                 self.auto_scroll = True
         super().wheelEvent(event)
 
     def append_log_line(self, line: str) -> None:
         scrollbar = self.verticalScrollBar()
-        was_at_bottom = self.auto_scroll and not scrollbar.isSliderDown() and not self.is_hovered
+        # 只要处于鼠标悬停、手动脱离最底部、拖拽滑块中、或正在划词选中文本，坚决不自动吸底
+        has_selection = bool(self.textCursor().hasSelection())
+        is_hover = self.is_viewport_or_mouse_hovered()
+        was_at_bottom = self.auto_scroll and not scrollbar.isSliderDown() and not is_hover and not has_selection
         prev_value = scrollbar.value()
 
-        self.appendPlainText(line)
+        self._is_appending = True
+        try:
+            if was_at_bottom:
+                self.appendPlainText(line)
+            else:
+                # 非吸底状态：使用独立光标静默在文档末尾追加文本，不移动主光标与视口，杜绝页面跳动
+                doc = self.document()
+                cursor = QTextCursor(doc)
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertBlock()
+                cursor.insertText(line)
+        finally:
+            self._is_appending = False
 
         if was_at_bottom:
             scrollbar.setValue(scrollbar.maximum())
@@ -464,8 +524,10 @@ class TargetedCancelDialog(QDialog):
         seller_discount: int = 0,
         official_discount: int = 0,
         embedded: bool = False,
+        busy_reason: Callable[[], str] | None = None,
     ):
         self.embedded = embedded
+        self._busy_reason_fn = busy_reason
         if embedded:
             super().__init__(parent, Qt.WindowType.Widget)
         else:
@@ -816,6 +878,11 @@ class TargetedCancelDialog(QDialog):
 
     def _sync_submit_state(self) -> None:
         ready = True if self._submission_ready is None else bool(self._submission_ready())
+        busy_msg = (
+            self._busy_reason_fn()
+            if getattr(self, "_busy_reason_fn", None)
+            else "缓存补偿仍在运行。可以先填写商品 ID；补偿结束后本按钮会自动启用，也可以关闭窗口后用主按钮停止补偿。"
+        )
         act = self.action()
         if act == "enroll":
             self.discount_note.setVisible(True)
@@ -825,8 +892,7 @@ class TargetedCancelDialog(QDialog):
             self.submit_button.setText("开始核对并报名")
             self.note.setText(
                 "点击后只读取命中的活动；存在匹配商品时会直接提交报名，不再弹出第二个确认框。"
-                if ready else
-                "缓存补偿仍在运行。可以先填写商品 ID；补偿结束后本按钮会自动启用，也可以关闭窗口后用主按钮停止补偿。"
+                if ready else busy_msg
             )
             self.submit_button.setEnabled(ready)
         elif act == "cancel":
@@ -835,8 +901,7 @@ class TargetedCancelDialog(QDialog):
             self.submit_button.setText("开始核对并取消")
             self.note.setText(
                 "点击后只读取命中的活动；存在匹配商品时会直接提交取消，不再弹出第二个确认框。"
-                if ready else
-                "缓存补偿仍在运行。可以先填写商品 ID；补偿结束后本按钮会自动启用，也可以关闭窗口后用主按钮停止补偿。"
+                if ready else busy_msg
             )
             self.submit_button.setEnabled(ready)
         else:
@@ -1237,14 +1302,7 @@ class ItemQueryDialog(QDialog):
         table_header.addStretch(1)
         history_layout.addLayout(table_header)
 
-        self.history_table = QTableWidget(0, 7)
-        self.history_table.setHorizontalHeaderLabels(["时间", "店铺", "活动", "动作", "状态", "价格", "说明"])
-        self.history_table.setAlternatingRowColors(True)
-        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.history_table.setShowGrid(True)
-        self.history_table.verticalHeader().setVisible(False)
+        self.history_table = make_table(["时间", "店铺", "活动", "动作", "状态", "价格", "说明"])
         self.history_table.verticalHeader().setDefaultSectionSize(32)
         header = self.history_table.horizontalHeader()
         header.setMinimumSectionSize(54)
@@ -2738,9 +2796,7 @@ class CopyZeroVisitIdsDialog(QDialog):
             return
         batch = self.batches[row]
         copied_text = " ".join(batch)
-        clipboard = QGuiApplication.clipboard()
-        if clipboard:
-            clipboard.setText(copied_text)
+        copy_pure_text(copied_text)
 
         status_item = self.table.item(row, 1)
         if status_item:

@@ -18,6 +18,17 @@ COLORS = {
     "weak": "#777266",
 }
 
+STATUS_COLORS = {
+    "paid": "#38A169",         # 已付款 - 稳健绿
+    "shipped": "#3182CE",      # 已发货 - 品牌蓝
+    "delivered": "#2F855A",    # 已送达 - 稳健深绿
+    "cancelled": "#E53E3E",    # 已取消 - 警示红
+    "pending": "#D69E2E",      # 待付款/处理中 - 提示金
+    "warning": "#DD6B20",      # 预警 - 暖橙
+    "dispute": "#E53E3E",      # 售后纠纷 - 警示红
+    "refunded": "#805AD5",     # 已退款 - 辅助紫
+}
+
 
 APP_QSS = f"""
 QWidget {{

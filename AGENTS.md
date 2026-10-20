@@ -193,3 +193,18 @@ Legacy 回退版发布：
 - 用户可见的“完成”“可用”“成品”必须与实际通过的产品路径和验收范围一致；只完成离线检查、GET-only 或写入前验证时必须明确其未覆盖的边界。
 - 每次代码改动、功能调整、逻辑修复或热更新同步，必须严格递增版本号（同步更新 package.json、main_window.py、spec 打包配置、测试用例以及安装包 build-info.json/Info.plist），确保客户端界面与运行产物版本清晰明确且完全一致。
 - 每次代码修改与测试通过后，默认自动执行构建打包脚本刷新桌面端与本地安装产物（属于默认交付闭环，无需让用户二次确认）；在桌面应用打包构建完成后，必须主动询问用户是否需要将本次变更推送到 GitHub。
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as local markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default canonical roles (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context (`GLOSSARY.md` and `docs/adr/` at repo root). See `docs/agents/domain.md`.
+

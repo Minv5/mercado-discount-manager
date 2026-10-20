@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import json
 import re
 import threading
@@ -12,6 +13,15 @@ from typing import Any, Callable
 from .auth import AuthManager
 from .client import MercadoClient, clean_error_message
 from .crypto import get_data_dir
+from .policy import (
+    ActionType,
+    EvaluationContext,
+    ItemEventPolicy,
+    PolicyPlan,
+    PromoAction,
+    SiblingCancelAction,
+    extract_dimensions_and_weight,
+)
 from .pricing import calculate_deal_price, extract_item_net_proceeds
 
 
@@ -27,6 +37,7 @@ class WebhookWorker:
         ack_url: str = DEFAULT_ACK_URL,
         secret: str | None = None,
         log_callback: Callable[[str], None] | None = None,
+        customer_service_callback: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.auth = auth_manager or AuthManager()
         self.client = client or MercadoClient(self.auth)
@@ -34,11 +45,14 @@ class WebhookWorker:
         self.ack_url = ack_url
         self._secret = secret
         self.log_callback = log_callback or (lambda msg: None)
+        self.customer_service_callback = customer_service_callback
 
         self._running = False
         self._thread: threading.Thread | None = None
         self.discount_percent = 30.0
         self.processed_count = 0
+        self._has_new_tasks = False
+        self._tasks_lock = threading.Lock()
         self._price_cache: dict[str, float] = {}
         self._net_cache: dict[str, float] = {}
         self._shipping_cache: dict[str, float] = {}
@@ -49,6 +63,8 @@ class WebhookWorker:
         self._recent_shipping_reenrolls: dict[str, tuple[float, float, float]] = {}
         self._recent_cbt_cascades: dict[str, float] = {}
         self._exits_lock = threading.Lock()
+        self._pending_review_items: dict[str, dict[str, Any]] = {}
+        self._pending_review_lock = threading.Lock()
         self._logs: list[str] = []
         self._logs_lock = threading.Lock()
 
@@ -71,6 +87,58 @@ class WebhookWorker:
     def _unmark_recently_exited(self, item_id: str, promo_id: str) -> None:
         with self._exits_lock:
             self._recently_exited_promos.pop((item_id, promo_id), None)
+
+    def _cancel_promotion_with_readback(
+        self,
+        account_id: str,
+        child_user_id: str,
+        item_id: str,
+        promotion_id: str,
+        promotion_type: str,
+        offer_id: str | None = None,
+    ) -> tuple[bool, str]:
+        """Cancels a promotion item with automatic read-back verification against network disconnects/IncompleteRead.
+        Returns (success: bool, clean_err: str).
+        """
+        try:
+            if offer_id:
+                self.client.cancel_promotion_item(
+                    account_id, child_user_id, item_id, promotion_id, promotion_type, offer_id=offer_id
+                )
+            else:
+                self.client.cancel_promotion_item(
+                    account_id, child_user_id, item_id, promotion_id, promotion_type
+                )
+            self._mark_recently_exited(item_id, promotion_id)
+            return True, ""
+        except Exception as cancel_err:
+            # 读回自愈核验：检查远端是否实际已经退出了（避免服务端响应单向断开造成假失败）
+            try:
+                remote_promos = self.client.get_item_promotions(account_id, child_user_id, item_id)
+                remote_matching = [
+                    rp for rp in remote_promos
+                    if str(rp.get("id") or "") == str(promotion_id) and rp.get("status") in ("started", "pending")
+                ]
+                if not remote_matching:
+                    self._mark_recently_exited(item_id, promotion_id)
+                    return True, ""
+            except Exception:
+                pass
+
+            err_str = str(cancel_err)
+            if "404" in err_str or "not found" in err_str.lower():
+                self._mark_recently_exited(item_id, promotion_id)
+                return True, ""
+
+            clean_err = clean_error_message(cancel_err)
+            return False, clean_err
+
+    def pop_has_new_tasks(self) -> bool:
+        return False
+
+    def _record_auto_task(self, *args: Any, **kwargs: Any) -> None:
+        """No-op: Background auto-reprice actions must never pollute the workbench execution records table."""
+        return None
 
     def _is_recently_shipping_reenrolled(
         self, item_id: str, net_proceeds: float, shipping_cost: float, ttl_sec: float = 60.0
@@ -206,6 +274,7 @@ class WebhookWorker:
         return ""
 
     def _run_loop(self) -> None:
+        last_review_reconcile = time.time()
         while self._running:
             had_events = False
             try:
@@ -213,11 +282,37 @@ class WebhookWorker:
             except Exception as err:
                 time.sleep(5.0)
 
+            # 定期 15 分钟（900秒）低频巡检审核中队列，防止平台漏推通知导致商品无法自动报回
+            now = time.time()
+            if (now - last_review_reconcile) >= 900.0:
+                last_review_reconcile = now
+                try:
+                    self._reconcile_pending_reviews()
+                except Exception:
+                    pass
+
             # Shorter delay when events are flowing to prevent accumulation; longer when empty
             if had_events:
                 time.sleep(0.1)
             else:
                 time.sleep(5.0)
+
+    def _reconcile_pending_reviews(self) -> None:
+        """Periodic reconciliation for items in under_review queue to auto re-enroll once platform review passes."""
+        with self._pending_review_lock:
+            items_to_check = list(self._pending_review_items.items())
+        if not items_to_check:
+            return
+        for item_id, meta in items_to_check:
+            if not self._running:
+                break
+            try:
+                acc_id = meta["account_id"]
+                c_user_id = meta["child_user_id"]
+                s_id = meta["site_id"]
+                self._process_marketplace_item(acc_id, c_user_id, s_id, item_id)
+            except Exception:
+                pass
 
     def _poll_and_process_batch(self) -> bool:
         events = self._claim_events()
@@ -443,8 +538,19 @@ class WebhookWorker:
         lease_id = str(event.get("lease_id") or "")
         topic = str(event.get("topic") or "").strip().lower()
 
-        # 1. Fast bypass for candidate/offer broadcasts (silent ack immediately)
-        if topic in ("public_candidates", "public_offers"):
+        # 1. Customer service topics: questions, claims, messages, orders_v2 (including marketplace_* prefixes)
+        cs_topics = (
+            "questions", "marketplace_questions",
+            "claims", "marketplace_claims",
+            "messages", "marketplace_messages",
+            "orders", "orders_v2", "marketplace_orders",
+        )
+        if topic in cs_topics:
+            if self.customer_service_callback:
+                try:
+                    self.customer_service_callback(event)
+                except Exception:
+                    pass
             self._ack_event(event_id, lease_id, ok=True)
             return
 
@@ -553,200 +659,14 @@ class WebhookWorker:
             if real_site_id and real_site_id != "CBT":
                 site_id = real_site_id
 
-            # 检查商品在售状态：非 active 状态（closed / inactive / under_review / paused）后台静默放行
+            # 检查商品在售状态：非 active 且非 under_review 状态（closed / inactive / paused）后台静默放行
             status = str(raw_item.get("status") or "").lower()
-            if status != "active":
+            sub_status = [str(s).lower() for s in (raw_item.get("sub_status") or [])]
+            if status not in ("active", "under_review") and "waiting_for_patch" not in sub_status:
                 self._price_cache.pop(item_id, None)
                 self._net_cache.pop(item_id, None)
                 self._shipping_cache.pop(item_id, None)
                 self._dim_cache.pop(item_id, None)
-                return True
-
-            item_info = extract_item_net_proceeds(raw_item)
-            current_price = float(item_info.price or 0.0)
-            current_net = float(item_info.net_proceeds or 0.0)
-            current_shipping = float(item_info.shipping_cost or 0.0)
-            official_orig = float(raw_item.get("original_price") or 0.0)
-            dim_str, weight_str = self._extract_dimensions_and_weight(raw_item)
-
-            # 读取内存与 SQLite 历史快照（含卖家净回款 net_proceeds、纯运费与包装尺寸/重量）
-            cached_price = self._price_cache.get(item_id)
-            cached_net = self._net_cache.get(item_id)
-            cached_shipping = self._shipping_cache.get(item_id)
-            cached_dims = self._dim_cache.get(item_id)
-            old_dim = cached_dims[0] if cached_dims else None
-            old_weight = cached_dims[1] if cached_dims else None
-            db_system = None
-
-            db_snap = self._load_db_snapshot(account_id, item_id)
-            if db_snap is not None:
-                if cached_price is None:
-                    db_p = db_snap.get("original_price") or db_snap.get("price")
-                    if db_p is not None:
-                        cached_price = float(db_p)
-                if old_dim is None:
-                    old_dim = db_snap.get("dimensions_json")
-                if old_weight is None:
-                    old_weight = db_snap.get("weight_json")
-                raw_j = db_snap.get("raw_json")
-                if raw_j:
-                    try:
-                        parsed_raw = json.loads(raw_j)
-                        if isinstance(parsed_raw, dict):
-                            db_system = parsed_raw.get("pricing_system")
-                            net_obj = parsed_raw.get("net_proceeds") or {}
-                            if isinstance(net_obj, dict):
-                                if cached_net is None:
-                                    net_amt = net_obj.get("amount")
-                                    if net_amt is not None:
-                                        cached_net = float(net_amt)
-                                if cached_shipping is None:
-                                    for concept in net_obj.get("additional_concepts") or []:
-                                        if str(concept.get("id") or "").lower() == "shipping_cost":
-                                            s_amt = concept.get("amount")
-                                            if s_amt is not None:
-                                                cached_shipping = float(s_amt)
-                    except Exception:
-                        pass
-
-            # 判定变动类型：
-            # - "seller_data"：卖家修改了商品数据（净回款 net_proceeds 或包装长宽高/重量） -> 体系 2（退活动且不重报）
-            # - "platform_shipping"：卖家净回款与尺寸重量未变，仅平台调整了运费/汇率 -> 体系 1（在活动中则退旧价并重报回原折扣）
-            change_type: str | None = None
-            change_desc = ""
-
-            dim_or_weight_changed = (
-                (old_dim and dim_str and old_dim != dim_str)
-                or (old_weight and weight_str and old_weight != weight_str)
-            )
-
-            if dim_or_weight_changed:
-                change_type = "seller_data"
-                change_desc = "包装尺寸/重量数据变动"
-            elif cached_net is not None and cached_net > 0 and current_net > 0:
-                if abs(cached_net - current_net) >= 0.01:
-                    change_type = "seller_data"
-                    ref_old = cached_price if cached_price is not None else cached_net
-                    change_desc = f"售价变动 (${ref_old:.2f} -> ${current_price:.2f})"
-                else:
-                    # 卖家净回款与尺寸重量均分毫未动！
-                    # 若商品正处于活动中（official_orig > 0）但价格构成与活动原价完全一致（not item_info.is_inconsistent），
-                    # 说明美客多线上活动早已按最新运费提报生效（仅本地历史快照未同步），直接静默同步快照而不重复退报。
-                    shipping_changed = (
-                        cached_shipping is not None
-                        and abs(cached_shipping - current_shipping) >= 0.01
-                    )
-                    already_synced_in_promo = (
-                        (official_orig > 0 and not item_info.is_inconsistent)
-                        or self._is_recently_shipping_reenrolled(item_id, current_net, current_shipping)
-                    )
-                    inconsistent_or_price_diverged = (
-                        (not already_synced_in_promo and item_info.is_inconsistent)
-                        or (
-                            not already_synced_in_promo
-                            and cached_price is not None
-                            and abs(cached_price - current_price) >= 0.05
-                            and (official_orig > 0 or db_system == "system1_discount" or shipping_changed)
-                        )
-                    )
-
-                    if not already_synced_in_promo and (shipping_changed or inconsistent_or_price_diverged) and db_system != "system2_155":
-                        change_type = "platform_shipping"
-                        if official_orig > 0 and abs(official_orig - current_price) >= 0.01:
-                            ref_old = official_orig
-                        elif cached_price is not None and abs(cached_price - current_price) >= 0.01:
-                            ref_old = cached_price
-                        elif cached_shipping is not None and item_info.fee_rate < 1.0 and current_net > 0:
-                            ref_old = round((current_net + cached_shipping) / (1.0 - item_info.fee_rate), 2)
-                        else:
-                            ref_old = current_price
-
-                        change_desc = self._format_platform_shipping_change_desc(
-                            ref_old_price=ref_old,
-                            current_price=current_price,
-                            cached_shipping=cached_shipping,
-                            current_shipping=current_shipping,
-                            current_net=current_net,
-                            fee_rate=item_info.fee_rate,
-                        )
-            elif current_net > 0:
-                # 本地尚无 cached_net（首次接触或此前未存 raw_json）
-                shipping_changed = (
-                    cached_shipping is not None
-                    and abs(cached_shipping - current_shipping) >= 0.01
-                )
-                already_synced_in_promo = (
-                    (official_orig > 0 and not item_info.is_inconsistent)
-                    or self._is_recently_shipping_reenrolled(item_id, current_net, current_shipping)
-                )
-                if not already_synced_in_promo and shipping_changed and db_system != "system2_155":
-                    change_type = "platform_shipping"
-                    if official_orig > 0 and abs(official_orig - current_price) >= 0.01:
-                        ref_old = official_orig
-                    elif cached_price is not None and abs(cached_price - current_price) >= 0.01:
-                        ref_old = cached_price
-                    elif item_info.fee_rate < 1.0:
-                        ref_old = round((current_net + cached_shipping) / (1.0 - item_info.fee_rate), 2)
-                    else:
-                        ref_old = current_price
-                    change_desc = self._format_platform_shipping_change_desc(
-                        ref_old_price=ref_old,
-                        current_price=current_price,
-                        cached_shipping=cached_shipping,
-                        current_shipping=current_shipping,
-                        current_net=current_net,
-                        fee_rate=item_info.fee_rate,
-                    )
-                elif not already_synced_in_promo and item_info.is_inconsistent and official_orig > 0:
-                    if self._is_platform_only_shipping_change_on_old_cbt(account_id, raw_item):
-                        change_type = "platform_shipping"
-                        change_desc = self._format_platform_shipping_change_desc(
-                            ref_old_price=official_orig,
-                            current_price=current_price,
-                            cached_shipping=cached_shipping,
-                            current_shipping=current_shipping,
-                            current_net=current_net,
-                            fee_rate=item_info.fee_rate,
-                        )
-                    else:
-                        change_type = "seller_data"
-                        change_desc = f"售价变动 (${official_orig:.2f} -> ${current_price:.2f})"
-                elif not already_synced_in_promo and cached_price is not None and abs(cached_price - current_price) >= 0.01:
-                    if (official_orig > 0 or db_system == "system1_discount") and self._is_platform_only_shipping_change_on_old_cbt(account_id, raw_item):
-                        change_type = "platform_shipping"
-                        change_desc = self._format_platform_shipping_change_desc(
-                            ref_old_price=cached_price,
-                            current_price=current_price,
-                            cached_shipping=cached_shipping,
-                            current_shipping=current_shipping,
-                            current_net=current_net,
-                            fee_rate=item_info.fee_rate,
-                        )
-                    elif not self._is_platform_only_shipping_change_on_old_cbt(account_id, raw_item):
-                        change_type = "seller_data"
-                        change_desc = f"售价变动 (${cached_price:.2f} -> ${current_price:.2f})"
-            else:
-                # 非 CBT 净回款模式或单测 Mock 商品（仅含 price）
-                if cached_price is None:
-                    self._price_cache[item_id] = current_price
-                    if current_shipping > 0:
-                        self._shipping_cache[item_id] = current_shipping
-                    self._dim_cache[item_id] = (dim_str, weight_str)
-                    self._save_db_snapshot(account_id, child_user_id, site_id, item_id, current_price, raw_item, dim_str, weight_str, db_system)
-                    return True
-                if abs(cached_price - current_price) >= 0.01:
-                    change_type = "seller_data"
-                    change_desc = f"售价变动 (${cached_price:.2f} -> ${current_price:.2f})"
-
-            if change_type is None:
-                # 首次建立基线或数据无变动（含无活动商品遇到平台运费微调），静默更新快照并放行
-                self._price_cache[item_id] = current_price
-                if current_net > 0:
-                    self._net_cache[item_id] = current_net
-                if current_shipping > 0:
-                    self._shipping_cache[item_id] = current_shipping
-                self._dim_cache[item_id] = (dim_str, weight_str)
-                self._save_db_snapshot(account_id, child_user_id, site_id, item_id, current_price, raw_item, dim_str, weight_str, db_system)
                 return True
 
             # 查询该商品当前正在进行（started）、待开始（pending）及可报候选（candidate）的活动
@@ -766,165 +686,90 @@ class WebhookWorker:
                     p_id = str(p.get("id") or "")
                     p_type = str(p.get("type") or "DEAL").upper()
                     p_status = str(p.get("status") or "").lower()
+                    p_name = str(p.get("name") or "").strip()
                     if p_status in ("started", "pending") and (p_id or p_type == "PRICE_DISCOUNT"):
-                        active_promos.append({"id": p_id, "type": p_type, "status": p_status, "raw": p})
+                        active_promos.append({"id": p_id, "type": p_type, "status": p_status, "name": p_name, "raw": p})
                     elif p_status == "candidate" and p_id and p_type not in ("PRICE_DISCOUNT", "BANK", "PAYMENT_METHOD"):
-                        candidate_promos.append({"id": p_id, "type": p_type, "status": p_status, "raw": p})
+                        candidate_promos.append({"id": p_id, "type": p_type, "status": p_status, "name": p_name, "raw": p})
             except Exception:
                 for p in raw_item.get("promotions") or []:
                     if not isinstance(p, dict):
                         continue
                     p_id = str(p.get("id") or "")
                     p_type = str(p.get("type") or "DEAL").upper()
+                    p_name = str(p.get("name") or "").strip()
                     if p_id:
-                        active_promos.append({"id": p_id, "type": p_type, "status": "started", "raw": p})
+                        active_promos.append({"id": p_id, "type": p_type, "status": "started", "name": p_name, "raw": p})
 
-            # 分支 A：【体系 2（卖家修改了商品数据 -> 155% 净利润新体系）】退出所有活动，保持不变，不再参加任何活动
-            if change_type == "seller_data":
-                self._price_cache[item_id] = current_price
-                if current_net > 0:
-                    self._net_cache[item_id] = current_net
-                if current_shipping > 0:
-                    self._shipping_cache[item_id] = current_shipping
-                self._dim_cache[item_id] = (dim_str, weight_str)
-                self._save_db_snapshot(
-                    account_id, child_user_id, site_id, item_id, current_price, raw_item, dim_str, weight_str,
-                    pricing_system="system2_155",
+            # 读取内存与 SQLite 历史快照
+            cached_snapshot = self._load_cached_snapshot(account_id, item_id)
+
+            cbt_id = str(raw_item.get("cbt_item_id") or "").strip().upper()
+            item_info = extract_item_net_proceeds(raw_item)
+            is_debounced = self._is_recently_shipping_reenrolled(
+                item_id, float(item_info.net_proceeds or 0.0), float(item_info.shipping_cost or 0.0)
+            )
+            is_old_cbt = self._is_platform_only_shipping_change_on_old_cbt(account_id, raw_item)
+
+            with self._pending_review_lock:
+                was_pending = item_id in self._pending_review_items
+
+            # 纯逻辑领域决策策略评估（通过 EvaluationContext 消除参数泥团）
+            ctx = EvaluationContext(
+                account_id=account_id,
+                child_user_id=child_user_id,
+                site_id=site_id,
+                raw_item=raw_item,
+                cached_snapshot=cached_snapshot,
+                active_promos=active_promos,
+                candidate_promos=candidate_promos,
+                store_alias=store_name,
+                discount_percent=self._get_current_discount(),
+                was_pending_review=was_pending,
+                is_recently_shipping_reenrolled=is_debounced,
+                is_old_cbt=is_old_cbt,
+            )
+            plan = ItemEventPolicy.evaluate(ctx)
+
+            # 1. 输出策略决策的人性化业务日志
+            for msg, tag in plan.log_messages:
+                self.log(msg, tag=tag)
+
+            # 2. 执行退出活动指令（主商品）
+            cancel_failed_ids: set[str] = set()
+            for ap in plan.promos_to_cancel:
+                p_id = ap.promotion_id
+                p_type = ap.promotion_type
+                if self._is_recently_exited(item_id, p_id, ttl_sec=15.0):
+                    continue
+                p_label = f"【{ap.name}】" if ap.name else p_id
+                success, clean_err = self._cancel_promotion_with_readback(
+                    account_id, child_user_id, item_id, p_id, p_type, offer_id=ap.offer_id
                 )
-
-                if active_promos or official_orig > 0:
+                if not success:
+                    cancel_failed_ids.add(p_id)
                     s_tag = self._get_site_label(item_id)
-                    to_cancel = [ap for ap in active_promos if not self._is_recently_exited(item_id, ap["id"])]
-                    if to_cancel or (official_orig > 0 and not active_promos):
-                        self.log(
-                            f"【{store_name}】{s_tag}商品 {item_id} 检测到{change_desc}，"
-                            f"执行新定价策略：退出所有活动，不再报任何活动。",
-                            tag="自动退出",
-                        )
-                    for ap in to_cancel:
-                        p_id = ap["id"]
-                        p_type = ap["type"]
-                        p_raw = ap.get("raw") or {}
-                        p_name = str(p_raw.get("name") or "").strip()
-                        p_label = f"【{p_name}】" if p_name else p_id
-                        offer_id = str(p_raw.get("offer_id") or ap.get("offer_id") or "").strip() or None
-                        try:
-                            if offer_id:
-                                self.client.cancel_promotion_item(
-                                    account_id, child_user_id, item_id, p_id, p_type, offer_id=offer_id
-                                )
-                            else:
-                                self.client.cancel_promotion_item(account_id, child_user_id, item_id, p_id, p_type)
-                            self._mark_recently_exited(item_id, p_id)
-                            self.log(f"【{store_name}】{s_tag}商品 {item_id}: 已退出活动 {p_label}。", tag="自动退出")
-                        except Exception as cancel_err:
-                            clean_err = clean_error_message(cancel_err)
-                            self.log(f"【{store_name}】{s_tag}商品 {item_id}: 尝试退出活动 {p_label} 异常: {clean_err}", tag="自动退出")
+                    self.log(f"【{store_name}】{s_tag}商品 {item_id}: 退出旧活动 {p_label} 异常: {clean_err}", tag="自动退出")
 
-                cbt_id = str(raw_item.get("cbt_item_id") or "").strip().upper()
-            else:
-                # 分支 B：【体系 1（仅平台调整了运费）】退出旧锁死原价并按最新运费继续报回折扣（全程持有 item_lock 避免并发重入）
-                started_promos = [ap for ap in active_promos if ap.get("status") == "started"]
-                target_promos = started_promos if started_promos else candidate_promos
-                s_tag = self._get_site_label(item_id)
-                if not target_promos:
-                    self._price_cache[item_id] = current_price
-                    if current_net > 0:
-                        self._net_cache[item_id] = current_net
-                    if current_shipping > 0:
-                        self._shipping_cache[item_id] = current_shipping
-                    self._dim_cache[item_id] = (dim_str, weight_str)
-                    self._mark_shipping_reenrolled(item_id, current_net, current_shipping)
-                    self._save_db_snapshot(account_id, child_user_id, site_id, item_id, current_price, raw_item, dim_str, weight_str, db_system)
-                    self.log(
-                        f"【{store_name}】{s_tag}商品 {item_id} 检测到{change_desc}，当前暂无可报活动，已更新最新运费基线。",
-                        tag="运费更新",
-                    )
-                    return True
+            # 3. CBT 跨站点联动退出（体系2）
+            if plan.decision_type in (ActionType.SELLER_DATA_CHANGE, ActionType.WAIT_PLATFORM_REVIEW) and cbt_id.startswith("CBT"):
+                self._cascade_cbt_system2_exit(account_id, cbt_id, trigger_item_id=item_id, cbt_reason=plan.change_desc)
 
-                discount = self._get_current_discount()
-                self.log(
-                    f"【{store_name}】{s_tag}商品 {item_id} {change_desc}，退出旧活动",
-                    tag="自动退出",
-                )
-
-                cancel_failed_ids: set[str] = set()
-                for ap in started_promos:
-                    p_id = ap["id"]
-                    p_type = ap["type"]
-                    if self._is_recently_exited(item_id, p_id, ttl_sec=15.0):
-                        continue
-                    p_raw = ap.get("raw") or {}
-                    p_name = str(p_raw.get("name") or "").strip()
-                    p_label = f"【{p_name}】" if p_name else p_id
-                    offer_id = str(p_raw.get("offer_id") or ap.get("offer_id") or "").strip() or None
-                    try:
-                        if offer_id:
-                            self.client.cancel_promotion_item(
-                                account_id, child_user_id, item_id, p_id, p_type, offer_id=offer_id
-                            )
-                        else:
-                            self.client.cancel_promotion_item(account_id, child_user_id, item_id, p_id, p_type)
-                        self._mark_recently_exited(item_id, p_id)
-                    except Exception as cancel_err:
-                        err_str = str(cancel_err)
-                        if "404" in err_str or "not found" in err_str.lower():
-                            pass
-                        else:
-                            cancel_failed_ids.add(p_id)
-                            clean_err = clean_error_message(cancel_err)
-                            self.log(f"【{store_name}】{s_tag}商品 {item_id}: 退出旧活动 {p_label} 异常: {clean_err}", tag="自动退出")
-
-                if started_promos and isinstance(self.client, MercadoClient):
+            # 4. 执行重报活动指令
+            if plan.promos_to_enroll:
+                if plan.promos_to_cancel and isinstance(self.client, MercadoClient):
                     time.sleep(1.0)
-
-                # 重新获取退出活动后的最新商品详情以刷新基准原价，并按之前的折扣重新报名回原活动
-                try:
-                    fresh_item = self.client.get_item_detail(account_id, item_id)
-                    if isinstance(fresh_item, dict) and fresh_item.get("id"):
-                        raw_item = fresh_item
-                        item_info = extract_item_net_proceeds(raw_item)
-                        current_price = float(item_info.price or current_price)
-                except Exception:
-                    pass
-
-                # 若存在退出异常的活动，查证其是否在美客多后台已转为 candidate；未转为 candidate 者跳过重报以防 429 冲突
-                current_candidate_ids: set[str] = set()
-                if cancel_failed_ids:
-                    try:
-                        current_promos = self.client.request(
-                            account_id,
-                            "GET",
-                            f"/marketplace/seller-promotions/items/{item_id}",
-                            params={"app_version": "v2", "user_id": child_user_id},
-                        )
-                        if isinstance(current_promos, list):
-                            for cp in current_promos:
-                                if isinstance(cp, dict) and str(cp.get("status") or "").lower() == "candidate":
-                                    current_candidate_ids.add(str(cp.get("id") or ""))
-                    except Exception:
-                        pass
-
-                any_enrolled_ok = False
-                for ap in target_promos:
-                    p_id = ap["id"]
-                    p_type = ap["type"]
-                    p_raw = ap.get("raw") or {}
-                    p_name = str(p_raw.get("name") or "").strip()
-                    p_label = f"【{p_name}】" if p_name else p_id
-
+                for ep in plan.promos_to_enroll:
+                    p_id = ep.promotion_id
+                    p_type = ep.promotion_type
+                    p_label = f"【{ep.name}】" if ep.name else p_id
+                    if p_id in cancel_failed_ids:
+                        continue
+                    offer_id = ep.offer_id
                     s_tag = self._get_site_label(item_id)
-                    if p_id in cancel_failed_ids and p_id not in current_candidate_ids:
-                        self.log(f"【{store_name}】{s_tag}商品 {item_id}: 旧活动 {p_label} 尚未完全退出，跳过本次重报以避免频控冲突。", tag="自动退出")
-                        continue
-
-                    calc = calculate_deal_price(item_info, discount, p_raw, p_type)
-                    if not calc.eligible or calc.deal_price <= 0:
-                        self.log(f"【{store_name}】{s_tag}商品 {item_id}: 活动 {p_label} 重算跳过 ({calc.skip_reason})。", tag="自动报回")
-                        continue
-                    offer_id = str(p_raw.get("offer_id") or "") or None
                     enrolled_ok = False
                     last_enroll_err: Exception | None = None
+                    reason_prefix = "按新净收益" if plan.decision_type == ActionType.REVIEW_RESOLVED_AUTO_REENROLL else "按新运费"
                     for attempt in range(3):
                         try:
                             self.client.enroll_promotion_item(
@@ -933,17 +778,16 @@ class WebhookWorker:
                                 item_id=item_id,
                                 promotion_id=p_id,
                                 promotion_type=p_type,
-                                deal_price=calc.deal_price,
+                                deal_price=ep.deal_price,
                                 offer_id=offer_id,
-                                original_price=calc.original_price,
+                                original_price=plan.current_price,
                             )
                             self.log(
-                                f"【{store_name}】{s_tag}商品 {item_id}: 按新运费报回活动 {p_label}，"
-                                f"折后售价 ${calc.deal_price:.2f}。",
+                                f"【{store_name}】{s_tag}商品 {item_id}: {reason_prefix}报回活动 {p_label}，"
+                                f"折后售价 ${ep.deal_price:.2f}。",
                                 tag="自动报回",
                             )
                             enrolled_ok = True
-                            any_enrolled_ok = True
                             self._unmark_recently_exited(item_id, p_id)
                             break
                         except Exception as enroll_err:
@@ -961,7 +805,17 @@ class WebhookWorker:
                         elif "LockedEntityException" in err_msg or "Offer Locked" in err_msg:
                             self.log(f"【{store_name}】{s_tag}商品 {item_id}: 失败，平台活动锁占用中（请稍后重试）", tag="自动报回")
                         elif "ERROR_CREDIBILITY_DISCOUNTED_PRICE" in err_msg:
-                            sugg_p = float(p_raw.get("suggested_discounted_price") or (p_raw.get("raw") or {}).get("suggested_discounted_price") or 0.0)
+                            p_raw = ep.raw or {}
+                            sugg_p = 0.0
+                            for cand_dict in (p_raw, p_raw.get("raw") or {}, (p_raw.get("raw") or {}).get("raw") or {}):
+                                if isinstance(cand_dict, dict) and cand_dict.get("suggested_discounted_price") is not None:
+                                    try:
+                                        val = float(cand_dict["suggested_discounted_price"])
+                                        if val > 0:
+                                            sugg_p = val
+                                            break
+                                    except (ValueError, TypeError):
+                                        pass
                             if sugg_p <= 0:
                                 try:
                                     cand_info = self.client.request(
@@ -976,46 +830,156 @@ class WebhookWorker:
                                 except Exception:
                                     pass
                             if sugg_p > 0:
-                                reason = f"失败，折扣价高于平台预期（折后价 ${calc.deal_price:.2f} ，平台预期${sugg_p:.2f} ）"
+                                reason = f"失败，折扣价高于平台预期（折后价 ${ep.deal_price:.2f} ，平台预期${sugg_p:.2f} ）"
                             else:
-                                reason = f"失败，折扣价高于平台预期（折后价 ${calc.deal_price:.2f} ）"
+                                reason = f"失败，折扣价高于平台预期（折后价 ${ep.deal_price:.2f} ）"
                             self.log(f"【{store_name}】{s_tag}商品 {item_id}: {reason}", tag="自动报回")
                         elif "ITEM_NOT_ELIGIBLE" in err_msg:
                             self.log(f"【{store_name}】{s_tag}商品 {item_id}: 失败，不满足活动准入条件", tag="自动报回")
                         else:
-                            clean_err = clean_error_message(err_msg)
-                            self.log(f"【{store_name}】{s_tag}商品 {item_id}: 报回活动 {p_label} 失败，{clean_err}", tag="自动报回")
+                            clean_err = clean_error_message(last_enroll_err)
+                            self.log(f"【{store_name}】{s_tag}商品 {item_id}: 失败，{clean_err}", tag="自动报回")
 
-                # 报名完成后再次同步最新快照
+            # 5. 待审队列管理（双重保障）
+            with self._pending_review_lock:
+                if plan.wait_for_review:
+                    self._pending_review_items[item_id] = {
+                        "account_id": account_id,
+                        "child_user_id": child_user_id,
+                        "site_id": site_id,
+                        "timestamp": time.time(),
+                    }
+                else:
+                    self._pending_review_items.pop(item_id, None)
+
+            # 6. 更新内存快照缓存与 SQLite 持久化
+            self._price_cache[item_id] = plan.current_price
+            if plan.current_net > 0:
+                self._net_cache[item_id] = plan.current_net
+            if plan.current_shipping > 0:
+                self._shipping_cache[item_id] = plan.current_shipping
+            if plan.dim_str or plan.weight_str:
+                self._dim_cache[item_id] = (plan.dim_str, plan.weight_str)
+            if plan.decision_type == ActionType.PLATFORM_SHIPPING_CHANGE:
+                self._mark_shipping_reenrolled(item_id, plan.current_net, plan.current_shipping)
+
+            self._save_db_snapshot(
+                account_id, child_user_id, site_id, item_id, plan.current_price, plan.raw_item_snapshot,
+                plan.dim_str, plan.weight_str, plan.pricing_system
+            )
+            return True
+
+    def _load_cached_snapshot(self, account_id: str, item_id: str) -> dict[str, Any]:
+        cached_price = self._price_cache.get(item_id)
+        cached_net = self._net_cache.get(item_id)
+        cached_shipping = self._shipping_cache.get(item_id)
+        cached_dims = self._dim_cache.get(item_id)
+        old_dim = cached_dims[0] if cached_dims else None
+        old_weight = cached_dims[1] if cached_dims else None
+        db_system = None
+
+        db_snap = self._load_db_snapshot(account_id, item_id)
+        if db_snap is not None:
+            if cached_price is None:
+                db_p = db_snap.get("original_price") or db_snap.get("price")
+                if db_p is not None:
+                    cached_price = float(db_p)
+            if old_dim is None:
+                old_dim = db_snap.get("dimensions_json")
+            if old_weight is None:
+                old_weight = db_snap.get("weight_json")
+            raw_j = db_snap.get("raw_json")
+            if raw_j:
                 try:
-                    after_item = self.client.get_item_detail(account_id, item_id)
-                    if isinstance(after_item, dict) and after_item.get("id"):
-                        raw_item = dict(after_item)
-                        if any_enrolled_ok and raw_item.get("original_price") is not None:
-                            raw_item["original_price"] = current_price
+                    parsed_raw = json.loads(raw_j)
+                    if isinstance(parsed_raw, dict):
+                        db_system = parsed_raw.get("pricing_system")
+                        net_obj = parsed_raw.get("net_proceeds") or {}
+                        if isinstance(net_obj, dict):
+                            if cached_net is None:
+                                net_amt = net_obj.get("amount")
+                                if net_amt is not None:
+                                    cached_net = float(net_amt)
+                            if cached_shipping is None:
+                                for concept in net_obj.get("additional_concepts") or []:
+                                    if str(concept.get("id") or "").lower() == "shipping_cost":
+                                        s_amt = concept.get("amount")
+                                        if s_amt is not None:
+                                            cached_shipping = float(s_amt)
                 except Exception:
                     pass
 
-                self._price_cache[item_id] = current_price
-                if current_net > 0:
-                    self._net_cache[item_id] = current_net
-                if current_shipping > 0:
-                    self._shipping_cache[item_id] = current_shipping
-                self._dim_cache[item_id] = (dim_str, weight_str)
-                self._mark_shipping_reenrolled(item_id, current_net, current_shipping)
-                self._save_db_snapshot(
-                    account_id, child_user_id, site_id, item_id, current_price, raw_item, dim_str, weight_str,
-                    pricing_system="system1_discount",
-                )
-                return True
+        return {
+            "price": cached_price,
+            "net_proceeds": cached_net,
+            "shipping_cost": cached_shipping,
+            "dimensions": old_dim,
+            "weight": old_weight,
+            "pricing_system": db_system,
+        }
 
-        if change_type == "seller_data":
-            if cbt_id.startswith("CBT"):
-                self._cascade_cbt_system2_exit(account_id, cbt_id, trigger_item_id=item_id)
-            return True
-        return True
+    def _collect_cbt_siblings(self, account_id: str, cbt_id: str, trigger_item_id: str) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        try:
+            raw_cbt = self.client.get_item_detail(account_id, cbt_id)
+            if not isinstance(raw_cbt, dict):
+                return results
+            cbt_children = raw_cbt.get("marketplace_items") or raw_cbt.get("site_items") or []
+            seen_sibs: set[str] = set()
+            for child_entry in cbt_children:
+                if not isinstance(child_entry, dict):
+                    continue
+                sib_id = str(child_entry.get("item_id") or child_entry.get("id") or "").strip().upper()
+                if not sib_id or sib_id == trigger_item_id or sib_id in seen_sibs:
+                    continue
+                seen_sibs.add(sib_id)
+                sib_user_id = str(child_entry.get("user_id") or child_entry.get("seller_id") or "").strip()
+                sib_site_id = str(child_entry.get("site_id") or sib_id[:3]).strip().upper()
+                if not sib_user_id:
+                    _, sib_user_id, sib_site_id = self._resolve_route(account_id, sib_id)
+                if not sib_user_id:
+                    continue
+                sib_promos: list[dict[str, Any]] = []
+                try:
+                    promos_res = self.client.request(
+                        account_id,
+                        "GET",
+                        f"/marketplace/seller-promotions/items/{sib_id}",
+                        params={"app_version": "v2", "user_id": sib_user_id},
+                    )
+                    for p in (promos_res if isinstance(promos_res, list) else []):
+                        if not isinstance(p, dict):
+                            continue
+                        p_id = str(p.get("id") or "")
+                        p_type = str(p.get("type") or "DEAL").upper()
+                        p_status = str(p.get("status") or "").lower()
+                        if p_status in ("started", "pending") and (p_id or p_type == "PRICE_DISCOUNT"):
+                            if not self._is_recently_exited(sib_id, p_id):
+                                sib_promos.append({
+                                    "id": p_id,
+                                    "type": p_type,
+                                    "name": str(p.get("name") or "").strip(),
+                                    "offer_id": str(p.get("offer_id") or "").strip() or None,
+                                })
+                except Exception:
+                    pass
+                results.append({
+                    "item_id": sib_id,
+                    "site_id": sib_site_id,
+                    "user_id": sib_user_id,
+                    "active_promos": sib_promos,
+                })
+        except Exception:
+            pass
+        return results
 
-    def _cascade_cbt_system2_exit(self, account_id: str, cbt_id: str, trigger_item_id: str) -> None:
+    def _cascade_cbt_system2_exit(
+        self,
+        account_id: str,
+        cbt_id: str,
+        trigger_item_id: str,
+        cbt_reason: str = "",
+    ) -> None:
         """When any child item under a global CBT parent triggers System 2 (seller data modification),
         cascade promotion exit and system2_155 snapshot marking to all sibling site items of the same CBT parent.
         """
@@ -1034,6 +998,7 @@ class WebhookWorker:
 
         store_name = self._get_store_alias(account_id)
         seen_sibs: set[str] = set()
+        reason_str = cbt_reason if cbt_reason else "数据变动"
         for child_entry in cbt_children:
             if not isinstance(child_entry, dict):
                 continue
@@ -1096,20 +1061,14 @@ class WebhookWorker:
                             p_name = ap.get("name") or ""
                             p_label = f"【{p_name}】" if p_name else p_id
                             offer_id = ap.get("offer_id")
-                            try:
-                                if offer_id:
-                                    self.client.cancel_promotion_item(
-                                        account_id, sib_user_id, sib_id, p_id, p_type, offer_id=offer_id
-                                    )
-                                else:
-                                    self.client.cancel_promotion_item(account_id, sib_user_id, sib_id, p_id, p_type)
-                                self._mark_recently_exited(sib_id, p_id)
-                                sib_site_tag = self._get_site_label(sib_id)
-                                self.log(f"【{store_name}】{sib_site_tag}商品 {sib_id}: 因同父商品 {cbt_id} 数据变动，已联动退出活动 {p_label}。", tag="自动退出")
-                            except Exception as cancel_err:
-                                clean_err = clean_error_message(cancel_err)
-                                sib_site_tag = self._get_site_label(sib_id)
-                                self.log(f"【{store_name}】{sib_site_tag}商品 {sib_id}: 联动退出活动 {p_label} 异常: {clean_err}", tag="自动退出")
+                            sib_site_tag = self._get_site_label(sib_id)
+                            success, clean_err = self._cancel_promotion_with_readback(
+                                account_id, sib_user_id, sib_id, p_id, p_type, offer_id=offer_id
+                            )
+                            if success:
+                                self.log(f"【{store_name}】{sib_site_tag}商品 {sib_id}: 因全球父商品 {cbt_id} {reason_str}，已联动退出活动 {p_label}。", tag="自动退出")
+                            else:
+                                self.log(f"【{store_name}】{sib_site_tag}商品 {sib_id}: 因全球父商品 {cbt_id} {reason_str}，联动退出活动 {p_label} 异常: {clean_err}", tag="自动退出")
                         try:
                             fresh_sib = self.client.get_item_detail(account_id, sib_id)
                             if isinstance(fresh_sib, dict) and fresh_sib.get("id"):

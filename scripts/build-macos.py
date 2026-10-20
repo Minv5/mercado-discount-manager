@@ -45,7 +45,8 @@ def terminate_running_app() -> None:
 
 def build() -> None:
     is_ci = os.environ.get("CI", "").lower() == "true"
-    if not is_ci:
+    allow_restart = "--restart" in sys.argv
+    if not is_ci and allow_restart:
         terminate_running_app()
 
     build_started = datetime.now(timezone.utc)
@@ -204,13 +205,18 @@ def build() -> None:
             print(f"[*] Updating {dest_desktop}...")
             shutil.rmtree(dest_desktop, ignore_errors=True)
             shutil.copytree(app_bundle, dest_desktop, symlinks=True)
-        terminate_running_app()
-        if desktop_dir_path.exists() and (desktop_dir_path / app_bundle.name).exists():
-            print(f"[*] Launching updated application from Desktop: {desktop_dir_path / app_bundle.name}...")
-            subprocess.run(["open", str(desktop_dir_path / app_bundle.name)], check=False)
-        elif apps_dir.exists() and (apps_dir / app_bundle.name).exists():
-            print(f"[*] Launching updated application from Applications: {apps_dir / app_bundle.name}...")
-            subprocess.run(["open", str(apps_dir / app_bundle.name)], check=False)
+            subprocess.run(["xattr", "-cr", str(dest_desktop)], check=False)
+        if allow_restart:
+            terminate_running_app()
+            if desktop_dir_path.exists() and (desktop_dir_path / app_bundle.name).exists():
+                print(f"[*] Launching updated application from Desktop: {desktop_dir_path / app_bundle.name}...")
+                subprocess.run(["open", str(desktop_dir_path / app_bundle.name)], check=False)
+            elif apps_dir.exists() and (apps_dir / app_bundle.name).exists():
+                print(f"[*] Launching updated application from Applications: {apps_dir / app_bundle.name}...")
+                subprocess.run(["open", str(apps_dir / app_bundle.name)], check=False)
+        else:
+            print("[*] Application bundles updated safely on Desktop and Applications.")
+            print("[*] Active running instances preserved to prevent task interruption.")
 
     # Clean tmp build
     shutil.rmtree(staging_dir, ignore_errors=True)

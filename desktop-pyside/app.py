@@ -185,6 +185,7 @@ def main() -> int:
         return exit_code
 
     app = create_application()
+    app.setQuitOnLastWindowClosed(True)
     project_root = Path(__file__).resolve().parents[1]
     service = NodeServiceManager(project_root)
     window = MainWindow(ApiClient(), service)

@@ -30,6 +30,112 @@ SITE_NAMES = {
     "MEC": "厄瓜多尔站",
 }
 
+SITE_FLAGS = {
+    "MLB": "🇧🇷",
+    "MLM": "🇲🇽",
+    "MLC": "🇨🇱",
+    "MCO": "🇨🇴",
+    "MLA": "🇦🇷",
+    "MLU": "🇺🇾",
+    "MPE": "🇵🇪",
+    "MEC": "🇪🇨",
+}
+
+_STORE_ALIAS_CACHE: dict[str, tuple[dict[str, str], dict[str, str], float]] = {}
+
+
+def get_store_alias(
+    auth_mgr: Any = None,
+    account_id: str | None = "",
+    site_id: str = "",
+    settings: dict[str, Any] | None = None,
+) -> str:
+    """Resolve user-configured Chinese store alias from memory or cached settings, strictly preventing English leakage."""
+    aid = str(account_id or "").strip()
+    if not aid or aid.upper() == "ALL":
+        return "全部店铺"
+
+    flag = SITE_FLAGS.get(str(site_id or "").strip().upper(), "")
+
+    aliases: dict[str, str] = {}
+    app_names: dict[str, str] = {}
+
+    if settings and isinstance(settings, dict):
+        aliases = {str(k): str(v).strip() for k, v in (settings.get("storeAliases") or {}).items() if str(v).strip()}
+        for app in settings.get("oauthApps") or []:
+            name = str(app.get("name") or "").strip()
+            if name:
+                app_id = str(app.get("id") or "").strip()
+                client_id = str(app.get("clientId") or "").strip()
+                if app_id:
+                    app_names[app_id] = name
+                if client_id:
+                    app_names[client_id] = name
+    else:
+        import json
+        import time
+        global _STORE_ALIAS_CACHE
+        now = time.monotonic()
+        cached = _STORE_ALIAS_CACHE.get("cache")
+        if cached and (now - cached[2]) < 5.0:
+            aliases, app_names, _ = cached
+        else:
+            try:
+                from engine.crypto import get_data_dir
+                s_path = get_data_dir() / "settings.json"
+                if s_path.exists():
+                    data = json.loads(s_path.read_text(encoding="utf-8"))
+                    aliases = {str(k): str(v).strip() for k, v in (data.get("storeAliases") or {}).items() if str(v).strip()}
+                    for app in data.get("oauthApps") or []:
+                        name = str(app.get("name") or "").strip()
+                        if name:
+                            app_id = str(app.get("id") or "").strip()
+                            client_id = str(app.get("clientId") or "").strip()
+                            if app_id:
+                                app_names[app_id] = name
+                            if client_id:
+                                app_names[client_id] = name
+                    _STORE_ALIAS_CACHE["cache"] = (aliases, app_names, now)
+            except Exception:
+                pass
+
+    if aid in aliases:
+        name = aliases[aid]
+        return f"{flag} {name}".strip() if flag else name
+    if aid in app_names:
+        name = app_names[aid]
+        return f"{flag} {name}".strip() if flag else name
+
+    if auth_mgr is not None and hasattr(auth_mgr, "list_accounts"):
+        try:
+            for a in auth_mgr.list_accounts():
+                if isinstance(a, dict):
+                    parent_id = str(a.get("account_id") or a.get("id") or a.get("user_id") or "").strip()
+                    disp = str(a.get("display_name") or a.get("store_name") or a.get("nickname") or "").strip()
+                    child_sites = a.get("child_sites")
+                else:
+                    parent_id = str(getattr(a, "account_id", "") or getattr(a, "user_id", "") or getattr(a, "id", "") or "").strip()
+                    disp = str(getattr(a, "display_name", "") or getattr(a, "store_name", "") or getattr(a, "nickname", "") or "").strip()
+                    child_sites = getattr(a, "child_sites", None)
+
+                if isinstance(child_sites, dict):
+                    for s_site, cid in child_sites.items():
+                        if str(cid).strip() == aid:
+                            p_name = aliases.get(parent_id) or app_names.get(parent_id) or disp or "美客多店铺"
+                            s_flag = SITE_FLAGS.get(s_site, flag)
+                            return f"{s_flag} {p_name}".strip() if s_flag else p_name
+
+                if parent_id == aid:
+                    p_name = aliases.get(parent_id) or app_names.get(parent_id) or disp or "美客多店铺"
+                    return f"{flag} {p_name}".strip() if flag else p_name
+        except Exception:
+            pass
+
+    return f"{flag} 店铺 {aid}".strip() if flag else f"店铺 {aid}"
+
+
+resolve_store_name = get_store_alias
+
 EXCLUDE_ACTIVITY = "__exclude__"
 BUSINESS_TIMEZONE = timezone(timedelta(hours=8))
 TERMINAL_EXECUTION_GROUP_STATES = {"completed", "partial_or_failed", "failed", "cancelled", "interrupted"}

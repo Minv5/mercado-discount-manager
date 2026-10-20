@@ -108,6 +108,14 @@ from engine.item_cleaner import (
 )
 from engine.client import MercadoClient
 from engine.auth import AuthManager
+from ui_common import (
+    CheckableComboBox,
+    ElidedLabel,
+    field_label,
+    make_table,
+    populate_store_combo,
+    section_label,
+)
 
 
 TASK_HEADERS = ["时间", "动作", "折扣", "活动", "类型", "商品 / 处理项", "结果", "失败", "失败原因"]
@@ -122,172 +130,7 @@ STARTUP_PHASE_LABELS = {
     "startup_readiness": "启动缓存",
 }
 
-
-class CheckableComboBox(QComboBox):
-    """支持多选复选框的下拉框控件，支持一键全选/反选与选择项自适应摘要显示。"""
-    selectionChanged = Signal(list)
-
-    def __init__(self, parent: QWidget | None = None, placeholder: str = "全部站点") -> None:
-        super().__init__(parent)
-        self.placeholder = placeholder
-        self._model = QStandardItemModel(self)
-        self.setModel(self._model)
-        self.view().viewport().installEventFilter(self)
-        self._line_edit = QLineEdit(self)
-        self._line_edit.setReadOnly(True)
-        self._line_edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._line_edit.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._line_edit.setStyleSheet("border: none; background: transparent; color: inherit; padding: 0;")
-        self._line_edit.installEventFilter(self)
-        self.setLineEdit(self._line_edit)
-        self._model.itemChanged.connect(self._on_item_changed)
-        self._updating = False
-
-    def eventFilter(self, obj: object, event: QEvent) -> bool:
-        if obj == self._line_edit:
-            if event.type() == QEvent.Type.MouseButtonPress:
-                return True
-            if event.type() == QEvent.Type.MouseButtonRelease:
-                if self.view().isVisible():
-                    self.hidePopup()
-                else:
-                    self.showPopup()
-                return True
-        if obj == self.view().viewport() and event.type() == QEvent.Type.MouseButtonRelease:
-            index = self.view().indexAt(event.pos())
-            item = self._model.itemFromIndex(index)
-            if item:
-                if item.data(Qt.ItemDataRole.UserRole) == "__ALL__":
-                    new_state = Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked else Qt.CheckState.Checked
-                    self._updating = True
-                    for r in range(self._model.rowCount()):
-                        it = self._model.item(r)
-                        if it:
-                            it.setCheckState(new_state)
-                    self._updating = False
-                    self._update_display_text()
-                else:
-                    new_state = Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked else Qt.CheckState.Checked
-                    item.setCheckState(new_state)
-                    self._sync_all_checkbox()
-                return True
-        return super().eventFilter(obj, event)
-
-    def _sync_all_checkbox(self) -> None:
-        if self._updating:
-            return
-        all_item = None
-        other_checked = 0
-        total_others = 0
-        for r in range(self._model.rowCount()):
-            it = self._model.item(r)
-            if not it:
-                continue
-            if it.data(Qt.ItemDataRole.UserRole) == "__ALL__":
-                all_item = it
-            else:
-                total_others += 1
-                if it.checkState() == Qt.CheckState.Checked:
-                    other_checked += 1
-        if all_item:
-            self._updating = True
-            if other_checked == total_others and total_others > 0:
-                all_item.setCheckState(Qt.CheckState.Checked)
-            elif other_checked > 0:
-                all_item.setCheckState(Qt.CheckState.PartiallyChecked)
-            else:
-                all_item.setCheckState(Qt.CheckState.Unchecked)
-            self._updating = False
-        self._update_display_text()
-
-    def _on_item_changed(self, item: QStandardItem) -> None:
-        if self._updating:
-            return
-        self._sync_all_checkbox()
-
-    def set_items(self, items: list[tuple[str, str]], checked_keys: list[str] | None = None) -> None:
-        """items: [(display_name, key)]"""
-        new_keys = [k for _, k in items]
-        if self.all_keys() == new_keys and checked_keys is None:
-            return
-        self._updating = True
-        self._model.clear()
-        if not items:
-            self._updating = False
-            self._update_display_text()
-            return
-
-        all_item = QStandardItem("全部站点 (全选/反选)")
-        all_item.setData("__ALL__", Qt.ItemDataRole.UserRole)
-        all_item.setCheckable(True)
-        all_item.setCheckState(Qt.CheckState.Checked)
-        self._model.appendRow(all_item)
-
-        initial_checked = set(checked_keys) if checked_keys is not None else {k for _, k in items}
-        for name, key in items:
-            it = QStandardItem(name)
-            it.setData(key, Qt.ItemDataRole.UserRole)
-            it.setCheckable(True)
-            st = Qt.CheckState.Checked if key in initial_checked else Qt.CheckState.Unchecked
-            it.setCheckState(st)
-            self._model.appendRow(it)
-
-        self._updating = False
-        self._sync_all_checkbox()
-
-    def checked_keys(self) -> list[str]:
-        keys = []
-        for r in range(self._model.rowCount()):
-            it = self._model.item(r)
-            if it and it.data(Qt.ItemDataRole.UserRole) != "__ALL__":
-                if it.checkState() == Qt.CheckState.Checked:
-                    keys.append(str(it.data(Qt.ItemDataRole.UserRole)))
-        return keys
-
-    def all_keys(self) -> list[str]:
-        keys = []
-        for r in range(self._model.rowCount()):
-            it = self._model.item(r)
-            if it and it.data(Qt.ItemDataRole.UserRole) != "__ALL__":
-                keys.append(str(it.data(Qt.ItemDataRole.UserRole)))
-        return keys
-
-    def set_checked_keys(self, keys: list[str]) -> None:
-        target_set = set(keys)
-        self._updating = True
-        for r in range(self._model.rowCount()):
-            it = self._model.item(r)
-            if it and it.data(Qt.ItemDataRole.UserRole) != "__ALL__":
-                k = str(it.data(Qt.ItemDataRole.UserRole))
-                it.setCheckState(Qt.CheckState.Checked if k in target_set else Qt.CheckState.Unchecked)
-        self._updating = False
-        self._sync_all_checkbox()
-
-    def display_text(self) -> str:
-        return self._line_edit.text()
-
-    def _update_display_text(self) -> None:
-        selected_names: list[str] = []
-        total = 0
-        for r in range(self._model.rowCount()):
-            it = self._model.item(r)
-            if it and it.data(Qt.ItemDataRole.UserRole) != "__ALL__":
-                total += 1
-                if it.checkState() == Qt.CheckState.Checked:
-                    raw_text = it.text().split(" (")[0]
-                    selected_names.append(raw_text)
-        if total == 0:
-            text = "无可用站点"
-        elif len(selected_names) == total:
-            text = f"全部站点 ({total}个)"
-        elif not selected_names:
-            text = "⚠️ 未选择站点"
-        elif len(selected_names) <= 2:
-            text = "、".join(selected_names)
-        else:
-            text = f"已选 {len(selected_names)}/{total} 站点"
-        self._line_edit.setText(text)
-        self.selectionChanged.emit(self.checked_keys())
+# CheckableComboBox is extracted to ui_common.widgets and imported above.
 
 
 class CleanerTableModel(QAbstractTableModel):
@@ -623,6 +466,7 @@ class MainWindow(QMainWindow):
         self.initial_site_discovery_consumed = False
         self.initial_site_discovery_pending = False
         self.auto_decision_token = 0
+        self.is_targeted_execution_running = False
         self.scope_ready = False
         self.scope_retry_count = 0
         self.running_group: dict[str, Any] = {}
@@ -738,10 +582,37 @@ class MainWindow(QMainWindow):
         self.activity_page, self.activity_table = self._build_activity_page()
         self.cleaner_page, self.cleaner_table = self._build_cleaner_page()
 
+        # 3: 客服与售后中心页面
+        from service_center.service_center_page import ServiceCenterPage
+        from orders.orders_page import OrdersPage
+        bridge = getattr(self.api, "bridge", None)
+        if not bridge:
+            try:
+                from engine.bridge import EngineBridge
+                bridge = EngineBridge.get_instance()
+            except Exception:
+                bridge = None
+        cs_client = getattr(bridge, "client", None) or MercadoClient(AuthManager())
+        cs_auth = getattr(bridge, "auth", None) or AuthManager()
+        self.service_center_page = ServiceCenterPage(cs_client, cs_auth, parent=self)
+        self.service_center_page.unreadCountChanged.connect(self._on_service_center_unread_count_changed)
+        self.service_center_page.oauthExpired.connect(self.handle_oauth_expired)
+        unread_init = len([s for s in self.service_center_page._all_sessions if s.is_unread])
+        self._on_service_center_unread_count_changed(unread_init)
+
+        if bridge and hasattr(bridge, "webhook") and bridge.webhook:
+            bridge.webhook.customer_service_callback = self._on_customer_service_webhook_event
+
+        # 4: 订单管理页面
+        self.orders_page = OrdersPage(cs_client, cs_auth, parent=self)
+        self.orders_page.oauthExpired.connect(self.handle_oauth_expired)
+
         self.pages = QStackedWidget()
         self.pages.addWidget(self.enrollment_page)
         self.pages.addWidget(self.activity_page)
         self.pages.addWidget(self.cleaner_page)
+        self.pages.addWidget(self.service_center_page)
+        self.pages.addWidget(self.orders_page)
 
         self.view_stack = QStackedWidget()
         self.view_stack.addWidget(self.pages)
@@ -775,6 +646,7 @@ class MainWindow(QMainWindow):
             seller_discount=5,
             official_discount=6,
             embedded=True,
+            busy_reason=self._targeted_cancel_busy_reason,
         )
         self.targeted_log_box = self.targeted_cancel_page.log_box
         self.targeted_cancel_page.submitted.connect(self._start_targeted_item_execution)
@@ -896,6 +768,24 @@ class MainWindow(QMainWindow):
         cleaner_btn.clicked.connect(lambda checked=False: self._show_page(2))
         self.nav_buttons.append(cleaner_btn)
         layout.addWidget(cleaner_btn)
+
+        # 6. 客服售后
+        self.service_center_btn = QPushButton("客服售后")
+        self.service_center_btn.setObjectName("nav")
+        self.service_center_btn.setCheckable(True)
+        self.service_center_btn.setFixedSize(90, 34)
+        self.service_center_btn.clicked.connect(lambda checked=False: self._show_page(3))
+        self.nav_buttons.append(self.service_center_btn)
+        layout.addWidget(self.service_center_btn)
+
+        # 7. 订单管理
+        self.orders_btn = QPushButton("订单管理")
+        self.orders_btn.setObjectName("nav")
+        self.orders_btn.setCheckable(True)
+        self.orders_btn.setFixedSize(90, 34)
+        self.orders_btn.clicked.connect(lambda checked=False: self._show_page(4))
+        self.nav_buttons.append(self.orders_btn)
+        layout.addWidget(self.orders_btn)
 
         # 分隔线
         sep = QFrame()
@@ -2128,6 +2018,8 @@ class MainWindow(QMainWindow):
             if self.startup_ready and not self.today_completion_ready:
                 self.log("启动缓存已就绪，正在自动核对今日执行记录...")
                 self.refresh_records()
+            if self.startup_ready and hasattr(self, "service_center_page"):
+                QTimer.singleShot(1500, self.service_center_page.reload_sessions)
             return
         if status in {"pending", "running"}:
             self.startup_ready = False
@@ -2471,6 +2363,10 @@ class MainWindow(QMainWindow):
             accounts_raw.append(r)
         self.accounts = [account_from_json(row) for row in accounts_raw]
         self.accounts = [account for account in self.accounts if account.account_id]
+        if hasattr(self, "service_center_page"):
+            self.service_center_page.refresh_accounts()
+        if hasattr(self, "orders_page"):
+            self.orders_page.refresh_accounts()
         discount = dict(data.get("discount") or {})
         self.global_seller_discount = int(
             discount.get("seller_discount")
@@ -2558,13 +2454,13 @@ class MainWindow(QMainWindow):
             self.store_combo.addItem(store, key)
         del blocker
         if hasattr(self, "cleaner_account_combo"):
-            cleaner_blocker = QSignalBlocker(self.cleaner_account_combo)
-            self.cleaner_account_combo.clear()
-            self.cleaner_account_combo.addItem(f"全部店铺（合并分析所有店铺 - {len(self.accounts)}个）", "all")
-            for account in self.accounts:
-                self.cleaner_account_combo.addItem(f"{account.store_name} ({account.account_id})", account.account_id)
-            self.cleaner_account_combo.setCurrentIndex(0)
-            del cleaner_blocker
+            populate_store_combo(
+                self.cleaner_account_combo,
+                accounts=self.accounts,
+                all_label=f"全部店铺（合并分析所有店铺 - {len(self.accounts)}个）",
+                all_value="all",
+                include_account_id_in_label=True,
+            )
             self._refresh_cleaner_sites()
 
     def _refresh_cleaner_sites(self) -> None:
@@ -3181,7 +3077,13 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_current_records(self, records: list[dict[str, Any]]) -> None:
-        self.records = list(records)
+        self.records = [
+            task for task in records
+            if not (
+                task.get("source") == "auto_reprice"
+                or '"source": "auto_reprice"' in str(task.get("summary_json") or "")
+            )
+        ]
         latest_delta = next(
             (dict(task.get("daily_item_delta") or {}) for task in self.records if isinstance(task.get("daily_item_delta"), dict)),
             {},
@@ -3273,6 +3175,38 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentIndex(index)
         active_btn = self.nav_buttons[index] if index < len(self.nav_buttons) else None
         self._update_nav_selection(active_btn)
+        if index == 3 and hasattr(self, "service_center_page"):
+            sizes = self.service_center_page.splitter.sizes()
+            if not sizes or sizes[0] < 380:
+                total_w = self.service_center_page.width() if self.service_center_page.width() > 800 else 1200
+                left_w = 410
+                right_w = max(480, total_w - left_w - self.service_center_page.splitter.handleWidth())
+                self.service_center_page.splitter.setSizes([left_w, right_w])
+            if getattr(self.service_center_page, "worker", None) is None:
+                self.service_center_page.reload_sessions()
+            elif self.service_center_page.session_list.count() > 0:
+                if self.service_center_page.session_list.currentRow() < 0 or not self.service_center_page._current_session:
+                    self.service_center_page.session_list.setCurrentRow(0)
+        elif index == 4 and hasattr(self, "orders_page"):
+            if getattr(self.orders_page, "_worker", None) is None:
+                self.orders_page.reload_orders()
+            elif self.orders_page.order_list.count() > 0:
+                if self.orders_page.order_list.currentRow() < 0 or not self.orders_page._current_order:
+                    self.orders_page.order_list.setCurrentRow(0)
+
+    def show_order(self, order_id: str) -> None:
+        """Switch to orders page and focus on the given order_id."""
+        self._show_page(4)
+        if hasattr(self, "orders_page"):
+            self.orders_page.select_order(order_id)
+
+    def _on_service_center_unread_count_changed(self, count: int) -> None:
+        if hasattr(self, "service_center_btn"):
+            self.service_center_btn.setText("客服售后")
+
+    def _on_customer_service_webhook_event(self, event: dict[str, Any]) -> None:
+        if hasattr(self, "service_center_page"):
+            QTimer.singleShot(0, lambda: self.service_center_page.handle_incoming_webhook_event(event))
 
     def _show_settings_page(self, initial_tab: str = "") -> None:
         if hasattr(self, "view_stack") and hasattr(self, "settings_page"):
@@ -3685,6 +3619,7 @@ class MainWindow(QMainWindow):
             if not self.prepare_poll_timer.isActive():
                 self.prepare_poll_timer.start()
             return
+        self.is_targeted_execution_running = False
         self.preparing_submission = {}
         self.pending_prepare_payload = None
         self._set_prepare_busy(False)
@@ -3693,6 +3628,7 @@ class MainWindow(QMainWindow):
     def _prepare_blocked_by_today_completion(self, details: dict[str, Any]) -> None:
         completed = dict(details.get("completed") or {})
         message = execution_completion_text(completed) if completed else "今天当前范围已有真实任务，自动模式不会重复准备。"
+        self.is_targeted_execution_running = False
         self.preparing_submission = {}
         self.pending_prepare_payload = None
         self.prepare_poll_timer.stop()
@@ -3754,17 +3690,20 @@ class MainWindow(QMainWindow):
             self._submission_prepared({"prepare": prepare})
             return
         if state == "reconfirm_required":
+            self.is_targeted_execution_running = False
             self.pending_prepare_payload = None
             self._set_prepare_busy(False)
             self.log("执行动作或活动结构已变化，本次未执行，请重新开始核对范围。")
             self._operation_error("核对执行范围", "执行动作或活动结构已变化，本次未执行，请重新开始核对范围。")
             return
         if state in {"failed", "expired"}:
+            self.is_targeted_execution_running = False
             self.pending_prepare_payload = None
             self._set_prepare_busy(False)
             self._operation_error("准备执行", prepare_failure_message(prepare))
             return
         if state in {"cancelled", "paused"}:
+            self.is_targeted_execution_running = False
             self.pending_prepare_payload = None
             self._set_prepare_busy(False)
             self.log("准备已停止，未创建执行组、未提交商品。" if state == "cancelled" else "本次准备已暂停，可在有效期内按相同范围恢复。")
@@ -4021,6 +3960,7 @@ class MainWindow(QMainWindow):
                 self.poll_timer.start()
             return
         if isinstance(error, ApiError) and not error.retryable and error.kind == "http":
+            self.is_targeted_execution_running = False
             self.pending_group_payload = None
             self.poll_timer.stop()
             self._operation_error("提交执行", error, execution=True)
@@ -4128,6 +4068,10 @@ class MainWindow(QMainWindow):
                 f"本次{action_label(action)}总汇总：店铺 {int(result.get('store_count') or len(stores))} 个，"
                 f"{execution_result_text(result, action)}{dur_suffix}。"
             )
+            if getattr(self, "is_targeted_execution_running", False):
+                self.is_targeted_execution_running = False
+                if hasattr(self, "targeted_log_box") and self.targeted_log_box is not None:
+                    self.targeted_log_box.append_log_line(f"[{datetime.now():%H:%M:%S}] [按ID操作] ✅ 指定商品操作全部完成！")
             self.running_group.clear()
             self.pending_group_payload = None
             self.job_log_seen.clear()
@@ -4308,6 +4252,7 @@ class MainWindow(QMainWindow):
             submission_ready=self._can_start_targeted_cancel,
             seller_discount=locked_seller_discount,
             official_discount=locked_official_discount,
+            busy_reason=self._targeted_cancel_busy_reason,
         )
         if dialog.exec() != QDialogAccepted:
             return
@@ -4349,6 +4294,7 @@ class MainWindow(QMainWindow):
         if not self._can_start_targeted_cancel():
             QMessageBox.information(self, "按商品 ID 操作活动", "缓存补偿或其它任务仍在运行，本次没有提交；请稍后重试。")
             return
+        self.is_targeted_execution_running = True
         settings = self.settings
         submission_id = str(uuid.uuid4())
         payload = execution_group_payload(
@@ -4478,6 +4424,10 @@ class MainWindow(QMainWindow):
         if settings:
             self.settings = settings
         self.accounts = accounts
+        if hasattr(self, "service_center_page"):
+            self.service_center_page.refresh_accounts()
+        if hasattr(self, "orders_page"):
+            self.orders_page.refresh_accounts()
         self.operating_rows_cache = operating
         self.benchmark_text_cache = benchmark
         if dialog.isVisible() or getattr(dialog, "embedded", False):
@@ -4706,6 +4656,17 @@ class MainWindow(QMainWindow):
             and bool(self.selected_account_ids())
         )
 
+    def _targeted_cancel_busy_reason(self) -> str:
+        if getattr(self, "is_targeted_execution_running", False) or bool(self.running_group) or bool(self.pending_group_payload):
+            return "指定商品活动正在后台提交中，请稍候；下方已实时同步执行日志。"
+        if bool(self.preparing_submission):
+            return "正在核对指定商品的可报名活动，请稍候..."
+        if self.refresh_busy:
+            return "缓存补偿仍在运行。可以先填写商品 ID；补偿结束后本按钮会自动启用，也可以关闭窗口后用主按钮停止补偿。"
+        if not self.selected_account_ids():
+            return "当前店铺没有可用授权账号。"
+        return "后台任务处理中，请稍候..."
+
     def _can_open_targeted_cancel(self) -> bool:
         return (
             not self.preparing_submission
@@ -4815,9 +4776,9 @@ class MainWindow(QMainWindow):
         is_activity = any(tag in message for tag in activity_tags)
         is_targeted = any(tag in message for tag in targeted_tags)
 
-        # 1. 路由至按ID操作专属日志框（仅当匹配指定商品/按ID操作专属标签时）
+        # 1. 路由至按ID操作专属日志框（当匹配专属标签，或当前正处于按ID后台任务执行中时镜像追加）
         if hasattr(self, "targeted_log_box") and self.targeted_log_box is not None:
-            if is_targeted:
+            if is_targeted or getattr(self, "is_targeted_execution_running", False):
                 self.targeted_log_box.append_log_line(formatted)
 
         # 2. 路由至商品清理或活动管理或常规主工作台日志框
@@ -5113,6 +5074,16 @@ class MainWindow(QMainWindow):
         auto_reprice_timer = getattr(self, "auto_reprice_timer", None)
         if auto_reprice_timer is not None:
             auto_reprice_timer.stop()
+        if hasattr(self, "service_center_page"):
+            try:
+                self.service_center_page.stop()
+            except Exception:
+                pass
+        if hasattr(self, "orders_page"):
+            try:
+                self.orders_page.stop()
+            except Exception:
+                pass
         self.service.stop()
         event.accept()
 
@@ -5140,35 +5111,10 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.1.33"
+    return "2.2.8"
 
 
-def make_table(headers: list[str]) -> QTableWidget:
-    table = QTableWidget(0, len(headers))
-    table.setHorizontalHeaderLabels(headers)
-    table.setAlternatingRowColors(True)
-    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-    table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-    table.setShowGrid(True)
-    table.verticalHeader().setVisible(False)
-    table.verticalHeader().setDefaultSectionSize(36)
-    header = table.horizontalHeader()
-    header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-    header.setSectionResizeMode(len(headers) - 1, QHeaderView.ResizeMode.Stretch)
-    return table
-
-
-def section_label(text: str) -> QLabel:
-    label = QLabel(text)
-    label.setObjectName("sectionTitle")
-    return label
-
-
-def field_label(text: str) -> QLabel:
-    label = QLabel(text)
-    label.setObjectName("muted")
-    return label
+# make_table, section_label, field_label are extracted to ui_common.widgets and imported above.
 
 
 def discount_spin(value: int) -> QSpinBox:

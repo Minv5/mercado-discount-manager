@@ -94,6 +94,7 @@ class ActionExecutor:
             cur = conn.cursor()
             cur.execute("""
                 SELECT * FROM promo_tasks
+                WHERE summary_json NOT LIKE '%"source": "auto_reprice"%' OR summary_json IS NULL
                 ORDER BY id DESC
                 LIMIT ?
             """, (limit,))

@@ -193,7 +193,18 @@ class QtUiTests(unittest.TestCase):
         }
 
     def tearDown(self) -> None:
-        self.window.close()
+        if hasattr(self, "window"):
+            if hasattr(self.window, "service_center_page"):
+                try:
+                    self.window.service_center_page.stop()
+                except Exception:
+                    pass
+            if hasattr(self.window, "orders_page"):
+                try:
+                    self.window.orders_page.stop()
+                except Exception:
+                    pass
+            self.window.close()
         from engine.item_cleaner import get_cleaner_draft_file
         draft = get_cleaner_draft_file()
         if draft.exists():
@@ -614,10 +625,10 @@ class QtUiTests(unittest.TestCase):
         self.window.refresh_records = lambda: calls.append(self.window.records_view)  # type: ignore[method-assign]
         self.window.records_refresh_button.clicked.emit()
         self.assertEqual(calls, ["recent"])
-        self.assertEqual([button.text() for button in self.window.nav_buttons], ["活动报名", "活动管理", "商品清理"])
+        self.assertEqual([button.text() for button in self.window.nav_buttons], ["活动报名", "活动管理", "商品清理", "客服售后", "订单管理"])
         self.assertFalse(hasattr(self.window, "history_table"))
         self.assertFalse(hasattr(self.window, "workbench_table"))
-        self.assertEqual(self.window.pages.count(), 3)
+        self.assertEqual(self.window.pages.count(), 5)
 
         # 验证切换到商品清理 (index=2) 时，当前主视图为 cleaner_page，controls 归属于 enrollment_page 而不在当前视图
         self.window._show_page(2)
@@ -2651,10 +2662,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.1.33")
- 
+        self.assertEqual(product_version(), "2.2.8")
+
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.1.33")
+        self.assertEqual(self.window.version_label.text(), "v2.2.8")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2666,7 +2677,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.1.33")
+        self.assertEqual(self.window.version_label.text(), "v2.2.8")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -2879,6 +2890,67 @@ class QtUiTests(unittest.TestCase):
         self.assertFalse(viewer.auto_scroll)
         viewer.append_log_line("test log line")
         self.assertIn("test log line", viewer.toPlainText())
+
+    def test_log_viewer_hover_and_append_lock_preserves_scroll_position(self) -> None:
+        from main_window import LogViewer
+        from PySide6.QtCore import QEvent
+        viewer = LogViewer()
+        self.assertFalse(viewer.is_hovered)
+        self.assertTrue(viewer.auto_scroll)
+
+        # 1. 模拟鼠标进入 viewport 激活悬停
+        enter_ev = QEvent(QEvent.Type.Enter)
+        viewer.eventFilter(viewer.viewport(), enter_ev)
+        self.assertTrue(viewer.is_hovered)
+
+        # 追加新日志，悬停锁定生效
+        viewer.append_log_line("hover line 1")
+        self.assertTrue(viewer.is_hovered)
+
+        # 2. 模拟鼠标离开 viewport 取消悬停
+        leave_ev = QEvent(QEvent.Type.Leave)
+        viewer.eventFilter(viewer.viewport(), leave_ev)
+        self.assertFalse(viewer.is_hovered)
+
+        # 3. 模拟滚轮向上滚动关闭 auto_scroll 后，追加新日志绝不被冲刷成 True
+        from PySide6.QtGui import QWheelEvent
+        from PySide6.QtCore import QPointF, QPoint
+        up_event = QWheelEvent(QPointF(0, 0), QPointF(0, 0), QPoint(0, 0), QPoint(0, 120), Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+        viewer.wheelEvent(up_event)
+        self.assertFalse(viewer.auto_scroll)
+
+        # 连续追加多条日志，验证 _is_appending 保护屏障有效，auto_scroll 稳固保持 False
+        for i in range(5):
+            viewer.append_log_line(f"subsequent line {i}")
+            self.assertFalse(viewer.auto_scroll)
+
+    def test_log_viewer_small_maximum_and_selection_lock(self) -> None:
+        """验证短日志场景(maximum < 15)向上滚动绝不误判为吸底，选中文本时光标与滚动条位置绝对冻结。"""
+        from main_window import LogViewer
+        viewer = LogViewer()
+        # 填充少量文本产生滚动条
+        for i in range(8):
+            viewer.append_log_line(f"initial line {i}")
+
+        scrollbar = viewer.verticalScrollBar()
+        max_val = scrollbar.maximum()
+        self.assertGreater(max_val, 0)
+
+        # 向上拖动滚动条 1 个单位（此时 value < max_val）
+        target_val = max(0, max_val - 1)
+        scrollbar.setValue(target_val)
+        self.assertFalse(viewer.auto_scroll)
+
+        # 追加新日志，验证滚动条位置精准保持为 target_val，绝不强制弹回底部
+        viewer.append_log_line("new log during scroll up")
+        self.assertEqual(scrollbar.value(), target_val)
+
+        # 模拟划词选中文本
+        viewer.selectAll()
+        self.assertTrue(viewer.textCursor().hasSelection())
+        # 在选中文本状态下追加日志，视口绝不跳转吸底
+        viewer.append_log_line("new log during selection")
+        self.assertEqual(scrollbar.value(), target_val)
 
     def test_embedded_surfaces_navigation_and_switching(self) -> None:
         self.window.show()
@@ -3193,7 +3265,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.1.33")
+        self.assertEqual(self.window.version_label.text(), "v2.2.8")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
@@ -3388,7 +3460,7 @@ class QtUiTests(unittest.TestCase):
         self.assertIsNotNone(header)
         buttons = [btn for btn in header.findChildren(QPushButton) if btn.objectName() == "nav"]
         button_texts = [btn.text().strip() for btn in buttons]
-        expected_order = ["活动报名", "活动管理", "查  询", "按ID操作", "商品清理", "设  置"]
+        expected_order = ["活动报名", "活动管理", "查  询", "按ID操作", "商品清理", "客服售后", "订单管理", "设  置"]
         self.assertEqual(button_texts, expected_order)
 
     def test_update_dialog_ui_and_cancel(self) -> None:
@@ -3402,7 +3474,7 @@ class QtUiTests(unittest.TestCase):
             asset_size=10485760,
             published_at="2026-10-07T00:00:00Z",
         )
-        dlg = UpdateDialog(info, "2.1.33", parent=self.window)
+        dlg = UpdateDialog(info, "2.2.8", parent=self.window)
         self.assertEqual(dlg.windowTitle(), "软件更新 - 美客多活动管家")
         self.assertIn("自动更新引擎", dlg.notes_edit.toPlainText())
         self.assertTrue(dlg.update_btn.isEnabled())

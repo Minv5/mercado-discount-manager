@@ -182,7 +182,7 @@ class NativeEngineTests(unittest.TestCase):
         health = bridge.handle_request("GET", "/api/health")
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], "3")
-        self.assertEqual(health["build_fingerprint"], "native-python-v2.1.33")
+        self.assertEqual(health["build_fingerprint"], "native-python-v2.2.8")
 
         accounts_res = bridge.handle_request("GET", "/api/accounts")
         self.assertEqual(len(accounts_res["accounts"]), 3)
@@ -1124,7 +1124,7 @@ class NativeEngineTests(unittest.TestCase):
         worker.client.cancel_promotion_item.assert_called_once_with(
             "3408885754", "3407227823", "MLM222222", "P-MLM17611046", "DEAL"
         )
-        self.assertTrue(any("因同父商品 CBT999888 数据变动，已联动退出活动 P-MLM17611046" in line for line in worker._logs))
+        self.assertTrue(any("因全球父商品 CBT999888 净收益变动（$10.40 -> $19.33），已联动退出活动 P-MLM17611046" in line for line in worker._logs))
 
     def test_webhook_worker_deduplication_and_cascade_debouncing(self) -> None:
         """Verify Webhook deduplicates multiple variations of the same CBT sibling item,
@@ -1790,6 +1790,213 @@ class NativeEngineTests(unittest.TestCase):
             self.assertEqual(cur.fetchone()[0], 1)
         finally:
             conn.close()
+
+    def test_client_incomplete_read_handling(self):
+        """Verify MercadoClient handles http.client.IncompleteRead gracefully for 2xx and 4xx partials."""
+        from engine.client import MercadoClient
+        import http.client
+
+        mock_auth = MagicMock()
+        mock_auth.get_token.return_value = MagicMock(access_token="test_tok")
+        client = MercadoClient(mock_auth)
+
+        # 1. 200 with IncompleteRead but valid partial JSON -> succeeds
+        mock_conn = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.getheader.return_value = "close"
+        mock_resp.read.side_effect = http.client.IncompleteRead(b'{"status": "ok"}', expected=100)
+        mock_conn.getresponse.return_value = mock_resp
+
+        with patch.object(client._conn_pool, "get_connection", return_value=mock_conn):
+            res = client.request("test_acc", "DELETE", "/test/path")
+            self.assertEqual(res, {"status": "ok"})
+
+        # 2. 400 with IncompleteRead containing pending/locked message -> parses clean error
+        mock_conn = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status = 400
+        mock_resp.getheader.return_value = "close"
+        mock_resp.read.side_effect = http.client.IncompleteRead(
+            b'{"message": "Cannot delete promotion in pending status", "error": "bad_request"}',
+            expected=120,
+        )
+        mock_conn.getresponse.return_value = mock_resp
+
+        with patch.object(client._conn_pool, "get_connection", return_value=mock_conn):
+            with self.assertRaises(RuntimeError) as cm:
+                client.request("test_acc", "DELETE", "/test/path")
+            self.assertIn("活动处于审核生效中，平台禁止退出", str(cm.exception))
+
+    def test_webhook_cancel_promotion_with_readback_healing(self):
+        """Verify WebhookWorker heals cancel failures if remote promotion is actually gone."""
+        from engine.webhook_worker import WebhookWorker
+
+        mock_client = MagicMock()
+        # Cancel fails with IncompleteRead / network error
+        mock_client.cancel_promotion_item.side_effect = RuntimeError("美客多网络请求超时或连接失败: IncompleteRead")
+        # But readback shows the promo is already candidate (exited)
+        mock_client.get_item_promotions.return_value = [
+            {"id": "P-TEST", "type": "DEAL", "status": "candidate"}
+        ]
+
+        worker = WebhookWorker(client=mock_client)
+        success, err = worker._cancel_promotion_with_readback(
+            "acc1", "usr1", "MLB100", "P-TEST", "DEAL"
+        )
+        self.assertTrue(success)
+        self.assertEqual(err, "")
+        self.assertTrue(worker._is_recently_exited("MLB100", "P-TEST"))
+
+        # If readback still shows started, it should return False and clean error
+        mock_client.get_item_promotions.return_value = [
+            {"id": "P-LOCKED", "type": "DEAL", "status": "started"}
+        ]
+        mock_client.cancel_promotion_item.side_effect = RuntimeError("美客多接口异常: 活动已锁定，平台禁止退出 (400)")
+        success2, err2 = worker._cancel_promotion_with_readback(
+            "acc1", "usr1", "MLB100", "P-LOCKED", "DEAL"
+        )
+        self.assertFalse(success2)
+        self.assertIn("活动已锁定", err2)
+
+    def test_client_409_conflict_not_retried(self) -> None:
+        """Verify HTTP 409 Conflict is not retried in exponential backoff loop, preventing anti-scraping blocks."""
+        from unittest.mock import MagicMock, patch
+        from engine.client import MercadoClient
+
+        mock_auth = MagicMock()
+        mock_auth.get_token.return_value = MagicMock(access_token="test_token")
+        client = MercadoClient(mock_auth)
+
+        # Mock connection returning 409 response
+        mock_resp = MagicMock()
+        mock_resp.status = 409
+        mock_resp.getheader.return_value = ""
+        mock_resp.read.return_value = b'{"message": "Item conflicts with another active promotion", "error": "conflict"}'
+
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = mock_resp
+
+        with patch.object(client._conn_pool, "get_connection", return_value=mock_conn):
+            with patch("time.sleep") as mock_sleep:
+                with self.assertRaises(RuntimeError) as ctx:
+                    client.request("acc1", "POST", "/marketplace/seller-promotions/items/MLM123", body={})
+                # sleep must NOT be called for 409 retry
+                mock_sleep.assert_not_called()
+                self.assertIn("409", str(ctx.exception))
+                self.assertIn("conflicts", str(ctx.exception))
+
+    def test_client_attachment_multipart_upload(self) -> None:
+        """Verify client constructs multipart/form-data request for attachments."""
+        from unittest.mock import MagicMock, patch
+        from engine.client import MercadoClient
+
+        mock_auth = MagicMock()
+        mock_auth.get_token.return_value = MagicMock(access_token="test_token")
+        client = MercadoClient(mock_auth)
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.getheader.return_value = ""
+        mock_resp.read.return_value = b'{"filename": "abc-123.jpg", "id": "abc-123.jpg"}'
+
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = mock_resp
+
+        with patch.object(client._conn_pool, "get_connection", return_value=mock_conn):
+            res = client.upload_claim_attachment("acc1", "5584116118", b"test_bytes", "evidence.jpg")
+            self.assertEqual(res.get("filename"), "abc-123.jpg")
+            self.assertTrue(mock_conn.request.called)
+            req_call = mock_conn.request.call_args
+            method, path = req_call[0][:2]
+            headers = req_call[1]["headers"]
+            body = req_call[1]["body"]
+            self.assertEqual(method, "POST")
+            self.assertIn("/post-purchase/v1/claims/5584116118/attachments", path)
+            self.assertIn("multipart/form-data; boundary=", headers["Content-Type"])
+            self.assertIn(b"evidence.jpg", body)
+            self.assertIn(b"test_bytes", body)
+
+    def test_webhook_record_auto_task_and_pop_has_new_tasks(self) -> None:
+        """Verify WebhookWorker does not insert tasks into promo_tasks & promo_action_results to avoid polluting execution records."""
+        import tempfile
+        from pathlib import Path
+        from engine.auth import AuthManager
+        from engine.webhook_worker import WebhookWorker
+
+        with tempfile.TemporaryDirectory() as td:
+            db_file = Path(td) / "test-db.sqlite"
+            auth = AuthManager(db_path=db_file)
+            worker = WebhookWorker(auth_manager=auth)
+
+            self.assertFalse(worker.pop_has_new_tasks())
+
+            task_id = worker._record_auto_task(
+                account_id="3408885754",
+                child_user_id="3407227825",
+                site_id="MLB",
+                item_id="MLB5086758861",
+                promotion_id="C-MLB5960233",
+                promotion_type="MARKETPLACE_CAMPAIGN",
+                promotion_name="95",
+                action="cancel",
+                success=True,
+                deal_price=27.45,
+            )
+            self.assertIsNone(task_id)
+            self.assertFalse(worker.pop_has_new_tasks())
+
+            conn = auth._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM promo_tasks")
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute("SELECT COUNT(*) FROM promo_action_results")
+                self.assertEqual(cur.fetchone()[0], 0)
+            finally:
+                conn.close()
+
+    def test_webhook_in_promo_deal_price_does_not_trigger_seller_data_or_cascade(self) -> None:
+        """Verify WebhookWorker does NOT misidentify active promotional deal price as seller price modification,
+        and does NOT cascade exit CBT sibling sites when net proceeds remain unchanged."""
+        from engine.webhook_worker import WebhookWorker
+        from unittest.mock import MagicMock
+
+        worker = WebhookWorker()
+        worker.client = MagicMock()
+        worker._price_cache["MCO2290987455"] = 18.84
+        worker._net_cache["MCO2290987455"] = 8.03
+        worker._shipping_cache["MCO2290987455"] = 8.08
+
+        # Simulated Mercado Libre response: Item currently in active promotion with deal price 17.43 and original 18.84
+        worker.client.get_item_detail.return_value = {
+            "id": "MCO2290987455",
+            "site_id": "MCO",
+            "seller_id": "3332096437",
+            "status": "active",
+            "price": 17.43,
+            "original_price": 18.84,
+            "cbt_item_id": "CBT5495629886",
+            "net_proceeds": {
+                "amount": 8.03,
+                "additional_concepts": [
+                    {"id": "shipping_cost", "amount": 8.08},
+                    {"id": "sale_fee", "amount": 2.73},
+                ],
+                "currency_id": "USD",
+            },
+        }
+        worker.client.request.return_value = [
+            {"id": "P-MCO17969016", "name": "AON HyI", "type": "DEAL", "status": "started"}
+        ]
+
+        worker._cascade_cbt_system2_exit = MagicMock()
+        res = worker._process_marketplace_item("3332096437", "3332096437", "MCO", "MCO2290987455")
+        self.assertTrue(res)
+        # Sibling sites must NOT be cascade cancelled!
+        worker._cascade_cbt_system2_exit.assert_not_called()
+        # Item itself must NOT be cancelled due to seller_data!
+        worker.client.cancel_promotion_item.assert_not_called()
 
 
 if __name__ == "__main__":
