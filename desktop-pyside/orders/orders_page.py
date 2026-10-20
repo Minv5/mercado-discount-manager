@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -45,6 +47,7 @@ from PySide6.QtWidgets import (
 from engine.auth import AuthManager
 from engine.client import MercadoClient
 from engine.crypto import get_data_dir
+from service_center.translator import translate_text
 from orders.models import (
     BADGE_STYLE_BLUE,
     BADGE_STYLE_GOLD,
@@ -124,6 +127,7 @@ def get_cny_exchange_rate(currency: str) -> float:
 class OrdersFetchWorker(QThread):
     """Background thread to fetch and enrich orders across multiple accounts without freezing UI."""
 
+    orders_chunk = Signal(list)
     orders_fetched = Signal(list)
     fetch_error = Signal(str)
     fetch_finished = Signal()
@@ -134,6 +138,7 @@ class OrdersFetchWorker(QThread):
         auth_mgr: AuthManager,
         target_account: str | None = None,
         limit_per_account: int = 50,
+        cached_orders: list[OrderModel] | None = None,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
@@ -142,6 +147,28 @@ class OrdersFetchWorker(QThread):
         self.target_account = target_account
         self.limit_per_account = limit_per_account
         self._is_stopped = False
+
+        self._cache_map: dict[str, OrderModel] = {}
+        self._item_cache: dict[str, dict[str, Any]] = {}
+        self._item_cache_lock = threading.Lock()
+
+        if cached_orders:
+            for o in cached_orders:
+                if not o or not o.order_id:
+                    continue
+                self._cache_map[str(o.order_id)] = o
+                if o.pack_id:
+                    self._cache_map[str(o.pack_id)] = o
+                for it in o.items:
+                    if it.item_id and (it.thumbnail or it.title or it.dimensions):
+                        with self._item_cache_lock:
+                            existing = self._item_cache.get(it.item_id) or {}
+                            self._item_cache[it.item_id] = {
+                                "title": it.title or existing.get("title", ""),
+                                "thumbnail": it.thumbnail or existing.get("thumbnail", ""),
+                                "dimensions": it.dimensions or existing.get("dimensions", ""),
+                                "permalink": it.permalink or existing.get("permalink", ""),
+                            }
 
     def stop(self) -> None:
         self._is_stopped = True
@@ -159,8 +186,37 @@ class OrdersFetchWorker(QThread):
         if not real_oid:
             real_oid = str(raw_item.get("id") or "")
 
+        # 1. Fast cache check
+        cached_ord = self._cache_map.get(real_oid) or self._cache_map.get(str(raw_item.get("id") or ""))
+        if cached_ord:
+            cached_status = str(cached_ord.status or "").lower()
+            raw_status = str(
+                (sub_orders[0].get("status") if sub_orders and isinstance(sub_orders, list) else None)
+                or raw_item.get("status")
+                or ""
+            ).lower()
+            if "delivered" in (raw_item.get("tags") or []):
+                raw_status = "delivered"
+            elif not raw_status and cached_status:
+                raw_status = cached_status
+
+            is_terminal = cached_status in ("delivered", "cancelled")
+            status_matched = (not raw_status) or (raw_status == cached_status)
+            has_tracking = bool(cached_ord.shipping.tracking_number)
+            has_items_pic = all(bool(it.thumbnail) for it in cached_ord.items) if cached_ord.items else True
+
+            if is_terminal or (status_matched and has_tracking and has_items_pic):
+                if store_label and cached_ord.store_name != store_label:
+                    cached_ord.store_name = store_label
+                return cached_ord
+
+        # 2. Enrich order
         full_data = raw_item
-        if real_oid:
+        has_items = bool(
+            raw_item.get("order_items")
+            or (sub_orders and isinstance(sub_orders, list) and sub_orders[0].get("order_items"))
+        )
+        if real_oid and not has_items:
             try:
                 det = self.client.get_marketplace_order(aid, real_oid)
                 if det and isinstance(det, dict) and "id" in det:
@@ -173,7 +229,7 @@ class OrdersFetchWorker(QThread):
             or full_data.get("site_id")
             or ""
         ).strip()
-        accurate_store = get_store_alias(self.auth_mgr, aid, site_id)
+        accurate_store = get_store_alias(self.auth_mgr, aid, site_id) or store_label
 
         ord_model = parse_order_from_dict(full_data, aid, accurate_store, site_id)
         if not ord_model.pack_id:
@@ -183,11 +239,33 @@ class OrdersFetchWorker(QThread):
             if raw_sh_id:
                 ord_model.shipping.shipment_id = raw_sh_id
 
-        # Enrich items (title, SKU variation picture, packaging dimensions)
+        # Enrich items (using item cache first)
         for it in ord_model.items:
             try:
-                need_var_pic = bool(it.variation_id and str(it.variation_id).strip())
-                if not it.thumbnail or not it.title or need_var_pic or not it.dimensions or not it.permalink:
+                with self._item_cache_lock:
+                    cached_it = self._item_cache.get(it.item_id)
+                if cached_it:
+                    if not it.title and cached_it.get("title"):
+                        it.title = cached_it["title"]
+                    if not it.permalink and cached_it.get("permalink"):
+                        it.permalink = cached_it["permalink"]
+                    if not it.dimensions and cached_it.get("dimensions"):
+                        it.dimensions = cached_it["dimensions"]
+                    var_dict = cached_it.get("variations") or {}
+                    var_info = var_dict.get(str(it.variation_id or ""))
+                    if var_info:
+                        if not it.thumbnail and var_info.get("thumbnail"):
+                            it.thumbnail = var_info["thumbnail"]
+                        if not it.variation_attributes and var_info.get("attributes"):
+                            it.variation_attributes = var_info["attributes"]
+                        if not it.sku and var_info.get("sku"):
+                            it.sku = var_info["sku"]
+                    elif not it.thumbnail and cached_it.get("thumbnail"):
+                        it.thumbnail = cached_it["thumbnail"]
+
+                need_var_pic = bool(it.variation_id and str(it.variation_id).strip() and not it.thumbnail)
+                need_var_attrs = bool(it.variation_id and str(it.variation_id).strip() and not it.variation_attributes)
+                if not it.thumbnail or not it.title or need_var_pic or need_var_attrs or not it.dimensions or not it.permalink:
                     it_detail = self.client.get_item_detail(aid, it.item_id)
                     if it_detail:
                         if not it.title:
@@ -204,13 +282,35 @@ class OrdersFetchWorker(QThread):
 
                         var_pic_url = ""
                         var_id_str = str(it.variation_id or "").strip()
+                        if not var_id_str and it.sku:
+                            for v in (it_detail.get("variations") or []):
+                                if isinstance(v, dict) and str(v.get("seller_custom_field") or "") == it.sku:
+                                    var_id_str = str(v.get("id") or "")
+                                    it.variation_id = var_id_str
+                                    break
+
                         if var_id_str:
                             for v in (it_detail.get("variations") or []):
                                 if isinstance(v, dict) and str(v.get("id")) == var_id_str:
                                     pic_ids = v.get("picture_ids") or []
                                     if pic_ids and str(pic_ids[0]) in pic_map:
                                         var_pic_url = pic_map[str(pic_ids[0])]
-                                        break
+                                    if not it.variation_attributes:
+                                        combos = v.get("attribute_combinations") or v.get("attributes") or []
+                                        v_attrs = []
+                                        for c in combos:
+                                            if isinstance(c, dict):
+                                                cn = c.get("name") or c.get("id") or ""
+                                                cv = c.get("value_name") or ""
+                                                if cn and cv:
+                                                    v_attrs.append(f"{cn}: {cv}")
+                                                elif cv:
+                                                    v_attrs.append(str(cv))
+                                        if v_attrs:
+                                            it.variation_attributes = "; ".join(v_attrs)
+                                    if not it.sku and v.get("seller_custom_field"):
+                                        it.sku = str(v.get("seller_custom_field"))
+                                    break
 
                         if var_pic_url:
                             it.thumbnail = var_pic_url
@@ -240,51 +340,77 @@ class OrdersFetchWorker(QThread):
                                 l_val = _get_val(l_attr)
                                 wt_val = _get_val(wt_attr) if wt_attr else None
                                 it.dimensions = format_dimensions_display({"length": l_val, "width": w_val, "height": h_val, "weight": wt_val})
+
+                        with self._item_cache_lock:
+                            existing = self._item_cache.get(it.item_id) or {}
+                            var_dict = existing.get("variations") or {}
+                            if var_id_str:
+                                var_dict[var_id_str] = {
+                                    "thumbnail": it.thumbnail,
+                                    "attributes": it.variation_attributes,
+                                    "sku": it.sku,
+                                }
+                            self._item_cache[it.item_id] = {
+                                "title": it.title,
+                                "thumbnail": it.thumbnail,
+                                "dimensions": it.dimensions,
+                                "permalink": it.permalink,
+                                "variations": var_dict,
+                            }
             except Exception:
                 pass
 
         # Enrich shipment tracking, dimensions, and actual seller shipping liability
         if ord_model.shipping.shipment_id:
             try:
-                ship_det = self.client.get_marketplace_shipment(aid, ord_model.shipping.shipment_id)
-                if ship_det:
-                    ord_model.shipping.tracking_number = str(ship_det.get("tracking_number") or ord_model.shipping.tracking_number or "")
-                    ord_model.shipping.tracking_method = str(ship_det.get("tracking_method") or ord_model.shipping.tracking_method or "")
-                    if not ord_model.shipping.status or ord_model.shipping.status == "paid":
-                        ord_model.shipping.status = str(ship_det.get("status") or ord_model.shipping.status)
-                    dims = ship_det.get("dimensions") or ship_det.get("shipping_dimensions")
-                    if dims:
-                        ord_model.shipping.dimensions = format_dimensions_display(dims)
-                    lead_time = ship_det.get("lead_time") or {}
-                    cost_type = str(lead_time.get("cost_type") or "").lower()
-                    buyer_cost = float(lead_time.get("cost") or 0.0)
-                    list_cost = float(lead_time.get("list_cost") or buyer_cost or 0.0)
-                    seller_ship_cost = list_cost
-                    if cost_type == "partially_free":
-                        seller_ship_cost = max(round(list_cost - buyer_cost, 2), 0.0)
-                    elif cost_type == "free":
+                if cached_ord and cached_ord.shipping.tracking_number and cached_ord.shipping.status == ord_model.shipping.status:
+                    ord_model.shipping.tracking_number = cached_ord.shipping.tracking_number
+                    ord_model.shipping.tracking_method = cached_ord.shipping.tracking_method
+                    ord_model.shipping.dimensions = cached_ord.shipping.dimensions
+                    ord_model.shipping.shipping_cost = cached_ord.shipping.shipping_cost
+                    ord_model.shipping_cost = cached_ord.shipping_cost
+                else:
+                    ship_det = self.client.get_marketplace_shipment(aid, ord_model.shipping.shipment_id)
+                    if ship_det:
+                        ord_model.shipping.tracking_number = str(ship_det.get("tracking_number") or ord_model.shipping.tracking_number or "")
+                        ord_model.shipping.tracking_method = str(ship_det.get("tracking_method") or ord_model.shipping.tracking_method or "")
+                        if not ord_model.shipping.status or ord_model.shipping.status == "paid":
+                            ord_model.shipping.status = str(ship_det.get("status") or ord_model.shipping.status)
+                        dims = ship_det.get("dimensions") or ship_det.get("shipping_dimensions")
+                        if dims:
+                            ord_model.shipping.dimensions = format_dimensions_display(dims)
+                        lead_time = ship_det.get("lead_time") or {}
+                        cost_type = str(lead_time.get("cost_type") or "").lower()
+                        buyer_cost = float(lead_time.get("cost") or 0.0)
+                        list_cost = float(lead_time.get("list_cost") or buyer_cost or 0.0)
                         seller_ship_cost = list_cost
-                    elif cost_type == "not_free":
-                        seller_ship_cost = 0.0
+                        if cost_type == "partially_free":
+                            seller_ship_cost = max(round(list_cost - buyer_cost, 2), 0.0)
+                        elif cost_type == "free":
+                            seller_ship_cost = list_cost
+                        elif cost_type == "not_free":
+                            seller_ship_cost = 0.0
 
-                    try:
-                        costs_det = self.client.get_marketplace_shipment_costs(aid, ord_model.shipping.shipment_id)
-                        if isinstance(costs_det, dict) and "senders" in costs_det:
-                            senders = costs_det.get("senders") or []
-                            if senders and isinstance(senders[0], dict) and "cost" in senders[0]:
-                                seller_ship_cost = float(senders[0]["cost"] or 0.0)
-                    except Exception:
-                        pass
+                        try:
+                            costs_det = self.client.get_marketplace_shipment_costs(aid, ord_model.shipping.shipment_id)
+                            if isinstance(costs_det, dict) and "senders" in costs_det:
+                                senders = costs_det.get("senders") or []
+                                if senders and isinstance(senders[0], dict) and "cost" in senders[0]:
+                                    seller_ship_cost = float(senders[0]["cost"] or 0.0)
+                        except Exception:
+                            pass
 
-                    ord_model.shipping.shipping_cost = seller_ship_cost
-                    ord_model.shipping_cost = seller_ship_cost
+                        ord_model.shipping.shipping_cost = seller_ship_cost
+                        ord_model.shipping_cost = seller_ship_cost
             except Exception:
                 pass
 
+        if ord_model.order_id:
+            self._cache_map[ord_model.order_id] = ord_model
         return ord_model
 
     def run(self) -> None:
-        all_orders: list[OrderModel] = []
+        orders_by_id: dict[str, OrderModel] = {}
         try:
             accounts = self.auth_mgr.list_accounts()
             target_list = accounts
@@ -292,6 +418,7 @@ class OrdersFetchWorker(QThread):
                 target_list = [a for a in accounts if str(a.get("account_id") or a.get("id")) == str(self.target_account)]
 
             raw_skeletons: list[tuple[str, dict[str, Any], str]] = []
+            immediate_chunk: list[OrderModel] = []
 
             for acc in target_list:
                 if self._is_stopped:
@@ -304,11 +431,10 @@ class OrdersFetchWorker(QThread):
 
                 # 1. CBT search
                 cbt_success = False
+                results = []
                 try:
                     res_cbt = self.client.search_marketplace_orders(aid, limit=self.limit_per_account)
                     results = res_cbt.get("results") or []
-                    for raw_item in results:
-                        raw_skeletons.append((aid, raw_item, store_label))
                     if results:
                         cbt_success = True
                 except Exception as cbt_err:
@@ -319,25 +445,67 @@ class OrdersFetchWorker(QThread):
                     try:
                         res_std = self.client.search_orders(aid, limit=self.limit_per_account)
                         results = res_std.get("results") or []
-                        for raw_item in results:
-                            raw_skeletons.append((aid, raw_item, store_label))
                     except Exception as std_err:
                         logger.debug("Std search error for %s: %s", aid, std_err)
 
-            # Concurrent enrich single orders
-            with ThreadPoolExecutor(max_workers=6) as executor:
-                futures = [executor.submit(self._enrich_single, item) for item in raw_skeletons]
-                for fut in as_completed(futures):
-                    if self._is_stopped:
-                        break
-                    try:
-                        res = fut.result()
-                        if res and res.order_id:
-                            all_orders.append(res)
-                    except Exception as e:
-                        logger.debug("Enrich order error: %s", e)
+                for raw_item in results:
+                    raw_skeletons.append((aid, raw_item, store_label))
 
-            # Sort orders date descending
+                    # Fast skeleton parse or cache hit for instant 1st screen presentation
+                    sub_orders = raw_item.get("orders") or []
+                    real_oid = str(sub_orders[0].get("id") if sub_orders and isinstance(sub_orders, list) else "") or str(raw_item.get("id") or "")
+                    cached = self._cache_map.get(real_oid) or self._cache_map.get(str(raw_item.get("id") or ""))
+                    if cached:
+                        orders_by_id[cached.order_id] = cached
+                        immediate_chunk.append(cached)
+                    else:
+                        try:
+                            skeleton = parse_order_from_dict(raw_item, aid, store_label, site_id)
+                            if skeleton.order_id:
+                                orders_by_id[skeleton.order_id] = skeleton
+                                immediate_chunk.append(skeleton)
+                        except Exception:
+                            pass
+
+                # Stream immediate chunk so UI displays orders without waiting
+                if immediate_chunk:
+                    self.orders_chunk.emit(list(immediate_chunk))
+                    immediate_chunk.clear()
+
+            # Concurrent enrich single orders for those needing updates
+            to_enrich: list[tuple[str, dict[str, Any], str]] = []
+            for item in raw_skeletons:
+                aid, raw_item, store_label = item
+                sub_orders = raw_item.get("orders") or []
+                real_oid = str(sub_orders[0].get("id") if sub_orders and isinstance(sub_orders, list) else "") or str(raw_item.get("id") or "")
+                cached = self._cache_map.get(real_oid) or self._cache_map.get(str(raw_item.get("id") or ""))
+                if cached and (cached.status in ("delivered", "cancelled") or (cached.shipping.tracking_number and cached.items and all(it.thumbnail for it in cached.items))):
+                    orders_by_id[cached.order_id] = cached
+                    continue
+                to_enrich.append(item)
+
+            if to_enrich:
+                enriched_chunk: list[OrderModel] = []
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = [executor.submit(self._enrich_single, item) for item in to_enrich]
+                    for fut in as_completed(futures):
+                        if self._is_stopped:
+                            break
+                        try:
+                            res = fut.result()
+                            if res and res.order_id:
+                                orders_by_id[res.order_id] = res
+                                enriched_chunk.append(res)
+                                if len(enriched_chunk) >= 8:
+                                    self.orders_chunk.emit(list(enriched_chunk))
+                                    enriched_chunk.clear()
+                        except Exception as e:
+                            logger.debug("Enrich order error: %s", e)
+                if enriched_chunk:
+                    self.orders_chunk.emit(list(enriched_chunk))
+                    enriched_chunk.clear()
+
+            all_orders = list(orders_by_id.values())
             all_orders.sort(key=lambda o: o.created_timestamp, reverse=True)
             self.orders_fetched.emit(all_orders)
         except Exception as e:
@@ -345,6 +513,342 @@ class OrdersFetchWorker(QThread):
             self.fetch_error.emit(str(e))
         finally:
             self.fetch_finished.emit()
+
+
+class OrderContactBuyerDialog(QDialog):
+    """Modern modal dialog allowing sellers to view post-sale message history and send messages to buyers directly from an order."""
+
+    def __init__(
+        self,
+        order: OrderModel,
+        client: MercadoClient,
+        auth_mgr: AuthManager,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.order = order
+        self.client = client
+        self.auth_mgr = auth_mgr
+        self.setWindowTitle(f"联系买家 - 订单 {order.order_id}")
+        self.resize(640, 580)
+        self.setMinimumSize(540, 480)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #171D1A;
+                color: #F6F3EA;
+            }
+        """)
+
+        # Determine target language based on site:
+        # MLB is Brazil -> Portuguese ("pt"), MLM/MLC/MCO/MLA/MLU/MPE are Spanish ("es")
+        self.target_lang = "pt" if (order.site_id or "").upper() == "MLB" else "es"
+        self.target_lang_name = "葡萄牙语 (巴西)" if self.target_lang == "pt" else "西班牙语"
+
+        self._build_ui()
+        QTimer.singleShot(60, self._load_conversation_history)
+
+    def _build_ui(self) -> None:
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(14, 14, 14, 14)
+        main_layout.setSpacing(10)
+
+        # 1. Top Banner
+        top_frame = QFrame()
+        top_frame.setStyleSheet("""
+            background: #1C2420;
+            border: 1px solid #4E472F;
+            border-radius: 8px;
+            padding: 4px;
+        """)
+        top_lay = QVBoxLayout(top_frame)
+        top_lay.setContentsMargins(10, 8, 10, 8)
+        top_lay.setSpacing(6)
+
+        t_row1 = QHBoxLayout()
+        st_lbl = QLabel(f"<b>店铺:</b> {self.order.store_name}  ·  <b>站点:</b> {self.order.site_id}")
+        st_lbl.setStyleSheet("color: #E6E2D8; font-size: 12px;")
+        t_row1.addWidget(st_lbl)
+        t_row1.addStretch()
+        oid_lbl = QLabel(f"订单号: {self.order.order_id}")
+        oid_lbl.setStyleSheet("color: #D4AF37; font-size: 12px; font-weight: 600;")
+        t_row1.addWidget(oid_lbl)
+        top_lay.addLayout(t_row1)
+
+        t_row2 = QHBoxLayout()
+        buyer_n = self.order.buyer_nickname or "买家"
+        rec_n = self.order.shipping.receiver_name or self.order.buyer_full_name or ""
+        buyer_text = f"<b>买家昵称:</b> {buyer_n}"
+        if rec_n:
+            buyer_text += f" (收件人: {rec_n})"
+        b_lbl = QLabel(buyer_text)
+        b_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
+        t_row2.addWidget(b_lbl)
+        t_row2.addStretch()
+        lang_chip = QLabel(f"🌐 站点语言: {self.target_lang_name}")
+        lang_chip.setStyleSheet("color: #34D399; font-size: 11px; background: rgba(52, 211, 153, 0.12); border: 1px solid rgba(52, 211, 153, 0.3); border-radius: 3px; padding: 1px 6px;")
+        t_row2.addWidget(lang_chip)
+        top_lay.addLayout(t_row2)
+
+        main_layout.addWidget(top_frame)
+
+        # 2. Conversation History
+        history_box = QFrame()
+        history_box.setStyleSheet("""
+            background: #121614;
+            border: 1px solid #2D3830;
+            border-radius: 8px;
+        """)
+        history_box_layout = QVBoxLayout(history_box)
+        history_box_layout.setContentsMargins(10, 10, 10, 10)
+        history_box_layout.setSpacing(8)
+
+        h_title_row = QHBoxLayout()
+        h_title = QLabel("💬 会话历史记录")
+        h_title.setStyleSheet("color: #F6F3EA; font-size: 12px; font-weight: bold;")
+        h_title_row.addWidget(h_title)
+        h_title_row.addStretch()
+        self.status_msg_lbl = QLabel("正在拉取会话消息...")
+        self.status_msg_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
+        h_title_row.addWidget(self.status_msg_lbl)
+        history_box_layout.addLayout(h_title_row)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self.msg_container = QWidget()
+        self.msg_container.setStyleSheet("background: transparent;")
+        self.msg_layout = QVBoxLayout(self.msg_container)
+        self.msg_layout.setContentsMargins(4, 4, 4, 4)
+        self.msg_layout.setSpacing(8)
+        self.msg_layout.addStretch(1)
+        self.scroll_area.setWidget(self.msg_container)
+        history_box_layout.addWidget(self.scroll_area, 1)
+
+        main_layout.addWidget(history_box, 1)
+
+        # 3. Message Compose Box
+        compose_frame = QFrame()
+        compose_frame.setStyleSheet("""
+            background: #1C2420;
+            border: 1px solid #4E472F;
+            border-radius: 8px;
+            padding: 4px;
+        """)
+        c_layout = QVBoxLayout(compose_frame)
+        c_layout.setContentsMargins(8, 8, 8, 8)
+        c_layout.setSpacing(8)
+
+        self.input_edit = QTextEdit()
+        self.input_edit.setPlaceholderText("输入要发送给买家的消息（支持输入中文，点击下方按钮一键翻译为对应外语）...")
+        self.input_edit.setMaximumHeight(85)
+        self.input_edit.setStyleSheet("""
+            QTextEdit {
+                background: #121614;
+                color: #F6F3EA;
+                border: 1px solid #333D35;
+                border-radius: 6px;
+                padding: 6px;
+                font-size: 12px;
+            }
+            QTextEdit:focus {
+                border-color: #D4AF37;
+            }
+        """)
+        c_layout.addWidget(self.input_edit)
+
+        # Action Buttons Row
+        act_row = QHBoxLayout()
+        act_row.setSpacing(8)
+
+        self.translate_btn = QPushButton(f"🌐 一键翻译为{self.target_lang_name.split()[0]}")
+        self.translate_btn.setStyleSheet("""
+            QPushButton {
+                background: #1E3A2B;
+                color: #A7F3D0;
+                border: 1px solid #059669;
+                border-radius: 4px;
+                padding: 5px 12px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #047857; color: #FFFFFF; }
+            QPushButton:pressed { background: #065F46; }
+            QPushButton:disabled { background: #1C221D; color: #78716C; border-color: #333D35; }
+        """)
+        self.translate_btn.clicked.connect(self._on_translate_clicked)
+        act_row.addWidget(self.translate_btn)
+
+        act_row.addStretch()
+
+        self.send_btn = QPushButton("🚀 发送消息")
+        self.send_btn.setStyleSheet("""
+            QPushButton {
+                background: #D4AF37;
+                color: #121614;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 18px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #E5C158; }
+            QPushButton:pressed { background: #B3922D; }
+            QPushButton:disabled { background: #2B332B; color: #78716C; }
+        """)
+        self.send_btn.clicked.connect(self._on_send_clicked)
+        act_row.addWidget(self.send_btn)
+
+        c_layout.addLayout(act_row)
+        main_layout.addWidget(compose_frame)
+
+    def _load_conversation_history(self) -> None:
+        def _fetch():
+            try:
+                pid = self.order.pack_id or self.order.order_id
+                res = self.client.get_pack_messages(self.order.account_id, pid)
+                raw_msgs = res.get("messages") or []
+                return raw_msgs, None
+            except Exception as e:
+                return [], str(e)
+
+        def _worker():
+            msgs, err = _fetch()
+            QTimer.singleShot(0, lambda: self._on_history_loaded(msgs, err))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_history_loaded(self, msgs: list, err: str | None) -> None:
+        if err or not msgs:
+            self.status_msg_lbl.setText("暂无历史私信记录")
+            empty_lbl = QLabel("暂无历史售后私信记录。\n您可以在下方输入消息直接向买家发起沟通。")
+            empty_lbl.setStyleSheet("color: #78716C; font-size: 12px; padding: 25px; line-height: 1.6;")
+            empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.msg_layout.insertWidget(0, empty_lbl)
+            return
+
+        self.status_msg_lbl.setText(f"共 {len(msgs)} 条消息")
+        sorted_msgs = list(reversed(msgs))
+        for m in sorted_msgs:
+            if not isinstance(m, dict):
+                continue
+            from_info = m.get("from") or {}
+            from_uid = str(from_info.get("user_id") or "")
+            is_seller = (from_uid == str(self.order.account_id)) or (str(from_info.get("role") or "").lower() == "seller")
+            text_info = m.get("text") or {}
+            if isinstance(text_info, dict):
+                content = str(text_info.get("plain") or "")
+            else:
+                content = str(text_info or "")
+
+            date_str = str(m.get("message_date", {}).get("created") or m.get("date") or "")
+            date_fmt = format_order_date(date_str) if date_str else ""
+
+            self._append_message_bubble(is_seller=is_seller, content=content, date_fmt=date_fmt)
+
+    def _append_message_bubble(self, is_seller: bool, content: str, date_fmt: str) -> None:
+        bubble_row = QHBoxLayout()
+        bubble_row.setContentsMargins(0, 0, 0, 0)
+
+        card = QFrame()
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(10, 7, 10, 7)
+        card_lay.setSpacing(4)
+
+        sender_label = "我 (卖家)" if is_seller else (self.order.buyer_nickname or "买家")
+        hdr_lbl = QLabel(f"<b>{sender_label}</b>  <span style='color: #78716C; font-size: 10px;'>{date_fmt}</span>")
+        hdr_lbl.setStyleSheet("font-size: 11px;")
+
+        txt_lbl = QLabel(content)
+        txt_lbl.setWordWrap(True)
+        txt_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        txt_lbl.setStyleSheet("font-size: 12px; color: #F6F3EA;")
+
+        card_lay.addWidget(hdr_lbl)
+        card_lay.addWidget(txt_lbl)
+
+        if is_seller:
+            card.setStyleSheet("""
+                QFrame {
+                    background: #1E3A2B;
+                    border: 1px solid #2D6A4F;
+                    border-radius: 8px;
+                    max-width: 440px;
+                }
+            """)
+            bubble_row.addStretch(1)
+            bubble_row.addWidget(card)
+        else:
+            card.setStyleSheet("""
+                QFrame {
+                    background: #232B25;
+                    border: 1px solid #3E4B40;
+                    border-radius: 8px;
+                    max-width: 440px;
+                }
+            """)
+            bubble_row.addWidget(card)
+            bubble_row.addStretch(1)
+
+        self.msg_layout.insertLayout(self.msg_layout.count() - 1, bubble_row)
+        QTimer.singleShot(50, lambda: self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum()))
+
+    def _on_translate_clicked(self) -> None:
+        text = self.input_edit.toPlainText().strip()
+        if not text:
+            return
+        self.translate_btn.setEnabled(False)
+        self.translate_btn.setText("正在翻译...")
+
+        def _do_trans():
+            try:
+                res = translate_text(text, target_lang=self.target_lang)
+                QTimer.singleShot(0, lambda: self._on_translated(res))
+            except Exception as e:
+                QTimer.singleShot(0, lambda: self._on_translated_error(str(e)))
+
+        threading.Thread(target=_do_trans, daemon=True).start()
+
+    def _on_translated(self, res: str) -> None:
+        self.translate_btn.setEnabled(True)
+        self.translate_btn.setText(f"🌐 一键翻译为{self.target_lang_name.split()[0]}")
+        if res:
+            self.input_edit.setPlainText(res)
+
+    def _on_translated_error(self, err: str) -> None:
+        self.translate_btn.setEnabled(True)
+        self.translate_btn.setText(f"🌐 一键翻译为{self.target_lang_name.split()[0]}")
+        QMessageBox.warning(self, "翻译失败", f"翻译服务暂不可用: {err}")
+
+    def _on_send_clicked(self) -> None:
+        text = self.input_edit.toPlainText().strip()
+        if not text:
+            QMessageBox.information(self, "提示", "请输入要发送的消息内容")
+            return
+        self.send_btn.setEnabled(False)
+        self.send_btn.setText("正在发送...")
+
+        def _do_send():
+            try:
+                pid = self.order.pack_id or self.order.order_id
+                self.client.send_pack_message(self.order.account_id, pid, text)
+                QTimer.singleShot(0, lambda: self._on_send_success(text))
+            except Exception as e:
+                QTimer.singleShot(0, lambda: self._on_send_failed(str(e)))
+
+        threading.Thread(target=_do_send, daemon=True).start()
+
+    def _on_send_success(self, sent_text: str) -> None:
+        self.send_btn.setEnabled(True)
+        self.send_btn.setText("🚀 发送消息")
+        self.input_edit.clear()
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        self._append_message_bubble(is_seller=True, content=sent_text, date_fmt=now_str)
+        QMessageBox.information(self, "发送成功", "私信已成功发送给买家！")
+
+    def _on_send_failed(self, err: str) -> None:
+        self.send_btn.setEnabled(True)
+        self.send_btn.setText("🚀 发送消息")
+        QMessageBox.critical(self, "发送失败", f"向买家发送消息失败: {err}")
 
 
 class OrdersPage(QWidget):
@@ -953,6 +1457,25 @@ class OrdersPage(QWidget):
         addr_title.setStyleSheet("color: #F6F3EA; font-size: 13px; font-weight: bold;")
         addr_hdr.addWidget(addr_title)
         addr_hdr.addStretch()
+
+        self.btn_contact_buyer = QPushButton("💬 联系买家")
+        self.btn_contact_buyer.setStyleSheet("""
+            QPushButton {
+                background: #1F3A2E;
+                color: #A7F3D0;
+                border: 1px solid #059669;
+                border-radius: 4px;
+                padding: 3px 12px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #047857; color: #FFFFFF; }
+            QPushButton:pressed { background: #065F46; }
+            QPushButton:disabled { background: #1C221D; color: #78716C; border-color: #333D35; }
+        """)
+        self.btn_contact_buyer.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_contact_buyer.clicked.connect(self._open_contact_buyer_dialog)
+        addr_hdr.addWidget(self.btn_contact_buyer)
         addr_layout.addLayout(addr_hdr)
 
         self.det_buyer_info_lbl = QLabel("收件人: - · 电话: -")
@@ -1012,18 +1535,40 @@ class OrdersPage(QWidget):
         )
 
     def reload_orders(self) -> None:
-        """Trigger asynchronous background fetching of orders."""
+        """Trigger asynchronous background fetching of orders with cache reuse and streaming chunks."""
         if self._worker and self._worker.isRunning():
             return
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("正在拉取...")
 
         target_acc = self.store_combo.currentData() or "ALL"
-        self._worker = OrdersFetchWorker(self.client, self.auth_mgr, target_account=target_acc, parent=self)
+        self._worker = OrdersFetchWorker(
+            self.client,
+            self.auth_mgr,
+            target_account=target_acc,
+            cached_orders=self._all_orders,
+            parent=self,
+        )
+        self._worker.orders_chunk.connect(self._on_orders_chunk)
         self._worker.orders_fetched.connect(self._on_orders_fetched)
         self._worker.fetch_error.connect(self._on_fetch_error)
         self._worker.fetch_finished.connect(self._on_fetch_finished)
         self._worker.start()
+
+    def _on_orders_chunk(self, chunk: list[OrderModel]) -> None:
+        if not chunk:
+            return
+        existing_map = {o.order_id: idx for idx, o in enumerate(self._all_orders)}
+        for o in chunk:
+            if not o or not o.order_id:
+                continue
+            if o.order_id in existing_map:
+                self._all_orders[existing_map[o.order_id]] = o
+            else:
+                self._all_orders.append(o)
+                existing_map[o.order_id] = len(self._all_orders) - 1
+        self._all_orders.sort(key=lambda x: x.created_timestamp, reverse=True)
+        self._apply_filters()
 
     def _on_orders_fetched(self, orders: list[OrderModel]) -> None:
         self._all_orders = orders
@@ -1104,10 +1649,16 @@ class OrdersPage(QWidget):
         self._render_order_list()
 
     def _render_order_list(self) -> None:
+        prev_selected_oid = ""
+        current_item = self.order_list.currentItem()
+        if current_item:
+            prev_selected_oid = current_item.data(Qt.ItemDataRole.UserRole) or ""
+
         self.order_list.clear()
         self.count_lbl.setText(f"共找到 {len(self._filtered_orders)} 笔订单")
 
-        for order in self._filtered_orders:
+        target_row = 0
+        for idx, order in enumerate(self._filtered_orders):
             item = QListWidgetItem(self.order_list)
             card_widget = self._create_order_card(order)
             h = card_widget.sizeHint().height()
@@ -1115,11 +1666,13 @@ class OrdersPage(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, order.order_id)
             self.order_list.addItem(item)
             self.order_list.setItemWidget(item, card_widget)
+            if prev_selected_oid and order.order_id == prev_selected_oid:
+                target_row = idx
 
         self._update_print_button_state()
 
         if self.order_list.count() > 0:
-            self.order_list.setCurrentRow(0)
+            self.order_list.setCurrentRow(target_row)
         else:
             self._render_empty_detail()
 
@@ -1303,17 +1856,45 @@ class OrdersPage(QWidget):
         row3.addWidget(qty_lbl)
 
         if var_attrs:
-            sep = QLabel("·")
-            sep.setStyleSheet("color: #78716C; font-size: 11px;")
-            row3.addWidget(sep)
-            var_lbl = ElidedLabel(var_attrs)
-            var_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
-            var_lbl.setMinimumWidth(0)
-            var_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            var_lbl.customContextMenuRequested.connect(
-                lambda pos, v=var_attrs, w=var_lbl: show_pure_copy_menu(w, pos, lambda: v)
+            var_chip = ElidedLabel(f"🎨 {var_attrs}")
+            var_chip.setStyleSheet("""
+                QLabel {
+                    color: #60A5FA;
+                    font-size: 11px;
+                    font-weight: 500;
+                    background: rgba(59, 130, 246, 0.12);
+                    border: 1px solid rgba(59, 130, 246, 0.35);
+                    border-radius: 3px;
+                    padding: 1px 4px;
+                }
+                QLabel:hover {
+                    background: rgba(59, 130, 246, 0.22);
+                    color: #93C5FD;
+                }
+            """)
+            var_chip.setMinimumWidth(0)
+            var_chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            var_chip.setToolTip(f"规格属性: {var_attrs} (点击复制)")
+            var_chip.mousePressEvent = lambda e, v=var_attrs: copy_pure_text(v) if e.button() == Qt.MouseButton.LeftButton else None
+            var_chip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            var_chip.customContextMenuRequested.connect(
+                lambda pos, v=var_attrs, w=var_chip: show_pure_copy_menu(w, pos, lambda: v)
             )
-            row3.addWidget(var_lbl)
+            row3.addWidget(var_chip)
+        else:
+            single_chip = QLabel("标准单品")
+            single_chip.setStyleSheet("""
+                QLabel {
+                    color: #A8A29E;
+                    font-size: 10px;
+                    background: rgba(255, 255, 255, 0.05);
+                    border: 1px solid rgba(255, 255, 255, 0.12);
+                    border-radius: 3px;
+                    padding: 1px 4px;
+                }
+            """)
+            single_chip.setToolTip("该商品在平台为标准单品，无多变体规格")
+            row3.addWidget(single_chip)
 
         row3.addStretch(1)
         info_layout.addLayout(row3)
@@ -1392,6 +1973,13 @@ class OrdersPage(QWidget):
             QMessageBox.warning(self, "提示", "请先选择需要打印面单的订单。")
             return
         self._do_print_shipment_labels([self._current_order])
+
+    def _open_contact_buyer_dialog(self) -> None:
+        if not self._current_order:
+            QMessageBox.warning(self, "提示", "请先选择需要联系买家的订单。")
+            return
+        dlg = OrderContactBuyerDialog(self._current_order, self.client, self.auth_mgr, parent=self)
+        dlg.exec()
 
     def _print_selected_labels(self) -> None:
         if not self._selected_order_ids:
@@ -1594,8 +2182,41 @@ class OrdersPage(QWidget):
                 meta_h.addWidget(s_lbl)
 
             if it.variation_attributes:
-                v_lbl = QLabel(it.variation_attributes)
-                v_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
+                v_lbl = QLabel(f"🎨 {it.variation_attributes}")
+                v_lbl.setStyleSheet("""
+                    QLabel {
+                        color: #60A5FA;
+                        font-size: 11px;
+                        font-weight: 500;
+                        background: rgba(59, 130, 246, 0.12);
+                        border: 1px solid rgba(59, 130, 246, 0.35);
+                        border-radius: 3px;
+                        padding: 1px 5px;
+                    }
+                    QLabel:hover {
+                        background: rgba(59, 130, 246, 0.22);
+                        color: #93C5FD;
+                    }
+                """)
+                v_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+                v_lbl.setToolTip(f"规格属性: {it.variation_attributes} (点击复制)")
+                v_lbl.mousePressEvent = lambda e, va=it.variation_attributes: copy_pure_text(va) if e.button() == Qt.MouseButton.LeftButton else None
+                v_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                v_lbl.customContextMenuRequested.connect(lambda pos, va=it.variation_attributes, w=v_lbl: show_pure_copy_menu(w, pos, lambda: va))
+                meta_h.addWidget(v_lbl)
+            else:
+                v_lbl = QLabel("标准单品")
+                v_lbl.setStyleSheet("""
+                    QLabel {
+                        color: #A8A29E;
+                        font-size: 11px;
+                        background: rgba(255, 255, 255, 0.05);
+                        border: 1px solid rgba(255, 255, 255, 0.12);
+                        border-radius: 3px;
+                        padding: 1px 5px;
+                    }
+                """)
+                v_lbl.setToolTip("该商品为标准单品，无多变体规格")
                 meta_h.addWidget(v_lbl)
 
             if it.dimensions:
@@ -1627,10 +2248,13 @@ class OrdersPage(QWidget):
             i_layout.addLayout(r_layout)
             self.items_container_layout.addWidget(item_row)
 
-        # Address & Buyer (Streamlined without repeating buyer nickname)
+        # Address & Buyer
+        buyer_nick = order.buyer_nickname or "买家"
         rec_name = order.shipping.receiver_name or order.buyer_full_name or "未填写"
         phone = order.shipping.receiver_phone or "无"
-        self.det_buyer_info_lbl.setText(f"收件人: <b>{rec_name}</b>  ·  电话: <b>{phone}</b>")
+        self.det_buyer_info_lbl.setText(f"买家昵称: <b>{buyer_nick}</b>  ·  收件人: <b>{rec_name}</b>  ·  电话: <b>{phone}</b>")
+        if hasattr(self, "btn_contact_buyer"):
+            self.btn_contact_buyer.setEnabled(bool(order and order.order_id))
 
         addr = order.shipping.full_address or "官方集运仓发货 / 无详细街道地址"
         if order.shipping.comment:
@@ -1778,6 +2402,8 @@ class OrdersPage(QWidget):
         self.det_fee_ship_val.setText("-USD 0.00")
         self.det_fee_net_val.setText("USD 0.00 (约 ¥0.00)")
         self.det_pay_detail_lbl.setText("支付方式: - · 支付流水号: -")
+        if hasattr(self, "btn_contact_buyer"):
+            self.btn_contact_buyer.setEnabled(False)
 
     def select_order(self, order_id: str) -> bool:
         """Select order by order_id programmatically (for cross-module navigation)."""

@@ -46,7 +46,7 @@ from orders.models import (
     OrderItemModel,
     ShippingInfoModel,
 )
-from orders.orders_page import OrdersPage, OrdersFetchWorker, copy_pure_text
+from orders.orders_page import OrdersPage, OrdersFetchWorker, copy_pure_text, OrderContactBuyerDialog
 
 
 class TestOrderModels(unittest.TestCase):
@@ -910,6 +910,210 @@ class TestOrdersPageUI(unittest.TestCase):
         restored = OrderModel.from_dict(d)
         self.assertEqual(restored.total_sale_fee, 9.0)
         self.assertEqual(restored.estimated_net_profit, 28.14)
+
+    def test_orders_fetch_worker_cached_order_reuse_zero_network(self) -> None:
+        """Verify that terminal cached orders (delivered/cancelled) are reused with zero network requests."""
+        cached_ord = OrderModel(
+            order_id="200009999",
+            account_id="2651442567",
+            store_name="湖北店",
+            site_id="MLB",
+            status="delivered",
+            items=[OrderItemModel(item_id="MLB999", title="Cached Item", thumbnail="https://img.com/p.jpg")],
+            shipping=ShippingInfoModel(shipment_id="ship_999", tracking_number="TRACK123", shipping_cost=5.50),
+        )
+        worker = OrdersFetchWorker(
+            self.mock_client,
+            self.mock_auth,
+            cached_orders=[cached_ord],
+        )
+
+        raw_entry = (
+            "2651442567",
+            {
+                "id": "200009999",
+                "status": "delivered",
+                "tags": ["delivered"],
+            },
+            "湖北店",
+        )
+        self.mock_client.get_marketplace_order.reset_mock()
+        self.mock_client.get_item_detail.reset_mock()
+        self.mock_client.get_marketplace_shipment.reset_mock()
+        self.mock_client.get_marketplace_shipment_costs.reset_mock()
+
+        res = worker._enrich_single(raw_entry)
+        self.assertIsNotNone(res)
+        assert res is not None
+        self.assertEqual(res.order_id, "200009999")
+        self.assertEqual(res.shipping.tracking_number, "TRACK123")
+        self.assertEqual(res.items[0].title, "Cached Item")
+
+        # Zero network calls made!
+        self.mock_client.get_marketplace_order.assert_not_called()
+        self.mock_client.get_item_detail.assert_not_called()
+        self.mock_client.get_marketplace_shipment.assert_not_called()
+        self.mock_client.get_marketplace_shipment_costs.assert_not_called()
+
+    def test_orders_page_chunk_streaming_and_selection_preservation(self) -> None:
+        """Verify that streaming chunks update the order list and preserve the selected row."""
+        o1 = OrderModel(order_id="ORD_1", account_id="111", store_name="店1", site_id="MLM", status="paid", total_amount=10.0, created_timestamp=1000.0)
+        o2 = OrderModel(order_id="ORD_2", account_id="111", store_name="店1", site_id="MLM", status="paid", total_amount=20.0, created_timestamp=2000.0)
+        self.page._all_orders = [o2, o1]
+        self.page._apply_filters()
+        self.assertEqual(self.page.order_list.count(), 2)
+
+        # Select ORD_1 (row 1)
+        self.page.order_list.setCurrentRow(1)
+        self.assertEqual(self.page.order_list.currentRow(), 1)
+        current_item = self.page.order_list.currentItem()
+        self.assertIsNotNone(current_item)
+        self.assertEqual(current_item.data(Qt.ItemDataRole.UserRole), "ORD_1")
+
+        # Now chunk arrives with updated ORD_1 (enriched with tracking) + new ORD_3
+        o1_enriched = OrderModel(order_id="ORD_1", account_id="111", store_name="店1", site_id="MLM", status="paid", total_amount=10.0, created_timestamp=1000.0, shipping=ShippingInfoModel(tracking_number="TRACK_AAA"))
+        o3 = OrderModel(order_id="ORD_3", account_id="111", store_name="店1", site_id="MLM", status="paid", total_amount=30.0, created_timestamp=3000.0)
+
+        self.page._on_orders_chunk([o1_enriched, o3])
+        # Total orders should now be 3 (ORD_3, ORD_2, ORD_1)
+        self.assertEqual(self.page.order_list.count(), 3)
+        # ORD_1 should STILL be selected!
+        selected_item = self.page.order_list.currentItem()
+        self.assertIsNotNone(selected_item)
+        self.assertEqual(selected_item.data(Qt.ItemDataRole.UserRole), "ORD_1")
+
+    def test_variation_attributes_enrichment_from_item_detail(self) -> None:
+        """Verify that missing variation attributes are enriched from item detail's attribute combinations."""
+        worker = OrdersFetchWorker(self.mock_client, self.mock_auth)
+        self.mock_client.get_item_detail.return_value = {
+            "id": "MLM5700283346",
+            "title": "Tapacantos Metálico Autoadhesivo",
+            "variations": [
+                {
+                    "id": 18293847291,
+                    "seller_custom_field": "MLB4685712727",
+                    "attribute_combinations": [
+                        {"name": "Color", "value_name": "Dorado"},
+                        {"name": "Ancho", "value_name": "1.5 cm"},
+                    ],
+                    "picture_ids": ["pic_dorado"],
+                }
+            ],
+            "pictures": [{"id": "pic_dorado", "secure_url": "https://img.com/dorado.jpg"}],
+        }
+
+        raw_entry = (
+            "2651442567",
+            {
+                "id": "2000019082949204",
+                "order_items": [
+                    {
+                        "item": {
+                            "id": "MLM5700283346",
+                            "variation_id": "18293847291",
+                            "seller_sku": "MLB4685712727",
+                        },
+                        "quantity": 3,
+                        "unit_price": 4.67,
+                    }
+                ],
+            },
+            "湖北店",
+        )
+        ord_model = worker._enrich_single(raw_entry)
+        self.assertIsNotNone(ord_model)
+        assert ord_model is not None
+        self.assertEqual(len(ord_model.items), 1)
+        it = ord_model.items[0]
+        self.assertEqual(it.sku, "MLB4685712727")
+        self.assertEqual(it.variation_attributes, "Color: Dorado; Ancho: 1.5 cm")
+        self.assertEqual(it.thumbnail, "https://img.com/dorado.jpg")
+
+    def test_single_spec_item_displays_standard_single_tag(self) -> None:
+        """Verify that single-spec items without variations display '标准单品'."""
+        single_ord = OrderModel(
+            order_id="ORD_SINGLE",
+            account_id="111",
+            store_name="店1",
+            site_id="MLM",
+            status="paid",
+            items=[OrderItemModel(item_id="MLM111", title="单品图书", sku="BOOK-001", variation_attributes="")],
+        )
+        self.page._all_orders = [single_ord]
+        self.page._apply_filters()
+        self.assertEqual(self.page.order_list.count(), 1)
+        # Select row 0 to render detail drawer
+        self.page.order_list.setCurrentRow(0)
+
+        # Check detail drawer contains '标准单品'
+        labels = [lbl.text() for lbl in self.page.items_container.findChildren(QLabel)]
+        self.assertIn("标准单品", labels)
+
+    def test_contact_buyer_dialog_and_messaging_execution(self) -> None:
+        """Verify OrderContactBuyerDialog language resolution, history rendering, and messaging."""
+        # 1. Mexico order -> Spanish
+        ord_mx = OrderModel(
+            order_id="2000019082949204",
+            pack_id="pack_123",
+            account_id="2651442567",
+            store_name="湖北店",
+            site_id="MLM",
+            buyer_nickname="BUYER_MX",
+        )
+        dlg_mx = OrderContactBuyerDialog(ord_mx, self.mock_client, self.mock_auth, parent=self.page)
+        self.assertEqual(dlg_mx.target_lang, "es")
+        self.assertIn("西班牙语", dlg_mx.target_lang_name)
+        dlg_mx.deleteLater()
+
+        # 2. Brazil order -> Portuguese
+        ord_br = OrderModel(
+            order_id="2000019082949205",
+            pack_id="pack_456",
+            account_id="2651442567",
+            store_name="巴西店",
+            site_id="MLB",
+            buyer_nickname="BUYER_BR",
+        )
+        dlg_br = OrderContactBuyerDialog(ord_br, self.mock_client, self.mock_auth, parent=self.page)
+        self.assertEqual(dlg_br.target_lang, "pt")
+        self.assertIn("葡萄牙语", dlg_br.target_lang_name)
+
+        # 3. Test _on_history_loaded renders bubbles
+        mock_msgs = [
+            {
+                "id": "m1",
+                "from": {"user_id": "999", "role": "buyer"},
+                "text": {"plain": "Olá, tudo bem?"},
+                "message_date": {"created": "2026-10-21T01:00:00Z"},
+            },
+            {
+                "id": "m2",
+                "from": {"user_id": "2651442567", "role": "seller"},
+                "text": {"plain": "Olá! Seu pedido já está sendo preparado."},
+                "message_date": {"created": "2026-10-21T01:10:00Z"},
+            },
+        ]
+        dlg_br._on_history_loaded(mock_msgs, None)
+        self.assertIn("共 2 条消息", dlg_br.status_msg_lbl.text())
+
+        # 4. Test sending message calls client.send_pack_message
+        dlg_br.input_edit.setPlainText("Muito obrigado!")
+        dlg_br._on_send_clicked()
+        self.mock_client.send_pack_message.assert_called_with("2651442567", "pack_456", "Muito obrigado!")
+        dlg_br.deleteLater()
+
+    def test_contact_buyer_button_in_page_drawer(self) -> None:
+        """Verify that '💬 联系买家' button exists and is active on selected orders."""
+        self.assertTrue(hasattr(self.page, "btn_contact_buyer"))
+        # When order is selected
+        ord_test = OrderModel(order_id="ORD_CONTACT", account_id="111", store_name="店1", site_id="MLM", buyer_nickname="TEST_BUYER")
+        self.page._render_order_detail(ord_test)
+        self.assertTrue(self.page.btn_contact_buyer.isEnabled())
+        self.assertEqual(self.page.btn_contact_buyer.text(), "💬 联系买家")
+
+        # When detail is empty
+        self.page._render_empty_detail()
+        self.assertFalse(self.page.btn_contact_buyer.isEnabled())
 
 
 if __name__ == "__main__":

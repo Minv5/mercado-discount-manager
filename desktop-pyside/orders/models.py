@@ -500,12 +500,21 @@ def parse_order_from_dict(
 
         # Format variation attributes
         var_attrs = []
-        for va in (it_obj.get("variation_attributes") or []):
+        raw_vas = (
+            it_obj.get("variation_attributes")
+            or ri.get("variation_attributes")
+            or it_obj.get("attribute_combinations")
+            or ri.get("attribute_combinations")
+            or []
+        )
+        for va in raw_vas:
             if isinstance(va, dict):
-                vn = va.get("name") or ""
+                vn = va.get("name") or va.get("id") or ""
                 vv = va.get("value_name") or ""
                 if vn and vv:
                     var_attrs.append(f"{vn}: {vv}")
+                elif vv:
+                    var_attrs.append(str(vv))
         var_text = "; ".join(var_attrs)
         it_dims = format_dimensions_display(it_obj.get("dimensions") or "")
         it_sale_fee = float(ri.get("sale_fee") or 0.0)
