@@ -191,6 +191,37 @@ class UICommonTests(unittest.TestCase):
         dlg = ImagePreviewDialog(pixmap=pix, title="测试大图")
         self.assertEqual(dlg.windowTitle(), "测试大图")
         self.assertFalse(dlg.img_lbl.pixmap().isNull())
+        self.assertTrue(dlg.prev_btn.isHidden())
+        self.assertTrue(dlg.next_btn.isHidden())
+
+    def test_lightbox_multi_image_gallery(self):
+        pix1 = QPixmap(50, 50)
+        pix1.fill(Qt.GlobalColor.red)
+        pix2 = QPixmap(60, 60)
+        pix2.fill(Qt.GlobalColor.blue)
+        pix3 = QPixmap(70, 70)
+        pix3.fill(Qt.GlobalColor.yellow)
+
+        dlg = ImagePreviewDialog(images=[pix1, pix2, pix3], initial_index=0, title="买家凭据")
+        self.assertEqual(dlg.counter_lbl.text(), "1 / 3")
+        self.assertFalse(dlg.prev_btn.isEnabled())
+        self.assertTrue(dlg.next_btn.isEnabled())
+
+        # Switch to next
+        dlg._on_next_clicked()
+        self.assertEqual(dlg.counter_lbl.text(), "2 / 3")
+        self.assertTrue(dlg.prev_btn.isEnabled())
+        self.assertTrue(dlg.next_btn.isEnabled())
+
+        # Switch to next again
+        dlg._on_next_clicked()
+        self.assertEqual(dlg.counter_lbl.text(), "3 / 3")
+        self.assertTrue(dlg.prev_btn.isEnabled())
+        self.assertFalse(dlg.next_btn.isEnabled())
+
+        # Switch back to prev
+        dlg._on_prev_clicked()
+        self.assertEqual(dlg.counter_lbl.text(), "2 / 3")
 
 
 if __name__ == "__main__":

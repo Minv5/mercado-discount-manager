@@ -2284,32 +2284,11 @@ class ServiceCenterPage(QFrame):
         )
         self.tags_row_layout.addWidget(self.chip_pack_lbl)
 
-        # Sep 3: between pack and stage
-        self.sep_pack_stage = QLabel(" · ")
-        self.sep_pack_stage.setStyleSheet("color: #78716C; font-size: 11px;")
-        self.tags_row_layout.addWidget(self.sep_pack_stage)
-
-        # 4) Claim Stage Badge Chip
-        self.chip_stage_lbl = QLabel("")
-        self.chip_stage_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
-        self.chip_stage_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.chip_stage_lbl.customContextMenuRequested.connect(
-            lambda pos: self._show_target_copy_menu(
-                pos, self.chip_stage_lbl,
-                lambda: CLAIM_STAGE_NAMES.get(self._current_session.stage.lower(), self._current_session.stage) if (self._current_session and self._current_session.stage) else ""
-            )
-        )
-        self.tags_row_layout.addWidget(self.chip_stage_lbl)
-
-        # Sep 4: between stage and reputation impact
-        self.sep_stage_rep = QLabel(" · ")
-        self.sep_stage_rep.setStyleSheet("color: #78716C; font-size: 11px;")
-        self.tags_row_layout.addWidget(self.sep_stage_rep)
-
-        # 5) Claim Affects Reputation Chip
-        self.chip_rep_lbl = QLabel("")
-        self.chip_rep_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
-        self.tags_row_layout.addWidget(self.chip_rep_lbl)
+        # Sep 3 & Sep 4 kept for backward compatibility (hidden)
+        self.sep_pack_stage = QLabel("")
+        self.sep_pack_stage.hide()
+        self.sep_stage_rep = QLabel("")
+        self.sep_stage_rep.hide()
 
         self.tags_row_layout.addStretch(1)
         info_col.addWidget(self.tags_row_widget)
@@ -2327,7 +2306,7 @@ class ServiceCenterPage(QFrame):
 
         ctx_layout.addLayout(info_col, 1)
 
-        # 1.3 Claim Action Toolbar - 2x2 Grid (Dispute, Partial Refund, Full Refund, Refresh Chat)
+        # 1.3 Claim Action Toolbar - Vertical Claim Status Badges (Stage & Rep) + 2x2 Buttons
         self.claim_actions_frame = QFrame()
         self.claim_actions_frame.setObjectName("claimActionsFrame")
         self.claim_actions_frame.setStyleSheet("""
@@ -2343,8 +2322,34 @@ class ServiceCenterPage(QFrame):
         """)
         ca_layout = QGridLayout(self.claim_actions_frame)
         ca_layout.setContentsMargins(0, 0, 0, 0)
-        ca_layout.setHorizontalSpacing(6)
+        ca_layout.setHorizontalSpacing(8)
         ca_layout.setVerticalSpacing(4)
+
+        # 4) Claim Stage Badge Chip (Top Row, Col 0 - Stacked vertically)
+        self.chip_stage_lbl = QLabel("")
+        self.chip_stage_lbl.setStyleSheet("color: #A8A29E; font-size: 11px; padding-right: 2px;")
+        self.chip_stage_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.chip_stage_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.chip_stage_lbl.customContextMenuRequested.connect(
+            lambda pos: self._show_target_copy_menu(
+                pos, self.chip_stage_lbl,
+                lambda: CLAIM_STAGE_NAMES.get(self._current_session.stage.lower(), self._current_session.stage) if (self._current_session and self._current_session.stage) else ""
+            )
+        )
+        ca_layout.addWidget(self.chip_stage_lbl, 0, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        # 5) Claim Affects Reputation Chip (Bottom Row, Col 0 - Stacked vertically)
+        self.chip_rep_lbl = QLabel("")
+        self.chip_rep_lbl.setStyleSheet("color: #A8A29E; font-size: 11px; padding-right: 2px;")
+        self.chip_rep_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.chip_rep_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.chip_rep_lbl.customContextMenuRequested.connect(
+            lambda pos: self._show_target_copy_menu(
+                pos, self.chip_rep_lbl,
+                lambda: ("影响信誉" if self._current_session.affects_reputation == "affected" else "不影响信誉") if (self._current_session and self._current_session.affects_reputation) else ""
+            )
+        )
+        ca_layout.addWidget(self.chip_rep_lbl, 1, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.claim_stage_lbl = QLabel("")
         self.claim_stage_lbl.hide()
@@ -2375,7 +2380,7 @@ class ServiceCenterPage(QFrame):
             }
         """)
         self.claim_dispute_btn.clicked.connect(self._on_request_mediation)
-        ca_layout.addWidget(self.claim_dispute_btn, 0, 0)
+        ca_layout.addWidget(self.claim_dispute_btn, 0, 1)
 
         # 按钮2: 部分退款
         self.claim_partial_refund_btn = QPushButton("部分退款")
@@ -2403,7 +2408,7 @@ class ServiceCenterPage(QFrame):
             }
         """)
         self.claim_partial_refund_btn.clicked.connect(self._on_partial_refund)
-        ca_layout.addWidget(self.claim_partial_refund_btn, 0, 1)
+        ca_layout.addWidget(self.claim_partial_refund_btn, 0, 2)
 
         # 按钮3: 全额退款
         self.claim_full_refund_btn = QPushButton("全额退款")
@@ -2431,9 +2436,9 @@ class ServiceCenterPage(QFrame):
             }
         """)
         self.claim_full_refund_btn.clicked.connect(self._on_full_refund)
-        ca_layout.addWidget(self.claim_full_refund_btn, 1, 0)
+        ca_layout.addWidget(self.claim_full_refund_btn, 1, 1)
 
-        # 按钮4: 刷新消息 (整合入田字格右下角)
+        # 按钮4: 刷新消息 (整合入右下角)
         self.refresh_chat_btn = QPushButton("⟳ 刷新消息")
         self.refresh_chat_btn.setFixedSize(86, 26)
         self.refresh_chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2459,7 +2464,7 @@ class ServiceCenterPage(QFrame):
             }
         """)
         self.refresh_chat_btn.clicked.connect(self._on_refresh_chat_clicked)
-        ca_layout.addWidget(self.refresh_chat_btn, 1, 1)
+        ca_layout.addWidget(self.refresh_chat_btn, 1, 2)
 
         self.claim_actions_frame.hide()
         ctx_layout.addWidget(self.claim_actions_frame, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -3635,7 +3640,7 @@ class ServiceCenterPage(QFrame):
         else:
             self.chip_stage_lbl.hide()
 
-        self.sep_pack_stage.setVisible((has_item or has_order or has_pack) and has_stage)
+        self.sep_pack_stage.hide()
 
         has_rep = bool(session.affects_reputation) and session.session_type == "claim"
         if has_rep:
@@ -3649,7 +3654,7 @@ class ServiceCenterPage(QFrame):
         else:
             self.chip_rep_lbl.hide()
 
-        self.sep_stage_rep.setVisible((has_item or has_order or has_pack or has_stage) and has_rep)
+        self.sep_stage_rep.hide()
 
         # Update backward-compatible context_link_lbl string
         link_parts = []
@@ -4021,20 +4026,23 @@ class ServiceCenterPage(QFrame):
         if msg.attachments:
             att_box = QHBoxLayout()
             att_box.setSpacing(8)
-            for att_path in msg.attachments:
+            all_attachments = [a for a in msg.attachments if a]
+            for idx, att_path in enumerate(all_attachments):
                 att_lbl = QLabel()
                 att_lbl.setFixedSize(76, 76)
                 att_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
                 att_lbl.setStyleSheet("border: 1px solid #4E472F; border-radius: 6px; background: #171D1A;")
                 att_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                att_lbl.setToolTip("点击放大查看买家上传凭据图片")
+                att_lbl.setToolTip(f"点击放大查看买家上传凭据图片 ({idx + 1}/{len(all_attachments)})")
                 load_image_async(
                     att_path,
                     QSize(76, 76),
                     att_lbl.setPixmap,
                     radius=6,
                 )
-                att_lbl.mousePressEvent = lambda e, p=att_path: show_image_preview(p, title="买家凭据原图", parent=self)
+                att_lbl.mousePressEvent = lambda e, i=idx, atts=all_attachments: show_image_preview(
+                    atts, title="买家凭据原图", parent=self, initial_index=i
+                )
                 att_box.addWidget(att_lbl)
             att_box.addStretch()
             b_layout.addLayout(att_box)

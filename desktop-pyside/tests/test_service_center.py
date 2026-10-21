@@ -1894,7 +1894,6 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         self.assertIn("MLM5868800338", page.chip_item_lbl.text())
         self.assertFalse(page.sep_item_order.isHidden())
         self.assertFalse(page.sep_order_pack.isHidden())
-        self.assertFalse(page.sep_pack_stage.isHidden())
         self.assertFalse(page.chip_stage_lbl.isHidden())
         self.assertIn("平台官方调解中", page.chip_stage_lbl.text())
 
@@ -2119,7 +2118,7 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         page._display_session_detail(sess_clean)
         self.assertFalse(page.chip_rep_lbl.isHidden())
         self.assertIn("不影响信誉", page.chip_rep_lbl.text())
-        self.assertFalse(page.sep_stage_rep.isHidden())
+        self.assertFalse(page.chip_stage_lbl.isHidden())
 
         page._display_session_detail(sess_impact)
         self.assertFalse(page.chip_rep_lbl.isHidden())
@@ -2127,7 +2126,7 @@ class TestServiceCenterSnapshot(unittest.TestCase):
 
         page._display_session_detail(None)
         self.assertTrue(page.chip_rep_lbl.isHidden())
-        self.assertTrue(page.sep_stage_rep.isHidden())
+        self.assertTrue(page.chip_stage_lbl.isHidden())
 
         # 6. Test FetchConversationMessagesWorker fetches affects_reputation
         worker_sess = ServiceSession(id="c_9999", session_type="claim", account_id="acc_1", account_name="店1", site_id="MLM")
