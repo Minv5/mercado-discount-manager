@@ -938,14 +938,19 @@ class OrdersPage(QWidget):
 
         # 2. Main Work Area: Splitter (Left: Order List; Right: Order Detail Drawer)
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        self.splitter.setHandleWidth(8)
+        self.splitter.setHandleWidth(6)
         self.splitter.setStyleSheet("""
             QSplitter::handle:horizontal {
-                background-color: transparent;
+                background: transparent;
+                border: none;
+                image: none;
+                width: 6px;
             }
             QSplitter::handle:horizontal:hover {
-                background-color: rgba(78, 71, 47, 0.3);
-                border-radius: 4px;
+                background: rgba(78, 71, 47, 0.35);
+                border: none;
+                image: none;
+                border-radius: 3px;
             }
         """)
 

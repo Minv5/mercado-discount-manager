@@ -235,5 +235,7 @@ QScrollBar:horizontal {{ background: {COLORS['main']}; height: 12px; margin: 0; 
 QScrollBar::handle:horizontal {{ background: {COLORS['gold']}; min-width: 24px; border-radius: 5px; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: {COLORS['main']}; }}
+QSplitter::handle {{ background: transparent; border: none; image: none; }}
+QSplitter::handle:hover {{ background: rgba(78, 71, 47, 0.35); border: none; image: none; }}
 QToolTip {{ background: {COLORS['card']}; color: {COLORS['text']}; border: 1px solid {COLORS['gold']}; }}
 """
