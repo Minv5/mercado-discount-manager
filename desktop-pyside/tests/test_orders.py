@@ -428,7 +428,10 @@ class TestOrdersPageUI(unittest.TestCase):
         self.assertIn("-USD 2.31", self.page.det_fee_sale_val.text())
         self.assertIn("-USD 6.59", self.page.det_fee_ship_val.text())
         self.assertIn("9.59", self.page.det_fee_net_val.text())
-        self.assertIn("¥69.05", self.page.det_fee_net_val.text())
+        from engine.exchange_rate import get_cny_exchange_rate
+        rate, _ = get_cny_exchange_rate("USD")
+        expected_cny = f"¥{round(9.59 * rate, 2):.2f}"
+        self.assertIn(expected_cny, self.page.det_fee_net_val.text())
         self.assertIn("3.78", self.page.det_pay_detail_lbl.text())
 
     def test_permalink_resolution_and_front_url(self):
@@ -1173,6 +1176,31 @@ class TestOrdersPageUI(unittest.TestCase):
         self.page._render_order_detail(order_shipped)
         self.assertTrue(self.page.det_sla_badge.isHidden())
 
+    def test_countdown_tick_synchronizes_both_left_list_and_right_detail(self) -> None:
+        """Verify that _on_countdown_tick refreshes both list badge and detail badge."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        test_order = OrderModel(
+            order_id="ORD_SYNC_TEST_1",
+            account_id="111",
+            store_name="🇲🇽 测试店",
+            site_id="MLM",
+            status="paid",
+            shipping=ShippingInfoModel(status="ready_to_ship"),
+            created_timestamp=(now - timedelta(hours=2)).timestamp(),
+        )
+
+        page = self.page
+        card = page._create_order_card(test_order)
+        self.assertIn("ORD_SYNC_TEST_1", page._list_sla_badges)
+        badge_widget, badge_order = page._list_sla_badges["ORD_SYNC_TEST_1"]
+        self.assertIsInstance(badge_widget, QLabel)
+
+        page._current_order = test_order
+        page._on_countdown_tick()
+        self.assertFalse(badge_widget.isHidden())
+        self.assertIn("⏳", badge_widget.text())
+
 
 class TestSlaCalendarAndDeadline(unittest.TestCase):
     def test_business_day_determination(self) -> None:
@@ -1290,6 +1318,24 @@ class TestSlaCalendarAndDeadline(unittest.TestCase):
         diff_sun = int((dl_sun - ref_now).total_seconds())
         self.assertEqual(diff_sun // 86400, 0)
         self.assertEqual((diff_sun % 86400) // 3600, 3)  # 余3小时
+
+    def test_live_exchange_rate_module(self) -> None:
+        """Verify that get_cny_exchange_rate resolves live rate and falls back gracefully."""
+        from engine.exchange_rate import get_cny_exchange_rate, DEFAULT_EXCHANGE_RATES
+        # CNY/RMB returns 1.0
+        rate_cny, src_cny = get_cny_exchange_rate("CNY")
+        self.assertEqual(rate_cny, 1.0)
+        self.assertEqual(src_cny, "基准")
+
+        # USD returns positive rate
+        rate_usd, src_usd = get_cny_exchange_rate("USD")
+        self.assertGreater(rate_usd, 6.0)
+        self.assertIn(src_usd, ["实时", "自定义", "参考"])
+
+        # Latin currencies return positive rate
+        for cur in ["MXN", "BRL", "COP", "CLP"]:
+            rate_lat, src_lat = get_cny_exchange_rate(cur)
+            self.assertGreater(rate_lat, 0.0)
 
 
 if __name__ == "__main__":

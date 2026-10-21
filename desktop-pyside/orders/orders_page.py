@@ -88,36 +88,7 @@ SITE_DOMAINS = {
     "MPE": "https://articulo.mercadolibre.com.pe",
 }
 
-DEFAULT_EXCHANGE_RATES: dict[str, float] = {
-    "USD": 7.20,
-    "MXN": 0.37,
-    "BRL": 1.30,
-    "CLP": 0.0075,
-    "COP": 0.0017,
-    "CNY": 1.0,
-    "RMB": 1.0,
-}
-
-
-def get_cny_exchange_rate(currency: str) -> float:
-    """Resolve exchange rate to CNY/RMB, prioritizing user settings if configured."""
-    cur = (currency or "USD").strip().upper()
-    try:
-        s_path = get_data_dir() / "settings.json"
-        if s_path.exists():
-            cfg = json.loads(s_path.read_text(encoding="utf-8"))
-            custom_rates = cfg.get("exchangeRates") or {}
-            if cur in custom_rates:
-                val = float(custom_rates[cur])
-                if val > 0:
-                    return val
-            if cur == "USD" and cfg.get("usdToCnyRate"):
-                val = float(cfg["usdToCnyRate"])
-                if val > 0:
-                    return val
-    except Exception:
-        pass
-    return DEFAULT_EXCHANGE_RATES.get(cur, 7.20 if cur == "USD" else 0.0)
+from engine.exchange_rate import get_cny_exchange_rate, trigger_async_rate_refresh
 
 
 # ElidedLabel, copy_pure_text, show_pure_copy_menu, label_copy_val
@@ -771,6 +742,7 @@ class OrdersPage(QWidget):
         self._current_site_filter = "ALL"
         self._current_status_filter = "ALL"
         self._current_time_filter = "ALL"
+        self._list_sla_badges: dict[str, tuple[QLabel, OrderModel]] = {}
 
         self._build_ui()
         self._load_local_snapshot()
@@ -1559,6 +1531,7 @@ class OrdersPage(QWidget):
             prev_selected_oid = current_item.data(Qt.ItemDataRole.UserRole) or ""
 
         self.order_list.clear()
+        self._list_sla_badges.clear()
         self.count_lbl.setText(f"共找到 {len(self._filtered_orders)} 笔订单")
 
         target_row = 0
@@ -1668,6 +1641,7 @@ class OrdersPage(QWidget):
             """)
             sla_badge.setToolTip("发货截止时效倒计时 (美客多跨境履约 SLA 预警)")
             row1.addWidget(sla_badge)
+            self._list_sla_badges[order.order_id] = (sla_badge, order)
 
         sep1 = QLabel(" · ")
         sep1.setStyleSheet("color: #78716C; font-size: 11px;")
@@ -2261,15 +2235,17 @@ class OrdersPage(QWidget):
 
         # Estimated net profit with RMB conversion
         net_val = order.estimated_net_profit
-        rate = get_cny_exchange_rate(cur)
+        rate, rate_src = get_cny_exchange_rate(cur)
         if rate > 0 and cur.upper() not in ("CNY", "RMB"):
             cny_val = round(net_val * rate, 2)
             if cny_val < 0:
                 self.det_fee_net_val.setText(f"{cur} {net_val:.2f} (约 -¥{abs(cny_val):.2f})")
             else:
                 self.det_fee_net_val.setText(f"{cur} {net_val:.2f} (约 ¥{cny_val:.2f})")
+            self.det_fee_net_val.setToolTip(f"折算汇率: 1 {cur} ≈ {rate:.4f} CNY ({rate_src})")
         else:
             self.det_fee_net_val.setText(f"{cur} {net_val:.2f}")
+            self.det_fee_net_val.setToolTip("")
 
         p_info = order.payments[0] if order.payments else PaymentInfoModel()
         pm = p_info.payment_method or "Mercado Pago"
@@ -2447,6 +2423,8 @@ class OrdersPage(QWidget):
         """Tick countdown badges without re-fetching network data."""
         if not self.isVisible():
             return
+
+        # 1. Update right detail SLA badge
         if self._current_order:
             deadline_info = self._current_order.shipping_deadline_info
             if deadline_info and hasattr(self, "det_sla_badge"):
@@ -2466,6 +2444,30 @@ class OrdersPage(QWidget):
                 self.det_sla_badge.show()
             elif hasattr(self, "det_sla_badge"):
                 self.det_sla_badge.hide()
+
+        # 2. Synchronously update left order list SLA badges
+        for oid, (badge, ord_item) in list(self._list_sla_badges.items()):
+            try:
+                deadline_info = ord_item.shipping_deadline_info
+                if deadline_info:
+                    dl_text, dl_color, dl_bg, dl_border = deadline_info
+                    badge.setText(f" {dl_text} ")
+                    badge.setStyleSheet(f"""
+                        QLabel {{
+                            color: {dl_color};
+                            background: {dl_bg};
+                            border: {dl_border};
+                            border-radius: 3px;
+                            font-size: 11px;
+                            font-weight: 600;
+                            padding: 1px 4px;
+                        }}
+                    """)
+                    badge.show()
+                else:
+                    badge.hide()
+            except Exception:
+                pass
 
     def stop(self) -> None:
         """Safely stop any ongoing background workers on application close."""
