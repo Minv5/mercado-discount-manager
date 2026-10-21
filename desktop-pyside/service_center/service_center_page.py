@@ -770,6 +770,20 @@ class FetchSessionsWorker(SafeWorkerBase):
                         buyer_id = str(buyer_data.get("id") or "")
                         is_unans = (q_status == "UNANSWERED" or q.get("status") == "UNANSWERED")
 
+                        cached = self.cache_map.get(f"q_{q_id}")
+
+                        # Auto-translate buyer question text to Chinese if foreign
+                        q_trans = ""
+                        if cached and cached.summary_translated and not is_fallback_title(cached.summary_translated):
+                            q_trans = cached.summary_translated.replace("[已回复] ", "").strip()
+                        elif q_text and not any('\u4e00' <= c <= '\u9fff' for c in q_text):
+                            try:
+                                zh = translate_text(q_text, target_lang="zh", timeout=3.0)
+                                if zh and zh.strip().lower() != q_text.strip().lower():
+                                    q_trans = zh
+                            except Exception:
+                                q_trans = ""
+
                         sess = ServiceSession(
                             id=f"q_{q_id}",
                             session_type="question",
@@ -783,12 +797,11 @@ class FetchSessionsWorker(SafeWorkerBase):
                             status="unanswered" if is_unans else "answered",
                             created_at=created_at,
                             summary=q_text if is_unans else f"[已回复] {q_text}",
-                            summary_translated="",
+                            summary_translated=q_trans if is_unans else (f"[已回复] {q_trans}" if q_trans else ""),
                             can_reply=is_unans,
                             is_unread=is_unans,
                             raw_data=q,
                         )
-                        cached = self.cache_map.get(sess.id)
                         if cached:
                             if not sess.item_thumbnail and cached.item_thumbnail:
                                 sess.item_thumbnail = cached.item_thumbnail
@@ -808,6 +821,7 @@ class FetchSessionsWorker(SafeWorkerBase):
                                 sender_role="buyer",
                                 sender_name=sess.buyer_nickname,
                                 text=q_text,
+                                text_translated=q_trans,
                                 created_at=created_at,
                                 is_seller=False,
                             )
@@ -815,12 +829,21 @@ class FetchSessionsWorker(SafeWorkerBase):
                         ans_data = q.get("answer") or {}
                         if ans_data.get("text") or ans_data.get("text_translated"):
                             ans_text = str(ans_data.get("text_translated") or ans_data.get("text") or "")
+                            ans_trans = ""
+                            if ans_text and not any('\u4e00' <= c <= '\u9fff' for c in ans_text):
+                                try:
+                                    zh_ans = translate_text(ans_text, target_lang="zh", timeout=2.0)
+                                    if zh_ans and zh_ans.strip().lower() != ans_text.strip().lower():
+                                        ans_trans = zh_ans
+                                except Exception:
+                                    ans_trans = ""
                             sess.messages.append(
                                 ServiceMessage(
                                     id=f"ans_{q_id}",
                                     sender_role="seller",
                                     sender_name="卖家",
                                     text=ans_text,
+                                    text_translated=ans_trans,
                                     created_at=str(ans_data.get("date_created") or ""),
                                     is_seller=True,
                                 )
@@ -3043,6 +3066,8 @@ class ServiceCenterPage(QFrame):
                 or query in s.buyer_nickname.lower()
                 or query in s.order_id.lower()
                 or query in s.summary.lower()
+                or (s.summary_translated and query in s.summary_translated.lower())
+                or (s.item_title and query in s.item_title.lower())
             ]
 
         # Sort: opened/unanswered sessions first, then strictly descending by created_at
@@ -3279,6 +3304,17 @@ class ServiceCenterPage(QFrame):
             oid_str = session.order_id or "无关联订单"
             snip_lbl = QLabel(f"订单: <b>{oid_str}</b> · {stage_cn}")
             snip_lbl.setStyleSheet(CARD_SNIP_CLAIM_STYLE)
+        elif session.session_type == "question":
+            if session.summary_translated:
+                display_text = f"问: {session.summary_translated}"
+            elif session.summary:
+                display_text = f"问: {session.summary}"
+            else:
+                display_text = session.item_title if (session.item_title and not session.item_title.startswith("商品 ")) else "售前咨询"
+            snip = display_text[:60] + ("..." if len(display_text) > 60 else "")
+            snip_lbl = QLabel(snip)
+            snip_lbl.setStyleSheet(CARD_SNIP_NORMAL_STYLE)
+            snip_lbl.setToolTip(f"关联商品: {session.item_title}\n提问原文: {session.summary}\n中文翻译: {session.summary_translated or '未翻译'}")
         else:
             display_text = session.item_title if (session.item_title and not session.item_title.startswith("商品 ")) else session.summary
             snip = display_text[:60] + ("..." if len(display_text) > 60 else "")
@@ -3299,7 +3335,16 @@ class ServiceCenterPage(QFrame):
 
         return widget
 
-        return widget
+    def _refresh_current_session_card(self) -> None:
+        """Refresh current session card widget in the left session list."""
+        if not self._current_session:
+            return
+        for r in range(self.session_list.count()):
+            it = self.session_list.item(r)
+            if it and it.data(Qt.ItemDataRole.UserRole) == self._current_session.id:
+                card = self._create_session_item_widget(self._current_session)
+                self.session_list.setItemWidget(it, card)
+                break
 
     def _update_claim_action_buttons(self, session: ServiceSession | None) -> None:
         if not session or session.session_type != "claim":
@@ -3692,6 +3737,7 @@ class ServiceCenterPage(QFrame):
                     sender_role="buyer",
                     sender_name=session.buyer_nickname,
                     text=session.summary,
+                    text_translated=session.summary_translated,
                     created_at=session.created_at,
                     is_seller=False,
                 )
@@ -3973,6 +4019,44 @@ class ServiceCenterPage(QFrame):
                 lambda pos, target=trans_lbl, m=msg: self._show_chat_context_menu(pos, target, m)
             )
             b_layout.addWidget(trans_lbl)
+        elif not msg.is_seller and msg.text and not any('\u4e00' <= c <= '\u9fff' for c in msg.text):
+            # Foreign buyer / mediator message without translation -> auto translate asynchronously
+            trans_lbl = QLabel("⏳ 正在翻译为中文...")
+            trans_lbl.setWordWrap(True)
+            trans_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            trans_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            trans_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+            trans_lbl.setStyleSheet("color: #8C877D; font-size: 11px; line-height: 1.4; font-style: normal;")
+            trans_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            trans_lbl.customContextMenuRequested.connect(
+                lambda pos, target=trans_lbl, m=msg: self._show_chat_context_menu(pos, target, m)
+            )
+            b_layout.addWidget(trans_lbl)
+
+            def _auto_translate_msg(target_lbl: QLabel, target_msg: ServiceMessage):
+                try:
+                    zh = translate_text(target_msg.text, target_lang="zh", timeout=3.5)
+                    if zh and zh.strip().lower() != target_msg.text.strip().lower():
+                        target_msg.text_translated = zh
+                        if self._current_session:
+                            if self._current_session.session_type == "question" and not self._current_session.summary_translated:
+                                self._current_session.summary_translated = zh
+                            save_sessions_snapshot(self._all_sessions)
+                        QTimer.singleShot(0, lambda: target_lbl.setText(f"译: {zh}"))
+                        QTimer.singleShot(0, lambda: target_lbl.setStyleSheet("color: #C8C3B7; font-size: 11px; line-height: 1.4; font-style: normal;"))
+                        QTimer.singleShot(0, self._refresh_current_session_card)
+                    else:
+                        QTimer.singleShot(0, lambda: target_lbl.hide())
+                except Exception:
+                    def _retry_fn(ev):
+                        target_lbl.setText("⏳ 正在重试翻译...")
+                        target_lbl.setStyleSheet("color: #8C877D; font-size: 11px;")
+                        threading.Thread(target=_auto_translate_msg, args=(target_lbl, target_msg), daemon=True).start()
+                    QTimer.singleShot(0, lambda: target_lbl.setText("🌐 翻译未完成，点击重试"))
+                    QTimer.singleShot(0, lambda: target_lbl.setStyleSheet("color: #F59E0B; font-size: 11px; text-decoration: underline; cursor: pointer;"))
+                    target_lbl.mousePressEvent = _retry_fn
+
+            threading.Thread(target=_auto_translate_msg, args=(trans_lbl, msg), daemon=True).start()
 
         # Attach right-click context menu to bubble frame, text, and header
         for target_w in (bubble_frame, text_lbl, hdr_lbl):
@@ -4065,6 +4149,7 @@ class ServiceCenterPage(QFrame):
                 sender_role="buyer",
                 sender_name=self._current_session.buyer_nickname,
                 text=self._current_session.summary,
+                text_translated=self._current_session.summary_translated,
                 created_at=self._current_session.created_at,
                 is_seller=False,
             )
@@ -4109,7 +4194,7 @@ class ServiceCenterPage(QFrame):
             act_copy = menu.addAction("复制")
             act_copy.triggered.connect(lambda: self._copy_single_message(msg, include_header=False))
 
-            act_trans = menu.addAction("🌐 翻译为中文")
+            act_trans = menu.addAction("🌐 重新翻译为中文" if msg.text_translated else "🌐 翻译为中文")
             act_trans.triggered.connect(lambda: self._translate_single_message(msg))
         else:
             act = menu.addAction("复制全部")
@@ -4130,8 +4215,11 @@ class ServiceCenterPage(QFrame):
                 if zh and zh.strip().lower() != msg.text.strip().lower():
                     msg.text_translated = zh
                     if self._current_session:
+                        if self._current_session.session_type == "question" and not self._current_session.summary_translated:
+                            self._current_session.summary_translated = zh
                         save_sessions_snapshot(self._all_sessions)
                     QTimer.singleShot(0, lambda: self._display_session_detail(self._current_session, force_rebuild=True))
+                    QTimer.singleShot(0, self._refresh_current_session_card)
                 else:
                     QTimer.singleShot(0, lambda: QToolTip.showText(QCursor.pos(), "已是中文或无需翻译", self))
             except Exception as e:

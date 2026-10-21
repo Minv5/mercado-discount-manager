@@ -1120,6 +1120,137 @@ class TestOrdersPageUI(unittest.TestCase):
         self.page._render_empty_detail()
         self.assertFalse(self.page.btn_contact_buyer.isEnabled())
 
+    def test_order_shipping_deadline_countdown_and_badge(self):
+        import time
+        now_ts = time.time()
+        # 1. Pending order with deadline
+        order_pending = OrderModel(
+            order_id="ORD_DEADLINE_TEST",
+            account_id="111",
+            store_name="🇲🇽 湖北店",
+            site_id="MLM",
+            status="paid",
+            created_timestamp=now_ts - (12 * 3600),  # Ordered 12h ago, remaining ~60h
+            items=[OrderItemModel(item_id="MLM123", title="Test Item", quantity=1)],
+        )
+        dl_info = order_pending.shipping_deadline_info
+        self.assertIsNotNone(dl_info)
+        text, color, bg, border = dl_info
+        self.assertIn("剩", text)
+        self.assertIn("⏳", text)
+
+        # 2. Render card and check SLA badge is visible in Row 1
+        self.page._all_orders = [order_pending]
+        self.page._apply_filters()
+        card_w = self.page.order_list.itemWidget(self.page.order_list.item(0))
+        self.assertIsNotNone(card_w)
+        card_layout = card_w.layout()
+        info_layout = card_layout.itemAt(2).layout()
+        row1 = info_layout.itemAt(0).layout()
+
+        # Find SLA badge in row 1
+        labels = [row1.itemAt(i).widget() for i in range(row1.count()) if isinstance(row1.itemAt(i).widget(), QLabel)]
+        badge_texts = [lbl.text() for lbl in labels]
+        self.assertTrue(any("⏳" in t and "剩" in t for t in badge_texts))
+
+        # Check detail drawer renders SLA badge
+        self.page._render_order_detail(order_pending)
+        self.assertFalse(self.page.det_sla_badge.isHidden())
+        self.assertIn("剩", self.page.det_sla_badge.text())
+
+        # 3. Shipped order has no SLA countdown
+        order_shipped = OrderModel(
+            order_id="ORD_SHIPPED_TEST",
+            account_id="111",
+            store_name="🇲🇽 湖北店",
+            site_id="MLM",
+            status="shipped",
+            shipping=ShippingInfoModel(status="shipped"),
+            created_timestamp=now_ts - (48 * 3600),
+            items=[OrderItemModel(item_id="MLM123", title="Test Item", quantity=1)],
+        )
+        self.assertIsNone(order_shipped.shipping_deadline_info)
+        self.page._render_order_detail(order_shipped)
+        self.assertTrue(self.page.det_sla_badge.isHidden())
+
+
+class TestSlaCalendarAndDeadline(unittest.TestCase):
+    def test_business_day_determination(self) -> None:
+        from datetime import date
+        from orders.sla_calendar import is_cbt_business_day
+
+        # Normal Wednesday (2026-03-11) -> True
+        self.assertTrue(is_cbt_business_day(date(2026, 3, 11)))
+
+        # Normal Saturday (2026-03-14) -> False
+        self.assertFalse(is_cbt_business_day(date(2026, 3, 14)))
+
+        # Normal Sunday (2026-03-15) -> False
+        self.assertFalse(is_cbt_business_day(date(2026, 3, 15)))
+
+        # 2026 National Day (2026-10-01) -> False
+        self.assertFalse(is_cbt_business_day(date(2026, 10, 1)))
+
+        # 2026 Adjusted Workday Saturday (2026-10-10) -> True
+        self.assertTrue(is_cbt_business_day(date(2026, 10, 10)))
+
+    def test_add_business_days_skips_weekends_and_holidays(self) -> None:
+        from datetime import datetime, timezone
+        from orders.sla_calendar import add_cbt_business_days
+
+        # Friday 2026-03-13 10:00:00 UTC + 3 business days -> skips Sat, Sun -> Wed 2026-03-18 10:00:00 UTC
+        start = datetime(2026, 3, 13, 10, 0, 0, tzinfo=timezone.utc)
+        deadline = add_cbt_business_days(start, 3)
+        self.assertEqual(deadline.year, 2026)
+        self.assertEqual(deadline.month, 3)
+        self.assertEqual(deadline.day, 18)
+        self.assertEqual(deadline.hour, 10)
+
+        # Cross 2026 National Day: 2026-09-30 15:00 UTC (Wed) + 3 business days
+        # 10-01 to 10-07 are public holidays.
+        # 10-08 (Thu) is Day 1.
+        # 10-09 (Fri) is Day 2.
+        # 10-10 (Sat) is official shift workday -> Day 3!
+        start_nd = datetime(2026, 9, 30, 15, 0, 0, tzinfo=timezone.utc)
+        deadline_nd = add_cbt_business_days(start_nd, 3)
+        self.assertEqual(deadline_nd.year, 2026)
+        self.assertEqual(deadline_nd.month, 10)
+        self.assertEqual(deadline_nd.day, 10)
+        self.assertEqual(deadline_nd.hour, 15)
+
+    def test_order_model_uses_sla_calendar_when_no_official_limit(self) -> None:
+        from datetime import datetime, timezone, timedelta
+        from orders.models import OrderModel, ShippingInfoModel
+
+        # Fresh order created 2 hours ago -> SLA is active and remaining
+        now = datetime.now(timezone.utc)
+        order_fresh = OrderModel(
+            order_id="ORD_SLA_TEST_FRESH",
+            account_id="111",
+            store_name="🇲🇽 测试店",
+            site_id="MLM",
+            status="paid",
+            shipping=ShippingInfoModel(status="pending", estimated_handling_limit=None),
+            created_timestamp=(now - timedelta(hours=2)).timestamp(),
+        )
+        info_fresh = order_fresh.shipping_deadline_info
+        self.assertIsNotNone(info_fresh)
+        self.assertIn("⏳", info_fresh[0])
+
+        # Past order created months ago -> SLA is overdue
+        order_past = OrderModel(
+            order_id="ORD_SLA_TEST_PAST",
+            account_id="111",
+            store_name="🇲🇽 测试店",
+            site_id="MLM",
+            status="paid",
+            shipping=ShippingInfoModel(status="pending", estimated_handling_limit=None),
+            created_timestamp=datetime(2026, 3, 13, 10, 0, 0, tzinfo=timezone.utc).timestamp(),
+        )
+        info_past = order_past.shipping_deadline_info
+        self.assertIsNotNone(info_past)
+        self.assertIn("⚠️ 已超时", info_past[0])
+
 
 if __name__ == "__main__":
     unittest.main()

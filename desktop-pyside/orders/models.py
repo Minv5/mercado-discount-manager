@@ -183,6 +183,7 @@ class ShippingInfoModel:
     zip_code: str = ""
     dimensions: str = ""
     shipping_cost: float = 0.0
+    estimated_handling_limit: str = ""
 
     @property
     def full_address(self) -> str:
@@ -270,6 +271,68 @@ class OrderModel:
     @property
     def status_badge_info(self) -> tuple[str, str, str]:
         return get_order_status_badge_info(self.status, self.shipping.status)
+
+    @property
+    def shipping_deadline_info(self) -> tuple[str, str, str, str] | None:
+        """Return (text, text_color, bg_color, border_style) for pending shipping SLA countdown.
+        
+        Returns None for orders that are already shipped, delivered, or cancelled.
+        """
+        _, _, filter_cat = self.status_badge_info
+        if filter_cat != "paid":
+            return None
+
+        # Determine deadline timestamp
+        deadline_ts = 0.0
+        if self.shipping.estimated_handling_limit:
+            deadline_ts = parse_order_timestamp(self.shipping.estimated_handling_limit)
+
+        # If no explicit limit from ML API, compute using CBT working days + statutory holidays calendar
+        if not deadline_ts and self.created_timestamp:
+            from orders.sla_calendar import compute_order_sla_deadline
+            deadline_dt = compute_order_sla_deadline(self.created_timestamp, handling_days=3)
+            deadline_ts = deadline_dt.timestamp()
+
+        if not deadline_ts:
+            return None
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+        diff = deadline_ts - now_ts
+
+        if diff > 0:
+            total_minutes = int(diff // 60)
+            hours = total_minutes // 60
+            minutes = total_minutes % 60
+            if hours >= 24:
+                days = hours // 24
+                rem_h = hours % 24
+                text = f"⏳ 剩 {days}天{rem_h}时" if rem_h > 0 else f"⏳ 剩 {days}天"
+                color = "#34D399"
+                bg = "rgba(52, 211, 153, 0.12)"
+                border = "1px solid rgba(52, 211, 153, 0.3)"
+            elif hours >= 6:
+                text = f"⏳ 剩 {hours}时{minutes}分"
+                color = "#FBBF24"
+                bg = "rgba(251, 191, 36, 0.12)"
+                border = "1px solid rgba(251, 191, 36, 0.35)"
+            else:
+                text = f"🚨 仅剩 {hours}时{minutes}分"
+                color = "#EF4444"
+                bg = "rgba(239, 68, 68, 0.18)"
+                border = "1px solid rgba(239, 68, 68, 0.4)"
+        else:
+            overdue_minutes = int(abs(diff) // 60)
+            overdue_h = overdue_minutes // 60
+            overdue_m = overdue_minutes % 60
+            if overdue_h > 0:
+                text = f"⚠️ 已超时 {overdue_h}时{overdue_m}分"
+            else:
+                text = f"⚠️ 已超时 {overdue_m}分"
+            color = "#F87171"
+            bg = "rgba(239, 68, 68, 0.22)"
+            border = "1px solid rgba(239, 68, 68, 0.5)"
+
+        return (text, color, bg, border)
 
     @property
     def primary_item(self) -> OrderItemModel:
@@ -360,6 +423,7 @@ class OrderModel:
             zip_code=str(sh.get("zip_code") or ""),
             dimensions=str(sh.get("dimensions") or ""),
             shipping_cost=float(sh.get("shipping_cost") or 0.0),
+            estimated_handling_limit=str(sh.get("estimated_handling_limit") or ""),
         ) if isinstance(sh, dict) else ShippingInfoModel()
 
         payments = []
@@ -554,6 +618,12 @@ def parse_order_from_dict(
     comment = str(rec_addr.get("comment") or "")
     zip_code = str(rec_addr.get("zip_code") or "")
     ship_dims = format_dimensions_display(shipping_dict.get("dimensions") or shipping_dict.get("shipping_dimensions") or "")
+    raw_handling_limit = str(
+        (shipping_dict.get("estimated_handling_limit") or {}).get("date")
+        or (shipping_dict.get("lead_time") or {}).get("estimated_handling_limit", {}).get("date")
+        or (primary_ord.get("manufacturing_ending_date"))
+        or ""
+    )
 
     shipping = ShippingInfoModel(
         shipment_id=ship_id,
@@ -571,6 +641,7 @@ def parse_order_from_dict(
         zip_code=zip_code,
         dimensions=ship_dims,
         shipping_cost=float(shipping_dict.get("shipping_cost") or 0.0),
+        estimated_handling_limit=raw_handling_limit,
     )
 
     # Payments

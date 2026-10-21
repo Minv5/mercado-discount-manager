@@ -376,6 +376,14 @@ class OrdersFetchWorker(QThread):
                         ord_model.shipping.tracking_method = str(ship_det.get("tracking_method") or ord_model.shipping.tracking_method or "")
                         if not ord_model.shipping.status or ord_model.shipping.status == "paid":
                             ord_model.shipping.status = str(ship_det.get("status") or ord_model.shipping.status)
+                        if not ord_model.shipping.estimated_handling_limit:
+                            ship_limit = str(
+                                (ship_det.get("estimated_handling_limit") or {}).get("date")
+                                or (ship_det.get("lead_time") or {}).get("estimated_handling_limit", {}).get("date")
+                                or ""
+                            )
+                            if ship_limit:
+                                ord_model.shipping.estimated_handling_limit = ship_limit
                         dims = ship_det.get("dimensions") or ship_det.get("shipping_dimensions")
                         if dims:
                             ord_model.shipping.dimensions = format_dimensions_display(dims)
@@ -750,6 +758,11 @@ class OrdersPage(QWidget):
         self._build_ui()
         self._load_local_snapshot()
 
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.setInterval(60000)
+        self._countdown_timer.timeout.connect(self._on_countdown_tick)
+        self._countdown_timer.start()
+
     def showEvent(self, event) -> None:
         super().showEvent(event)
         if not self._has_auto_fetched:
@@ -1077,6 +1090,10 @@ class OrdersPage(QWidget):
         self.det_store_badge = QLabel("-")
         self.det_store_badge.setStyleSheet("color: #A8A29E; font-size: 12px; font-weight: bold;")
         ov_top.addWidget(self.det_store_badge)
+
+        self.det_sla_badge = QLabel("")
+        self.det_sla_badge.hide()
+        ov_top.addWidget(self.det_sla_badge)
 
         ov_top.addStretch()
 
@@ -1595,12 +1612,14 @@ class OrdersPage(QWidget):
         info_layout.setContentsMargins(0, 0, 0, 0)
         info_layout.setSpacing(4)
 
-        # Row 1: [店铺名] · [买家昵称] ------------------ [待发货]
+        # Row 1: [店铺名] · [站点] · [买家] · [时效倒计时] ------------------ [待发货]
         row1 = QHBoxLayout()
         row1.setContentsMargins(0, 0, 0, 0)
         row1.setSpacing(6)
 
-        store_lbl = QLabel(order.store_name)
+        site_code = f" · {order.site_id}" if order.site_id else ""
+        store_display = f"{order.store_name}{site_code}"
+        store_lbl = QLabel(store_display)
         store_lbl.setStyleSheet("color: #A8A29E; font-size: 11px; font-weight: bold;")
         store_lbl.setMinimumWidth(0)
         store_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1609,13 +1628,33 @@ class OrdersPage(QWidget):
         )
         row1.addWidget(store_lbl)
 
+        # Shipping SLA Countdown Badge (for pending shipment orders, placed right after store & site)
+        deadline_info = order.shipping_deadline_info
+        if deadline_info:
+            dl_text, dl_color, dl_bg, dl_border = deadline_info
+            sla_badge = QLabel(f" {dl_text} ")
+            sla_badge.setStyleSheet(f"""
+                QLabel {{
+                    color: {dl_color};
+                    background: {dl_bg};
+                    border: {dl_border};
+                    border-radius: 3px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    padding: 1px 4px;
+                }}
+            """)
+            sla_badge.setToolTip("发货截止时效倒计时 (美客多跨境履约 SLA 预警)")
+            row1.addWidget(sla_badge)
+
         sep1 = QLabel(" · ")
         sep1.setStyleSheet("color: #78716C; font-size: 11px;")
         row1.addWidget(sep1)
 
         buyer_name = order.buyer_nickname or "买家"
         buyer_lbl = ElidedLabel(buyer_name)
-        buyer_lbl.setStyleSheet("color: #F6F3EA; font-size: 12px; font-weight: bold;")
+        buyer_lbl.setStyleSheet("color: #F6F3EA; font-size: 11px; font-weight: bold;")
+        buyer_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         buyer_lbl.setMinimumWidth(0)
         buyer_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         buyer_lbl.customContextMenuRequested.connect(
@@ -1940,7 +1979,28 @@ class OrdersPage(QWidget):
 
     def _render_order_detail(self, order: OrderModel) -> None:
         """Render selected order details in right drawer."""
-        self.det_store_badge.setText(order.store_name)
+        site_code = f" · {order.site_id}" if order.site_id else ""
+        self.det_store_badge.setText(f"{order.store_name}{site_code}")
+        deadline_info = order.shipping_deadline_info
+        if deadline_info and hasattr(self, "det_sla_badge"):
+            dl_text, dl_color, dl_bg, dl_border = deadline_info
+            self.det_sla_badge.setText(f" {dl_text} ")
+            self.det_sla_badge.setStyleSheet(f"""
+                QLabel {{
+                    color: {dl_color};
+                    background: {dl_bg};
+                    border: {dl_border};
+                    border-radius: 4px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    padding: 2px 6px;
+                }}
+            """)
+            self.det_sla_badge.setToolTip("发货截止时效倒计时 (美客多跨境履约 SLA 预警)")
+            self.det_sla_badge.show()
+        elif hasattr(self, "det_sla_badge"):
+            self.det_sla_badge.hide()
+
         self.det_order_id_lbl.setText(f"订单号: {order.order_id}")
         created_str = order.display_time or "未知"
         self.det_dates_lbl.setText(f"下单时间: {created_str}")
@@ -2258,6 +2318,8 @@ class OrdersPage(QWidget):
 
     def _render_empty_detail(self) -> None:
         self.det_store_badge.setText("-")
+        if hasattr(self, "det_sla_badge"):
+            self.det_sla_badge.hide()
         self.det_order_id_lbl.setText("订单号: -")
         self.det_dates_lbl.setText("下单时间: -")
         while self.items_container_layout.count():
@@ -2351,8 +2413,34 @@ class OrdersPage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"导出文件时发生异常：\n{e}")
 
+    def _on_countdown_tick(self) -> None:
+        """Tick countdown badges without re-fetching network data."""
+        if not self.isVisible():
+            return
+        if self._current_order:
+            deadline_info = self._current_order.shipping_deadline_info
+            if deadline_info and hasattr(self, "det_sla_badge"):
+                dl_text, dl_color, dl_bg, dl_border = deadline_info
+                self.det_sla_badge.setText(f" {dl_text} ")
+                self.det_sla_badge.setStyleSheet(f"""
+                    QLabel {{
+                        color: {dl_color};
+                        background: {dl_bg};
+                        border: {dl_border};
+                        border-radius: 4px;
+                        font-size: 11px;
+                        font-weight: 600;
+                        padding: 2px 6px;
+                    }}
+                """)
+                self.det_sla_badge.show()
+            elif hasattr(self, "det_sla_badge"):
+                self.det_sla_badge.hide()
+
     def stop(self) -> None:
         """Safely stop any ongoing background workers on application close."""
+        if hasattr(self, "_countdown_timer") and self._countdown_timer.isActive():
+            self._countdown_timer.stop()
         if self._worker and self._worker.isRunning():
             self._worker.stop()
             self._worker.wait(1500)
