@@ -207,6 +207,79 @@ class TestItemEventPolicy(unittest.TestCase):
         self.assertEqual(plan.item_id, "MLM3554614505")
         self.assertEqual(plan.site_id, "MLM")
 
+    def test_dimensions_and_weight_semantic_comparison_no_false_positive(self) -> None:
+        """Verify that comparing raw DB snapshot with normalized API data produces no false positives when numbers are identical."""
+        from engine.policy import is_dimensions_or_weight_changed, parse_dimensions_values, parse_weight_value
+
+        # Real case from user database:
+        db_raw_dim = '{"LENGTH": {"number": 14, "unit": "cm"}, "PACKAGE_HEIGHT": {"number": 14, "unit": "cm"}, "PACKAGE_LENGTH": {"number": 14, "unit": "cm"}, "PACKAGE_WIDTH": {"number": 14, "unit": "cm"}}'
+        db_raw_weight = '{"PACKAGE_WEIGHT": {"number": 560, "unit": "g"}}'
+
+        api_norm_dim = '{"height": {"number": 14, "unit": "cm"}, "length": {"number": 14, "unit": "cm"}, "width": {"number": 14, "unit": "cm"}}'
+        api_norm_weight = '{"number": 560, "unit": "g"}'
+
+        # 1. Parsing correctness
+        self.assertEqual(parse_dimensions_values(db_raw_dim), (14.0, 14.0, 14.0))
+        self.assertEqual(parse_dimensions_values(api_norm_dim), (14.0, 14.0, 14.0))
+        self.assertEqual(parse_weight_value(db_raw_weight), 560.0)
+        self.assertEqual(parse_weight_value(api_norm_weight), 560.0)
+
+        # 2. No false positive: identical numbers must return False
+        self.assertFalse(is_dimensions_or_weight_changed(db_raw_dim, api_norm_dim, db_raw_weight, api_norm_weight))
+
+        # 3. Unit conversion (0.14m is 14cm, 0.56kg is 560g)
+        m_dim = '{"height": {"number": 0.14, "unit": "m"}, "length": {"number": 0.14, "unit": "m"}, "width": {"number": 0.14, "unit": "m"}}'
+        kg_weight = '{"number": 0.56, "unit": "kg"}'
+        self.assertFalse(is_dimensions_or_weight_changed(db_raw_dim, m_dim, db_raw_weight, kg_weight))
+
+        # 4. Genuine change in dimension (14cm -> 20cm)
+        changed_dim = '{"height": {"number": 20, "unit": "cm"}, "length": {"number": 14, "unit": "cm"}, "width": {"number": 14, "unit": "cm"}}'
+        self.assertTrue(is_dimensions_or_weight_changed(db_raw_dim, changed_dim, db_raw_weight, api_norm_weight))
+
+        # 5. Genuine change in weight (560g -> 800g)
+        changed_weight = '{"number": 800, "unit": "g"}'
+        self.assertTrue(is_dimensions_or_weight_changed(db_raw_dim, api_norm_dim, db_raw_weight, changed_weight))
+
+    def test_item_event_policy_does_not_trigger_system2_on_identical_dim_numbers(self) -> None:
+        """Verify ItemEventPolicy does not trigger SELLER_DATA_CHANGE or promotion cancels when dimensions/weights only differ in JSON formatting."""
+        raw = dict(self.raw_item_base)
+        raw["attributes"] = [
+            {"id": "PACKAGE_HEIGHT", "value_struct": {"number": 14, "unit": "cm"}},
+            {"id": "PACKAGE_WIDTH", "value_struct": {"number": 14, "unit": "cm"}},
+            {"id": "PACKAGE_LENGTH", "value_struct": {"number": 14, "unit": "cm"}},
+            {"id": "PACKAGE_WEIGHT", "value_struct": {"number": 560, "unit": "g"}},
+        ]
+
+        # Old snapshot in database was saved in raw upper-case candidate format
+        cached_snapshot = {
+            "price": 25.12,
+            "net_proceeds": 15.43,
+            "shipping_cost": 5.80,
+            "dimensions": '{"LENGTH": {"number": 14, "unit": "cm"}, "PACKAGE_HEIGHT": {"number": 14, "unit": "cm"}, "PACKAGE_LENGTH": {"number": 14, "unit": "cm"}, "PACKAGE_WIDTH": {"number": 14, "unit": "cm"}}',
+            "weight": '{"PACKAGE_WEIGHT": {"number": 560, "unit": "g"}}',
+            "pricing_system": "system1_discount",
+        }
+
+        active_promos = [
+            {"id": "C-MLM1665569", "type": "SELLER_CAMPAIGN", "name": "95折"}
+        ]
+
+        plan = ItemEventPolicy.evaluate(
+            account_id="2651442567",
+            child_user_id="2668034127",
+            site_id="MLM",
+            raw_item=raw,
+            cached_snapshot=cached_snapshot,
+            active_promos=active_promos,
+            candidate_promos=[],
+            store_alias="湖北店",
+        )
+
+        # Must not exit promotions!
+        self.assertNotEqual(plan.decision_type, ActionType.SELLER_DATA_CHANGE)
+        self.assertEqual(len(plan.promos_to_cancel), 0)
+        self.assertNotIn("包装尺寸/重量数据变动", [msg for msg, _ in plan.log_messages])
+
 
 if __name__ == "__main__":
     unittest.main()

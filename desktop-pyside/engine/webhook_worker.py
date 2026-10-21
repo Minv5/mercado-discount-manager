@@ -354,59 +354,7 @@ class WebhookWorker:
 
     def _extract_dimensions_and_weight(self, raw_item: dict[str, Any]) -> tuple[str | None, str | None]:
         """Extract normalized dimensions and weight JSON strings from item detail (supporting root attributes and variations)."""
-        attrs: dict[str, Any] = {}
-
-        def _collect_attrs(source_list: list[Any]) -> None:
-            for attr in source_list or []:
-                if not isinstance(attr, dict):
-                    continue
-                aid = str(attr.get("id") or "").strip().upper()
-                if not aid or aid in attrs:
-                    continue
-                v_struct = attr.get("value_struct")
-                if isinstance(v_struct, dict) and v_struct.get("number") is not None:
-                    attrs[aid] = {"number": v_struct.get("number"), "unit": v_struct.get("unit")}
-                elif attr.get("value_name") is not None:
-                    attrs[aid] = str(attr.get("value_name")).strip()
-
-        _collect_attrs(raw_item.get("attributes") or [])
-
-        dim_candidates = [
-            "SELLER_PACKAGE_HEIGHT", "PACKAGE_HEIGHT", "HEIGHT",
-            "SELLER_PACKAGE_WIDTH", "PACKAGE_WIDTH", "WIDTH",
-            "SELLER_PACKAGE_LENGTH", "PACKAGE_LENGTH", "LENGTH", "DEPTH",
-        ]
-        weight_candidates = ["SELLER_PACKAGE_WEIGHT", "PACKAGE_WEIGHT", "WEIGHT"]
-
-        has_dim = any(c in attrs for c in dim_candidates)
-        has_weight = any(c in attrs for c in weight_candidates)
-
-        if not (has_dim and has_weight):
-            for v in raw_item.get("variations") or []:
-                if isinstance(v, dict):
-                    _collect_attrs(v.get("attributes") or [])
-                    if any(c in attrs for c in dim_candidates) and any(c in attrs for c in weight_candidates):
-                        break
-
-        dims: dict[str, Any] = {}
-        for key, candidates in [
-            ("height", ["SELLER_PACKAGE_HEIGHT", "PACKAGE_HEIGHT", "HEIGHT"]),
-            ("width", ["SELLER_PACKAGE_WIDTH", "PACKAGE_WIDTH", "WIDTH"]),
-            ("length", ["SELLER_PACKAGE_LENGTH", "PACKAGE_LENGTH", "LENGTH", "DEPTH"]),
-        ]:
-            for cand in candidates:
-                if cand in attrs:
-                    dims[key] = attrs[cand]
-                    break
-        dim_str = json.dumps(dims, sort_keys=True, ensure_ascii=False) if dims else None
-
-        weight_val = None
-        for cand in weight_candidates:
-            if cand in attrs:
-                weight_val = attrs[cand]
-                break
-        weight_str = json.dumps(weight_val, sort_keys=True, ensure_ascii=False) if weight_val is not None else None
-        return dim_str, weight_str
+        return extract_dimensions_and_weight(raw_item)
 
     def _load_db_snapshot(self, account_id: str, item_id: str) -> dict[str, Any] | None:
         """Load persisted item snapshot from SQLite item_price_cache if available."""

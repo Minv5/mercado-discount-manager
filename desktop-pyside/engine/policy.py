@@ -80,6 +80,163 @@ class EvaluationContext:
     is_old_cbt: bool = False
 
 
+def _parse_num_with_unit(raw_val: Any, default_unit: str = "cm") -> tuple[float | None, str]:
+    if raw_val is None:
+        return None, default_unit
+    if isinstance(raw_val, (int, float)):
+        return float(raw_val), default_unit
+    if isinstance(raw_val, dict):
+        num = raw_val.get("number")
+        unit = str(raw_val.get("unit") or default_unit).strip().lower()
+        if num is not None:
+            try:
+                return float(num), unit
+            except (ValueError, TypeError):
+                return None, unit
+        return None, default_unit
+    if isinstance(raw_val, str):
+        raw_str = raw_val.strip()
+        import re
+        m = re.match(r"^([\d.]+)\s*([a-zA-Z]*)$", raw_str)
+        if m:
+            try:
+                n = float(m.group(1))
+                u = m.group(2).lower() or default_unit
+                return n, u
+            except ValueError:
+                pass
+    return None, default_unit
+
+
+def _convert_dim_to_cm(num: float | None, unit: str) -> float | None:
+    if num is None:
+        return None
+    u = unit.lower()
+    if u in ("m", "meter", "meters"):
+        return num * 100.0
+    if u in ("mm", "millimeter", "millimeters"):
+        return num / 10.0
+    if u in ("in", "inch", "inches"):
+        return num * 2.54
+    return num
+
+
+def _convert_weight_to_grams(num: float | None, unit: str) -> float | None:
+    if num is None:
+        return None
+    u = unit.lower()
+    if u in ("kg", "kilogram", "kilograms"):
+        return num * 1000.0
+    if u in ("mg", "milligram"):
+        return num / 1000.0
+    if u in ("lb", "lbs", "pound", "pounds"):
+        return num * 453.592
+    if u in ("oz", "ounce", "ounces"):
+        return num * 28.3495
+    return num
+
+
+def parse_dimensions_values(dim_input: str | dict[str, Any] | None) -> tuple[float | None, float | None, float | None]:
+    """Parse (length, width, height) in centimeters from normalized or raw candidate dict/JSON."""
+    if not dim_input:
+        return None, None, None
+    data = dim_input
+    if isinstance(dim_input, str):
+        try:
+            data = json.loads(dim_input)
+        except Exception:
+            return None, None, None
+    if not isinstance(data, dict):
+        return None, None, None
+
+    l_raw = None
+    for k in ("PACKAGE_LENGTH", "SELLER_PACKAGE_LENGTH", "length", "LENGTH", "DEPTH"):
+        if k in data:
+            l_raw = data[k]
+            break
+
+    w_raw = None
+    for k in ("PACKAGE_WIDTH", "SELLER_PACKAGE_WIDTH", "width", "WIDTH"):
+        if k in data:
+            w_raw = data[k]
+            break
+
+    h_raw = None
+    for k in ("PACKAGE_HEIGHT", "SELLER_PACKAGE_HEIGHT", "height", "HEIGHT"):
+        if k in data:
+            h_raw = data[k]
+            break
+
+    l_num, l_u = _parse_num_with_unit(l_raw, "cm")
+    w_num, w_u = _parse_num_with_unit(w_raw, "cm")
+    h_num, h_u = _parse_num_with_unit(h_raw, "cm")
+
+    return _convert_dim_to_cm(l_num, l_u), _convert_dim_to_cm(w_num, w_u), _convert_dim_to_cm(h_num, h_u)
+
+
+def parse_weight_value(weight_input: str | dict[str, Any] | None) -> float | None:
+    """Parse weight in grams from normalized or raw candidate dict/JSON."""
+    if not weight_input:
+        return None
+    data = weight_input
+    if isinstance(weight_input, str):
+        try:
+            data = json.loads(weight_input)
+        except Exception:
+            return None
+    if isinstance(data, (int, float)):
+        return float(data)
+    if not isinstance(data, dict):
+        return None
+
+    if "number" in data:
+        n, u = _parse_num_with_unit(data, "g")
+        return _convert_weight_to_grams(n, u)
+
+    for k in ("PACKAGE_WEIGHT", "SELLER_PACKAGE_WEIGHT", "weight", "WEIGHT"):
+        if k in data:
+            n, u = _parse_num_with_unit(data[k], "g")
+            return _convert_weight_to_grams(n, u)
+
+    return None
+
+
+def is_dimensions_or_weight_changed(
+    old_dim: str | dict[str, Any] | None,
+    new_dim: str | dict[str, Any] | None,
+    old_weight: str | dict[str, Any] | None,
+    new_weight: str | dict[str, Any] | None,
+) -> bool:
+    """Determine whether dimensions or weight genuinely changed numerically.
+    
+    Tolerates differences in JSON structure, case sensitivity, and raw vs normalized format.
+    Ignores initial baseline snapshot creation when old records are empty.
+    """
+    if not old_dim and not old_weight:
+        return False
+    if not new_dim and not new_weight:
+        return False
+
+    old_l, old_w, old_h = parse_dimensions_values(old_dim)
+    new_l, new_w, new_h = parse_dimensions_values(new_dim)
+
+    # Compare length, width, height with 0.1 cm tolerance
+    for o_val, n_val in ((old_l, new_l), (old_w, new_w), (old_h, new_h)):
+        if o_val is not None and n_val is not None:
+            if abs(o_val - n_val) >= 0.1:
+                return True
+
+    old_wt = parse_weight_value(old_weight)
+    new_wt = parse_weight_value(new_weight)
+
+    # Compare weight with 1.0 g tolerance
+    if old_wt is not None and new_wt is not None:
+        if abs(old_wt - new_wt) >= 1.0:
+            return True
+
+    return False
+
+
 def extract_dimensions_and_weight(raw_item: dict[str, Any]) -> tuple[str | None, str | None]:
     """Extract normalized dimensions and weight JSON strings from item detail."""
     attrs: dict[str, Any] = {}
@@ -117,11 +274,24 @@ def extract_dimensions_and_weight(raw_item: dict[str, Any]) -> tuple[str | None,
             if any(c in attrs for c in dim_candidates) and any(c in attrs for c in weight_candidates):
                 break
 
-    dim_data = {k: attrs[k] for k in dim_candidates if k in attrs}
-    weight_data = {k: attrs[k] for k in weight_candidates if k in attrs}
+    dims: dict[str, Any] = {}
+    for key, candidates in [
+        ("height", ["SELLER_PACKAGE_HEIGHT", "PACKAGE_HEIGHT", "HEIGHT"]),
+        ("width", ["SELLER_PACKAGE_WIDTH", "PACKAGE_WIDTH", "WIDTH"]),
+        ("length", ["SELLER_PACKAGE_LENGTH", "PACKAGE_LENGTH", "LENGTH", "DEPTH"]),
+    ]:
+        for cand in candidates:
+            if cand in attrs:
+                dims[key] = attrs[cand]
+                break
+    dim_str = json.dumps(dims, sort_keys=True, ensure_ascii=False) if dims else None
 
-    dim_str = json.dumps(dim_data, sort_keys=True) if dim_data else None
-    weight_str = json.dumps(weight_data, sort_keys=True) if weight_data else None
+    weight_val = None
+    for cand in weight_candidates:
+        if cand in attrs:
+            weight_val = attrs[cand]
+            break
+    weight_str = json.dumps(weight_val, sort_keys=True, ensure_ascii=False) if weight_val is not None else None
     return dim_str, weight_str
 
 
@@ -296,11 +466,8 @@ class ItemEventPolicy:
             plan.decision_type = ActionType.UPDATE_SNAPSHOT_ONLY
             return plan
 
-        # Check dimension/weight change
-        dim_or_weight_changed = (
-            (old_dim and dim_str and old_dim != dim_str)
-            or (old_weight and weight_str and old_weight != weight_str)
-        )
+        # Check dimension/weight change using semantic numerical comparison
+        dim_or_weight_changed = is_dimensions_or_weight_changed(old_dim, dim_str, old_weight, weight_str)
 
         change_type: str | None = None
         change_desc = ""

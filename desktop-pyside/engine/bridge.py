@@ -195,7 +195,7 @@ class EngineBridge:
                 "service": "native-python-engine",
                 "product": "mercado-discount-manager",
                 "protocol_version": "3",
-                "build_fingerprint": "native-python-v2.2.17",
+                "build_fingerprint": "native-python-v2.2.18",
             }
 
         # 2. Settings
