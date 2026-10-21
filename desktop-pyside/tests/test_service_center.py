@@ -1894,6 +1894,7 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         self.assertIn("MLM5868800338", page.chip_item_lbl.text())
         self.assertFalse(page.sep_item_order.isHidden())
         self.assertFalse(page.sep_order_pack.isHidden())
+        self.assertFalse(page.sep_pack_stage.isHidden())
         self.assertFalse(page.chip_stage_lbl.isHidden())
         self.assertIn("平台官方调解中", page.chip_stage_lbl.text())
 

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLayout,
@@ -2207,47 +2208,17 @@ class ServiceCenterPage(QFrame):
         info_col.setSpacing(3)
         info_col.setContentsMargins(0, 0, 0, 0)
 
-        # 1.2.1 Title Row: Product Title + Claim Stage Badge + Reputation Impact Chip
-        self.title_row_widget = QWidget()
-        self.title_row_layout = QHBoxLayout(self.title_row_widget)
-        self.title_row_layout.setContentsMargins(0, 0, 0, 0)
-        self.title_row_layout.setSpacing(8)
-
+        # 1.2.1 Product Title (Full row, uninterrupted)
         self.context_title_lbl = QLabel("暂无选中的会话")
         self.context_title_lbl.setStyleSheet("color: #F6F3EA; font-size: 13px; font-weight: bold;")
         self.context_title_lbl.setWordWrap(False)
-        self.context_title_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.context_title_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.context_title_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.context_title_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.context_title_lbl.customContextMenuRequested.connect(
             lambda pos, w=self.context_title_lbl: self._show_simple_copy_menu(pos, w)
         )
-        self.title_row_layout.addWidget(self.context_title_lbl)
-
-        # 4) Claim Stage Badge Chip (Directly after Title)
-        self.chip_stage_lbl = QLabel("")
-        self.chip_stage_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
-        self.chip_stage_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.chip_stage_lbl.customContextMenuRequested.connect(
-            lambda pos: self._show_target_copy_menu(
-                pos, self.chip_stage_lbl,
-                lambda: CLAIM_STAGE_NAMES.get(self._current_session.stage.lower(), self._current_session.stage) if (self._current_session and self._current_session.stage) else ""
-            )
-        )
-        self.title_row_layout.addWidget(self.chip_stage_lbl)
-
-        # Sep between stage and reputation impact
-        self.sep_stage_rep = QLabel(" · ")
-        self.sep_stage_rep.setStyleSheet("color: #78716C; font-size: 11px;")
-        self.title_row_layout.addWidget(self.sep_stage_rep)
-
-        # 5) Claim Affects Reputation Chip (Directly after Title)
-        self.chip_rep_lbl = QLabel("")
-        self.chip_rep_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
-        self.title_row_layout.addWidget(self.chip_rep_lbl)
-
-        self.title_row_layout.addStretch(1)
-        info_col.addWidget(self.title_row_widget)
+        info_col.addWidget(self.context_title_lbl)
 
         # 1.2.2 Meta Row: Site flag, store, buyer, price, SKU
         self.context_meta_lbl = QLabel("请在左侧列表中点击任意提问或索赔会话")
@@ -2260,7 +2231,7 @@ class ServiceCenterPage(QFrame):
         info_col.addWidget(self.context_meta_lbl)
         self.context_info_lbl = self.context_meta_lbl  # Alias for backward compatibility
 
-        # 1.2.3 Independent Metadata Chips Row (Item link, Order ID, Pack ID)
+        # 1.2.3 Independent Metadata Chips Row
         self.tags_row_widget = QWidget()
         self.tags_row_layout = QHBoxLayout(self.tags_row_widget)
         self.tags_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -2313,9 +2284,32 @@ class ServiceCenterPage(QFrame):
         )
         self.tags_row_layout.addWidget(self.chip_pack_lbl)
 
-        # Sep 3: kept for backward compatibility with existing tests (hidden)
-        self.sep_pack_stage = QLabel("")
-        self.sep_pack_stage.hide()
+        # Sep 3: between pack and stage
+        self.sep_pack_stage = QLabel(" · ")
+        self.sep_pack_stage.setStyleSheet("color: #78716C; font-size: 11px;")
+        self.tags_row_layout.addWidget(self.sep_pack_stage)
+
+        # 4) Claim Stage Badge Chip
+        self.chip_stage_lbl = QLabel("")
+        self.chip_stage_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
+        self.chip_stage_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.chip_stage_lbl.customContextMenuRequested.connect(
+            lambda pos: self._show_target_copy_menu(
+                pos, self.chip_stage_lbl,
+                lambda: CLAIM_STAGE_NAMES.get(self._current_session.stage.lower(), self._current_session.stage) if (self._current_session and self._current_session.stage) else ""
+            )
+        )
+        self.tags_row_layout.addWidget(self.chip_stage_lbl)
+
+        # Sep 4: between stage and reputation impact
+        self.sep_stage_rep = QLabel(" · ")
+        self.sep_stage_rep.setStyleSheet("color: #78716C; font-size: 11px;")
+        self.tags_row_layout.addWidget(self.sep_stage_rep)
+
+        # 5) Claim Affects Reputation Chip
+        self.chip_rep_lbl = QLabel("")
+        self.chip_rep_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
+        self.tags_row_layout.addWidget(self.chip_rep_lbl)
 
         self.tags_row_layout.addStretch(1)
         info_col.addWidget(self.tags_row_widget)
@@ -2333,7 +2327,7 @@ class ServiceCenterPage(QFrame):
 
         ctx_layout.addLayout(info_col, 1)
 
-        # 1.3 Claim Action Toolbar (Dispute, Partial Refund, Full Refund - moved to top right)
+        # 1.3 Claim Action Toolbar - 2x2 Grid (Dispute, Partial Refund, Full Refund, Refresh Chat)
         self.claim_actions_frame = QFrame()
         self.claim_actions_frame.setObjectName("claimActionsFrame")
         self.claim_actions_frame.setStyleSheet("""
@@ -2347,16 +2341,17 @@ class ServiceCenterPage(QFrame):
                 padding: 0;
             }
         """)
-        ca_layout = QHBoxLayout(self.claim_actions_frame)
+        ca_layout = QGridLayout(self.claim_actions_frame)
         ca_layout.setContentsMargins(0, 0, 0, 0)
-        ca_layout.setSpacing(8)
+        ca_layout.setHorizontalSpacing(6)
+        ca_layout.setVerticalSpacing(4)
 
         self.claim_stage_lbl = QLabel("")
         self.claim_stage_lbl.hide()
 
         # 按钮1: 请求调解
         self.claim_dispute_btn = QPushButton("请求调解")
-        self.claim_dispute_btn.setFixedHeight(30)
+        self.claim_dispute_btn.setFixedSize(86, 26)
         self.claim_dispute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.claim_dispute_btn.setToolTip("向美客多官方申请人工介入调解仲裁")
         self.claim_dispute_btn.setStyleSheet("""
@@ -2364,10 +2359,10 @@ class ServiceCenterPage(QFrame):
                 background: #3B331E;
                 color: #FDE047;
                 border: 1px solid #854D0E;
-                border-radius: 6px;
-                padding: 4px 14px;
+                border-radius: 5px;
+                padding: 2px 6px;
                 font-weight: bold;
-                font-size: 12px;
+                font-size: 11px;
             }
             QPushButton:hover {
                 background: #544423;
@@ -2380,11 +2375,11 @@ class ServiceCenterPage(QFrame):
             }
         """)
         self.claim_dispute_btn.clicked.connect(self._on_request_mediation)
-        ca_layout.addWidget(self.claim_dispute_btn)
+        ca_layout.addWidget(self.claim_dispute_btn, 0, 0)
 
         # 按钮2: 部分退款
         self.claim_partial_refund_btn = QPushButton("部分退款")
-        self.claim_partial_refund_btn.setFixedHeight(30)
+        self.claim_partial_refund_btn.setFixedSize(86, 26)
         self.claim_partial_refund_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.claim_partial_refund_btn.setToolTip("向买家发起保留商品的百分比部分退款提议")
         self.claim_partial_refund_btn.setStyleSheet("""
@@ -2392,10 +2387,10 @@ class ServiceCenterPage(QFrame):
                 background: #163832;
                 color: #5EEAD4;
                 border: 1px solid #0F766E;
-                border-radius: 6px;
-                padding: 4px 14px;
+                border-radius: 5px;
+                padding: 2px 6px;
                 font-weight: bold;
-                font-size: 12px;
+                font-size: 11px;
             }
             QPushButton:hover {
                 background: #1C4D44;
@@ -2408,11 +2403,11 @@ class ServiceCenterPage(QFrame):
             }
         """)
         self.claim_partial_refund_btn.clicked.connect(self._on_partial_refund)
-        ca_layout.addWidget(self.claim_partial_refund_btn)
+        ca_layout.addWidget(self.claim_partial_refund_btn, 0, 1)
 
         # 按钮3: 全额退款
         self.claim_full_refund_btn = QPushButton("全额退款")
-        self.claim_full_refund_btn.setFixedHeight(30)
+        self.claim_full_refund_btn.setFixedSize(86, 26)
         self.claim_full_refund_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.claim_full_refund_btn.setToolTip("直接退款给买家并关闭该笔索赔争议")
         self.claim_full_refund_btn.setStyleSheet("""
@@ -2420,10 +2415,10 @@ class ServiceCenterPage(QFrame):
                 background: #451E1E;
                 color: #FCA5A5;
                 border: 1px solid #991B1B;
-                border-radius: 6px;
-                padding: 4px 14px;
+                border-radius: 5px;
+                padding: 2px 6px;
                 font-weight: bold;
-                font-size: 12px;
+                font-size: 11px;
             }
             QPushButton:hover {
                 background: #5E2626;
@@ -2436,14 +2431,11 @@ class ServiceCenterPage(QFrame):
             }
         """)
         self.claim_full_refund_btn.clicked.connect(self._on_full_refund)
-        ca_layout.addWidget(self.claim_full_refund_btn)
+        ca_layout.addWidget(self.claim_full_refund_btn, 1, 0)
 
-        self.claim_actions_frame.hide()
-        ctx_layout.addWidget(self.claim_actions_frame, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
-        # 刷新消息按钮
+        # 按钮4: 刷新消息 (整合入田字格右下角)
         self.refresh_chat_btn = QPushButton("⟳ 刷新消息")
-        self.refresh_chat_btn.setFixedHeight(30)
+        self.refresh_chat_btn.setFixedSize(86, 26)
         self.refresh_chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_chat_btn.setToolTip("从美客多官方接口实时拉取本会话最新沟通记录与平台调解动态")
         self.refresh_chat_btn.setStyleSheet("""
@@ -2451,9 +2443,9 @@ class ServiceCenterPage(QFrame):
                 background: #232C24;
                 color: #F6F3EA;
                 border: 1px solid #4E472F;
-                border-radius: 6px;
-                padding: 4px 12px;
-                font-size: 12px;
+                border-radius: 5px;
+                padding: 2px 6px;
+                font-size: 11px;
                 font-weight: 600;
             }
             QPushButton:hover {
@@ -2467,7 +2459,20 @@ class ServiceCenterPage(QFrame):
             }
         """)
         self.refresh_chat_btn.clicked.connect(self._on_refresh_chat_clicked)
-        ctx_layout.addWidget(self.refresh_chat_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        ca_layout.addWidget(self.refresh_chat_btn, 1, 1)
+
+        self.claim_actions_frame.hide()
+        ctx_layout.addWidget(self.claim_actions_frame, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        # 独立刷新按钮 (专用于非索赔的售前/售后私信等场景)
+        self.standalone_refresh_btn = QPushButton("⟳ 刷新消息")
+        self.standalone_refresh_btn.setFixedSize(86, 26)
+        self.standalone_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.standalone_refresh_btn.setToolTip("从美客多官方接口实时拉取本会话最新沟通记录")
+        self.standalone_refresh_btn.setStyleSheet(self.refresh_chat_btn.styleSheet())
+        self.standalone_refresh_btn.clicked.connect(self._on_refresh_chat_clicked)
+        self.standalone_refresh_btn.hide()
+        ctx_layout.addWidget(self.standalone_refresh_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         # Legacy / hidden helper buttons preserved for test compatibility
         self.open_browser_btn = QPushButton("在默认浏览器打开 ↗")
@@ -3561,6 +3566,9 @@ class ServiceCenterPage(QFrame):
             self.open_browser_btn.setEnabled(False)
             self.refresh_chat_btn.setEnabled(False)
             self.refresh_chat_btn.hide()
+            if hasattr(self, "standalone_refresh_btn"):
+                self.standalone_refresh_btn.setEnabled(False)
+                self.standalone_refresh_btn.hide()
             self.toggle_read_btn.setEnabled(False)
             self.toggle_read_btn.setText("标为已读")
             self.reply_dock.setEnabled(False)
@@ -3627,6 +3635,8 @@ class ServiceCenterPage(QFrame):
         else:
             self.chip_stage_lbl.hide()
 
+        self.sep_pack_stage.setVisible((has_item or has_order or has_pack) and has_stage)
+
         has_rep = bool(session.affects_reputation) and session.session_type == "claim"
         if has_rep:
             if session.affects_reputation == "affected":
@@ -3639,7 +3649,7 @@ class ServiceCenterPage(QFrame):
         else:
             self.chip_rep_lbl.hide()
 
-        self.sep_stage_rep.setVisible(has_stage and has_rep)
+        self.sep_stage_rep.setVisible((has_item or has_order or has_pack or has_stage) and has_rep)
 
         # Update backward-compatible context_link_lbl string
         link_parts = []
@@ -3676,9 +3686,13 @@ class ServiceCenterPage(QFrame):
         self.toggle_read_btn.setText("标为已读" if session.is_unread else "标为未读")
 
         if hasattr(self, "refresh_chat_btn"):
-            self.refresh_chat_btn.setVisible(session.session_type in ("claim", "message"))
+            self.refresh_chat_btn.setVisible(session.session_type == "claim")
             self.refresh_chat_btn.setEnabled(True)
             self.refresh_chat_btn.setText("⟳ 刷新消息")
+        if hasattr(self, "standalone_refresh_btn"):
+            self.standalone_refresh_btn.setVisible(session.session_type == "message")
+            self.standalone_refresh_btn.setEnabled(True)
+            self.standalone_refresh_btn.setText("⟳ 刷新消息")
 
         if session.session_type == "question":
             self.upload_img_btn.setEnabled(False)
@@ -3780,6 +3794,9 @@ class ServiceCenterPage(QFrame):
         if hasattr(self, "refresh_chat_btn"):
             self.refresh_chat_btn.setEnabled(False)
             self.refresh_chat_btn.setText("⟳ 正在同步...")
+        if hasattr(self, "standalone_refresh_btn"):
+            self.standalone_refresh_btn.setEnabled(False)
+            self.standalone_refresh_btn.setText("⟳ 正在同步...")
         self._fetch_conversation_messages(self._current_session)
 
     def _fetch_conversation_messages(self, session: ServiceSession) -> None:
@@ -3793,6 +3810,9 @@ class ServiceCenterPage(QFrame):
         if hasattr(self, "refresh_chat_btn"):
             self.refresh_chat_btn.setEnabled(False)
             self.refresh_chat_btn.setText("⟳ 正在同步...")
+        if hasattr(self, "standalone_refresh_btn"):
+            self.standalone_refresh_btn.setEnabled(False)
+            self.standalone_refresh_btn.setText("⟳ 正在同步...")
 
         worker = FetchConversationMessagesWorker(self.client, session, auth_mgr=self.auth)
         self._active_msg_workers.add(worker)
@@ -3803,6 +3823,9 @@ class ServiceCenterPage(QFrame):
             if hasattr(self, "refresh_chat_btn"):
                 self.refresh_chat_btn.setEnabled(True)
                 self.refresh_chat_btn.setText("⟳ 刷新消息")
+            if hasattr(self, "standalone_refresh_btn"):
+                self.standalone_refresh_btn.setEnabled(True)
+                self.standalone_refresh_btn.setText("⟳ 刷新消息")
 
         worker.finished.connect(self._on_messages_loaded)
         worker.error.connect(self._on_messages_fetch_error)
