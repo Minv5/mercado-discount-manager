@@ -422,6 +422,7 @@ class ItemEventPolicy:
             )
 
         item_id = str(ctx.raw_item.get("id") or "")
+        cbt_id = str(ctx.raw_item.get("cbt_item_id") or "").strip().upper()
         site_label = cls.get_site_label(item_id, ctx.site_id)
         store_prefix = f"【{ctx.store_alias}】" if ctx.store_alias else ""
         item_tag = f"{store_prefix}{site_label}商品 {item_id}" if site_label else f"{store_prefix}商品 {item_id}"
@@ -572,8 +573,17 @@ class ItemEventPolicy:
             plan.pricing_system = "system2_155"
             plan.decision_type = ActionType.WAIT_PLATFORM_REVIEW
 
-            desc = change_desc or "数据变动"
-            plan.change_desc = desc
+            sub_status_str = f" [{', '.join(sub_status)}]" if sub_status else ""
+            status_desc = f"处于美客多平台审核中（{status}{sub_status_str}）"
+
+            if change_desc:
+                event_desc = f"{change_desc}（平台审核中）"
+                cbt_reason = f"全球父商品 {cbt_id} {change_desc}"
+            else:
+                event_desc = status_desc
+                cbt_reason = f"全球父商品 {cbt_id} {status_desc}"
+
+            plan.change_desc = event_desc
 
             for ap in ctx.active_promos:
                 p_id = ap.get("id") or ""
@@ -593,7 +603,6 @@ class ItemEventPolicy:
                 )
 
             # 跨站点联动退出
-            cbt_id = str(ctx.raw_item.get("cbt_item_id") or "").strip().upper()
             if cbt_id.startswith("CBT") and ctx.cbt_siblings_data:
                 for sib in ctx.cbt_siblings_data:
                     sib_id = sib.get("item_id")
@@ -608,20 +617,32 @@ class ItemEventPolicy:
                                     promotion_type=sp.get("type") or "DEAL",
                                     offer_id=sp.get("offer_id"),
                                     promotion_name=sp.get("name") or "",
-                                    reason=f"全球父商品 {cbt_id} {desc}",
+                                    reason=cbt_reason,
                                 )
                             )
 
             if plan.promos_to_cancel:
-                plan.log_messages.append((
-                    f"{item_tag}: 检测到{desc}（平台审核中），已触发防亏退出旧活动，待审核生效后将自动以新利润报回。",
-                    "自动退出",
-                ))
+                if change_desc:
+                    plan.log_messages.append((
+                        f"{item_tag}: 检测到{change_desc}（平台审核中），已触发防亏退出旧活动，待审核生效后将自动以新利润报回。",
+                        "自动退出",
+                    ))
+                else:
+                    plan.log_messages.append((
+                        f"{item_tag}: 检测到{status_desc}，已触发防亏退出旧活动，待平台审核通过后将自动以最新利润报回。",
+                        "自动退出",
+                    ))
             else:
-                plan.log_messages.append((
-                    f"{item_tag}: 检测到{desc}（平台审核中），已置入待审队列，待审核生效后自动以新利润重算报回。",
-                    "自动同步",
-                ))
+                if change_desc:
+                    plan.log_messages.append((
+                        f"{item_tag}: 检测到{change_desc}（平台审核中），已置入待审队列，待审核生效后自动以新利润重算报回。",
+                        "自动同步",
+                    ))
+                else:
+                    plan.log_messages.append((
+                        f"{item_tag}: 检测到{status_desc}，已置入待审队列，待平台审核通过后自动以最新利润重算报回。",
+                        "自动同步",
+                    ))
             return plan
 
         # 分支 2：审核结束恢复正常活跃（Review Resolved! 自动按新净收益重报活动）
@@ -695,7 +716,6 @@ class ItemEventPolicy:
                 ))
 
             # 跨站点联动退出
-            cbt_id = str(ctx.raw_item.get("cbt_item_id") or "").strip().upper()
             if cbt_id.startswith("CBT") and ctx.cbt_siblings_data:
                 for sib in ctx.cbt_siblings_data:
                     sib_id = sib.get("item_id")

@@ -280,6 +280,40 @@ class TestItemEventPolicy(unittest.TestCase):
         self.assertEqual(len(plan.promos_to_cancel), 0)
         self.assertNotIn("包装尺寸/重量数据变动", [msg for msg, _ in plan.log_messages])
 
+    def test_under_review_without_numeric_changes_logs_clear_status_not_ambiguous_data_change(self) -> None:
+        """When an item is under_review without price/margin/dimension changes:
+        Log must explicitly show '处于美客多平台审核中（under_review）' instead of ambiguous '数据变动'.
+        """
+        raw = dict(self.raw_item_base)
+        raw["price"] = 25.12
+        raw["status"] = "under_review"
+        raw["sub_status"] = ["waiting_for_patch"]
+
+        # Cached snapshot matches current price, net proceeds, and shipping exactly
+        cached_snapshot = {
+            "price": 25.12,
+            "net_proceeds": 15.43,
+            "shipping_cost": 5.80,
+            "dimensions": None,
+            "weight": None,
+            "pricing_system": "system1_discount",
+        }
+
+        plan = ItemEventPolicy.evaluate(
+            account_id="2651442567",
+            child_user_id="2668034127",
+            site_id="MLM",
+            raw_item=raw,
+            cached_snapshot=cached_snapshot,
+            active_promos=[],
+            candidate_promos=[],
+            store_alias="广东店",
+        )
+
+        self.assertEqual(plan.decision_type, ActionType.WAIT_PLATFORM_REVIEW)
+        self.assertTrue(any("处于美客多平台审核中（under_review [waiting_for_patch]）" in msg for msg, _ in plan.log_messages))
+        self.assertFalse(any("检测到数据变动" in msg for msg, _ in plan.log_messages))
+
 
 if __name__ == "__main__":
     unittest.main()

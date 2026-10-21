@@ -946,7 +946,7 @@ class WebhookWorker:
 
         store_name = self._get_store_alias(account_id)
         seen_sibs: set[str] = set()
-        reason_str = cbt_reason if cbt_reason else "数据变动"
+        reason_str = cbt_reason if cbt_reason else "处于美客多平台审核或数据变动中"
         for child_entry in cbt_children:
             if not isinstance(child_entry, dict):
                 continue
