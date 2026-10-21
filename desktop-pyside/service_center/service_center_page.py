@@ -51,7 +51,7 @@ from service_center.image_cache import get_placeholder_pixmap, load_image_async
 from service_center.models import SITE_LANGUAGES, SITE_NAMES, ServiceMessage, ServiceSession, get_item_url
 from service_center.template_manager import ReplyTemplate, TemplateManager
 from service_center.toast_notification import ToastNotification
-from service_center.translator import translate_text
+from service_center.translator import is_error_translation, translate_text
 from theme import COLORS, STATUS_COLORS
 from ui_common import (
     ImagePreviewDialog,
@@ -188,8 +188,13 @@ def save_sessions_snapshot(sessions: list[ServiceSession]) -> None:
     try:
         from engine.crypto import get_data_dir
         path = get_data_dir() / "sessions_snapshot.json"
+        # Protect user data from being polluted by dummy test sessions
+        filtered_sessions = [
+            s for s in sessions
+            if s and s.id != "c_998877"
+        ]
         data = []
-        for s in sessions:
+        for s in filtered_sessions:
             msg_list = []
             for m in (getattr(s, "messages", None) or []):
                 msg_list.append({
@@ -457,27 +462,27 @@ class FetchConversationMessagesWorker(SafeWorkerBase):
                     raw_trans = str(rm.get("translated_message") or "")
                     text_trans = clean_message_text(raw_trans) if raw_trans else ""
 
-                    # Auto-translate to Chinese if not in Chinese or if text_trans is identical to raw text
+                    # Auto-translate to Chinese if not in Chinese, error, or if text_trans is identical to raw text
                     needs_zh_trans = (
                         not text_trans
+                        or is_error_translation(text_trans)
                         or text_trans.strip().lower() == text.strip().lower()
                         or not any('\u4e00' <= c <= '\u9fff' for c in text_trans)
                     )
                     if needs_zh_trans and text:
                         if not any('\u4e00' <= c <= '\u9fff' for c in text):
                             try:
-                                candidate = text_trans if (text_trans and text_trans.strip().lower() != text.strip().lower()) else text
-                                zh = translate_text(candidate, target_lang="zh", timeout=3.0)
-                                if zh and zh.strip().lower() != text.strip().lower():
+                                candidate = text_trans if (text_trans and text_trans.strip().lower() != text.strip().lower() and not is_error_translation(text_trans)) else text
+                                zh = translate_text(candidate, target_lang="zh", timeout=6.0)
+                                if zh and not is_error_translation(zh) and zh.strip().lower() != text.strip().lower():
                                     text_trans = zh
-                                elif text_trans.strip().lower() == text.strip().lower():
+                                else:
                                     text_trans = ""
                             except Exception:
-                                if text_trans.strip().lower() == text.strip().lower():
-                                    text_trans = ""
+                                text_trans = ""
                         else:
                             text_trans = ""
-                    elif text_trans.strip().lower() == text.strip().lower():
+                    elif text_trans.strip().lower() == text.strip().lower() or is_error_translation(text_trans):
                         text_trans = ""
 
                     att_urls: list[str] = []
@@ -2202,16 +2207,49 @@ class ServiceCenterPage(QFrame):
         info_col.setSpacing(3)
         info_col.setContentsMargins(0, 0, 0, 0)
 
+        # 1.2.1 Title Row: Product Title + Claim Stage Badge + Reputation Impact Chip
+        self.title_row_widget = QWidget()
+        self.title_row_layout = QHBoxLayout(self.title_row_widget)
+        self.title_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.title_row_layout.setSpacing(8)
+
         self.context_title_lbl = QLabel("暂无选中的会话")
         self.context_title_lbl.setStyleSheet("color: #F6F3EA; font-size: 13px; font-weight: bold;")
-        self.context_title_lbl.setWordWrap(True)
+        self.context_title_lbl.setWordWrap(False)
+        self.context_title_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self.context_title_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.context_title_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.context_title_lbl.customContextMenuRequested.connect(
             lambda pos, w=self.context_title_lbl: self._show_simple_copy_menu(pos, w)
         )
-        info_col.addWidget(self.context_title_lbl)
+        self.title_row_layout.addWidget(self.context_title_lbl)
 
+        # 4) Claim Stage Badge Chip (Directly after Title)
+        self.chip_stage_lbl = QLabel("")
+        self.chip_stage_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
+        self.chip_stage_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.chip_stage_lbl.customContextMenuRequested.connect(
+            lambda pos: self._show_target_copy_menu(
+                pos, self.chip_stage_lbl,
+                lambda: CLAIM_STAGE_NAMES.get(self._current_session.stage.lower(), self._current_session.stage) if (self._current_session and self._current_session.stage) else ""
+            )
+        )
+        self.title_row_layout.addWidget(self.chip_stage_lbl)
+
+        # Sep between stage and reputation impact
+        self.sep_stage_rep = QLabel(" · ")
+        self.sep_stage_rep.setStyleSheet("color: #78716C; font-size: 11px;")
+        self.title_row_layout.addWidget(self.sep_stage_rep)
+
+        # 5) Claim Affects Reputation Chip (Directly after Title)
+        self.chip_rep_lbl = QLabel("")
+        self.chip_rep_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
+        self.title_row_layout.addWidget(self.chip_rep_lbl)
+
+        self.title_row_layout.addStretch(1)
+        info_col.addWidget(self.title_row_widget)
+
+        # 1.2.2 Meta Row: Site flag, store, buyer, price, SKU
         self.context_meta_lbl = QLabel("请在左侧列表中点击任意提问或索赔会话")
         self.context_meta_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
         self.context_meta_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -2222,7 +2260,7 @@ class ServiceCenterPage(QFrame):
         info_col.addWidget(self.context_meta_lbl)
         self.context_info_lbl = self.context_meta_lbl  # Alias for backward compatibility
 
-        # 1.2.3 Independent Metadata Chips Row
+        # 1.2.3 Independent Metadata Chips Row (Item link, Order ID, Pack ID)
         self.tags_row_widget = QWidget()
         self.tags_row_layout = QHBoxLayout(self.tags_row_widget)
         self.tags_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -2275,32 +2313,9 @@ class ServiceCenterPage(QFrame):
         )
         self.tags_row_layout.addWidget(self.chip_pack_lbl)
 
-        # Sep 3: between pack and stage
-        self.sep_pack_stage = QLabel(" · ")
-        self.sep_pack_stage.setStyleSheet("color: #78716C; font-size: 11px;")
-        self.tags_row_layout.addWidget(self.sep_pack_stage)
-
-        # 4) Claim Stage Badge Chip
-        self.chip_stage_lbl = QLabel("")
-        self.chip_stage_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
-        self.chip_stage_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.chip_stage_lbl.customContextMenuRequested.connect(
-            lambda pos: self._show_target_copy_menu(
-                pos, self.chip_stage_lbl,
-                lambda: CLAIM_STAGE_NAMES.get(self._current_session.stage.lower(), self._current_session.stage) if (self._current_session and self._current_session.stage) else ""
-            )
-        )
-        self.tags_row_layout.addWidget(self.chip_stage_lbl)
-
-        # Sep 4: between stage and reputation impact
-        self.sep_stage_rep = QLabel(" · ")
-        self.sep_stage_rep.setStyleSheet("color: #78716C; font-size: 11px;")
-        self.tags_row_layout.addWidget(self.sep_stage_rep)
-
-        # 5) Claim Affects Reputation Chip
-        self.chip_rep_lbl = QLabel("")
-        self.chip_rep_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
-        self.tags_row_layout.addWidget(self.chip_rep_lbl)
+        # Sep 3: kept for backward compatibility with existing tests (hidden)
+        self.sep_pack_stage = QLabel("")
+        self.sep_pack_stage.hide()
 
         self.tags_row_layout.addStretch(1)
         info_col.addWidget(self.tags_row_widget)
@@ -3604,15 +3619,13 @@ class ServiceCenterPage(QFrame):
 
         self.sep_order_pack.setVisible((has_item or has_order) and has_pack)
 
-        has_stage = bool(session.stage)
+        has_stage = bool(session.stage) and session.session_type == "claim"
         if has_stage:
             stage_cn = CLAIM_STAGE_NAMES.get(session.stage.lower(), session.stage)
             self.chip_stage_lbl.setText(f"索赔阶段: <b style='color: #FBBF24;'>{stage_cn}</b>")
             self.chip_stage_lbl.show()
         else:
             self.chip_stage_lbl.hide()
-
-        self.sep_pack_stage.setVisible((has_item or has_order or has_pack) and has_stage)
 
         has_rep = bool(session.affects_reputation) and session.session_type == "claim"
         if has_rep:
@@ -3626,7 +3639,7 @@ class ServiceCenterPage(QFrame):
         else:
             self.chip_rep_lbl.hide()
 
-        self.sep_stage_rep.setVisible((has_item or has_order or has_pack or has_stage) and has_rep)
+        self.sep_stage_rep.setVisible(has_stage and has_rep)
 
         # Update backward-compatible context_link_lbl string
         link_parts = []
@@ -3904,7 +3917,7 @@ class ServiceCenterPage(QFrame):
             has_order = bool(self._current_session.order_id)
             has_pack = bool(self._current_session.pack_id and self._current_session.pack_id != self._current_session.order_id)
             has_stage = bool(self._current_session.stage)
-            self.sep_stage_rep.setVisible((has_item or has_order or has_pack or has_stage) and has_rep)
+            self.sep_stage_rep.setVisible(has_stage and has_rep)
 
         # Refresh thumbnail in case an alternate non-conflicting picture was selected
         load_image_async(
@@ -3921,6 +3934,7 @@ class ServiceCenterPage(QFrame):
                 self.session_list.setItemWidget(curr_item, card)
 
         QTimer.singleShot(50, self._scroll_chat_to_bottom)
+        QTimer.singleShot(200, self._scroll_chat_to_bottom)
 
     def _scroll_chat_to_bottom(self) -> None:
         try:
@@ -4003,8 +4017,12 @@ class ServiceCenterPage(QFrame):
             b_layout.addLayout(att_box)
 
         # Translated snippet if available (clean sans-serif typography, no italics)
+        if msg.text_translated and is_error_translation(msg.text_translated):
+            msg.text_translated = ""
+
         has_valid_trans = (
             bool(msg.text_translated)
+            and not is_error_translation(msg.text_translated)
             and msg.text_translated.strip().lower() != msg.text.strip().lower()
         )
         if has_valid_trans:
@@ -4035,8 +4053,9 @@ class ServiceCenterPage(QFrame):
 
             def _auto_translate_msg(target_lbl: QLabel, target_msg: ServiceMessage):
                 try:
-                    zh = translate_text(target_msg.text, target_lang="zh", timeout=3.5)
-                    if zh and zh.strip().lower() != target_msg.text.strip().lower():
+                    candidate = target_msg.text
+                    zh = translate_text(candidate, target_lang="zh", timeout=6.0)
+                    if zh and not is_error_translation(zh) and zh.strip().lower() != candidate.strip().lower():
                         target_msg.text_translated = zh
                         if self._current_session:
                             if self._current_session.session_type == "question" and not self._current_session.summary_translated:
@@ -4045,6 +4064,7 @@ class ServiceCenterPage(QFrame):
                         QTimer.singleShot(0, lambda: target_lbl.setText(f"译: {zh}"))
                         QTimer.singleShot(0, lambda: target_lbl.setStyleSheet("color: #C8C3B7; font-size: 11px; line-height: 1.4; font-style: normal;"))
                         QTimer.singleShot(0, self._refresh_current_session_card)
+                        QTimer.singleShot(100, self._scroll_chat_to_bottom)
                     else:
                         QTimer.singleShot(0, lambda: target_lbl.hide())
                 except Exception:

@@ -833,31 +833,31 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_data_dir = Path(tmp_dir)
             with patch("engine.crypto.get_data_dir", return_value=tmp_data_dir):
-                s = ServiceSession(
-                    id="c_test1",
-                    session_type="claim",
-                    account_id="acc_1",
-                    account_name="店铺1",
-                    site_id="MLB",
-                    item_id="MLB999",
-                    item_title="商品标题",
-                    item_thumbnail="http://example.com/img.jpg",
-                    item_price="R$ 99.9",
-                    sku="SKU123",
-                    order_id="2000001",
-                    status="opened",
-                    summary="退款测试",
-                    is_unread=True,
-                )
-                save_sessions_snapshot([s])
-                loaded = load_sessions_snapshot()
-                self.assertEqual(len(loaded), 1)
-                self.assertEqual(loaded[0].id, "c_test1")
-                self.assertEqual(loaded[0].item_title, "商品标题")
-                self.assertEqual(loaded[0].item_thumbnail, "http://example.com/img.jpg")
-                self.assertEqual(loaded[0].item_price, "R$ 99.9")
-                self.assertEqual(loaded[0].sku, "SKU123")
-                self.assertTrue(loaded[0].is_unread)
+                    s = ServiceSession(
+                        id="c_test1",
+                        session_type="claim",
+                        account_id="acc_1",
+                        account_name="店铺1",
+                        site_id="MLB",
+                        item_id="MLB999",
+                        item_title="商品标题",
+                        item_thumbnail="http://example.com/img.jpg",
+                        item_price="R$ 99.9",
+                        sku="SKU123",
+                        order_id="2000001",
+                        status="opened",
+                        summary="退款测试",
+                        is_unread=True,
+                    )
+                    save_sessions_snapshot([s])
+                    loaded = load_sessions_snapshot()
+                    self.assertEqual(len(loaded), 1)
+                    self.assertEqual(loaded[0].id, "c_test1")
+                    self.assertEqual(loaded[0].item_title, "商品标题")
+                    self.assertEqual(loaded[0].item_thumbnail, "http://example.com/img.jpg")
+                    self.assertEqual(loaded[0].item_price, "R$ 99.9")
+                    self.assertEqual(loaded[0].sku, "SKU123")
+                    self.assertTrue(loaded[0].is_unread)
 
     def test_safe_worker_base_lifecycle(self):
         from PySide6.QtCore import QCoreApplication, Signal
@@ -1746,7 +1746,9 @@ class TestServiceCenterSnapshot(unittest.TestCase):
 
                 page.stop()
 
-    def test_service_center_v2_1_70_unified_copy_menu_and_bubble_dimension_lock(self):
+    @patch("service_center.service_center_page.load_sessions_snapshot", return_value=[])
+    @patch("service_center.service_center_page.save_sessions_snapshot")
+    def test_service_center_v2_1_70_unified_copy_menu_and_bubble_dimension_lock(self, mock_save, mock_load):
         """Test v2.1.70: unified simple copy menu without tooltips, bubble physical dimension lock, and list stability."""
         mock_client = MagicMock()
         mock_auth = MagicMock()
@@ -1825,7 +1827,9 @@ class TestServiceCenterSnapshot(unittest.TestCase):
 
         page.stop()
 
-    def test_service_center_v2_1_71_pure_id_copy_and_independent_chips(self):
+    @patch("service_center.service_center_page.load_sessions_snapshot", return_value=[])
+    @patch("service_center.service_center_page.save_sessions_snapshot")
+    def test_service_center_v2_1_71_pure_id_copy_and_independent_chips(self, mock_save, mock_load):
         """Test v2.1.71: independent metadata chips and pure ID copy without prefix/suffix/separator."""
         from PySide6.QtGui import QMouseEvent
         from PySide6.QtCore import QEvent, QPointF
@@ -1890,7 +1894,8 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         self.assertIn("MLM5868800338", page.chip_item_lbl.text())
         self.assertFalse(page.sep_item_order.isHidden())
         self.assertFalse(page.sep_order_pack.isHidden())
-        self.assertFalse(page.sep_pack_stage.isHidden())
+        self.assertFalse(page.chip_stage_lbl.isHidden())
+        self.assertIn("平台官方调解中", page.chip_stage_lbl.text())
 
         with patch.object(page, "_open_item_in_browser") as mock_open_browser:
             page.chip_item_lbl.mousePressEvent(left_click)
