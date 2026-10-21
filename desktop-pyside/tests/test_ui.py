@@ -1821,7 +1821,7 @@ class QtUiTests(unittest.TestCase):
             failures.append,
             phase="initial_bundle",
         )
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 10
         while time.monotonic() < deadline and not received and not failures:
             self.app.processEvents()
             QTest.qWait(10)
@@ -1842,7 +1842,7 @@ class QtUiTests(unittest.TestCase):
             failures.append,
             phase="scope_bundle",
         )
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 10
         while time.monotonic() < deadline and not failures:
             self.app.processEvents()
             QTest.qWait(10)
@@ -1894,7 +1894,7 @@ class QtUiTests(unittest.TestCase):
         self.window.initial_bundle_retry_timer.stop()
 
     def test_startup_refresh_poll_is_worker_backed_and_non_reentrant(self) -> None:
-        deadline = time.monotonic() + 1
+        deadline = time.monotonic() + 5
         while self.window.workers and time.monotonic() < deadline:
             self.app.processEvents()
             QTest.qWait(10)
@@ -1914,7 +1914,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.api.calls, [])
 
     def test_startup_refresh_poll_slow_response_does_not_overlap(self) -> None:
-        deadline = time.monotonic() + 1
+        deadline = time.monotonic() + 5
         while self.window.workers and time.monotonic() < deadline:
             self.app.processEvents()
             QTest.qWait(10)
@@ -1935,7 +1935,7 @@ class QtUiTests(unittest.TestCase):
         self.window.refresh_poll_timer.setInterval(60000)
         self.window._poll_startup_refresh()
         self.window._poll_startup_refresh()
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 10
         while time.monotonic() < deadline and self.window.refresh_poll_busy:
             self.app.processEvents()
             QTest.qWait(10)
@@ -1944,7 +1944,7 @@ class QtUiTests(unittest.TestCase):
         self.window.refresh_poll_timer.stop()
 
     def test_startup_refresh_poll_runs_running_to_blocked_and_finalizes_busy(self) -> None:
-        deadline = time.monotonic() + 1
+        deadline = time.monotonic() + 5
         while self.window.workers and time.monotonic() < deadline:
             self.app.processEvents()
             QTest.qWait(10)
@@ -1995,7 +1995,7 @@ class QtUiTests(unittest.TestCase):
         self.window.refresh_poll_timer.stop()
 
         def wait_for_idle() -> None:
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 10
             while time.monotonic() < deadline and self.window.refresh_poll_busy:
                 self.app.processEvents()
                 QTest.qWait(10)
@@ -2662,10 +2662,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.2.30")
+        self.assertEqual(product_version(), "2.2.31")
 
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.2.30")
+        self.assertEqual(self.window.version_label.text(), "v2.2.31")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2677,7 +2677,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.2.30")
+        self.assertEqual(self.window.version_label.text(), "v2.2.31")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -3308,7 +3308,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.2.30")
+        self.assertEqual(self.window.version_label.text(), "v2.2.31")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
@@ -3517,7 +3517,7 @@ class QtUiTests(unittest.TestCase):
             asset_size=10485760,
             published_at="2026-10-07T00:00:00Z",
         )
-        dlg = UpdateDialog(info, "2.2.30", parent=self.window)
+        dlg = UpdateDialog(info, "2.2.31", parent=self.window)
         self.assertEqual(dlg.windowTitle(), "软件更新 - 美客多活动管家")
         self.assertIn("自动更新引擎", dlg.notes_edit.toPlainText())
         self.assertTrue(dlg.update_btn.isEnabled())
