@@ -343,8 +343,8 @@ class TestOrdersPageUI(unittest.TestCase):
         self.assertEqual(o_rev.items[0].dimensions, "10 × 10 × 11 cm · 200 g")
 
     def test_splitter_handle_and_no_redundant_button(self):
-        # Verify splitter handle width is 8
-        self.assertEqual(self.page.splitter.handleWidth(), 8)
+        # Verify splitter handle width is 6
+        self.assertEqual(self.page.splitter.handleWidth(), 6)
 
         # Verify redundant open button does NOT exist
         self.assertFalse(hasattr(self.page, "btn_open_mcl_order"))
@@ -1250,6 +1250,46 @@ class TestSlaCalendarAndDeadline(unittest.TestCase):
         info_past = order_past.shipping_deadline_info
         self.assertIsNotNone(info_past)
         self.assertIn("⚠️ 已超时", info_past[0])
+
+    def test_compute_order_sla_deadline_matches_cbt_business_standards(self) -> None:
+        """Validate that SLA deadline aligns to 23:59:59 Beijing time and extends across weekends."""
+        from datetime import datetime, timezone, timedelta
+        from orders.sla_calendar import compute_order_sla_deadline
+
+        bjt = timezone(timedelta(hours=8))
+        ref_now = datetime(2026, 10, 21, 20, 57, 0, tzinfo=bjt)
+
+        # 1. Wednesday 2026-10-21 order -> 2 business days (Thu, Fri) + weekend (Sat, Sun) -> Sun 23:59:59
+        wed_order = datetime(2026, 10, 21, 2, 47, 0, tzinfo=bjt)
+        dl_wed = compute_order_sla_deadline(wed_order, handling_days=2)
+        self.assertEqual(dl_wed.strftime("%Y-%m-%d %H:%M:%S"), "2026-10-25 23:59:59")
+        diff_wed = int((dl_wed - ref_now).total_seconds())
+        self.assertEqual(diff_wed // 86400, 4)
+        self.assertEqual((diff_wed % 86400) // 3600, 3)  # 余4天3小时
+
+        # 2. Tuesday 2026-10-20 order -> 2 business days (Wed, Thu) -> Thu 23:59:59
+        tue_order = datetime(2026, 10, 20, 9, 32, 0, tzinfo=bjt)
+        dl_tue = compute_order_sla_deadline(tue_order, handling_days=2)
+        self.assertEqual(dl_tue.strftime("%Y-%m-%d %H:%M:%S"), "2026-10-22 23:59:59")
+        diff_tue = int((dl_tue - ref_now).total_seconds())
+        self.assertEqual(diff_tue // 86400, 1)
+        self.assertEqual((diff_tue % 86400) // 3600, 3)  # 余1天3小时
+
+        # 3. Monday 2026-10-19 order -> 2 business days (Tue, Wed) -> Wed 23:59:59
+        mon_order = datetime(2026, 10, 19, 20, 7, 0, tzinfo=bjt)
+        dl_mon = compute_order_sla_deadline(mon_order, handling_days=2)
+        self.assertEqual(dl_mon.strftime("%Y-%m-%d %H:%M:%S"), "2026-10-21 23:59:59")
+        diff_mon = int((dl_mon - ref_now).total_seconds())
+        self.assertEqual(diff_mon // 86400, 0)
+        self.assertEqual((diff_mon % 86400) // 3600, 3)  # 余3小时
+
+        # 4. Sunday 2026-10-18 order -> weekend shifts to Monday -> Tue, Wed -> Wed 23:59:59
+        sun_order = datetime(2026, 10, 18, 13, 44, 0, tzinfo=bjt)
+        dl_sun = compute_order_sla_deadline(sun_order, handling_days=2)
+        self.assertEqual(dl_sun.strftime("%Y-%m-%d %H:%M:%S"), "2026-10-21 23:59:59")
+        diff_sun = int((dl_sun - ref_now).total_seconds())
+        self.assertEqual(diff_sun // 86400, 0)
+        self.assertEqual((diff_sun % 86400) // 3600, 3)  # 余3小时
 
 
 if __name__ == "__main__":

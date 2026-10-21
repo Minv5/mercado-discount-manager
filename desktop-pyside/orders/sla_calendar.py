@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -146,12 +146,14 @@ def add_cbt_business_days(start_dt: datetime, business_days: int = 3) -> datetim
 
 def compute_order_sla_deadline(
     created_dt_or_ts: datetime | float | str,
-    handling_days: int = 3,
+    handling_days: int = 2,
     manufacturing_days: int = 0,
 ) -> datetime:
     """Calculate the definitive Mercado Libre CBT handling/shipping deadline.
     
-    Defaults to 3 business days, plus any listing manufacturing/custom lead time.
+    Defaults to 2 business days (aligning with standard CBT fulfillment & ERPs like Dianxiaomi),
+    plus any listing manufacturing/custom lead time.
+    Aligns cutoff to 23:59:59 Beijing time (UTC+8) and extends through consecutive non-working weekend days.
     """
     if isinstance(created_dt_or_ts, (int, float)):
         base_dt = datetime.fromtimestamp(float(created_dt_or_ts), tz=timezone.utc)
@@ -166,5 +168,27 @@ def compute_order_sla_deadline(
     else:
         base_dt = datetime.now(timezone.utc)
 
+    # Convert to Beijing time (UTC+8) for CBT logistics handling cutoff
+    bjt_tz = timezone(timedelta(hours=8))
+    local_dt = base_dt.astimezone(bjt_tz)
+    curr_date = local_dt.date()
+
+    # Move to the first business day if placed on a weekend / statutory holiday
+    while not is_cbt_business_day(curr_date):
+        curr_date += timedelta(days=1)
+
     total_bdays = max(handling_days + manufacturing_days, 1)
-    return add_cbt_business_days(base_dt, total_bdays)
+    days_counted = 0
+    max_iter = 120
+    while days_counted < total_bdays and max_iter > 0:
+        curr_date += timedelta(days=1)
+        max_iter -= 1
+        if is_cbt_business_day(curr_date):
+            days_counted += 1
+
+    # Extend across consecutive non-business days (weekends / holidays immediately following the deadline day)
+    while not is_cbt_business_day(curr_date + timedelta(days=1)):
+        curr_date += timedelta(days=1)
+
+    # Deadline is 23:59:59 of curr_date in Beijing time
+    return datetime.combine(curr_date, time(23, 59, 59), tzinfo=bjt_tz)

@@ -369,6 +369,9 @@ class OrdersFetchWorker(QThread):
                     ord_model.shipping.dimensions = cached_ord.shipping.dimensions
                     ord_model.shipping.shipping_cost = cached_ord.shipping.shipping_cost
                     ord_model.shipping_cost = cached_ord.shipping_cost
+                    ord_model.shipping.handling_hours = cached_ord.shipping.handling_hours
+                    ord_model.shipping.estimated_delivery_date = cached_ord.shipping.estimated_delivery_date
+                    ord_model.shipping.estimated_delivery_offset = cached_ord.shipping.estimated_delivery_offset
                 else:
                     ship_det = self.client.get_marketplace_shipment(aid, ord_model.shipping.shipment_id)
                     if ship_det:
@@ -388,6 +391,20 @@ class OrdersFetchWorker(QThread):
                         if dims:
                             ord_model.shipping.dimensions = format_dimensions_display(dims)
                         lead_time = ship_det.get("lead_time") or {}
+                        est_del = lead_time.get("estimated_delivery_time") or {}
+                        handling_val = est_del.get("handling")
+                        if handling_val is not None:
+                            try:
+                                ord_model.shipping.handling_hours = int(handling_val)
+                            except Exception:
+                                pass
+                        est_date = str(est_del.get("date") or "")
+                        if est_date:
+                            ord_model.shipping.estimated_delivery_date = est_date
+                        est_offset = str((est_del.get("offset") or {}).get("date") or "")
+                        if est_offset:
+                            ord_model.shipping.estimated_delivery_offset = est_offset
+
                         cost_type = str(lead_time.get("cost_type") or "").lower()
                         buyer_cost = float(lead_time.get("cost") or 0.0)
                         list_cost = float(lead_time.get("list_cost") or buyer_cost or 0.0)
@@ -2204,7 +2221,15 @@ class OrdersPage(QWidget):
         ship_mode = order.shipping.logistic_type or "官方物流"
         substatus = order.shipping.substatus or order.shipping.status or "正常运输"
         carrier = order.shipping.tracking_method or "Mercado Envíos"
-        self.det_ship_meta_lbl.setText(f"物流方式: {ship_mode}  ·  承运商: {carrier}  ·  最新状态: {substatus}")
+        meta_parts = [f"物流方式: {ship_mode}  ·  承运商: {carrier}  ·  最新状态: {substatus}"]
+        timeline_parts = []
+        if order.shipping.estimated_delivery_date:
+            timeline_parts.append(f"买家承诺送达: {order.shipping.estimated_delivery_date[:10]}")
+        if order.shipping.estimated_delivery_offset:
+            timeline_parts.append(f"最晚妥投保证: {order.shipping.estimated_delivery_offset[:10]}")
+        if timeline_parts:
+            meta_parts.append("  ·  ".join(timeline_parts))
+        self.det_ship_meta_lbl.setText("\n".join(meta_parts))
 
         pid_text = order.pack_id or "无包裹号"
         self.det_pack_chip.setText(f"包裹号: {pid_text}")

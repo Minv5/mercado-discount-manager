@@ -184,6 +184,9 @@ class ShippingInfoModel:
     dimensions: str = ""
     shipping_cost: float = 0.0
     estimated_handling_limit: str = ""
+    estimated_delivery_date: str = ""
+    estimated_delivery_offset: str = ""
+    handling_hours: int = 0
 
     @property
     def full_address(self) -> str:
@@ -290,7 +293,8 @@ class OrderModel:
         # If no explicit limit from ML API, compute using CBT working days + statutory holidays calendar
         if not deadline_ts and self.created_timestamp:
             from orders.sla_calendar import compute_order_sla_deadline
-            deadline_dt = compute_order_sla_deadline(self.created_timestamp, handling_days=3)
+            h_days = max(2, self.shipping.handling_hours // 24) if self.shipping.handling_hours else 2
+            deadline_dt = compute_order_sla_deadline(self.created_timestamp, handling_days=h_days)
             deadline_ts = deadline_dt.timestamp()
 
         if not deadline_ts:
@@ -316,7 +320,7 @@ class OrderModel:
                 bg = "rgba(251, 191, 36, 0.12)"
                 border = "1px solid rgba(251, 191, 36, 0.35)"
             else:
-                text = f"🚨 仅剩 {hours}时{minutes}分"
+                text = f"🚨 仅剩 {hours}时{minutes}分" if minutes > 0 else f"🚨 仅剩 {hours}时"
                 color = "#EF4444"
                 bg = "rgba(239, 68, 68, 0.18)"
                 border = "1px solid rgba(239, 68, 68, 0.4)"
@@ -324,7 +328,11 @@ class OrderModel:
             overdue_minutes = int(abs(diff) // 60)
             overdue_h = overdue_minutes // 60
             overdue_m = overdue_minutes % 60
-            if overdue_h > 0:
+            if overdue_h >= 24:
+                overdue_d = overdue_h // 24
+                overdue_rem_h = overdue_h % 24
+                text = f"⚠️ 已超时 {overdue_d}天{overdue_rem_h}时" if overdue_rem_h > 0 else f"⚠️ 已超时 {overdue_d}天"
+            elif overdue_h > 0:
                 text = f"⚠️ 已超时 {overdue_h}时{overdue_m}分"
             else:
                 text = f"⚠️ 已超时 {overdue_m}分"
@@ -424,6 +432,9 @@ class OrderModel:
             dimensions=str(sh.get("dimensions") or ""),
             shipping_cost=float(sh.get("shipping_cost") or 0.0),
             estimated_handling_limit=str(sh.get("estimated_handling_limit") or ""),
+            estimated_delivery_date=str(sh.get("estimated_delivery_date") or ""),
+            estimated_delivery_offset=str(sh.get("estimated_delivery_offset") or ""),
+            handling_hours=int(sh.get("handling_hours") or 0),
         ) if isinstance(sh, dict) else ShippingInfoModel()
 
         payments = []
@@ -642,6 +653,9 @@ def parse_order_from_dict(
         dimensions=ship_dims,
         shipping_cost=float(shipping_dict.get("shipping_cost") or 0.0),
         estimated_handling_limit=raw_handling_limit,
+        estimated_delivery_date=str((shipping_dict.get("lead_time") or {}).get("estimated_delivery_time", {}).get("date") or ""),
+        estimated_delivery_offset=str(((shipping_dict.get("lead_time") or {}).get("estimated_delivery_time", {}).get("offset") or {}).get("date") or ""),
+        handling_hours=int((shipping_dict.get("lead_time") or {}).get("estimated_delivery_time", {}).get("handling") or 0),
     )
 
     # Payments
