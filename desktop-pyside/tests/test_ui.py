@@ -2662,10 +2662,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.2.16")
+        self.assertEqual(product_version(), "2.2.17")
 
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.2.16")
+        self.assertEqual(self.window.version_label.text(), "v2.2.17")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2677,7 +2677,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.2.16")
+        self.assertEqual(self.window.version_label.text(), "v2.2.17")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -2951,6 +2951,48 @@ class QtUiTests(unittest.TestCase):
         # 在选中文本状态下追加日志，视口绝不跳转吸底
         viewer.append_log_line("new log during selection")
         self.assertEqual(scrollbar.value(), target_val)
+
+    def test_log_viewer_hover_at_bottom_continues_auto_scroll_and_drag_to_bottom_resumes(self) -> None:
+        """验证底座特性：在最底部时悬停绝不阻断自动吸底，拖动滑块回最底端立即恢复自动吸底。"""
+        from main_window import LogViewer
+        from PySide6.QtCore import QEvent
+        viewer = LogViewer()
+        for i in range(15):
+            viewer.append_log_line(f"line {i}")
+
+        scrollbar = viewer.verticalScrollBar()
+        max_val = scrollbar.maximum()
+        self.assertGreater(max_val, 0)
+        self.assertEqual(scrollbar.value(), max_val)
+        self.assertTrue(viewer.auto_scroll)
+
+        # 1. 模拟鼠标悬停进入日志框（此时滚动条在底部）
+        enter_ev = QEvent(QEvent.Type.Enter)
+        viewer.eventFilter(viewer.viewport(), enter_ev)
+        self.assertTrue(viewer.is_hovered)
+
+        # 追加新日志，验证在悬停状态下依然持续自动吸底到最新行
+        viewer.append_log_line("line while hovered at bottom")
+        self.assertTrue(viewer.auto_scroll)
+        self.assertEqual(scrollbar.value(), scrollbar.maximum())
+
+        # 2. 模拟向上滚动离开底部
+        target_val = max(0, scrollbar.maximum() - 5)
+        scrollbar.setValue(target_val)
+        self.assertFalse(viewer.auto_scroll)
+
+        # 追加新日志，滚动条位置被冻结在 target_val
+        viewer.append_log_line("line while scrolled up")
+        self.assertEqual(scrollbar.value(), target_val)
+
+        # 3. 模拟用户把滚动条拖回最底端
+        scrollbar.setValue(scrollbar.maximum())
+        self.assertTrue(viewer.auto_scroll)
+
+        # 追加新日志，立即恢复自动吸底
+        viewer.append_log_line("line after dragged to bottom")
+        self.assertEqual(scrollbar.value(), scrollbar.maximum())
+        self.assertTrue(viewer.auto_scroll)
 
     def test_embedded_surfaces_navigation_and_switching(self) -> None:
         self.window.show()
@@ -3265,7 +3307,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.2.16")
+        self.assertEqual(self.window.version_label.text(), "v2.2.17")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
@@ -3474,7 +3516,7 @@ class QtUiTests(unittest.TestCase):
             asset_size=10485760,
             published_at="2026-10-07T00:00:00Z",
         )
-        dlg = UpdateDialog(info, "2.2.16", parent=self.window)
+        dlg = UpdateDialog(info, "2.2.17", parent=self.window)
         self.assertEqual(dlg.windowTitle(), "软件更新 - 美客多活动管家")
         self.assertIn("自动更新引擎", dlg.notes_edit.toPlainText())
         self.assertTrue(dlg.update_btn.isEnabled())

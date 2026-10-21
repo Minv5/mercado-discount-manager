@@ -459,12 +459,19 @@ class LogViewer(QPlainTextEdit):
         max_val = scrollbar.maximum()
         if max_val <= 0:
             return
-        # 只要滚动条脱离最底部（哪怕只差 1 个单位），或正按住滑块，立即暂停自动吸底
-        if scrollbar.isSliderDown() or value < max_val:
-            self.auto_scroll = False
-        elif value >= max_val:
-            # 只有当用户确实手动将滚动条拉至最底端时，才恢复自动吸底
+        # 用户拖拽滑块或滚动时：
+        # 只要当前位置处于最底部，保持/恢复自动吸底；向上翻动时暂停自动吸底
+        if scrollbar.isSliderDown():
+            if value >= max_val:
+                self.auto_scroll = True
+            else:
+                self.auto_scroll = False
+            return
+
+        if value >= max_val:
             self.auto_scroll = True
+        else:
+            self.auto_scroll = False
 
     def enterEvent(self, event) -> None:
         self.is_hovered = True
@@ -475,7 +482,7 @@ class LogViewer(QPlainTextEdit):
         super().leaveEvent(event)
 
     def wheelEvent(self, event) -> None:
-        # 滚轮向上滚动：用户明确查看历史日志，立即暂停自动吸底
+        # 滚轮向上滚动：用户明确查看历史日志，暂停自动吸底
         if event.angleDelta().y() > 0:
             self.auto_scroll = False
         elif event.angleDelta().y() < 0:
@@ -486,10 +493,11 @@ class LogViewer(QPlainTextEdit):
 
     def append_log_line(self, line: str) -> None:
         scrollbar = self.verticalScrollBar()
-        # 只要处于鼠标悬停、手动脱离最底部、拖拽滑块中、或正在划词选中文本，坚决不自动吸底
         has_selection = bool(self.textCursor().hasSelection())
-        is_hover = self.is_viewport_or_mouse_hovered()
-        was_at_bottom = self.auto_scroll and not scrollbar.isSliderDown() and not is_hover and not has_selection
+        is_dragging_up = scrollbar.isSliderDown() and scrollbar.value() < scrollbar.maximum()
+
+        # 只要处于自滚动模式，且未划词选中文本、未正在向上拖拽滑块，无论鼠标是否悬停，均坚决保持自动吸底
+        was_at_bottom = self.auto_scroll and not has_selection and not is_dragging_up
         prev_value = scrollbar.value()
 
         self._is_appending = True
@@ -497,7 +505,7 @@ class LogViewer(QPlainTextEdit):
             if was_at_bottom:
                 self.appendPlainText(line)
             else:
-                # 非吸底状态：使用独立光标静默在文档末尾追加文本，不移动主光标与视口，杜绝页面跳动
+                # 非吸底状态（如正在翻看历史或选中文本）：使用独立光标静默在文档末尾追加文本，不移动主光标与视口，杜绝页面跳动
                 doc = self.document()
                 cursor = QTextCursor(doc)
                 cursor.movePosition(QTextCursor.MoveOperation.End)
