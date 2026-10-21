@@ -2079,6 +2079,7 @@ class ServiceCenterPage(QFrame):
                 background: transparent;
                 border: none;
                 padding: 0px;
+                outline: none;
             }
             QListWidget#sessionListWidget::item {
                 background: #171D1A;
@@ -2086,15 +2087,20 @@ class ServiceCenterPage(QFrame):
                 border-radius: 8px;
                 padding: 0px;
                 margin: 3px 6px;
+                outline: none;
             }
             QListWidget#sessionListWidget::item:hover {
                 background: #1C2420;
                 border-color: #38463B;
             }
+            QListWidget#sessionListWidget::item:focus {
+                outline: none;
+            }
             QListWidget#sessionListWidget::item:selected {
                 background: #203A2B;
                 border: 1px solid #3E7B4B;
                 border-radius: 8px;
+                outline: none;
             }
             QListWidget#sessionListWidget QScrollBar:vertical {
                 background: transparent;
@@ -2294,11 +2300,7 @@ class ServiceCenterPage(QFrame):
         )
         self.tags_row_layout.addWidget(self.chip_pack_lbl)
 
-        # Sep 3 & Sep 4 kept for backward compatibility (hidden)
-        self.sep_pack_stage = QLabel("")
-        self.sep_pack_stage.hide()
-        self.sep_stage_rep = QLabel("")
-        self.sep_stage_rep.hide()
+
 
         self.tags_row_layout.addStretch(1)
         info_col.addWidget(self.tags_row_widget)
@@ -3576,8 +3578,6 @@ class ServiceCenterPage(QFrame):
             self.chip_rep_lbl.hide()
             self.sep_item_order.hide()
             self.sep_order_pack.hide()
-            self.sep_pack_stage.hide()
-            self.sep_stage_rep.hide()
             self.open_browser_btn.setEnabled(False)
             self.refresh_chat_btn.setEnabled(False)
             self.refresh_chat_btn.hide()
@@ -3650,8 +3650,6 @@ class ServiceCenterPage(QFrame):
         else:
             self.chip_stage_lbl.hide()
 
-        self.sep_pack_stage.hide()
-
         has_rep = bool(session.affects_reputation) and session.session_type == "claim"
         if has_rep:
             if session.affects_reputation == "affected":
@@ -3663,8 +3661,6 @@ class ServiceCenterPage(QFrame):
             self.chip_rep_lbl.show()
         else:
             self.chip_rep_lbl.hide()
-
-        self.sep_stage_rep.hide()
 
         # Update backward-compatible context_link_lbl string
         link_parts = []
@@ -3951,11 +3947,6 @@ class ServiceCenterPage(QFrame):
                 self.chip_rep_lbl.show()
             else:
                 self.chip_rep_lbl.hide()
-            has_item = bool(self._current_session.item_id or self._current_session.item_url)
-            has_order = bool(self._current_session.order_id)
-            has_pack = bool(self._current_session.pack_id and self._current_session.pack_id != self._current_session.order_id)
-            has_stage = bool(self._current_session.stage)
-            self.sep_stage_rep.setVisible(has_stage and has_rep)
 
         # Refresh thumbnail in case an alternate non-conflicting picture was selected
         load_image_async(
