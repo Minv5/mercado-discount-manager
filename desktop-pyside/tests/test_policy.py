@@ -311,7 +311,8 @@ class TestItemEventPolicy(unittest.TestCase):
         )
 
         self.assertEqual(plan.decision_type, ActionType.WAIT_PLATFORM_REVIEW)
-        self.assertTrue(any("处于美客多平台审核中（under_review [waiting_for_patch]）" in msg for msg, _ in plan.log_messages))
+        self.assertTrue(any("处于美客多官方平台审核中" in msg for msg, _ in plan.log_messages))
+        self.assertFalse(any("under_review" in msg for msg, _ in plan.log_messages))
         self.assertFalse(any("检测到数据变动" in msg for msg, _ in plan.log_messages))
 
 

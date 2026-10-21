@@ -573,11 +573,10 @@ class ItemEventPolicy:
             plan.pricing_system = "system2_155"
             plan.decision_type = ActionType.WAIT_PLATFORM_REVIEW
 
-            sub_status_str = f" [{', '.join(sub_status)}]" if sub_status else ""
-            status_desc = f"处于美客多平台审核中（{status}{sub_status_str}）"
+            status_desc = "处于美客多官方平台审核中"
 
             if change_desc:
-                event_desc = f"{change_desc}（平台审核中）"
+                event_desc = f"{change_desc}（官方审核中）"
                 cbt_reason = f"全球父商品 {cbt_id} {change_desc}"
             else:
                 event_desc = status_desc
