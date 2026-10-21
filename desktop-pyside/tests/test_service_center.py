@@ -2263,6 +2263,30 @@ class TestServiceCenterSnapshot(unittest.TestCase):
             res = client.get_pack_messages("acc_1", "pack_123")
             self.assertEqual(res, {"messages": [], "paging": {"total": 0}})
 
+    def test_order_cancellations_filtered_from_claims(self):
+        """Verify that cancel_sale, cancel_purchase and stage='none' are excluded from claims."""
+        from service_center.service_center_page import FetchSessionsWorker
+        mock_client = MagicMock()
+        mock_auth = MagicMock()
+        # Mock client.get_claims to return a mix of real claims and cancellation records
+        mock_client.get_claims.return_value = {
+            "data": [
+                {"id": "c_real_1", "type": "mediations", "stage": "claim", "status": "opened"},
+                {"id": "c_cancel_1", "type": "cancel_sale", "stage": "none", "status": "closed"},
+                {"id": "c_cancel_2", "type": "cancel_purchase", "stage": "none", "status": "closed"},
+                {"id": "c_real_2", "type": "mediations", "stage": "dispute", "status": "closed"},
+            ],
+            "paging": {"total": 4},
+        }
+        worker = FetchSessionsWorker(mock_client, mock_auth, ["acc1"], "claim")
+        sites = [{"child_user_id": "child1", "site_id": "MLB"}]
+        results = worker._fetch_claims_for_account("acc1", "测试店", sites)
+        result_ids = [s.id for s in results]
+        self.assertIn("c_c_real_1", result_ids)
+        self.assertIn("c_c_real_2", result_ids)
+        self.assertNotIn("c_c_cancel_1", result_ids)
+        self.assertNotIn("c_c_cancel_2", result_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

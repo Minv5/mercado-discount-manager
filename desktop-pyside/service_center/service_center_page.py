@@ -189,10 +189,10 @@ def save_sessions_snapshot(sessions: list[ServiceSession]) -> None:
     try:
         from engine.crypto import get_data_dir
         path = get_data_dir() / "sessions_snapshot.json"
-        # Protect user data from being polluted by dummy test sessions
+        # Protect user data from being polluted by dummy test sessions and pure order cancellations
         filtered_sessions = [
             s for s in sessions
-            if s and s.id != "c_998877"
+            if s and s.id != "c_998877" and not (s.session_type == "claim" and str(getattr(s, "stage", "")).lower() == "none")
         ]
         data = []
         for s in filtered_sessions:
@@ -334,6 +334,12 @@ def load_sessions_snapshot() -> list[ServiceSession]:
         valid_fields = set(ServiceSession.__dataclass_fields__.keys())
         for item in data:
             if isinstance(item, dict):
+                # Filter out pure order cancellations from historical cache
+                if item.get("session_type") == "claim":
+                    stage_val = str(item.get("stage") or "").lower()
+                    claim_type = str(item.get("raw_data", {}).get("type") or "").lower() if isinstance(item.get("raw_data"), dict) else ""
+                    if stage_val == "none" or claim_type in ("cancel_sale", "cancel_purchase"):
+                        continue
                 raw_msgs = item.pop("messages", None) or []
                 clean_item = {k: v for k, v in item.items() if k in valid_fields}
                 sess = ServiceSession(**clean_item)
@@ -917,6 +923,13 @@ class FetchSessionsWorker(SafeWorkerBase):
                         claim_id = str(c.get("id") or "")
                         if not claim_id or claim_id in seen_claim_ids:
                             continue
+
+                        # Exclude pure order cancellations and direct refunds that belong to Order Management
+                        claim_type = str(c.get("type") or "").lower()
+                        stage_val = str(c.get("stage") or "").lower()
+                        if claim_type in ("cancel_sale", "cancel_purchase") or stage_val == "none":
+                            continue
+
                         seen_claim_ids.add(claim_id)
                         sess_id = f"c_{claim_id}"
                         cached = self.cache_map.get(sess_id)
