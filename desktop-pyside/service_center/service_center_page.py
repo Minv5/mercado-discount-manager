@@ -103,11 +103,11 @@ def play_notification_chime() -> None:
 
 
 CLAIM_STAGE_NAMES: dict[str, str] = {
-    "claim": "买家发起投诉",
-    "dispute": "平台官方调解中",
-    "recontact": "售后协商阶段",
-    "closed": "已结案",
-    "none": "已结案",
+    "claim": "买家投诉",
+    "dispute": "平台调解",
+    "recontact": "售后协商",
+    "closed": "已经结案",
+    "none": "已经结案",
 }
 
 # Pre-compiled style constants for session list cards to eliminate stylesheet parsing overhead
@@ -2325,10 +2325,10 @@ class ServiceCenterPage(QFrame):
         ca_layout.setHorizontalSpacing(8)
         ca_layout.setVerticalSpacing(4)
 
-        # 4) Claim Stage Badge Chip (Top Row, Col 0 - Stacked vertically)
+        # 4) Claim Stage Badge Chip (Top Row, Col 0 - Stacked vertically, Left-Aligned)
         self.chip_stage_lbl = QLabel("")
-        self.chip_stage_lbl.setStyleSheet("color: #A8A29E; font-size: 11px; padding-right: 2px;")
-        self.chip_stage_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.chip_stage_lbl.setStyleSheet("color: #A8A29E; font-size: 11px; padding-right: 4px;")
+        self.chip_stage_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.chip_stage_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.chip_stage_lbl.customContextMenuRequested.connect(
             lambda pos: self._show_target_copy_menu(
@@ -2336,20 +2336,20 @@ class ServiceCenterPage(QFrame):
                 lambda: CLAIM_STAGE_NAMES.get(self._current_session.stage.lower(), self._current_session.stage) if (self._current_session and self._current_session.stage) else ""
             )
         )
-        ca_layout.addWidget(self.chip_stage_lbl, 0, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        ca_layout.addWidget(self.chip_stage_lbl, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        # 5) Claim Affects Reputation Chip (Bottom Row, Col 0 - Stacked vertically)
+        # 5) Claim Affects Reputation Chip (Bottom Row, Col 0 - Stacked vertically, Left-Aligned)
         self.chip_rep_lbl = QLabel("")
-        self.chip_rep_lbl.setStyleSheet("color: #A8A29E; font-size: 11px; padding-right: 2px;")
-        self.chip_rep_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.chip_rep_lbl.setStyleSheet("color: #A8A29E; font-size: 11px; padding-right: 4px;")
+        self.chip_rep_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.chip_rep_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.chip_rep_lbl.customContextMenuRequested.connect(
             lambda pos: self._show_target_copy_menu(
                 pos, self.chip_rep_lbl,
-                lambda: ("影响信誉" if self._current_session.affects_reputation == "affected" else "不影响信誉") if (self._current_session and self._current_session.affects_reputation) else ""
+                lambda: ("影响信誉" if self._current_session.affects_reputation == "affected" else "不受影响") if (self._current_session and self._current_session.affects_reputation) else ""
             )
         )
-        ca_layout.addWidget(self.chip_rep_lbl, 1, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        ca_layout.addWidget(self.chip_rep_lbl, 1, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         self.claim_stage_lbl = QLabel("")
         self.claim_stage_lbl.hide()
@@ -3645,9 +3645,9 @@ class ServiceCenterPage(QFrame):
         has_rep = bool(session.affects_reputation) and session.session_type == "claim"
         if has_rep:
             if session.affects_reputation == "affected":
-                self.chip_rep_lbl.setText("信誉影响: <b style='color: #F87171;'>影响信誉 ⚠️</b>")
+                self.chip_rep_lbl.setText("信誉影响: <b style='color: #F87171;'>影响信誉</b>")
             elif session.affects_reputation == "not_affected":
-                self.chip_rep_lbl.setText("信誉影响: <b style='color: #34D399;'>不影响信誉 🛡️</b>")
+                self.chip_rep_lbl.setText("信誉影响: <b style='color: #34D399;'>不受影响</b>")
             else:
                 self.chip_rep_lbl.setText(f"信誉影响: <b>{session.affects_reputation}</b>")
             self.chip_rep_lbl.show()
@@ -3669,7 +3669,7 @@ class ServiceCenterPage(QFrame):
             stage_cn = CLAIM_STAGE_NAMES.get(session.stage.lower(), session.stage)
             link_parts.append(f"索赔阶段: <b>{stage_cn}</b>")
         if session.affects_reputation and session.session_type == "claim":
-            rep_text = "影响信誉" if session.affects_reputation == "affected" else "不影响信誉"
+            rep_text = "影响信誉" if session.affects_reputation == "affected" else "不受影响"
             link_parts.append(f"信誉影响: <b>{rep_text}</b>")
         self.context_link_lbl.setText(" | ".join(link_parts))
 
@@ -3933,9 +3933,9 @@ class ServiceCenterPage(QFrame):
             has_rep = bool(self._current_session.affects_reputation)
             if has_rep:
                 if self._current_session.affects_reputation == "affected":
-                    self.chip_rep_lbl.setText("信誉影响: <b style='color: #F87171;'>影响信誉 ⚠️</b>")
+                    self.chip_rep_lbl.setText("信誉影响: <b style='color: #F87171;'>影响信誉</b>")
                 elif self._current_session.affects_reputation == "not_affected":
-                    self.chip_rep_lbl.setText("信誉影响: <b style='color: #34D399;'>不影响信誉 🛡️</b>")
+                    self.chip_rep_lbl.setText("信誉影响: <b style='color: #34D399;'>不受影响</b>")
                 else:
                     self.chip_rep_lbl.setText(f"信誉影响: <b>{self._current_session.affects_reputation}</b>")
                 self.chip_rep_lbl.show()

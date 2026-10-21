@@ -1069,7 +1069,7 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         self.assertTrue(page.claim_dispute_btn.isEnabled())
         self.assertTrue(page.claim_partial_refund_btn.isEnabled())
         self.assertTrue(page.claim_full_refund_btn.isEnabled())
-        self.assertIn("买家发起投诉", page.claim_stage_lbl.text())
+        self.assertIn("买家投诉", page.claim_stage_lbl.text())
 
         # 4. Test dispute stage disables dispute button
         claim_dispute = ServiceSession(
@@ -1582,11 +1582,11 @@ class TestServiceCenterSnapshot(unittest.TestCase):
 
         # 3. Test Chinese claim stage translation in context_link_lbl
         page._display_session_detail(c_opened)
-        self.assertIn("买家发起投诉", page.context_link_lbl.text())
+        self.assertIn("买家投诉", page.context_link_lbl.text())
 
         c_dispute = ServiceSession(id="c3", session_type="claim", account_id="acc1", account_name="店1", site_id="MLM", status="opened", stage="dispute")
         page._display_session_detail(c_dispute)
-        self.assertIn("平台官方调解中", page.context_link_lbl.text())
+        self.assertIn("平台调解", page.context_link_lbl.text())
 
         # 4. Test single input box in-place flow
         page.reply_input.setPlainText("你好")
@@ -1895,7 +1895,7 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         self.assertFalse(page.sep_item_order.isHidden())
         self.assertFalse(page.sep_order_pack.isHidden())
         self.assertFalse(page.chip_stage_lbl.isHidden())
-        self.assertIn("平台官方调解中", page.chip_stage_lbl.text())
+        self.assertIn("平台调解", page.chip_stage_lbl.text())
 
         with patch.object(page, "_open_item_in_browser") as mock_open_browser:
             page.chip_item_lbl.mousePressEvent(left_click)
@@ -2117,7 +2117,7 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         # 5. Test detail chip view
         page._display_session_detail(sess_clean)
         self.assertFalse(page.chip_rep_lbl.isHidden())
-        self.assertIn("不影响信誉", page.chip_rep_lbl.text())
+        self.assertIn("不受影响", page.chip_rep_lbl.text())
         self.assertFalse(page.chip_stage_lbl.isHidden())
 
         page._display_session_detail(sess_impact)
