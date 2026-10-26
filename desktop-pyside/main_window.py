@@ -608,12 +608,17 @@ class MainWindow(QMainWindow):
         self.orders_page.oauthExpired.connect(self.handle_oauth_expired)
         self.orders_page.contactBuyerRequested.connect(self._on_contact_buyer_requested)
 
+        # 5: 商品管理页面
+        from items import ItemsPage
+        self.items_page = ItemsPage(cs_client, cs_auth, parent=self)
+
         self.pages = QStackedWidget()
         self.pages.addWidget(self.enrollment_page)
         self.pages.addWidget(self.activity_page)
         self.pages.addWidget(self.cleaner_page)
-        self.pages.addWidget(self.service_center_page)
         self.pages.addWidget(self.orders_page)
+        self.pages.addWidget(self.service_center_page)
+        self.pages.addWidget(self.items_page)
 
         self.view_stack = QStackedWidget()
         self.view_stack.addWidget(self.pages)
@@ -698,6 +703,14 @@ class MainWindow(QMainWindow):
         )
         title_row.addWidget(self.version_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        # 授权状态徽章移至左侧品牌区
+        self.license_badge = QPushButton("🛡️ 授权状态")
+        self.license_badge.setFixedHeight(22)
+        self.license_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.license_badge.clicked.connect(self._show_license_dialog)
+        title_row.addWidget(self.license_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._refresh_license_badge()
+
         self.update_notice_btn = QPushButton("🚀 发现新版")
         self.update_notice_btn.setObjectName("updateNoticeBtn")
         self.update_notice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -770,23 +783,32 @@ class MainWindow(QMainWindow):
         self.nav_buttons.append(cleaner_btn)
         layout.addWidget(cleaner_btn)
 
-        # 6. 客服售后
-        self.service_center_btn = QPushButton("客服售后")
-        self.service_center_btn.setObjectName("nav")
-        self.service_center_btn.setCheckable(True)
-        self.service_center_btn.setFixedSize(90, 34)
-        self.service_center_btn.clicked.connect(lambda checked=False: self._show_page(3))
-        self.nav_buttons.append(self.service_center_btn)
-        layout.addWidget(self.service_center_btn)
-
-        # 7. 订单管理
+        # 6. 订单管理
         self.orders_btn = QPushButton("订单管理")
         self.orders_btn.setObjectName("nav")
         self.orders_btn.setCheckable(True)
         self.orders_btn.setFixedSize(90, 34)
-        self.orders_btn.clicked.connect(lambda checked=False: self._show_page(4))
+        self.orders_btn.clicked.connect(lambda checked=False: self._show_page(3))
         self.nav_buttons.append(self.orders_btn)
         layout.addWidget(self.orders_btn)
+
+        # 7. 客服售后
+        self.service_center_btn = QPushButton("客服售后")
+        self.service_center_btn.setObjectName("nav")
+        self.service_center_btn.setCheckable(True)
+        self.service_center_btn.setFixedSize(90, 34)
+        self.service_center_btn.clicked.connect(lambda checked=False: self._show_page(4))
+        self.nav_buttons.append(self.service_center_btn)
+        layout.addWidget(self.service_center_btn)
+
+        # 8. 商品管理
+        self.items_btn = QPushButton("商品管理")
+        self.items_btn.setObjectName("nav")
+        self.items_btn.setCheckable(True)
+        self.items_btn.setFixedSize(90, 34)
+        self.items_btn.clicked.connect(lambda checked=False: self._show_page(5))
+        self.nav_buttons.append(self.items_btn)
+        layout.addWidget(self.items_btn)
 
         # 分隔线
         sep = QFrame()
@@ -803,12 +825,6 @@ class MainWindow(QMainWindow):
         self.settings_button.clicked.connect(self._show_settings_page)
         layout.addWidget(self.settings_button)
 
-        layout.addSpacing(6)
-        self.auto_shutdown_check = QCheckBox("执行完自动关机")
-        self.auto_shutdown_check.setObjectName("muted")
-        self.auto_shutdown_check.setChecked(bool(self.settings.get("autoShutdownAfterExecution")))
-        self.auto_shutdown_check.stateChanged.connect(self._on_auto_shutdown_toggled)
-        layout.addWidget(self.auto_shutdown_check)
         self.nav_buttons[0].setChecked(True)
         return header
 
@@ -877,6 +893,12 @@ class MainWindow(QMainWindow):
         self.execute_button.setMinimumHeight(42)
         self.execute_button.clicked.connect(self._on_execute_clicked)
         layout.addWidget(self.execute_button)
+
+        self.auto_shutdown_check = QCheckBox("执行完自动关机")
+        self.auto_shutdown_check.setObjectName("muted")
+        self.auto_shutdown_check.setChecked(bool(self.settings.get("autoShutdownAfterExecution")))
+        self.auto_shutdown_check.stateChanged.connect(self._on_auto_shutdown_toggled)
+        layout.addWidget(self.auto_shutdown_check, 0, Qt.AlignmentFlag.AlignHCenter)
         self.mode_combo.currentTextChanged.connect(self._mode_changed)
         self.store_combo.currentIndexChanged.connect(self._scope_changed)
         self.site_combo.currentIndexChanged.connect(self._site_changed)
@@ -3176,7 +3198,13 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentIndex(index)
         active_btn = self.nav_buttons[index] if index < len(self.nav_buttons) else None
         self._update_nav_selection(active_btn)
-        if index == 3 and hasattr(self, "service_center_page"):
+        if index == 3 and hasattr(self, "orders_page"):
+            if getattr(self.orders_page, "_worker", None) is None:
+                self.orders_page.reload_orders()
+            elif self.orders_page.order_list.count() > 0:
+                if self.orders_page.order_list.currentRow() < 0 or not self.orders_page._current_order:
+                    self.orders_page.order_list.setCurrentRow(0)
+        elif index == 4 and hasattr(self, "service_center_page"):
             sizes = self.service_center_page.splitter.sizes()
             if not sizes or sizes[0] < 380:
                 total_w = self.service_center_page.width() if self.service_center_page.width() > 800 else 1200
@@ -3188,22 +3216,16 @@ class MainWindow(QMainWindow):
             elif self.service_center_page.session_list.count() > 0:
                 if self.service_center_page.session_list.currentRow() < 0 or not self.service_center_page._current_session:
                     self.service_center_page.session_list.setCurrentRow(0)
-        elif index == 4 and hasattr(self, "orders_page"):
-            if getattr(self.orders_page, "_worker", None) is None:
-                self.orders_page.reload_orders()
-            elif self.orders_page.order_list.count() > 0:
-                if self.orders_page.order_list.currentRow() < 0 or not self.orders_page._current_order:
-                    self.orders_page.order_list.setCurrentRow(0)
 
     def show_order(self, order_id: str) -> None:
         """Switch to orders page and focus on the given order_id."""
-        self._show_page(4)
+        self._show_page(3)
         if hasattr(self, "orders_page"):
             self.orders_page.select_order(order_id)
 
     def _on_contact_buyer_requested(self, order: Any) -> None:
         """Switch to Service Center page and open after-sales chat for this order."""
-        self._show_page(3)
+        self._show_page(4)
         if hasattr(self, "service_center_page"):
             self.service_center_page.open_order_conversation(order)
 
@@ -3230,6 +3252,80 @@ class MainWindow(QMainWindow):
                 lambda context: self._apply_settings_context(self.settings_page, context),
                 lambda error: self.log("设置后台刷新未完成：" + product_error(error)),
             )
+
+    def _refresh_license_badge(self) -> None:
+        """刷新顶部导航栏授权状态徽章。"""
+        if not hasattr(self, "license_badge"):
+            return
+        try:
+            from license import LicenseManager, LicenseStatus
+            info = LicenseManager.get_instance().check_license()
+            if info.status == LicenseStatus.LICENSED:
+                if info.is_developer:
+                    self.license_badge.setText("🛡️ 开发者永久版")
+                elif info.expiration_str == "终身永久":
+                    self.license_badge.setText("🛡️ 永久商业版")
+                else:
+                    self.license_badge.setText(f"🛡️ 授权至 {info.expiration_str}")
+                self.license_badge.setStyleSheet("""
+                    QPushButton {
+                        background: rgba(47, 107, 63, 0.25);
+                        color: #86EFAC;
+                        border: 1px solid #2F6B3F;
+                        border-radius: 4px;
+                        padding: 1px 7px;
+                        font-size: 11px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background: rgba(47, 107, 63, 0.45);
+                        border-color: #48BB78;
+                    }
+                """)
+            elif info.status == LicenseStatus.TRIAL:
+                self.license_badge.setText(f"⏳ 试用中 (剩{info.remaining_days}天)")
+                self.license_badge.setStyleSheet("""
+                    QPushButton {
+                        background: rgba(140, 109, 35, 0.25);
+                        color: #FDE047;
+                        border: 1px solid #8C6D23;
+                        border-radius: 4px;
+                        padding: 1px 7px;
+                        font-size: 11px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background: rgba(140, 109, 35, 0.45);
+                        border-color: #ECC94B;
+                    }
+                """)
+            else:
+                self.license_badge.setText("⚠️ 授权已到期")
+                self.license_badge.setStyleSheet("""
+                    QPushButton {
+                        background: rgba(127, 45, 45, 0.25);
+                        color: #FCA5A5;
+                        border: 1px solid #7F2D2D;
+                        border-radius: 4px;
+                        padding: 1px 7px;
+                        font-size: 11px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background: rgba(127, 45, 45, 0.45);
+                        border-color: #F87171;
+                    }
+                """)
+        except Exception as e:
+            logger.debug("Failed to refresh license badge: %s", e)
+
+    def _show_license_dialog(self) -> None:
+        """弹出授权激活与机器码查看窗口。"""
+        from license import ActivationDialog
+        dlg = ActivationDialog(parent=self)
+        dlg.activated.connect(self._refresh_license_badge)
+        dlg.exec()
+
 
     def _check_update_async(self, manual: bool = False) -> None:
         """后台异步检测 GitHub 最新 Release，静默不阻塞主界面。"""
@@ -5118,7 +5214,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.31"
+    return "2.2.46"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.

@@ -104,22 +104,26 @@ def format_dimensions_display(dims: Any) -> str:
     return raw
 
 
-def get_order_status_badge_info(status: str, shipping_status: str = "") -> tuple[str, str, str]:
+def get_order_status_badge_info(status: str, shipping_status: str = "", shipping_substatus: str = "") -> tuple[str, str, str]:
     """Return (badge_text, qss_style, filter_category) for order status.
 
-    Strictly prioritizes shipping.status over order payment status to correctly reflect delivery stage.
+    Strictly prioritizes shipping.status and shipping.substatus over order payment status to correctly reflect delivery stage.
     """
     ship_st = (shipping_status or "").strip().lower()
-    if ship_st in ("shipped", "in_transit"):
-        return ("运送中", BADGE_STYLE_BLUE, "shipped")
-    elif ship_st in ("delivered", "completed"):
+    ship_sub = (shipping_substatus or "").strip().lower()
+
+    if ship_st in ("delivered", "completed") or ship_sub in ("delivered",):
         return ("已送达", BADGE_STYLE_GREEN, "delivered")
+    elif ship_st == "cancelled" or ship_sub in ("cancelled", "returned_to_warehouse", "returning_to_warehouse"):
+        return ("已取消", BADGE_STYLE_GRAY, "cancelled")
+    elif ship_st in ("not_delivered", "failed") or ship_sub in ("not_delivered", "failed"):
+        return ("未送达", BADGE_STYLE_GRAY, "not_delivered")
+    elif ship_st in ("shipped", "in_transit") or ship_sub in (
+        "picked_up", "dropped_off", "in_hub", "forwarded_to_carrier", "in_packing_list", "customs_cleared", "on_carrier"
+    ):
+        return ("运送中", BADGE_STYLE_BLUE, "shipped")
     elif ship_st in ("ready_to_ship", "to_be_shipped"):
         return ("待发货", BADGE_STYLE_GOLD, "paid")
-    elif ship_st == "cancelled":
-        return ("已取消", BADGE_STYLE_GRAY, "cancelled")
-    elif ship_st in ("not_delivered", "failed"):
-        return ("未送达", BADGE_STYLE_GRAY, "not_delivered")
 
     st = (status or "").strip().lower()
     if st in ("paid", "confirmed", "to_be_shipped", "ready_to_ship"):
@@ -187,6 +191,10 @@ class ShippingInfoModel:
     estimated_delivery_date: str = ""
     estimated_delivery_offset: str = ""
     handling_hours: int = 0
+    base_shipping_cost: float = 0.0
+    shipping_adjustment: float = 0.0
+    shipping_adjustment_reason: str = ""
+    actual_dimensions: str = ""
 
     @property
     def full_address(self) -> str:
@@ -262,6 +270,20 @@ class OrderModel:
         return round(self.shipping_cost or self.shipping.shipping_cost, 2)
 
     @property
+    def has_shipping_adjustment(self) -> bool:
+        """Whether this order incurred official carrier shipping fee adjustment (compensations)."""
+        return self.shipping.shipping_adjustment > 0
+
+    @property
+    def shipping_adjustment_text(self) -> str:
+        """Formatted human-readable description for shipping fee adjustment."""
+        if self.shipping.shipping_adjustment > 0:
+            b = self.shipping.base_shipping_cost or round(self.effective_shipping_cost - self.shipping.shipping_adjustment, 2)
+            reason = self.shipping.shipping_adjustment_reason or "尺寸/重量差异"
+            return f"有运费调整: ${b:g} ➔ ${self.effective_shipping_cost:g} ({reason} +${self.shipping.shipping_adjustment:g})"
+        return ""
+
+    @property
     def estimated_net_profit(self) -> float:
         """Estimated net received profit after subtracting commission and shipping fees."""
         base = self.paid_amount if self.paid_amount > 0 else self.total_amount
@@ -273,7 +295,7 @@ class OrderModel:
 
     @property
     def status_badge_info(self) -> tuple[str, str, str]:
-        return get_order_status_badge_info(self.status, self.shipping.status)
+        return get_order_status_badge_info(self.status, self.shipping.status, self.shipping.substatus)
 
     @property
     def shipping_deadline_info(self) -> tuple[str, str, str, str] | None:
@@ -283,6 +305,14 @@ class OrderModel:
         """
         _, _, filter_cat = self.status_badge_info
         if filter_cat != "paid":
+            return None
+
+        # Check if shipping is already dispatched, in-hub, or in-transit
+        ship_st = (self.shipping.status or "").strip().lower()
+        ship_sub = (self.shipping.substatus or "").strip().lower()
+        if ship_st in ("shipped", "in_transit", "delivered", "completed", "cancelled") or ship_sub in (
+            "picked_up", "dropped_off", "in_hub", "forwarded_to_carrier", "on_carrier", "customs_cleared"
+        ):
             return None
 
         # Determine deadline timestamp
@@ -435,6 +465,10 @@ class OrderModel:
             estimated_delivery_date=str(sh.get("estimated_delivery_date") or ""),
             estimated_delivery_offset=str(sh.get("estimated_delivery_offset") or ""),
             handling_hours=int(sh.get("handling_hours") or 0),
+            base_shipping_cost=float(sh.get("base_shipping_cost") or 0.0),
+            shipping_adjustment=float(sh.get("shipping_adjustment") or 0.0),
+            shipping_adjustment_reason=str(sh.get("shipping_adjustment_reason") or ""),
+            actual_dimensions=str(sh.get("actual_dimensions") or ""),
         ) if isinstance(sh, dict) else ShippingInfoModel()
 
         payments = []

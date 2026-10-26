@@ -105,6 +105,35 @@ class UICommonTests(unittest.TestCase):
         attach_copy_menu(target, get_val_fn=lambda: "自动提取值", popup=True)
         self.assertEqual(target.contextMenuPolicy(), Qt.ContextMenuPolicy.CustomContextMenu)
 
+    def test_make_selectable_label_and_selection_precedence(self):
+        from ui_common import make_selectable_label
+        from PySide6.QtGui import QMouseEvent
+        from PySide6.QtCore import QPointF, QEvent
+
+        lbl = QLabel("订单号: 2000018983593552")
+        make_selectable_label(lbl, fallback_getter=lambda: "2000018983593552")
+        self.assertTrue(lbl.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        # 1. When text is selected with mouse, show_pure_copy_menu copies the selected text (not fallback)
+        lbl.setSelection(5, 16)  # Selects "2000018983593552"
+        self.assertEqual(lbl.selectedText(), "2000018983593552")
+        menu = show_pure_copy_menu(lbl, QPoint(5, 5), getter=lambda: "FALLBACK_IGNORE", popup=True)
+        menu.actions()[0].trigger()
+        self.assertEqual(QApplication.clipboard().text(), "2000018983593552")
+
+        # 2. When partial text is selected, only that part is copied
+        lbl.setSelection(5, 6)  # Selects "200001"
+        self.assertEqual(lbl.selectedText(), "200001")
+        menu2 = show_pure_copy_menu(lbl, QPoint(5, 5), getter=lambda: "FALLBACK_IGNORE", popup=True)
+        menu2.actions()[0].trigger()
+        self.assertEqual(QApplication.clipboard().text(), "200001")
+
+        # 3. On mouse release, if text is selected, automatically copies selected text
+        QApplication.clipboard().clear()
+        rel_evt = QMouseEvent(QEvent.Type.MouseButtonRelease, QPointF(5, 5), Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        lbl.mouseReleaseEvent(rel_evt)
+        self.assertEqual(QApplication.clipboard().text(), "200001")
+
     def test_make_click_copy_handler(self):
         chip = QLabel("2000018676400878")
         handler = make_click_copy_handler(chip, lambda: "2000018676400878")
@@ -222,6 +251,32 @@ class UICommonTests(unittest.TestCase):
         # Switch back to prev
         dlg._on_prev_clicked()
         self.assertEqual(dlg.counter_lbl.text(), "2 / 3")
+
+    def test_lightbox_copy_image_context_menu_and_shortcut(self):
+        from PySide6.QtGui import QKeyEvent
+        from PySide6.QtCore import QEvent
+
+        pix = QPixmap(80, 80)
+        pix.fill(Qt.GlobalColor.magenta)
+        dlg = ImagePreviewDialog(pixmap=pix, title="待复制图片")
+
+        # 1. 验证大图弹窗保持极简设计，无多余的顶部复制按钮
+        self.assertFalse(hasattr(dlg, "copy_btn"))
+
+        # 2. 验证快捷键 Ctrl+C / Cmd+C 触发复制
+        QApplication.clipboard().clear()
+        evt = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+        dlg.keyPressEvent(evt)
+        self.assertFalse(QApplication.clipboard().pixmap().isNull())
+
+        # 3. 验证图片控件启用了自定义右键菜单，具备快捷复制图片能力
+        self.assertEqual(dlg.img_lbl.contextMenuPolicy(), Qt.ContextMenuPolicy.CustomContextMenu)
+
+        # 4. 验证直接调用 copy_current_image 成功
+        QApplication.clipboard().clear()
+        self.assertTrue(dlg.copy_current_image())
+        self.assertFalse(QApplication.clipboard().pixmap().isNull())
+        dlg.close()
 
 
 if __name__ == "__main__":

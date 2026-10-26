@@ -186,6 +186,17 @@ def main() -> int:
 
     app = create_application()
     app.setQuitOnLastWindowClosed(True)
+
+    # 软件商业授权与3天免费试用风控拦截
+    from PySide6.QtWidgets import QDialog
+    from license import ActivationDialog, LicenseManager
+    lic_mgr = LicenseManager.get_instance()
+    lic_info = lic_mgr.check_license()
+    if lic_info.is_expired:
+        dlg = ActivationDialog(manager=lic_mgr, force_modal=True)
+        if dlg.exec() != QDialog.DialogCode.Accepted or lic_mgr.check_license().is_expired:
+            return 0
+
     project_root = Path(__file__).resolve().parents[1]
     service = NodeServiceManager(project_root)
     window = MainWindow(ApiClient(), service)

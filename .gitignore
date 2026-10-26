@@ -21,3 +21,6 @@ dist-mac/
 dist-win/
 .pytest_cache/
 .coverage
+tools/license_private_key.pem
+*.pem
+

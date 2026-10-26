@@ -79,11 +79,13 @@ def clean_message_text(text: str) -> str:
     return text.strip()
 
 
-def play_notification_chime() -> None:
+def play_notification_chime(sound_name: str = "Funk") -> None:
     """Cross-platform non-blocking notification sound playback."""
     try:
         if sys.platform == "darwin":
-            sound_file = Path("/System/Library/Sounds/Funk.aiff")
+            sound_file = Path(f"/System/Library/Sounds/{sound_name}.aiff")
+            if not sound_file.exists():
+                sound_file = Path("/System/Library/Sounds/Funk.aiff")
             if sound_file.exists():
                 subprocess.Popen(["afplay", str(sound_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return
@@ -534,6 +536,19 @@ class FetchConversationMessagesWorker(SafeWorkerBase):
                 pid = pack_id
                 res = self.client.get_pack_messages(account_id, pid)
                 raw_msgs = res.get("messages") or []
+                conv_status = res.get("conversation_status") or {}
+                if isinstance(conv_status, dict):
+                    c_status = str(conv_status.get("status") or "").lower()
+                    c_substatus = str(conv_status.get("substatus") or "").lower()
+                    if c_status == "blocked":
+                        self.session.can_reply = False
+                        if c_substatus == "blocked_by_claim":
+                            self.session.blocked_reason = "该订单买家已发起退货索赔，平台已关闭私信通道，请前往【订单索赔】处理"
+                        else:
+                            self.session.blocked_reason = "平台已关闭该订单私信通道"
+                    elif c_status == "active":
+                        self.session.can_reply = True
+                        self.session.blocked_reason = None
                 if isinstance(raw_msgs, list):
                     sorted_raw = list(reversed(raw_msgs))
                 else:
@@ -1833,12 +1848,14 @@ class ServiceCenterPage(QFrame):
 
     unreadCountChanged = Signal(int)
     oauthExpired = Signal(str, str)
+    ui_dispatch_signal = Signal(object)
 
     def __init__(self, client: MercadoClient, auth_mgr: AuthManager, parent: QWidget | None = None):
         super().__init__(parent)
         self.client = client
         self.auth = auth_mgr
         self.template_mgr = TemplateManager()
+        self.ui_dispatch_signal.connect(lambda fn: fn())
 
         self._all_sessions: list[ServiceSession] = load_sessions_snapshot()
         self._current_session: ServiceSession | None = None
@@ -3968,6 +3985,15 @@ class ServiceCenterPage(QFrame):
             self.context_thumb_lbl.setPixmap,
             radius=6,
         )
+
+        if not self._current_session.can_reply:
+            self.reply_dock.setEnabled(False)
+            self.status_banner.setText(f"⚠️ {self._current_session.blocked_reason or '当前会话不可回复'}")
+            self.status_banner.show()
+        else:
+            self.reply_dock.setEnabled(True)
+            self.status_banner.hide()
+
         curr_row = self.session_list.currentRow()
         if curr_row >= 0:
             curr_item = self.session_list.item(curr_row)
@@ -4106,20 +4132,24 @@ class ServiceCenterPage(QFrame):
                             if self._current_session.session_type == "question" and not self._current_session.summary_translated:
                                 self._current_session.summary_translated = zh
                             save_sessions_snapshot(self._all_sessions)
-                        QTimer.singleShot(0, lambda: target_lbl.setText(f"译: {zh}"))
-                        QTimer.singleShot(0, lambda: target_lbl.setStyleSheet("color: #C8C3B7; font-size: 11px; line-height: 1.4; font-style: normal;"))
-                        QTimer.singleShot(0, self._refresh_current_session_card)
-                        QTimer.singleShot(100, self._scroll_chat_to_bottom)
+                        def _apply_success():
+                            target_lbl.setText(f"译: {zh}")
+                            target_lbl.setStyleSheet("color: #C8C3B7; font-size: 11px; line-height: 1.4; font-style: normal;")
+                            self._refresh_current_session_card()
+                            self._scroll_chat_to_bottom()
+                        self.ui_dispatch_signal.emit(_apply_success)
                     else:
-                        QTimer.singleShot(0, lambda: target_lbl.hide())
+                        self.ui_dispatch_signal.emit(lambda: target_lbl.hide())
                 except Exception:
-                    def _retry_fn(ev):
-                        target_lbl.setText("⏳ 正在重试翻译...")
-                        target_lbl.setStyleSheet("color: #8C877D; font-size: 11px;")
-                        threading.Thread(target=_auto_translate_msg, args=(target_lbl, target_msg), daemon=True).start()
-                    QTimer.singleShot(0, lambda: target_lbl.setText("🌐 翻译未完成，点击重试"))
-                    QTimer.singleShot(0, lambda: target_lbl.setStyleSheet("color: #F59E0B; font-size: 11px; text-decoration: underline; cursor: pointer;"))
-                    target_lbl.mousePressEvent = _retry_fn
+                    def _apply_fail():
+                        def _retry_fn(ev):
+                            target_lbl.setText("⏳ 正在重试翻译...")
+                            target_lbl.setStyleSheet("color: #8C877D; font-size: 11px;")
+                            threading.Thread(target=_auto_translate_msg, args=(target_lbl, target_msg), daemon=True).start()
+                        target_lbl.setText("🌐 翻译未完成，点击重试")
+                        target_lbl.setStyleSheet("color: #F59E0B; font-size: 11px; text-decoration: underline; cursor: pointer;")
+                        target_lbl.mousePressEvent = _retry_fn
+                    self.ui_dispatch_signal.emit(_apply_fail)
 
             threading.Thread(target=_auto_translate_msg, args=(trans_lbl, msg), daemon=True).start()
 
@@ -4458,6 +4488,11 @@ class ServiceCenterPage(QFrame):
         if not self._current_session:
             return
 
+        if not self._current_session.can_reply:
+            reason = self._current_session.blocked_reason or "当前会话不可回复"
+            QMessageBox.warning(self, "发送被阻止", f"无法发送：{reason}")
+            return
+
         final_text = self.reply_input.toPlainText().strip()
         if not final_text:
             QMessageBox.warning(self, "发送被阻止", "回复内容不能为空！请输入回复文本。")
@@ -4605,7 +4640,7 @@ class ServiceCenterPage(QFrame):
             self._qsettings.setValue("sound_enabled", self._sound_enabled)
         self.sound_btn.setText("🔔 提示音: 开" if self._sound_enabled else "🔕 提示音: 关")
         if self._sound_enabled:
-            play_notification_chime()
+            play_notification_chime("Funk")
 
     def _alert_new_session(self, sess: ServiceSession) -> None:
         """Trigger chime sound and toast notification for newly arrived unread session."""
@@ -4619,7 +4654,8 @@ class ServiceCenterPage(QFrame):
         self._recent_alert_ids[sess.id] = now
 
         if self._sound_enabled:
-            play_notification_chime()
+            sound_to_play = "Glass" if getattr(sess, "session_type", "") == "order" else "Funk"
+            play_notification_chime(sound_to_play)
 
         if sess.session_type == "claim":
             title = "收到新索赔"
@@ -4667,7 +4703,11 @@ class ServiceCenterPage(QFrame):
             sess_type = "claim"
             title = "收到新索赔"
             site_label = "订单索赔"
-        elif "message" in raw_topic or "order" in raw_topic:
+        elif "order" in raw_topic:
+            sess_type = "order"
+            title = "收到新订单"
+            site_label = "订单通知"
+        elif "message" in raw_topic:
             sess_type = "message"
             title = "收到买家新私信"
             site_label = "售后私信"
@@ -4682,7 +4722,8 @@ class ServiceCenterPage(QFrame):
         if resource and resource not in self._recent_alert_ids:
             self._recent_alert_ids[resource] = now
             if self._sound_enabled:
-                play_notification_chime()
+                sound_to_play = "Glass" if "order" in raw_topic else "Funk"
+                play_notification_chime(sound_to_play)
 
             toast = ToastNotification(
                 parent=self.window(),

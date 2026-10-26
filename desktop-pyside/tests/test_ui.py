@@ -625,10 +625,10 @@ class QtUiTests(unittest.TestCase):
         self.window.refresh_records = lambda: calls.append(self.window.records_view)  # type: ignore[method-assign]
         self.window.records_refresh_button.clicked.emit()
         self.assertEqual(calls, ["recent"])
-        self.assertEqual([button.text() for button in self.window.nav_buttons], ["活动报名", "活动管理", "商品清理", "客服售后", "订单管理"])
+        self.assertEqual([button.text() for button in self.window.nav_buttons], ["活动报名", "活动管理", "商品清理", "订单管理", "客服售后", "商品管理"])
         self.assertFalse(hasattr(self.window, "history_table"))
         self.assertFalse(hasattr(self.window, "workbench_table"))
-        self.assertEqual(self.window.pages.count(), 5)
+        self.assertEqual(self.window.pages.count(), 6)
 
         # 验证切换到商品清理 (index=2) 时，当前主视图为 cleaner_page，controls 归属于 enrollment_page 而不在当前视图
         self.window._show_page(2)
@@ -2662,10 +2662,10 @@ class QtUiTests(unittest.TestCase):
         self.assertNotIn("font-size: 22px", APP_QSS)
         self.assertNotIn("font-size: 15px", APP_QSS)
         self.assertIn("font-size: 10pt", APP_QSS)
-        self.assertEqual(product_version(), "2.2.31")
+        self.assertEqual(product_version(), "2.2.46")
 
     def test_version_label_reflects_version(self) -> None:
-        self.assertEqual(self.window.version_label.text(), "v2.2.31")
+        self.assertEqual(self.window.version_label.text(), "v2.2.46")
         self.assertNotIn("0.1.12", self.window.version_label.text())
         self.assertTrue(self.window.statusBar().isHidden())
 
@@ -2677,7 +2677,7 @@ class QtUiTests(unittest.TestCase):
         self.assertEqual(self.window.statusBar().currentMessage(), "")
         self.assertEqual(self.window.statusBar().toolTip(), "")
         self.assertTrue(self.window.version_label.isVisible())
-        self.assertEqual(self.window.version_label.text(), "v2.2.31")
+        self.assertEqual(self.window.version_label.text(), "v2.2.46")
 
     def test_control_groups_are_three_closed_gold_sections(self) -> None:
         sections = self.window.findChildren(QFrame, "controlSection")
@@ -3308,7 +3308,7 @@ class QtUiTests(unittest.TestCase):
 
         # 2. 状态栏彻底隐藏，版本标签置于顶部品牌区
         self.assertTrue(self.window.statusBar().isHidden())
-        self.assertEqual(self.window.version_label.text(), "v2.2.31")
+        self.assertEqual(self.window.version_label.text(), "v2.2.46")
 
         # 3. 设置页面优化：Tab等宽字距、保存置于右上角、无底部多余按键、应用表格明确
         self.assertEqual(self.window.settings_page.tabs.tabText(3), "高  级")
@@ -3503,7 +3503,7 @@ class QtUiTests(unittest.TestCase):
         self.assertIsNotNone(header)
         buttons = [btn for btn in header.findChildren(QPushButton) if btn.objectName() == "nav"]
         button_texts = [btn.text().strip() for btn in buttons]
-        expected_order = ["活动报名", "活动管理", "查  询", "按ID操作", "商品清理", "客服售后", "订单管理", "设  置"]
+        expected_order = ["活动报名", "活动管理", "查  询", "按ID操作", "商品清理", "订单管理", "客服售后", "商品管理", "设  置"]
         self.assertEqual(button_texts, expected_order)
 
     def test_update_dialog_ui_and_cancel(self) -> None:
@@ -3517,7 +3517,7 @@ class QtUiTests(unittest.TestCase):
             asset_size=10485760,
             published_at="2026-10-07T00:00:00Z",
         )
-        dlg = UpdateDialog(info, "2.2.31", parent=self.window)
+        dlg = UpdateDialog(info, "2.2.46", parent=self.window)
         self.assertEqual(dlg.windowTitle(), "软件更新 - 美客多活动管家")
         self.assertIn("自动更新引擎", dlg.notes_edit.toPlainText())
         self.assertTrue(dlg.update_btn.isEnabled())

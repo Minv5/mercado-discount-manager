@@ -205,7 +205,9 @@ def build() -> None:
             print(f"[*] Updating {dest_desktop}...")
             shutil.rmtree(dest_desktop, ignore_errors=True)
             shutil.copytree(app_bundle, dest_desktop, symlinks=True)
+            # Run xattr twice to ensure quarantine flags are fully cleared
             subprocess.run(["xattr", "-cr", str(dest_desktop)], check=False)
+            subprocess.run(["xattr", "-rd", "com.apple.quarantine", str(dest_desktop)], check=False)
         if allow_restart:
             terminate_running_app()
             if desktop_dir_path.exists() and (desktop_dir_path / app_bundle.name).exists():

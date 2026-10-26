@@ -69,12 +69,15 @@ from ui_common import (
     get_placeholder_pixmap,
     label_copy_val,
     load_image_async,
+    make_selectable_label,
     populate_store_combo,
     show_image_preview,
     show_pure_copy_menu,
 )
 from core import SITE_FLAGS, get_store_alias, resolve_store_name
 from theme import COLORS, STATUS_COLORS
+from orders.shipping_audits import get_all_shipping_audits, init_shipping_audits_db, save_shipping_audit
+from orders.zhiying_sync import ZhiyingSyncReceiver
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +125,10 @@ class OrdersFetchWorker(QThread):
         self._cache_map: dict[str, OrderModel] = {}
         self._item_cache: dict[str, dict[str, Any]] = {}
         self._item_cache_lock = threading.Lock()
+        try:
+            self._audits_map: dict[str, str] = get_all_shipping_audits()
+        except Exception:
+            self._audits_map = {}
 
         if cached_orders:
             for o in cached_orders:
@@ -161,6 +168,7 @@ class OrdersFetchWorker(QThread):
         cached_ord = self._cache_map.get(real_oid) or self._cache_map.get(str(raw_item.get("id") or ""))
         if cached_ord:
             cached_status = str(cached_ord.status or "").lower()
+            cached_ship_st = str(cached_ord.shipping.status or "").lower()
             raw_status = str(
                 (sub_orders[0].get("status") if sub_orders and isinstance(sub_orders, list) else None)
                 or raw_item.get("status")
@@ -171,12 +179,9 @@ class OrdersFetchWorker(QThread):
             elif not raw_status and cached_status:
                 raw_status = cached_status
 
-            is_terminal = cached_status in ("delivered", "cancelled")
-            status_matched = (not raw_status) or (raw_status == cached_status)
-            has_tracking = bool(cached_ord.shipping.tracking_number)
-            has_items_pic = all(bool(it.thumbnail) for it in cached_ord.items) if cached_ord.items else True
+            is_terminal = cached_status in ("delivered", "cancelled") or cached_ship_st in ("delivered", "cancelled")
 
-            if is_terminal or (status_matched and has_tracking and has_items_pic):
+            if is_terminal:
                 if store_label and cached_ord.store_name != store_label:
                     cached_ord.store_name = store_label
                 return cached_ord
@@ -334,22 +339,40 @@ class OrdersFetchWorker(QThread):
         # Enrich shipment tracking, dimensions, and actual seller shipping liability
         if ord_model.shipping.shipment_id:
             try:
-                if cached_ord and cached_ord.shipping.tracking_number and cached_ord.shipping.status == ord_model.shipping.status:
+                cached_ship_st = str(cached_ord.shipping.status or "").lower() if cached_ord else ""
+                if cached_ord and cached_ord.shipping.tracking_number and cached_ship_st in ("delivered", "cancelled"):
                     ord_model.shipping.tracking_number = cached_ord.shipping.tracking_number
                     ord_model.shipping.tracking_method = cached_ord.shipping.tracking_method
+                    ord_model.shipping.status = cached_ord.shipping.status
+                    ord_model.shipping.substatus = cached_ord.shipping.substatus
                     ord_model.shipping.dimensions = cached_ord.shipping.dimensions
                     ord_model.shipping.shipping_cost = cached_ord.shipping.shipping_cost
                     ord_model.shipping_cost = cached_ord.shipping_cost
                     ord_model.shipping.handling_hours = cached_ord.shipping.handling_hours
                     ord_model.shipping.estimated_delivery_date = cached_ord.shipping.estimated_delivery_date
                     ord_model.shipping.estimated_delivery_offset = cached_ord.shipping.estimated_delivery_offset
+                    ord_model.shipping.base_shipping_cost = cached_ord.shipping.base_shipping_cost
+                    ord_model.shipping.shipping_adjustment = cached_ord.shipping.shipping_adjustment
+                    ord_model.shipping.shipping_adjustment_reason = cached_ord.shipping.shipping_adjustment_reason
+                    ord_model.shipping.actual_dimensions = cached_ord.shipping.actual_dimensions
                 else:
                     ship_det = self.client.get_marketplace_shipment(aid, ord_model.shipping.shipment_id)
                     if ship_det:
-                        ord_model.shipping.tracking_number = str(ship_det.get("tracking_number") or ord_model.shipping.tracking_number or "")
-                        ord_model.shipping.tracking_method = str(ship_det.get("tracking_method") or ord_model.shipping.tracking_method or "")
-                        if not ord_model.shipping.status or ord_model.shipping.status == "paid":
-                            ord_model.shipping.status = str(ship_det.get("status") or ord_model.shipping.status)
+                        if ship_det.get("tracking_number"):
+                            ord_model.shipping.tracking_number = str(ship_det["tracking_number"])
+                        elif cached_ord and cached_ord.shipping.tracking_number:
+                            ord_model.shipping.tracking_number = cached_ord.shipping.tracking_number
+
+                        if ship_det.get("tracking_method"):
+                            ord_model.shipping.tracking_method = str(ship_det["tracking_method"])
+                        elif cached_ord and cached_ord.shipping.tracking_method:
+                            ord_model.shipping.tracking_method = cached_ord.shipping.tracking_method
+
+                        if ship_det.get("status"):
+                            ord_model.shipping.status = str(ship_det["status"])
+                        if ship_det.get("substatus"):
+                            ord_model.shipping.substatus = str(ship_det["substatus"])
+
                         if not ord_model.shipping.estimated_handling_limit:
                             ship_limit = str(
                                 (ship_det.get("estimated_handling_limit") or {}).get("date")
@@ -361,6 +384,9 @@ class OrdersFetchWorker(QThread):
                         dims = ship_det.get("dimensions") or ship_det.get("shipping_dimensions")
                         if dims:
                             ord_model.shipping.dimensions = format_dimensions_display(dims)
+                        elif cached_ord and cached_ord.shipping.dimensions:
+                            ord_model.shipping.dimensions = cached_ord.shipping.dimensions
+
                         lead_time = ship_det.get("lead_time") or {}
                         est_del = lead_time.get("estimated_delivery_time") or {}
                         handling_val = est_del.get("handling")
@@ -387,19 +413,43 @@ class OrdersFetchWorker(QThread):
                         elif cost_type == "not_free":
                             seller_ship_cost = 0.0
 
+                        base_ship_cost = seller_ship_cost
+                        adj_ship_cost = 0.0
+                        adj_reason = ""
+
                         try:
                             costs_det = self.client.get_marketplace_shipment_costs(aid, ord_model.shipping.shipment_id)
                             if isinstance(costs_det, dict) and "senders" in costs_det:
                                 senders = costs_det.get("senders") or []
-                                if senders and isinstance(senders[0], dict) and "cost" in senders[0]:
-                                    seller_ship_cost = float(senders[0]["cost"] or 0.0)
+                                if senders and isinstance(senders[0], dict):
+                                    if "cost" in senders[0]:
+                                        base_ship_cost = float(senders[0]["cost"] or 0.0)
+                                    compensations = senders[0].get("compensations") or []
+                                    if compensations:
+                                        adj_ship_cost = round(sum(float(c.get("amount") or 0.0) for c in compensations), 2)
+                                        comp_reasons = [str(c.get("reason") or c.get("comment") or "") for c in compensations]
+                                        if any("dimension" in r.lower() for r in comp_reasons):
+                                            adj_reason = "尺寸/重量差异"
+                                        elif comp_reasons and comp_reasons[0]:
+                                            adj_reason = comp_reasons[0]
+                                        else:
+                                            adj_reason = "运费调整"
                         except Exception:
                             pass
 
-                        ord_model.shipping.shipping_cost = seller_ship_cost
-                        ord_model.shipping_cost = seller_ship_cost
+                        final_ship_cost = round(base_ship_cost + adj_ship_cost, 2)
+                        ord_model.shipping.base_shipping_cost = base_ship_cost
+                        ord_model.shipping.shipping_adjustment = adj_ship_cost
+                        ord_model.shipping.shipping_adjustment_reason = adj_reason
+                        ord_model.shipping.shipping_cost = final_ship_cost
+                        ord_model.shipping_cost = final_ship_cost
             except Exception:
                 pass
+
+        if hasattr(self, "_audits_map") and self._audits_map and not ord_model.shipping.actual_dimensions:
+            aud = self._audits_map.get(ord_model.order_id) or self._audits_map.get(ord_model.shipping.shipment_id)
+            if aud:
+                ord_model.shipping.actual_dimensions = aud
 
         if ord_model.order_id:
             self._cache_map[ord_model.order_id] = ord_model
@@ -475,7 +525,8 @@ class OrdersFetchWorker(QThread):
                 sub_orders = raw_item.get("orders") or []
                 real_oid = str(sub_orders[0].get("id") if sub_orders and isinstance(sub_orders, list) else "") or str(raw_item.get("id") or "")
                 cached = self._cache_map.get(real_oid) or self._cache_map.get(str(raw_item.get("id") or ""))
-                if cached and (cached.status in ("delivered", "cancelled") or (cached.shipping.tracking_number and cached.items and all(it.thumbnail for it in cached.items))):
+                cached_ship_st = str(cached.shipping.status or "").lower() if cached else ""
+                if cached and (cached.status in ("delivered", "cancelled") or cached_ship_st in ("delivered", "cancelled")):
                     orders_by_id[cached.order_id] = cached
                     continue
                 to_enrich.append(item)
@@ -726,8 +777,9 @@ class OrdersPage(QWidget):
 
     oauthExpired = Signal(str, str)
     contactBuyerRequested = Signal(object)
+    zhiyingPacketReceived = Signal()
 
-    def __init__(self, client: MercadoClient, auth_mgr: AuthManager, parent: QWidget | None = None):
+    def __init__(self, client: MercadoClient, auth_mgr: AuthManager, parent: QWidget | None = None, enable_sync_receiver: bool = True):
         super().__init__(parent)
         self.client = client
         self.auth_mgr = auth_mgr
@@ -743,6 +795,12 @@ class OrdersPage(QWidget):
         self._current_status_filter = "ALL"
         self._current_time_filter = "ALL"
         self._list_sla_badges: dict[str, tuple[QLabel, OrderModel]] = {}
+
+        self._zhiying_receiver: ZhiyingSyncReceiver | None = None
+        if enable_sync_receiver and not os.environ.get("PYTEST_CURRENT_TEST"):
+            self.zhiyingPacketReceived.connect(self._on_zhiying_sync_packet)
+            self._zhiying_receiver = ZhiyingSyncReceiver(on_packet=lambda _pkg: self.zhiyingPacketReceived.emit())
+            self._zhiying_receiver.start()
 
         self._build_ui()
         self._load_local_snapshot()
@@ -799,6 +857,16 @@ class OrdersPage(QWidget):
                         if o.order_id:
                             orders.append(o)
                 if orders:
+                    try:
+                        audits_map = get_all_shipping_audits()
+                        if audits_map:
+                            for o in orders:
+                                if not o.shipping.actual_dimensions:
+                                    aud = audits_map.get(o.order_id) or audits_map.get(o.shipping.shipment_id)
+                                    if aud:
+                                        o.shipping.actual_dimensions = aud
+                    except Exception:
+                        pass
                     orders.sort(key=lambda x: x.created_timestamp, reverse=True)
                     self._all_orders = orders
                     self._apply_filters()
@@ -1116,18 +1184,11 @@ class OrdersPage(QWidget):
                 color: #D4AF37;
             }
         """)
-        self.det_order_id_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.det_order_id_lbl.setToolTip("点击或右键复制纯订单号")
-        self.det_order_id_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.det_order_id_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.det_order_id_lbl.customContextMenuRequested.connect(
-            lambda pos: show_pure_copy_menu(
-                self.det_order_id_lbl,
-                pos,
-                lambda: label_copy_val(self.det_order_id_lbl, self._current_order.order_id if self._current_order else "")
-            )
+        make_selectable_label(
+            self.det_order_id_lbl,
+            fallback_getter=lambda: self._current_order.order_id if self._current_order else "",
+            tooltip="鼠标选择即可复制 (或右键/快捷键复制纯订单号)",
         )
-        self.det_order_id_lbl.mousePressEvent = lambda e: copy_pure_text(self._current_order.order_id if self._current_order else "") if e.button() == Qt.MouseButton.LeftButton else None
         ov_mid.addWidget(self.det_order_id_lbl)
 
         ov_mid.addStretch()
@@ -1179,6 +1240,7 @@ class OrdersPage(QWidget):
         lbl_t2.setToolTip("美客多平台销售佣金/手续费（Sale Fee）")
         self.det_fee_sale_val = QLabel("-USD 0.00")
         self.det_fee_sale_val.setStyleSheet("color: #FB923C; font-size: 14px; font-weight: bold;")
+        make_selectable_label(self.det_fee_sale_val, fallback_getter=lambda: label_copy_val(self.det_fee_sale_val))
         b_fee_lay.addWidget(lbl_t2)
         b_fee_lay.addWidget(self.det_fee_sale_val)
         grid_row.addWidget(box_fee)
@@ -1194,8 +1256,16 @@ class OrdersPage(QWidget):
         lbl_t3.setToolTip("官方物流运单登记运费（卖家包邮承担）")
         self.det_fee_ship_val = QLabel("-USD 0.00")
         self.det_fee_ship_val.setStyleSheet("color: #818CF8; font-size: 14px; font-weight: bold;")
+        make_selectable_label(self.det_fee_ship_val, fallback_getter=lambda: label_copy_val(self.det_fee_ship_val))
         b_ship_lay.addWidget(lbl_t3)
         b_ship_lay.addWidget(self.det_fee_ship_val)
+
+        self.det_fee_ship_adj_lbl = QLabel("")
+        self.det_fee_ship_adj_lbl.setStyleSheet("color: #F87171; font-size: 10px; font-weight: 500;")
+        self.det_fee_ship_adj_lbl.setVisible(False)
+        make_selectable_label(self.det_fee_ship_adj_lbl, fallback_getter=lambda: label_copy_val(self.det_fee_ship_adj_lbl))
+        b_ship_lay.addWidget(self.det_fee_ship_adj_lbl)
+
         grid_row.addWidget(box_ship)
 
         # Box 3: 预估净结余
@@ -1209,14 +1279,19 @@ class OrdersPage(QWidget):
         lbl_t4.setToolTip("扣除佣金手续费与物流运费后的实际到手利润（自动折合人民币）")
         self.det_fee_net_val = QLabel("USD 0.00 (约 ¥0.00)")
         self.det_fee_net_val.setStyleSheet("color: #FCD34D; font-size: 14px; font-weight: bold;")
+        make_selectable_label(self.det_fee_net_val, fallback_getter=lambda: label_copy_val(self.det_fee_net_val))
         b_net_lay.addWidget(lbl_t4)
         b_net_lay.addWidget(self.det_fee_net_val)
         grid_row.addWidget(box_net)
 
         pay_layout.addLayout(grid_row)
 
+        self.det_shipping_adj_banner = QLabel("")
+        self.det_shipping_adj_banner.setVisible(False)
+
         self.det_pay_detail_lbl = QLabel("支付方式: - · 支付流水号: -")
         self.det_pay_detail_lbl.setStyleSheet("color: #A8A29E; font-size: 11px;")
+        make_selectable_label(self.det_pay_detail_lbl, fallback_getter=lambda: label_copy_val(self.det_pay_detail_lbl))
         pay_layout.addWidget(self.det_pay_detail_lbl)
 
         self.detail_layout.addWidget(self.payment_card)
@@ -1267,49 +1342,64 @@ class OrdersPage(QWidget):
         )
         ship_layout.addWidget(self.det_ship_meta_lbl)
 
-        # Shipment and Pack ID Chips
-        ship_chips_layout = QHBoxLayout()
-        ship_chips_layout.setSpacing(12)
+        # Row 1: Package Number & Tracking Number Chips
+        ship_row1 = QHBoxLayout()
+        ship_row1.setSpacing(14)
 
         self.det_pack_chip = QLabel("包裹号: -")
         self.det_pack_chip.setStyleSheet("color: #A8A29E; font-size: 11px;")
-        self.det_pack_chip.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.det_pack_chip.setToolTip("点击或右键复制纯包裹号")
-        self.det_pack_chip.mousePressEvent = lambda e: copy_pure_text(self._current_order.pack_id if self._current_order else "") if e.button() == Qt.MouseButton.LeftButton else None
-        self.det_pack_chip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.det_pack_chip.customContextMenuRequested.connect(
-            lambda pos: show_pure_copy_menu(
-                self.det_pack_chip, pos, lambda: self._current_order.pack_id if self._current_order else ""
-            )
+        make_selectable_label(
+            self.det_pack_chip,
+            fallback_getter=lambda: self._current_order.pack_id if self._current_order else "",
+            tooltip="鼠标选择即可复制 (或右键/快捷键复制纯包裹号)",
         )
-        ship_chips_layout.addWidget(self.det_pack_chip)
+        ship_row1.addWidget(self.det_pack_chip)
 
         self.det_track_chip = QLabel("运单号: -")
         self.det_track_chip.setStyleSheet("color: #A8A29E; font-size: 11px;")
-        self.det_track_chip.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.det_track_chip.setToolTip("点击或右键复制纯运单号")
-        self.det_track_chip.mousePressEvent = lambda e: copy_pure_text(self._current_order.shipping.tracking_number if self._current_order else "") if e.button() == Qt.MouseButton.LeftButton else None
-        self.det_track_chip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.det_track_chip.customContextMenuRequested.connect(
-            lambda pos: show_pure_copy_menu(
-                self.det_track_chip, pos, lambda: self._current_order.shipping.tracking_number if self._current_order else ""
-            )
+        make_selectable_label(
+            self.det_track_chip,
+            fallback_getter=lambda: self._current_order.shipping.tracking_number if self._current_order else "",
+            tooltip="鼠标选择即可复制 (或右键/快捷键复制纯运单号)",
         )
-        ship_chips_layout.addWidget(self.det_track_chip)
+        ship_row1.addWidget(self.det_track_chip)
+        ship_row1.addStretch()
+        ship_layout.addLayout(ship_row1)
+
+        # Row 2: Declared Packaging Dimensions & Audited Secondary Dimensions Badge
+        ship_row2 = QHBoxLayout()
+        ship_row2.setSpacing(10)
 
         self.det_dimensions_chip = QLabel("📦 出单包装尺重: -")
         self.det_dimensions_chip.setStyleSheet("color: #A8A29E; font-size: 11px;")
-        self.det_dimensions_chip.setToolTip("出单时系统锁定的运单包装尺重（运费核算依据）")
-        self.det_dimensions_chip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.det_dimensions_chip.customContextMenuRequested.connect(
-            lambda pos: show_pure_copy_menu(
-                self.det_dimensions_chip, pos, lambda: label_copy_val(self.det_dimensions_chip)
-            )
+        make_selectable_label(
+            self.det_dimensions_chip,
+            fallback_getter=lambda: label_copy_val(self.det_dimensions_chip),
+            tooltip="出单时系统锁定的运单包装尺重（鼠标选择即可复制）",
         )
-        ship_chips_layout.addWidget(self.det_dimensions_chip)
+        ship_row2.addWidget(self.det_dimensions_chip)
 
-        ship_chips_layout.addStretch()
-        ship_layout.addLayout(ship_chips_layout)
+        self.det_actual_dimensions_chip = QLabel("")
+        self.det_actual_dimensions_chip.setStyleSheet("""
+            QLabel {
+                color: #60A5FA;
+                font-size: 11px;
+                font-weight: 600;
+                background: rgba(59, 130, 246, 0.15);
+                border: 1px solid rgba(59, 130, 246, 0.4);
+                border-radius: 4px;
+                padding: 2px 8px;
+            }
+        """)
+        self.det_actual_dimensions_chip.setVisible(False)
+        make_selectable_label(
+            self.det_actual_dimensions_chip,
+            fallback_getter=lambda: label_copy_val(self.det_actual_dimensions_chip),
+            tooltip="官方实测复重（鼠标选择即可复制）",
+        )
+        ship_row2.addWidget(self.det_actual_dimensions_chip)
+        ship_row2.addStretch()
+        ship_layout.addLayout(ship_row2)
 
         self.detail_layout.addWidget(self.shipping_card)
 
@@ -1356,44 +1446,36 @@ class OrdersPage(QWidget):
 
         self.det_buyer_info_lbl = QLabel("收件人: - · 电话: -")
         self.det_buyer_info_lbl.setStyleSheet("color: #E6E2D8; font-size: 12px;")
-        self.det_buyer_info_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        make_selectable_label(
+            self.det_buyer_info_lbl,
+            fallback_getter=lambda: label_copy_val(
+                self.det_buyer_info_lbl,
+                f"收件人: {self._current_order.shipping.receiver_name or '-'} · 电话: {self._current_order.shipping.receiver_phone or '-'}" if self._current_order else ""
+            ),
+            tooltip="鼠标选择即可复制 (或右键/快捷键复制)",
+        )
         addr_layout.addWidget(self.det_buyer_info_lbl)
 
         self.det_address_lbl = QLabel("详细地址: -")
         self.det_address_lbl.setWordWrap(True)
         self.det_address_lbl.setStyleSheet("color: #C8C3B7; font-size: 12px; line-height: 1.4;")
-        self.det_address_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        make_selectable_label(
+            self.det_address_lbl,
+            fallback_getter=lambda: label_copy_val(
+                self.det_address_lbl,
+                self._current_order.shipping.full_address if self._current_order else ""
+            ),
+            tooltip="鼠标选择即可复制 (或右键/快捷键复制详细地址)",
+        )
         addr_layout.addWidget(self.det_address_lbl)
 
-        # Enable right-click pure "复制" menu
+        # Enable right-click pure "复制" menu on address card
         self.address_card.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.address_card.customContextMenuRequested.connect(
             lambda pos: show_pure_copy_menu(
                 self.address_card,
                 pos,
                 lambda: self._get_full_shipping_text()
-            )
-        )
-        self.det_buyer_info_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.det_buyer_info_lbl.customContextMenuRequested.connect(
-            lambda pos: show_pure_copy_menu(
-                self.det_buyer_info_lbl,
-                pos,
-                lambda: label_copy_val(
-                    self.det_buyer_info_lbl,
-                    f"收件人: {self._current_order.shipping.receiver_name or '-'} · 电话: {self._current_order.shipping.receiver_phone or '-'}" if self._current_order else ""
-                )
-            )
-        )
-        self.det_address_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.det_address_lbl.customContextMenuRequested.connect(
-            lambda pos: show_pure_copy_menu(
-                self.det_address_lbl,
-                pos,
-                lambda: label_copy_val(
-                    self.det_address_lbl,
-                    self._current_order.shipping.full_address if self._current_order else ""
-                )
             )
         )
 
@@ -1732,12 +1814,14 @@ class OrdersPage(QWidget):
             """)
             sku_chip.setMinimumWidth(0)
             sku_chip.setCursor(Qt.CursorShape.PointingHandCursor)
-            sku_chip.setToolTip(f"点击或右键复制纯SKU: {sku_val}")
-            sku_chip.mousePressEvent = lambda e, s=sku_val: copy_pure_text(s) if e.button() == Qt.MouseButton.LeftButton else None
-            sku_chip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            sku_chip.customContextMenuRequested.connect(
-                lambda pos, s=sku_val, w=sku_chip: show_pure_copy_menu(w, pos, lambda: s)
-            )
+            orig_sku_press = getattr(sku_chip, "mousePressEvent", None)
+            def _on_sku_press(e, s=sku_val):
+                if e.button() == Qt.MouseButton.LeftButton:
+                    copy_pure_text(s)
+                if callable(orig_sku_press):
+                    orig_sku_press(e)
+            sku_chip.mousePressEvent = _on_sku_press
+            make_selectable_label(sku_chip, fallback_getter=lambda s=sku_val: s, tooltip=f"鼠标选择即可复制 (或右键复制纯SKU: {sku_val})")
             row3.addWidget(sku_chip)
 
         lbl_price = QLabel(amt_text)
@@ -1775,16 +1859,18 @@ class OrdersPage(QWidget):
             """)
             var_chip.setMinimumWidth(0)
             var_chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            orig_var_press = getattr(var_chip, "mousePressEvent", None)
+            def _on_var_press(e, v=zh_var_attrs):
+                if e.button() == Qt.MouseButton.LeftButton:
+                    copy_pure_text(v)
+                if callable(orig_var_press):
+                    orig_var_press(e)
+            var_chip.mousePressEvent = _on_var_press
             tooltip_text = f"规格属性: {zh_var_attrs}"
             if zh_var_attrs != var_attrs:
                 tooltip_text += f"\n原规格: {var_attrs}"
-            tooltip_text += " (点击复制中文规格，右键复制)"
-            var_chip.setToolTip(tooltip_text)
-            var_chip.mousePressEvent = lambda e, v=zh_var_attrs: copy_pure_text(v) if e.button() == Qt.MouseButton.LeftButton else None
-            var_chip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            var_chip.customContextMenuRequested.connect(
-                lambda pos, v=zh_var_attrs, w=var_chip: show_pure_copy_menu(w, pos, lambda: v)
-            )
+            tooltip_text += " (鼠标选择即可复制，右键复制)"
+            make_selectable_label(var_chip, fallback_getter=lambda v=zh_var_attrs: v, tooltip=tooltip_text)
             row3.addWidget(var_chip)
         else:
             single_chip = QLabel("标准单品")
@@ -1800,6 +1886,22 @@ class OrdersPage(QWidget):
             """)
             single_chip.setToolTip("该商品在平台为标准单品，无多变体规格")
             row3.addWidget(single_chip)
+
+        if order.has_shipping_adjustment:
+            adj_chip = QLabel("⚠️ 运费调整")
+            adj_chip.setStyleSheet("""
+                QLabel {
+                    color: #F87171;
+                    font-size: 10px;
+                    font-weight: 500;
+                    background: rgba(239, 68, 68, 0.15);
+                    border: 1px solid rgba(239, 68, 68, 0.35);
+                    border-radius: 3px;
+                    padding: 1px 4px;
+                }
+            """)
+            adj_chip.setToolTip(f"{order.shipping_adjustment_text}\n点击查看订单明细")
+            row3.addWidget(adj_chip)
 
         row3.addStretch(1)
         info_layout.addLayout(row3)
@@ -2077,10 +2179,14 @@ class OrdersPage(QWidget):
                     }
                 """)
                 id_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-                id_lbl.setToolTip("点击或右键复制商品编号")
-                id_lbl.mousePressEvent = lambda e, iid=it.item_id: copy_pure_text(iid) if e.button() == Qt.MouseButton.LeftButton else None
-                id_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-                id_lbl.customContextMenuRequested.connect(lambda pos, iid=it.item_id, w=id_lbl: show_pure_copy_menu(w, pos, lambda: iid))
+                orig_id_press = getattr(id_lbl, "mousePressEvent", None)
+                def _on_id_press(e, iid=it.item_id):
+                    if e.button() == Qt.MouseButton.LeftButton:
+                        copy_pure_text(iid)
+                    if callable(orig_id_press):
+                        orig_id_press(e)
+                id_lbl.mousePressEvent = _on_id_press
+                make_selectable_label(id_lbl, fallback_getter=lambda iid=it.item_id: iid, tooltip="点击或右键复制商品编号 (鼠标选择即可复制)")
                 meta_h.addWidget(id_lbl)
 
             if it.sku:
@@ -2100,10 +2206,7 @@ class OrdersPage(QWidget):
                     }
                 """)
                 s_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-                s_lbl.setToolTip("点击或右键复制SKU")
-                s_lbl.mousePressEvent = lambda e, s=it.sku: copy_pure_text(s) if e.button() == Qt.MouseButton.LeftButton else None
-                s_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-                s_lbl.customContextMenuRequested.connect(lambda pos, s=it.sku, w=s_lbl: show_pure_copy_menu(w, pos, lambda: s))
+                make_selectable_label(s_lbl, fallback_getter=lambda s=it.sku: s, tooltip="鼠标选择即可复制 (或右键复制SKU)")
                 meta_h.addWidget(s_lbl)
 
             if it.variation_attributes:
@@ -2128,11 +2231,8 @@ class OrdersPage(QWidget):
                 det_tip = f"规格属性: {zh_va}"
                 if zh_va != it.variation_attributes:
                     det_tip += f"\n原规格: {it.variation_attributes}"
-                det_tip += " (点击复制中文规格，右键复制)"
-                v_lbl.setToolTip(det_tip)
-                v_lbl.mousePressEvent = lambda e, va=zh_va: copy_pure_text(va) if e.button() == Qt.MouseButton.LeftButton else None
-                v_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-                v_lbl.customContextMenuRequested.connect(lambda pos, va=zh_va, w=v_lbl: show_pure_copy_menu(w, pos, lambda: va))
+                det_tip += " (鼠标选择即可复制，右键复制)"
+                make_selectable_label(v_lbl, fallback_getter=lambda va=zh_va: va, tooltip=det_tip)
                 meta_h.addWidget(v_lbl)
             else:
                 v_lbl = QLabel("标准单品")
@@ -2214,6 +2314,40 @@ class OrdersPage(QWidget):
         dim_text = order.shipping.dimensions or "未记录"
         self.det_dimensions_chip.setText(f"📦 出单包装尺重: {dim_text}")
 
+        if hasattr(self, "det_actual_dimensions_chip"):
+            if order.shipping.actual_dimensions:
+                self.det_actual_dimensions_chip.setText(f"⚖️ 官方实测复重: {order.shipping.actual_dimensions}")
+                self.det_actual_dimensions_chip.setStyleSheet("""
+                    QLabel {
+                        color: #60A5FA;
+                        font-size: 11px;
+                        font-weight: 600;
+                        background: rgba(59, 130, 246, 0.15);
+                        border: 1px solid rgba(59, 130, 246, 0.4);
+                        border-radius: 4px;
+                        padding: 2px 8px;
+                    }
+                """)
+                self.det_actual_dimensions_chip.setToolTip("集运仓 DWS 自动化设备扫码实测数据（长宽高及物理实重）")
+                self.det_actual_dimensions_chip.setVisible(True)
+            elif order.has_shipping_adjustment:
+                self.det_actual_dimensions_chip.setText(f"⚠️ 官方复测超标 (产生运费补扣 +${order.shipping.shipping_adjustment:g})")
+                self.det_actual_dimensions_chip.setStyleSheet("""
+                    QLabel {
+                        color: #F87171;
+                        font-size: 11px;
+                        font-weight: 500;
+                        background: rgba(239, 68, 68, 0.12);
+                        border: 1px solid rgba(239, 68, 68, 0.35);
+                        border-radius: 4px;
+                        padding: 2px 8px;
+                    }
+                """)
+                self.det_actual_dimensions_chip.setToolTip(f"该包裹在集运仓复测超标，官方产生运费调整补扣 +${order.shipping.shipping_adjustment:g}")
+                self.det_actual_dimensions_chip.setVisible(True)
+            else:
+                self.det_actual_dimensions_chip.setVisible(False)
+
         # Payments & Financial Breakdown
         paid_val = order.paid_amount if order.paid_amount > 0 else order.total_amount
         cur = order.currency_id or "USD"
@@ -2232,6 +2366,18 @@ class OrdersPage(QWidget):
             self.det_fee_ship_val.setText(f"-{cur} {ship_val:.2f}")
         else:
             self.det_fee_ship_val.setText("免运费/未记录")
+
+        if hasattr(self, "det_fee_ship_adj_lbl"):
+            if order.has_shipping_adjustment:
+                b = order.shipping.base_shipping_cost or round(order.effective_shipping_cost - order.shipping.shipping_adjustment, 2)
+                self.det_fee_ship_adj_lbl.setText(f"原 ${b:g} + 补扣 +${order.shipping.shipping_adjustment:g}")
+                self.det_fee_ship_adj_lbl.setToolTip(f"原始出单运费: ${b:g}，因复测超标补扣 ${order.shipping.shipping_adjustment:g}")
+                self.det_fee_ship_adj_lbl.setVisible(True)
+            else:
+                self.det_fee_ship_adj_lbl.setVisible(False)
+
+        if hasattr(self, "det_shipping_adj_banner"):
+            self.det_shipping_adj_banner.setVisible(False)
 
         # Estimated net profit with RMB conversion
         net_val = order.estimated_net_profit
@@ -2339,6 +2485,15 @@ class OrdersPage(QWidget):
         self.det_pack_chip.setText("包裹号: -")
         self.det_track_chip.setText("运单号: -")
         self.det_dimensions_chip.setText("📦 出单包装尺重: -")
+        if hasattr(self, "det_actual_dimensions_chip"):
+            self.det_actual_dimensions_chip.setText("")
+            self.det_actual_dimensions_chip.setVisible(False)
+        if hasattr(self, "det_fee_ship_adj_lbl"):
+            self.det_fee_ship_adj_lbl.setText("")
+            self.det_fee_ship_adj_lbl.setVisible(False)
+        if hasattr(self, "det_shipping_adj_banner"):
+            self.det_shipping_adj_banner.setText("")
+            self.det_shipping_adj_banner.setVisible(False)
         self.det_fee_paid_val.setText("USD 0.00")
         self.det_fee_sale_val.setText("-USD 0.00")
         self.det_fee_ship_val.setText("-USD 0.00")
@@ -2469,8 +2624,33 @@ class OrdersPage(QWidget):
             except Exception:
                 pass
 
+    def _on_zhiying_sync_packet(self) -> None:
+        """Handle incoming Zhiying sync packet on Qt GUI thread."""
+        try:
+            audits_map = get_all_shipping_audits()
+            if not audits_map:
+                return
+            updated_any = False
+            for o in self._all_orders:
+                aud = audits_map.get(o.order_id) or audits_map.get(o.shipping.shipment_id)
+                if aud and o.shipping.actual_dimensions != aud:
+                    o.shipping.actual_dimensions = aud
+                    updated_any = True
+            if updated_any and self._current_order:
+                cur_aud = audits_map.get(self._current_order.order_id) or audits_map.get(self._current_order.shipping.shipment_id)
+                if cur_aud:
+                    self._current_order.shipping.actual_dimensions = cur_aud
+                    self._render_order_details(self._current_order)
+        except Exception as e:
+            logger.debug("Failed to handle zhiying sync packet update: %s", e)
+
     def stop(self) -> None:
         """Safely stop any ongoing background workers on application close."""
+        if hasattr(self, "_zhiying_receiver") and self._zhiying_receiver:
+            try:
+                self._zhiying_receiver.stop()
+            except Exception:
+                pass
         if hasattr(self, "_countdown_timer") and self._countdown_timer.isActive():
             self._countdown_timer.stop()
         if self._worker and self._worker.isRunning():

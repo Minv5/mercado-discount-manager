@@ -11,11 +11,13 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
+from ui_common.clipboard import copy_pixmap, make_selectable_label
 from ui_common.image_cache import load_image_async
 
 
@@ -54,6 +56,7 @@ class ImagePreviewDialog(QDialog):
 
         self._current_index = max(0, min(initial_index, len(self._images) - 1)) if self._images else 0
         self._base_title = title
+        self._current_pixmap: QPixmap | None = None
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(16, 16, 16, 16)
@@ -67,6 +70,8 @@ class ImagePreviewDialog(QDialog):
                 border-radius: 12px;
             }
         """)
+        self.card.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.card.customContextMenuRequested.connect(self._show_card_context_menu)
         card_layout = QVBoxLayout(self.card)
         card_layout.setContentsMargins(18, 14, 18, 16)
         card_layout.setSpacing(12)
@@ -74,6 +79,7 @@ class ImagePreviewDialog(QDialog):
         hdr = QHBoxLayout()
         self.title_lbl = QLabel(title)
         self.title_lbl.setStyleSheet("color: #F6F3EA; font-size: 14px; font-weight: bold; background: transparent; border: none;")
+        make_selectable_label(self.title_lbl)
         hdr.addWidget(self.title_lbl, 1)
 
         # Counter / page indicator chip
@@ -158,6 +164,10 @@ class ImagePreviewDialog(QDialog):
         self.img_lbl = QLabel("正在加载高清大图...")
         self.img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.img_lbl.setStyleSheet("background: #121614; color: #C8C3B7; font-size: 13px; border: 1px solid #333333; border-radius: 8px;")
+        self.img_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.img_lbl.setToolTip("右键或快捷键 Ctrl/Cmd+C 复制图片")
+        self.img_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.img_lbl.customContextMenuRequested.connect(self._show_image_context_menu)
         preview_row.addWidget(self.img_lbl, 1)
 
         # Right / Next Button
@@ -207,6 +217,7 @@ class ImagePreviewDialog(QDialog):
     def set_pixmap(self, pixmap: QPixmap) -> None:
         if pixmap.isNull():
             return
+        self._current_pixmap = pixmap
         if pixmap.width() > 900 or pixmap.height() > 650:
             scaled = pixmap.scaled(
                 QSize(860, 600),
@@ -218,8 +229,81 @@ class ImagePreviewDialog(QDialog):
         self.img_lbl.setText("")
         self.img_lbl.setPixmap(scaled)
 
+    def copy_current_image(self) -> bool:
+        """Copy current high-resolution image to system clipboard."""
+        pix = self._current_pixmap
+        if not pix or pix.isNull():
+            pix = self.img_lbl.pixmap()
+        if pix and not pix.isNull():
+            copy_pixmap(pix)
+            return True
+        return False
+
+    def _show_image_context_menu(self, pos: QPoint) -> None:
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #1F2421;
+                color: #F6F3EA;
+                border: 1px solid #4E472F;
+                border-radius: 6px;
+                padding: 4px 0;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+            }
+            QMenu::item:selected {
+                background-color: #2D3A30;
+                color: #FBBF24;
+            }
+        """)
+        act = menu.addAction("复制图片")
+        has_img = bool(
+            (self._current_pixmap and not self._current_pixmap.isNull())
+            or (self.img_lbl.pixmap() and not self.img_lbl.pixmap().isNull())
+        )
+        act.setEnabled(has_img)
+        act.triggered.connect(self.copy_current_image)
+        menu.exec(self.img_lbl.mapToGlobal(pos))
+
+    def _show_card_context_menu(self, pos: QPoint) -> None:
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #1F2421;
+                color: #F6F3EA;
+                border: 1px solid #4E472F;
+                border-radius: 6px;
+                padding: 4px 0;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+            }
+            QMenu::item:selected {
+                background-color: #2D3A30;
+                color: #FBBF24;
+            }
+        """)
+        act = menu.addAction("复制图片")
+        has_img = bool(
+            (self._current_pixmap and not self._current_pixmap.isNull())
+            or (self.img_lbl.pixmap() and not self.img_lbl.pixmap().isNull())
+        )
+        act.setEnabled(has_img)
+        act.triggered.connect(self.copy_current_image)
+        menu.exec(self.card.mapToGlobal(pos))
+
     def keyPressEvent(self, event) -> None:
         key = event.key()
+        modifiers = event.modifiers()
+        # Handle Ctrl+C (Windows/Linux) or Cmd+C (macOS)
+        if key == Qt.Key.Key_C and (
+            modifiers & Qt.KeyboardModifier.ControlModifier
+            or modifiers & Qt.KeyboardModifier.MetaModifier
+        ):
+            if self.copy_current_image():
+                event.accept()
+                return
         if key in (Qt.Key.Key_Escape, Qt.Key.Key_Return, Qt.Key.Key_Space):
             self.close()
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_A, Qt.Key.Key_PageUp):
@@ -244,6 +328,7 @@ class ImagePreviewDialog(QDialog):
     def _load_current_image(self) -> None:
         if not self._images:
             return
+        self._current_pixmap = None
         total = len(self._images)
         self.counter_lbl.setText(f"{self._current_index + 1} / {total}")
         self.counter_lbl.setVisible(total > 1)

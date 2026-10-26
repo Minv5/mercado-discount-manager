@@ -33,6 +33,10 @@ def copy_pixmap(pixmap: QPixmap) -> None:
         clipboard = QApplication.clipboard()
         if clipboard:
             clipboard.setPixmap(pixmap)
+            try:
+                clipboard.setImage(pixmap.toImage())
+            except Exception:
+                pass
 
 
 def extract_copyable_text(widget: QWidget | None, fallback: str = "") -> str:
@@ -94,15 +98,32 @@ def show_pure_copy_menu(
         action_text: Text for the copy menu item, defaults to '复制'.
     """
     val = None
-    if callable(getter):
-        try:
-            val = getter()
-        except Exception:
-            val = None
-    elif getter is not None:
-        val = getter
-    else:
-        val = extract_copyable_text(parent)
+
+    # Priority 1: Check if parent or any child widget has text selected with mouse
+    if isinstance(parent, QLabel) and parent.hasSelectedText():
+        val = parent.selectedText().strip()
+    elif isinstance(parent, (QTextEdit, QLineEdit)):
+        sel = extract_copyable_text(parent)
+        if sel and sel != str(getattr(parent, "text", getattr(parent, "toPlainText", lambda: ""))()).strip():
+            val = sel
+    elif isinstance(parent, QWidget):
+        for child in parent.findChildren(QLabel):
+            if child.hasSelectedText():
+                val = child.selectedText().strip()
+                if val:
+                    break
+
+    # Priority 2: Fallback to getter or clean widget text
+    if not val:
+        if callable(getter):
+            try:
+                val = getter()
+            except Exception:
+                val = None
+        elif getter is not None:
+            val = getter
+        else:
+            val = extract_copyable_text(parent)
 
     if val is None or val == "":
         return None
@@ -127,6 +148,66 @@ def show_pure_copy_menu(
     if chosen == act:
         _do_copy()
     return menu
+
+
+def make_selectable_label(
+    lbl: QLabel,
+    fallback_getter: Callable[[], str] | str | None = None,
+    tooltip: str = "鼠标选择即可复制 (或右键/快捷键复制)",
+) -> None:
+    """Configure a QLabel so that mouse selection automatically copies selected text.
+
+    - Enables TextSelectableByMouse | TextSelectableByKeyboard
+    - Sets tooltip explaining mouse selection copy
+    - On mouse release with selection: copies exact highlighted text
+    - On right-click: copies highlighted text if any, else fallback or clean text
+    """
+    lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+    if tooltip:
+        lbl.setToolTip(tooltip)
+
+    orig_release = getattr(lbl, "mouseReleaseEvent", None)
+
+    def _on_mouse_release(event):
+        if callable(orig_release):
+            try:
+                orig_release(event)
+            except Exception:
+                pass
+        else:
+            try:
+                QLabel.mouseReleaseEvent(lbl, event)
+            except Exception:
+                pass
+
+        if event.button() == Qt.MouseButton.LeftButton and lbl.hasSelectedText():
+            sel = lbl.selectedText().strip()
+            if sel:
+                copy_pure_text(sel)
+
+    lbl.mouseReleaseEvent = _on_mouse_release
+
+    def _get_val():
+        if lbl.hasSelectedText():
+            sel = lbl.selectedText().strip()
+            if sel:
+                return sel
+        if callable(fallback_getter):
+            try:
+                fb = fallback_getter()
+                if fb:
+                    return str(fb).strip()
+            except Exception:
+                pass
+        elif fallback_getter:
+            return str(fallback_getter).strip()
+        raw = lbl.text() or ""
+        return QTextDocumentFragment.fromHtml(raw).toPlainText().strip()
+
+    lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    lbl.customContextMenuRequested.connect(
+        lambda pos: show_pure_copy_menu(lbl, pos, getter=_get_val)
+    )
 
 
 def make_click_copy_handler(widget: QWidget, get_val_fn: Callable[[], Any]):

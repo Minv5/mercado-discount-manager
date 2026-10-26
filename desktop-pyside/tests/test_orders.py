@@ -66,6 +66,70 @@ class TestOrderModels(unittest.TestCase):
             self.assertIn("border-radius: 4px", style)
             self.assertIn("font-size: 11px", style)
 
+    def test_order_status_badge_with_shipping_substatus(self):
+        """Verify that shipping substatus like picked_up, in_hub, dropped_off maps to in-transit."""
+        # 1. ready_to_ship with picked_up / in_hub / dropped_off -> 运送中
+        text, _, cat = get_order_status_badge_info("paid", "ready_to_ship", "picked_up")
+        self.assertEqual(text, "运送中")
+        self.assertEqual(cat, "shipped")
+
+        text, _, cat = get_order_status_badge_info("paid", "ready_to_ship", "in_hub")
+        self.assertEqual(text, "运送中")
+        self.assertEqual(cat, "shipped")
+
+        text, _, cat = get_order_status_badge_info("paid", "ready_to_ship", "dropped_off")
+        self.assertEqual(text, "运送中")
+        self.assertEqual(cat, "shipped")
+
+        # 2. ready_to_ship with printed or empty -> 待发货
+        text, _, cat = get_order_status_badge_info("paid", "ready_to_ship", "printed")
+        self.assertEqual(text, "待发货")
+        self.assertEqual(cat, "paid")
+
+        text, _, cat = get_order_status_badge_info("paid", "ready_to_ship", "")
+        self.assertEqual(text, "待发货")
+        self.assertEqual(cat, "paid")
+
+    def test_shipping_deadline_info_hidden_when_shipped_or_picked_up(self):
+        """Verify that SLA countdown and overdue warnings are suppressed when parcel is shipped or picked up."""
+        # Order overdue by created timestamp
+        old_ts = 1000.0
+        # When shipping is ready_to_ship and no substatus -> shows overdue warning
+        ord_pending = OrderModel(
+            order_id="1",
+            account_id="acc",
+            store_name="store",
+            status="paid",
+            created_timestamp=old_ts,
+            shipping=ShippingInfoModel(status="ready_to_ship", substatus=""),
+        )
+        self.assertIsNotNone(ord_pending.shipping_deadline_info)
+        info = ord_pending.shipping_deadline_info
+        assert info is not None
+        self.assertIn("已超时", info[0])
+
+        # When shipping status is shipped -> None
+        ord_shipped = OrderModel(
+            order_id="2",
+            account_id="acc",
+            store_name="store",
+            status="paid",
+            created_timestamp=old_ts,
+            shipping=ShippingInfoModel(status="shipped", substatus=""),
+        )
+        self.assertIsNone(ord_shipped.shipping_deadline_info)
+
+        # When shipping is ready_to_ship but substatus is picked_up -> None
+        ord_picked_up = OrderModel(
+            order_id="3",
+            account_id="acc",
+            store_name="store",
+            status="paid",
+            created_timestamp=old_ts,
+            shipping=ShippingInfoModel(status="ready_to_ship", substatus="picked_up"),
+        )
+        self.assertIsNone(ord_picked_up.shipping_deadline_info)
+
     def test_parse_standard_order(self):
         raw = {
             "id": 2000018676400878,
@@ -154,6 +218,47 @@ class TestOrderModels(unittest.TestCase):
         self.assertEqual(order.status, "shipped")
         badge_text, _, _ = order.status_badge_info
         self.assertEqual(badge_text, "运送中")
+
+    def test_shipping_info_model_and_order_model_compensations(self) -> None:
+        """Verify model serialization and helper properties for shipping compensations."""
+        ord_model = OrderModel(
+            order_id="2000018983593552",
+            account_id="3408885754",
+            store_name="CNLIUYANG",
+            site_id="MLA",
+            total_amount=15.62,
+            paid_amount=15.62,
+            sale_fee=2.00,
+            shipping_cost=4.46,
+            shipping=ShippingInfoModel(
+                shipment_id="48259875494",
+                dimensions="5 × 14 × 19 cm · 186 g",
+                shipping_cost=4.46,
+                base_shipping_cost=4.22,
+                shipping_adjustment=0.24,
+                shipping_adjustment_reason="尺寸/重量差异",
+                actual_dimensions="22 × 17 × 10 cm · 259 g",
+            ),
+        )
+        self.assertTrue(ord_model.has_shipping_adjustment)
+        self.assertIn("有运费调整: $4.22 ➔ $4.46", ord_model.shipping_adjustment_text)
+        self.assertIn("+$0.24", ord_model.shipping_adjustment_text)
+        # Net profit = 15.62 - 2.00 - 4.46 = 9.16
+        self.assertEqual(ord_model.estimated_net_profit, 9.16)
+
+        # Verify to_dict and from_dict
+        d = ord_model.to_dict()
+        self.assertEqual(d["shipping"]["base_shipping_cost"], 4.22)
+        self.assertEqual(d["shipping"]["shipping_adjustment"], 0.24)
+        self.assertEqual(d["shipping"]["shipping_adjustment_reason"], "尺寸/重量差异")
+        self.assertEqual(d["shipping"]["actual_dimensions"], "22 × 17 × 10 cm · 259 g")
+
+        restored = OrderModel.from_dict(d)
+        self.assertTrue(restored.has_shipping_adjustment)
+        self.assertEqual(restored.shipping.base_shipping_cost, 4.22)
+        self.assertEqual(restored.shipping.shipping_adjustment, 0.24)
+        self.assertEqual(restored.shipping.actual_dimensions, "22 × 17 × 10 cm · 259 g")
+        self.assertEqual(restored.effective_shipping_cost, 4.46)
 
 
 class TestOrdersPageUI(unittest.TestCase):
@@ -958,6 +1063,61 @@ class TestOrdersPageUI(unittest.TestCase):
         self.mock_client.get_marketplace_shipment.assert_not_called()
         self.mock_client.get_marketplace_shipment_costs.assert_not_called()
 
+    def test_enrich_single_updates_shipping_status_and_substatus_from_shipment(self) -> None:
+        """Verify that non-terminal order calls get_marketplace_shipment to refresh shipping status and substatus."""
+        cached_ord = OrderModel(
+            order_id="2000019055716854",
+            account_id="2651442567",
+            store_name="湖北店",
+            site_id="MLB",
+            status="paid",
+            total_amount=12.89,
+            created_timestamp=1000.0,
+            items=[OrderItemModel(item_id="MLB7696778504", title="Cached Title", thumbnail="thumb.jpg")],
+            shipping=ShippingInfoModel(
+                shipment_id="48293738268",
+                tracking_number="OLD_TRACK",
+                status="ready_to_ship",
+                substatus="",
+            ),
+        )
+        worker = OrdersFetchWorker(
+            self.mock_client,
+            self.mock_auth,
+            cached_orders=[cached_ord],
+        )
+
+        # Mock shipment returning updated status and substatus
+        self.mock_client.get_marketplace_shipment.return_value = {
+            "tracking_number": "888002732884427",
+            "tracking_method": "J&T LM CBT MLB",
+            "status": "shipped",
+            "substatus": "picked_up",
+        }
+        self.mock_client.get_marketplace_shipment_costs.return_value = {}
+
+        raw_entry = (
+            "2651442567",
+            {
+                "id": "2000019055716854",
+                "status": "paid",
+                "shipping": {"id": 48293738268, "status": "ready_to_ship"},
+            },
+            "湖北店",
+        )
+
+        res = worker._enrich_single(raw_entry)
+        self.assertIsNotNone(res)
+        assert res is not None
+        self.assertEqual(res.order_id, "2000019055716854")
+        self.assertEqual(res.shipping.tracking_number, "888002732884427")
+        self.assertEqual(res.shipping.status, "shipped")
+        self.assertEqual(res.shipping.substatus, "picked_up")
+        badge_text, _, cat = res.status_badge_info
+        self.assertEqual(badge_text, "运送中")
+        self.assertEqual(cat, "shipped")
+        self.assertIsNone(res.shipping_deadline_info)
+
     def test_orders_page_chunk_streaming_and_selection_preservation(self) -> None:
         """Verify that streaming chunks update the order list and preserve the selected row."""
         o1 = OrderModel(order_id="ORD_1", account_id="111", store_name="店1", site_id="MLM", status="paid", total_amount=10.0, created_timestamp=1000.0)
@@ -1200,6 +1360,172 @@ class TestOrdersPageUI(unittest.TestCase):
         page._on_countdown_tick()
         self.assertFalse(badge_widget.isHidden())
         self.assertIn("⏳", badge_widget.text())
+
+    def test_enrich_single_parses_shipping_fee_compensations(self) -> None:
+        """Verify worker automatically calculates adjusted shipping fee from shipment costs compensations."""
+        worker = OrdersFetchWorker(self.mock_client, self.mock_auth, target_account="3408885754")
+        self.mock_client.get_marketplace_order.return_value = {}
+        self.mock_client.get_item_detail.return_value = {}
+        self.mock_client.get_marketplace_shipment.return_value = {
+            "tracking_number": "EFFDA7Y4ZVK5ZGFBY6ZC4ADIPM",
+            "tracking_method": "MEL Distribution",
+            "status": "shipped",
+            "substatus": "consolidated_delivery",
+            "lead_time": {
+                "cost": 0,
+                "list_cost": 4.22,
+                "cost_type": "free",
+            },
+        }
+        self.mock_client.get_marketplace_shipment_costs.return_value = {
+            "gross_amount": 15.66,
+            "senders": [
+                {
+                    "cost": 4.22,
+                    "compensations": [
+                        {
+                            "amount": 0.24,
+                            "reason": "incorrect_dimensions",
+                            "comment": "Incorrect package dimensions",
+                        }
+                    ],
+                }
+            ],
+        }
+        raw_entry = (
+            "3408885754",
+            {
+                "id": "2000018983593552",
+                "paid_amount": 15.62,
+                "currency_id": "USD",
+                "order_items": [
+                    {
+                        "item": {"id": "MLA3681299254", "title": "Retro Bag"},
+                        "unit_price": 15.62,
+                        "sale_fee": 1.95,
+                    }
+                ],
+                "shipping": {"id": 48259875494},
+            },
+            "湖南店",
+        )
+        ord_model = worker._enrich_single(raw_entry)
+        self.assertIsNotNone(ord_model)
+        assert ord_model is not None
+        self.assertEqual(ord_model.shipping.base_shipping_cost, 4.22)
+        self.assertEqual(ord_model.shipping.shipping_adjustment, 0.24)
+        self.assertEqual(ord_model.shipping.shipping_adjustment_reason, "尺寸/重量差异")
+        self.assertEqual(ord_model.shipping.shipping_cost, 4.46)
+        self.assertEqual(ord_model.shipping_cost, 4.46)
+        self.assertTrue(ord_model.has_shipping_adjustment)
+        self.assertEqual(ord_model.estimated_net_profit, 9.21)
+
+    def test_drawer_renders_shipping_fee_adjustment_and_retested_dimensions(self) -> None:
+        """Verify right drawer displays adjustment badges, amounts, and chips."""
+        page = self.page
+
+        order = OrderModel(
+            order_id="2000018983593552",
+            account_id="3408885754",
+            store_name="湖南店",
+            site_id="MLA",
+            status="shipped",
+            total_amount=15.62,
+            paid_amount=15.62,
+            currency_id="USD",
+            sale_fee=1.95,
+            shipping_cost=4.46,
+            items=[
+                OrderItemModel(
+                    item_id="MLA3681299254",
+                    title="Retro Bag",
+                    sku="BAG001",
+                    unit_price=15.62,
+                    sale_fee=1.95,
+                )
+            ],
+            shipping=ShippingInfoModel(
+                shipment_id="48259875494",
+                dimensions="5 × 14 × 19 cm · 186 g",
+                status="shipped",
+                substatus="consolidated_delivery",
+                shipping_cost=4.46,
+                base_shipping_cost=4.22,
+                shipping_adjustment=0.24,
+                shipping_adjustment_reason="尺寸/重量差异",
+            ),
+        )
+
+        page._current_order = order
+        page._render_order_detail(order)
+
+        self.assertEqual(page.det_fee_ship_val.text(), "-USD 4.46")
+        self.assertFalse(page.det_fee_ship_adj_lbl.isHidden())
+        self.assertIn("+$0.24", page.det_fee_ship_adj_lbl.text())
+        self.assertTrue(page.det_shipping_adj_banner.isHidden())
+        self.assertFalse(page.det_actual_dimensions_chip.isHidden())
+        self.assertIn("复测超标", page.det_actual_dimensions_chip.text())
+
+        # Also test order card
+        card = page._create_order_card(order)
+        self.addCleanup(card.deleteLater)
+        card_labels = [c.text() for c in card.findChildren(QLabel)]
+        self.assertTrue(any("运费调整" in t for t in card_labels))
+
+    def test_drawer_renders_audited_secondary_dimensions(self) -> None:
+        """Verify right drawer displays audited dimensions chip when present."""
+        page = self.page
+        order = OrderModel(
+            order_id="2000018983593552",
+            account_id="3408885754",
+            store_name="湖南店",
+            site_id="MLA",
+            status="shipped",
+            total_amount=15.62,
+            paid_amount=15.62,
+            currency_id="USD",
+            shipping=ShippingInfoModel(
+                shipment_id="48259875494",
+                dimensions="5 × 14 × 19 cm · 186 g",
+                actual_dimensions="22 × 17 × 10 cm · 259 g",
+                status="shipped",
+                shipping_cost=4.46,
+                base_shipping_cost=4.22,
+                shipping_adjustment=0.24,
+            ),
+        )
+        page._current_order = order
+        page._render_order_detail(order)
+
+        self.assertFalse(page.det_actual_dimensions_chip.isHidden())
+        self.assertIn("官方实测复重: 22 × 17 × 10 cm · 259 g", page.det_actual_dimensions_chip.text())
+        self.assertIn("出单包装尺重: 5 × 14 × 19 cm · 186 g", page.det_dimensions_chip.text())
+
+    def test_shipping_audits_and_zhiying_sync_pipeline(self) -> None:
+        """Verify shipping audit persistence and Zhiying sync parsing."""
+        from orders.shipping_audits import save_shipping_audit, get_shipping_audit, get_all_shipping_audits
+        from orders.zhiying_sync import format_audited_dimensions, parse_and_save_zhiying_packet
+
+        formatted = format_audited_dimensions(22, 17, 10, 259)
+        self.assertEqual(formatted, "22 × 17 × 10 cm · 259 g")
+
+        formatted_kg = format_audited_dimensions(22, 17, 10, 0.259)
+        self.assertEqual(formatted_kg, "22 × 17 × 10 cm · 259 g")
+
+        pkt = {
+            "order_id": "TEST_AUDIT_ORDER_999",
+            "shipment_id": "TEST_AUDIT_SHIP_999",
+            "official_dimensions": "259克 22x17x10厘米",
+        }
+        saved = parse_and_save_zhiying_packet(pkt)
+        self.assertEqual(saved, 1)
+
+        aud = get_shipping_audit("TEST_AUDIT_ORDER_999")
+        self.assertIsNotNone(aud)
+        self.assertEqual(aud["actual_dimensions"], "22 × 17 × 10 cm · 259 g")
+
+        all_audits = get_all_shipping_audits()
+        self.assertEqual(all_audits.get("TEST_AUDIT_ORDER_999"), "22 × 17 × 10 cm · 259 g")
 
 
 class TestSlaCalendarAndDeadline(unittest.TestCase):

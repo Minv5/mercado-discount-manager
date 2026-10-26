@@ -7,6 +7,7 @@ from ui_common.clipboard import (
     extract_copyable_text,
     label_copy_val,
     make_click_copy_handler,
+    make_selectable_label,
     show_pure_copy_menu,
 )
 from ui_common.combos import populate_store_combo
@@ -35,6 +36,7 @@ __all__ = [
     "extract_copyable_text",
     "label_copy_val",
     "make_click_copy_handler",
+    "make_selectable_label",
     "show_pure_copy_menu",
     "populate_store_combo",
     "clear_disk_cache",

@@ -129,7 +129,7 @@ class TestServiceCenterTranslator(unittest.TestCase):
     @patch("urllib.request.urlopen", side_effect=Exception("Network error"))
     def test_translate_failure_fallback(self, mock_urlopen):
         res = translate_text("网络故障兜底", target_lang="es")
-        self.assertEqual(res, "网络故障兜底")
+        self.assertEqual(res, "")
 
 
 class TestServiceCenterTemplateManager(unittest.TestCase):
@@ -563,13 +563,15 @@ class TestServiceCenterPage(unittest.TestCase):
         win = MainWindow(mock_api, mock_service, auto_start=False)
         self.assertTrue(hasattr(win, "service_center_page"))
         self.assertTrue(hasattr(win, "service_center_btn"))
-        self.assertEqual(win.pages.widget(3), win.service_center_page)
-        self.assertEqual(win.nav_buttons[3], win.service_center_btn)
+        self.assertEqual(win.pages.widget(3), win.orders_page)
+        self.assertEqual(win.nav_buttons[3], win.orders_btn)
+        self.assertEqual(win.pages.widget(4), win.service_center_page)
+        self.assertEqual(win.nav_buttons[4], win.service_center_btn)
 
-        # Test switching to page 3
+        # Test switching to page 4
         with patch.object(win.service_center_page, "reload_sessions"):
-            win._show_page(3)
-        self.assertEqual(win.pages.currentIndex(), 3)
+            win._show_page(4)
+        self.assertEqual(win.pages.currentIndex(), 4)
         self.assertTrue(win.service_center_btn.isChecked())
 
         # Test unread badge (permanently displays 客服售后 without badge per design)
@@ -1425,11 +1427,28 @@ class TestServiceCenterSnapshot(unittest.TestCase):
             }
             page.handle_incoming_webhook_event(event_c)
 
-            mock_chime.assert_called_once()
+            mock_chime.assert_called_once_with("Funk")
             mock_reload.assert_called_with(silent=True)
             mock_toast.assert_called_once()
             self.assertEqual(mock_toast.call_args[1]["session_type"], "claim")
             self.assertEqual(mock_toast.call_args[1]["title"], "收到新索赔")
+
+            # Test marketplace_orders (Acoustic Glass Chime & Order Session Type)
+            mock_chime.reset_mock()
+            mock_reload.reset_mock()
+            mock_toast.reset_mock()
+
+            event_o = {
+                "topic": "marketplace_orders",
+                "resource": "/orders/200001888999",
+                "user_id": "acc_1",
+            }
+            page.handle_incoming_webhook_event(event_o)
+
+            mock_chime.assert_called_once_with("Glass")
+            mock_toast.assert_called_once()
+            self.assertEqual(mock_toast.call_args[1]["session_type"], "order")
+            self.assertEqual(mock_toast.call_args[1]["title"], "收到新订单")
 
         page.stop()
 
@@ -2190,6 +2209,41 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         labels_sys = [lbl.text() for lbl in bubble_sys.findChildren(QLabel)]
         self.assertFalse(any("平台仲裁调解专员通知" in txt for txt in labels_sys))
         self.assertFalse(any("美客多官方调解员" in txt for txt in labels_sys))
+
+        page.stop()
+
+    def test_foreign_buyer_message_auto_translation_with_gui_dispatcher(self):
+        import time
+        mock_client = MagicMock()
+        mock_auth = MagicMock()
+        mock_auth.list_accounts.return_value = []
+        page = ServiceCenterPage(mock_client, mock_auth)
+
+        foreign_msg = ServiceMessage(
+            id="m_foreign",
+            sender_role="buyer",
+            sender_name="买家 127241",
+            text="Para cuanta capacidad de ml es?",
+            created_at="2026-10-21 15:17:00",
+            is_seller=False,
+        )
+
+        with patch("service_center.service_center_page.translate_text", return_value="容量是多少毫升？"):
+            bubble = page._create_chat_bubble(foreign_msg)
+            trans_lbl = None
+            for lbl in bubble.findChildren(QLabel):
+                if "正在翻译" in lbl.text():
+                    trans_lbl = lbl
+                    break
+            self.assertIsNotNone(trans_lbl)
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and "正在翻译" in trans_lbl.text():
+                QApplication.processEvents()
+                time.sleep(0.02)
+
+            self.assertEqual(trans_lbl.text(), "译: 容量是多少毫升？")
+            self.assertEqual(foreign_msg.text_translated, "容量是多少毫升？")
 
         page.stop()
 
