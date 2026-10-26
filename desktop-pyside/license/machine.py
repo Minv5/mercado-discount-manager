@@ -23,19 +23,20 @@ def get_machine_id() -> str:
             pass
     elif system == "windows":
         try:
-            out = subprocess.check_output("wmic csproduct get uuid", shell=True, text=True)
-            lines = [l.strip() for l in out.splitlines() if l.strip()]
-            if len(lines) > 1 and lines[1].lower() != "uuid":
-                raw_id = lines[1]
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", "(Get-CimInstance -Class Win32_ComputerSystemProduct).UUID"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            raw_id = out.strip()
         except Exception:
             pass
-        if not raw_id:
+        if not raw_id or len(raw_id) < 5:
             try:
-                out = subprocess.check_output(
-                    ["powershell", "-NoProfile", "-Command", "(Get-CimInstance -Class Win32_ComputerSystemProduct).UUID"],
-                    text=True,
-                )
-                raw_id = out.strip()
+                out = subprocess.check_output("wmic csproduct get uuid", shell=True, text=True, stderr=subprocess.DEVNULL)
+                lines = [l.strip() for l in out.splitlines() if l.strip()]
+                if len(lines) > 1 and lines[1].lower() != "uuid":
+                    raw_id = lines[1]
             except Exception:
                 pass
     elif system == "linux":

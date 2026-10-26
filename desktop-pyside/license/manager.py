@@ -12,12 +12,6 @@ from .storage import get_trial_status, load_license, save_license
 
 logger = logging.getLogger(__name__)
 
-# Developer / Owner machine exemptions (permanently authorized)
-DEVELOPER_MACHINE_IDS = {
-    "MDM-6F57-29F3-CEB8-2BC5",  # Current developer workstation
-}
-
-
 class LicenseStatus(str, Enum):
     LICENSED = "LICENSED"      # Valid permanent or commercial license
     TRIAL = "TRIAL"            # Within 3 days free trial
@@ -62,24 +56,7 @@ class LicenseManager:
         """Inspect current machine license state."""
         mid = self._machine_id
 
-        # 1. Developer machine auto-exemption
-        if mid.upper() in DEVELOPER_MACHINE_IDS:
-            return LicenseInfo(
-                status=LicenseStatus.LICENSED,
-                is_valid=True,
-                is_trial=False,
-                is_expired=False,
-                is_developer=True,
-                machine_id=mid,
-                license_type="开发者永久版",
-                expiration_str="终身永久授权",
-                remaining_days=99999,
-                remaining_hours=99999,
-                customer_name="开发者专属",
-                message="当前设备已获开发者终身永久授权",
-            )
-
-        # 2. Check saved formal license
+        # 1. Check saved formal license
         code = load_license()
         if code:
             payload = verify_license_code(code, mid)

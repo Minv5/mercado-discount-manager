@@ -31,11 +31,49 @@ from tools.license_generator import generate_license_code
 
 
 class TestLicenseSystem(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        import license.crypto as crypto
+
+        priv_path = PROJ_ROOT / "tools" / "license_private_key.pem"
+        cls.temp_key_dir = None
+        cls.priv_patcher = None
+        cls.pub_patcher = None
+
+        if not priv_path.exists():
+            cls.temp_key_dir = tempfile.mkdtemp()
+            temp_priv = Path(cls.temp_key_dir) / "license_private_key.pem"
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            priv_pem = key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+            pub_pem = key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            ).decode("utf-8")
+            temp_priv.write_bytes(priv_pem)
+
+            cls.priv_patcher = patch("tools.license_generator.get_private_key_path", return_value=temp_priv)
+            cls.priv_patcher.start()
+
+            cls.pub_patcher = patch.object(crypto, "PUBLIC_KEY_PEM", pub_pem)
+            cls.pub_patcher.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.priv_patcher:
+            cls.priv_patcher.stop()
+        if cls.pub_patcher:
+            cls.pub_patcher.stop()
+        if cls.temp_key_dir:
+            shutil.rmtree(cls.temp_key_dir, ignore_errors=True)
+
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
-        self.patcher = patch("license.storage.get_data_dir", return_value=self.test_dir)
-        # Convert Path object
-        from pathlib import Path
         self.patcher = patch("license.storage.get_data_dir", return_value=Path(self.test_dir))
         self.patcher.start()
 
