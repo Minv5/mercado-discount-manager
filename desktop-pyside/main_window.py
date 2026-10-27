@@ -5214,7 +5214,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.50"
+    return "2.2.51"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.
