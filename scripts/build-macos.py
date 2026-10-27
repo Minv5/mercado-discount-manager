@@ -45,7 +45,7 @@ def terminate_running_app() -> None:
 
 def build() -> None:
     is_ci = os.environ.get("CI", "").lower() == "true"
-    allow_restart = "--restart" in sys.argv
+    allow_restart = "--restart" in sys.argv or (not is_ci and "--no-restart" not in sys.argv)
     if not is_ci and allow_restart:
         terminate_running_app()
 

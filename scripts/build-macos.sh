@@ -14,4 +14,4 @@ else
     exit 1
 fi
 
-"$PYTHON" "$PROJECT_ROOT/scripts/build-macos.py"
+"$PYTHON" "$PROJECT_ROOT/scripts/build-macos.py" "$@"
