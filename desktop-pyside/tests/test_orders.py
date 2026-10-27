@@ -814,16 +814,21 @@ class TestOrdersPageUI(unittest.TestCase):
         self.assertIsInstance(thumb_lbl, QLabel)
         self.assertEqual(thumb_lbl.width(), 50)
         self.assertEqual(thumb_lbl.height(), 50)
-        self.assertEqual(thumb_lbl.cursor().shape(), Qt.CursorShape.PointingHandCursor)
-        self.assertIn("放大", thumb_lbl.toolTip())
+        self.assertEqual(thumb_lbl.cursor().shape(), Qt.CursorShape.ArrowCursor)
+        self.assertNotIn("放大", thumb_lbl.toolTip())
+        self.assertIn("复制", thumb_lbl.toolTip())
 
-        # Check thumbnail click triggers lightbox
+        # Check left card thumbnail does NOT trigger lightbox
         with patch.object(self.page, "_show_image_lightbox") as mock_lightbox:
             from PySide6.QtGui import QMouseEvent
             from PySide6.QtCore import QPointF, QEvent
             evt = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(5, 5), Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
-            thumb_lbl.mousePressEvent(evt)
-            mock_lightbox.assert_called_once_with("https://img.com/test.jpg", "Pantorrillas Y Piernas Con Máquina De Ejercicio Sentada")
+            if hasattr(thumb_lbl, "mousePressEvent") and thumb_lbl.mousePressEvent:
+                try:
+                    thumb_lbl.mousePressEvent(evt)
+                except Exception:
+                    pass
+            mock_lightbox.assert_not_called()
 
         # Check right info column: Row 1 has Store, Buyer, Stretch, Status Badge
         info_layout = card_layout.itemAt(2).layout()
@@ -948,6 +953,7 @@ class TestOrdersPageUI(unittest.TestCase):
                 OrderItemModel(
                     item_id="MLB7696778504",
                     title="1 Pair Elegant Cord Curtain Tiebacks",
+                    thumbnail="https://http2.mlstatic.com/D_7696778504.jpg",
                     sku="MLM3163056513",
                     permalink="https://articulo.mercadolibre.com.br/MLB-7696778504",
                 )
@@ -959,6 +965,18 @@ class TestOrdersPageUI(unittest.TestCase):
         self.assertEqual(self.page.items_container_layout.count(), 1)
         item_frame = self.page.items_container_layout.itemAt(0).widget()
         self.assertIsNotNone(item_frame)
+
+        # Thumbnail in right drawer retains click to zoom
+        drawer_thumb = item_frame.layout().itemAt(0).widget()
+        self.assertIsInstance(drawer_thumb, QLabel)
+        self.assertEqual(drawer_thumb.cursor().shape(), Qt.CursorShape.PointingHandCursor)
+        self.assertIn("放大", drawer_thumb.toolTip())
+        with patch.object(self.page, "_show_image_lightbox") as mock_lightbox:
+            from PySide6.QtGui import QMouseEvent
+            from PySide6.QtCore import QPointF, QEvent
+            evt_thumb = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(5, 5), Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+            drawer_thumb.mousePressEvent(evt_thumb)
+            mock_lightbox.assert_called_once()
 
         # Center text layout has title and meta_h
         c_layout = item_frame.layout().itemAt(1).layout()

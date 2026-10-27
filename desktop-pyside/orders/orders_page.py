@@ -1034,16 +1034,10 @@ class OrdersPage(QWidget):
         thumb_lbl.setStyleSheet("background: #121614; border: 1px solid #4E472F; border-radius: 6px;")
         thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._load_async_thumbnail(order.primary_thumbnail, thumb_lbl)
-        thumb_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-        thumb_lbl.setToolTip("点击放大查看高清大图 (右键可直接复制图片)")
-        def _on_thumb_clicked(e, url=order.primary_thumbnail, title=order.primary_item.title):
-            if e.button() == Qt.MouseButton.LeftButton:
-                if url:
-                    self._show_image_lightbox(url, title)
-        thumb_lbl.mousePressEvent = _on_thumb_clicked
+        thumb_lbl.setToolTip("右键可复制")
         thumb_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         thumb_lbl.customContextMenuRequested.connect(
-            lambda pos, lbl=thumb_lbl: show_pure_copy_menu(lbl, pos, lambda: lbl.pixmap())
+            lambda pos, lbl=thumb_lbl: show_pure_copy_menu(lbl, pos, lambda: lbl.pixmap(), action_text="复制")
         )
         card_layout.addWidget(thumb_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -1497,14 +1491,14 @@ class OrdersPage(QWidget):
             t_lbl.setStyleSheet("background: #121614; border: 1px solid #4E472F; border-radius: 4px;")
             t_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             t_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-            t_lbl.setToolTip("点击放大查看大图 (右键可直接复制图片)")
+            t_lbl.setToolTip("点击放大查看大图 (右键可复制)")
             pic_url = it.thumbnail or order.primary_thumbnail
             self._load_async_thumbnail(pic_url, t_lbl)
             def _make_zoom_handler(u=pic_url, t=it.title):
                 return lambda e: self._show_image_lightbox(u, t) if e.button() == Qt.MouseButton.LeftButton and u else None
             t_lbl.mousePressEvent = _make_zoom_handler()
             t_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            t_lbl.customContextMenuRequested.connect(lambda pos, lbl=t_lbl: show_pure_copy_menu(lbl, pos, lambda: lbl.pixmap()))
+            t_lbl.customContextMenuRequested.connect(lambda pos, lbl=t_lbl: show_pure_copy_menu(lbl, pos, lambda: lbl.pixmap(), action_text="复制"))
             i_layout.addWidget(t_lbl, 0, Qt.AlignmentFlag.AlignTop)
 
             # Center text column

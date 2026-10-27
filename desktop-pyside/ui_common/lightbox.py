@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QSize, Qt
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -24,8 +25,13 @@ from ui_common.image_cache import load_image_async
 class ImagePreviewDialog(QDialog):
     """High-resolution lightbox dialog for viewing product images and claim attachments.
 
-    Supports multi-image gallery with Next / Prev buttons, page indicators, and keyboard shortcuts (Left/Right/ESC).
-    Centered on parent window with smooth mouse dragging and instant close shortcuts.
+    Features:
+      - Smooth mouse wheel zoom with anchor at cursor position (20% to 500%).
+      - Drag-to-pan when zoomed in, double-click to toggle fit / zoom.
+      - Clean zoom controls toolbar (+, -, fit, 1:1, zoom percentage badge).
+      - Multi-image gallery with Next / Prev buttons, indicators, and arrow shortcuts.
+      - Right-click pure "复制" menu and Cmd/Ctrl+C shortcut.
+      - Frameless dark translucent card centered on active window.
     """
 
     def __init__(
@@ -57,6 +63,10 @@ class ImagePreviewDialog(QDialog):
         self._current_index = max(0, min(initial_index, len(self._images) - 1)) if self._images else 0
         self._base_title = title
         self._current_pixmap: QPixmap | None = None
+        self._base_size: QSize | None = None
+        self._zoom_factor: float = 1.0
+        self._is_panning: bool = False
+        self._pan_start: QPoint = QPoint()
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(16, 16, 16, 16)
@@ -92,14 +102,88 @@ class ImagePreviewDialog(QDialog):
         hdr.addWidget(self.counter_lbl)
 
         # Shortcut hint
-        self.shortcut_hint_lbl = QLabel("支持键盘 ← / → 翻页 · ESC 退出")
+        self.shortcut_hint_lbl = QLabel("支持鼠标滚轮缩放 · 拖拽平移 · ESC退出")
         self.shortcut_hint_lbl.setStyleSheet(
             "color: #78716C; font-size: 11px; background: transparent; border: none; margin-left: 8px;"
         )
-        self.shortcut_hint_lbl.setVisible(len(self._images) > 1)
+        self.shortcut_hint_lbl.setVisible(True)
         hdr.addWidget(self.shortcut_hint_lbl)
 
-        hdr.addStretch(0)
+        hdr.addStretch(1)
+
+        # Zoom controls toolbar
+        self.zoom_out_btn = QPushButton("－")
+        self.zoom_out_btn.setFixedSize(26, 24)
+        self.zoom_out_btn.setToolTip("缩小 (滚轮向下)")
+        self.zoom_out_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.zoom_out_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(35, 44, 36, 0.85);
+                color: #F6F3EA;
+                border: 1px solid #4E472F;
+                border-radius: 4px;
+                font-size: 13px;
+                font-weight: bold;
+                padding: 0;
+            }
+            QPushButton:hover {
+                background: #2D3A30;
+                border-color: #FBBF24;
+                color: #FBBF24;
+            }
+        """)
+        self.zoom_out_btn.clicked.connect(lambda: self.zoom_out())
+        hdr.addWidget(self.zoom_out_btn)
+
+        self.zoom_lbl = QLabel("100%")
+        self.zoom_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.zoom_lbl.setToolTip("当前缩放比例 (滚轮缩放 · 双击还原)")
+        self.zoom_lbl.setStyleSheet(
+            "color: #FBBF24; font-size: 11px; font-weight: bold; background: rgba(35, 44, 36, 0.85); "
+            "border: 1px solid #4E472F; border-radius: 4px; padding: 2px 8px; min-width: 44px;"
+        )
+        hdr.addWidget(self.zoom_lbl)
+
+        self.zoom_in_btn = QPushButton("＋")
+        self.zoom_in_btn.setFixedSize(26, 24)
+        self.zoom_in_btn.setToolTip("放大 (滚轮向上)")
+        self.zoom_in_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.zoom_in_btn.setStyleSheet(self.zoom_out_btn.styleSheet())
+        self.zoom_in_btn.clicked.connect(lambda: self.zoom_in())
+        hdr.addWidget(self.zoom_in_btn)
+
+        self.zoom_reset_btn = QPushButton("适应")
+        self.zoom_reset_btn.setFixedSize(38, 24)
+        self.zoom_reset_btn.setToolTip("还原为最佳适应尺寸 (双击图片也可还原)")
+        self.zoom_reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.zoom_reset_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(35, 44, 36, 0.85);
+                color: #D4AF37;
+                border: 1px solid #4E472F;
+                border-radius: 4px;
+                font-size: 11px;
+                font-weight: 500;
+                padding: 0;
+            }
+            QPushButton:hover {
+                background: #2D3A30;
+                border-color: #FBBF24;
+                color: #FFFFFF;
+            }
+        """)
+        self.zoom_reset_btn.clicked.connect(self.reset_zoom)
+        hdr.addWidget(self.zoom_reset_btn)
+
+        self.zoom_100_btn = QPushButton("1:1")
+        self.zoom_100_btn.setFixedSize(34, 24)
+        self.zoom_100_btn.setToolTip("原始像素 100% 查看")
+        self.zoom_100_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.zoom_100_btn.setStyleSheet(self.zoom_reset_btn.styleSheet())
+        self.zoom_100_btn.clicked.connect(self.zoom_original)
+        hdr.addWidget(self.zoom_100_btn)
+
+        hdr.addSpacing(6)
 
         close_btn = QPushButton("✕")
         close_btn.setFixedSize(26, 26)
@@ -161,14 +245,64 @@ class ImagePreviewDialog(QDialog):
         self.prev_btn.setVisible(len(self._images) > 1)
         preview_row.addWidget(self.prev_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        # ScrollArea hosting the zoomable image label
+        self.scroll_area = QScrollArea(self.card)
+        self.scroll_area.setObjectName("lightboxScrollArea")
+        self.scroll_area.setWidgetResizable(False)
+        self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scroll_area.setStyleSheet("""
+            QScrollArea#lightboxScrollArea {
+                background: #121614;
+                border: 1px solid #333333;
+                border-radius: 8px;
+            }
+            QScrollArea#lightboxScrollArea > QWidget > QWidget {
+                background: transparent;
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 8px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 0.2);
+                min-height: 24px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(255, 255, 255, 0.35);
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                background: transparent;
+                height: 8px;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: rgba(255, 255, 255, 0.2);
+                min-width: 24px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: rgba(255, 255, 255, 0.35);
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+        """)
+
         self.img_lbl = QLabel("正在加载高清大图...")
         self.img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.img_lbl.setStyleSheet("background: #121614; color: #C8C3B7; font-size: 13px; border: 1px solid #333333; border-radius: 8px;")
-        self.img_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.img_lbl.setToolTip("右键或快捷键 Ctrl/Cmd+C 复制图片")
+        self.img_lbl.setStyleSheet("background: transparent; color: #C8C3B7; font-size: 13px; border: none;")
+        self.img_lbl.setCursor(Qt.CursorShape.ArrowCursor)
+        self.img_lbl.setToolTip("右键或快捷键 Ctrl/Cmd+C 复制 · 滚轮可缩放")
         self.img_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.img_lbl.customContextMenuRequested.connect(self._show_image_context_menu)
-        preview_row.addWidget(self.img_lbl, 1)
+
+        self.scroll_area.setWidget(self.img_lbl)
+        preview_row.addWidget(self.scroll_area, 1)
 
         # Right / Next Button
         self.next_btn = QPushButton("›")
@@ -182,6 +316,11 @@ class ImagePreviewDialog(QDialog):
 
         card_layout.addLayout(preview_row, 1)
         main_layout.addWidget(self.card)
+
+        # Event filter for wheel zooming, panning, and double clicking
+        self.img_lbl.installEventFilter(self)
+        self.scroll_area.viewport().installEventFilter(self)
+        self.scroll_area.installEventFilter(self)
 
         if self._images:
             self._load_current_image()
@@ -218,16 +357,89 @@ class ImagePreviewDialog(QDialog):
         if pixmap.isNull():
             return
         self._current_pixmap = pixmap
-        if pixmap.width() > 900 or pixmap.height() > 650:
-            scaled = pixmap.scaled(
-                QSize(860, 600),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
-            )
+        vp = self.scroll_area.viewport()
+        vp_w = vp.width() if vp.width() > 100 else 840
+        vp_h = vp.height() if vp.height() > 100 else 580
+        max_w = max(400, vp_w - 20)
+        max_h = max(300, vp_h - 20)
+
+        if pixmap.width() > max_w or pixmap.height() > max_h:
+            base_size = pixmap.size().scaled(QSize(max_w, max_h), Qt.AspectRatioMode.KeepAspectRatio)
         else:
-            scaled = pixmap
+            base_size = pixmap.size()
+
+        self._base_size = base_size
+        self._zoom_factor = 1.0
+        self._apply_zoom_at(1.0)
+
+    def _apply_zoom_at(self, new_factor: float, cursor_pos: QPoint | None = None) -> None:
+        if not self._current_pixmap or self._current_pixmap.isNull():
+            return
+        if not self._base_size or self._base_size.width() <= 0:
+            return
+
+        hbar = self.scroll_area.horizontalScrollBar()
+        vbar = self.scroll_area.verticalScrollBar()
+        vp = self.scroll_area.viewport()
+
+        old_w = self.img_lbl.width()
+        old_h = self.img_lbl.height()
+        view_pos = cursor_pos if cursor_pos is not None else QPoint(vp.width() // 2, vp.height() // 2)
+
+        rel_x = 0.5
+        rel_y = 0.5
+        if old_w > 0 and old_h > 0:
+            lbl_pos = self.img_lbl.mapFrom(vp, view_pos)
+            rel_x = max(0.0, min(1.0, lbl_pos.x() / old_w))
+            rel_y = max(0.0, min(1.0, lbl_pos.y() / old_h))
+
+        self._zoom_factor = max(0.2, min(5.0, new_factor))
+
+        target_w = max(10, int(self._base_size.width() * self._zoom_factor))
+        target_h = max(10, int(self._base_size.height() * self._zoom_factor))
+        scaled = self._current_pixmap.scaled(
+            QSize(target_w, target_h),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
         self.img_lbl.setText("")
         self.img_lbl.setPixmap(scaled)
+        self.img_lbl.setFixedSize(scaled.size())
+        self.zoom_lbl.setText(f"{int(round(self._zoom_factor * 100))}%")
+
+        new_w = scaled.width()
+        new_h = scaled.height()
+        if new_w > vp.width():
+            target_h_val = int(rel_x * new_w - view_pos.x())
+            hbar.setValue(max(hbar.minimum(), min(hbar.maximum(), target_h_val)))
+        if new_h > vp.height():
+            target_v_val = int(rel_y * new_h - view_pos.y())
+            vbar.setValue(max(vbar.minimum(), min(vbar.maximum(), target_v_val)))
+
+        is_zoomed = self._is_content_zoomed()
+        cur = Qt.CursorShape.OpenHandCursor if is_zoomed else Qt.CursorShape.ArrowCursor
+        self.img_lbl.setCursor(cur)
+        self.scroll_area.viewport().setCursor(cur)
+
+    def _is_content_zoomed(self) -> bool:
+        if self._zoom_factor > 1.05:
+            return True
+        vp = self.scroll_area.viewport()
+        return self.img_lbl.width() > vp.width() or self.img_lbl.height() > vp.height()
+
+    def zoom_in(self, step: float = 1.15, cursor_pos: QPoint | None = None) -> None:
+        self._apply_zoom_at(self._zoom_factor * step, cursor_pos=cursor_pos)
+
+    def zoom_out(self, step: float = 1.15, cursor_pos: QPoint | None = None) -> None:
+        self._apply_zoom_at(self._zoom_factor / step, cursor_pos=cursor_pos)
+
+    def reset_zoom(self) -> None:
+        self._apply_zoom_at(1.0)
+
+    def zoom_original(self) -> None:
+        if self._current_pixmap and self._base_size and self._base_size.width() > 0:
+            target_factor = self._current_pixmap.width() / self._base_size.width()
+            self._apply_zoom_at(target_factor)
 
     def copy_current_image(self) -> bool:
         """Copy current high-resolution image to system clipboard."""
@@ -239,7 +451,7 @@ class ImagePreviewDialog(QDialog):
             return True
         return False
 
-    def _show_image_context_menu(self, pos: QPoint) -> None:
+    def _show_image_context_menu(self, pos: QPoint, popup: bool = False) -> QMenu:
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
@@ -257,16 +469,20 @@ class ImagePreviewDialog(QDialog):
                 color: #FBBF24;
             }
         """)
-        act = menu.addAction("复制图片")
+        act = menu.addAction("复制")
         has_img = bool(
             (self._current_pixmap and not self._current_pixmap.isNull())
             or (self.img_lbl.pixmap() and not self.img_lbl.pixmap().isNull())
         )
         act.setEnabled(has_img)
         act.triggered.connect(self.copy_current_image)
-        menu.exec(self.img_lbl.mapToGlobal(pos))
+        if popup:
+            menu.popup(self.img_lbl.mapToGlobal(pos))
+        else:
+            menu.exec(self.img_lbl.mapToGlobal(pos))
+        return menu
 
-    def _show_card_context_menu(self, pos: QPoint) -> None:
+    def _show_card_context_menu(self, pos: QPoint, popup: bool = False) -> QMenu:
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
@@ -284,14 +500,81 @@ class ImagePreviewDialog(QDialog):
                 color: #FBBF24;
             }
         """)
-        act = menu.addAction("复制图片")
+        act = menu.addAction("复制")
         has_img = bool(
             (self._current_pixmap and not self._current_pixmap.isNull())
             or (self.img_lbl.pixmap() and not self.img_lbl.pixmap().isNull())
         )
         act.setEnabled(has_img)
         act.triggered.connect(self.copy_current_image)
-        menu.exec(self.card.mapToGlobal(pos))
+        if popup:
+            menu.popup(self.card.mapToGlobal(pos))
+        else:
+            menu.exec(self.card.mapToGlobal(pos))
+        return menu
+
+    def eventFilter(self, watched, event: QEvent) -> bool:
+        if watched in (self.img_lbl, self.scroll_area.viewport(), self.scroll_area):
+            ev_type = event.type()
+            if ev_type == QEvent.Type.Wheel:
+                delta = event.angleDelta().y()
+                if delta == 0:
+                    delta = event.angleDelta().x()
+                if delta != 0:
+                    vp_pos = self.scroll_area.viewport().mapFromGlobal(event.globalPosition().toPoint())
+                    if delta > 0:
+                        self.zoom_in(cursor_pos=vp_pos)
+                    else:
+                        self.zoom_out(cursor_pos=vp_pos)
+                    return True
+            elif ev_type == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    if self._is_content_zoomed():
+                        self._is_panning = True
+                        self._pan_start = event.globalPosition().toPoint()
+                        self.img_lbl.setCursor(Qt.CursorShape.ClosedHandCursor)
+                        self.scroll_area.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+                        return True
+            elif ev_type == QEvent.Type.MouseMove:
+                if getattr(self, "_is_panning", False) and (event.buttons() & Qt.MouseButton.LeftButton):
+                    cur_pos = event.globalPosition().toPoint()
+                    delta = cur_pos - self._pan_start
+                    self._pan_start = cur_pos
+                    hbar = self.scroll_area.horizontalScrollBar()
+                    vbar = self.scroll_area.verticalScrollBar()
+                    hbar.setValue(hbar.value() - delta.x())
+                    vbar.setValue(vbar.value() - delta.y())
+                    return True
+            elif ev_type == QEvent.Type.MouseButtonRelease:
+                if getattr(self, "_is_panning", False):
+                    self._is_panning = False
+                    cur = Qt.CursorShape.OpenHandCursor if self._is_content_zoomed() else Qt.CursorShape.ArrowCursor
+                    self.img_lbl.setCursor(cur)
+                    self.scroll_area.viewport().setCursor(cur)
+                    return True
+            elif ev_type == QEvent.Type.MouseButtonDblClick:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    if self._zoom_factor > 1.05 or self._is_content_zoomed():
+                        self.reset_zoom()
+                    else:
+                        vp_pos = self.scroll_area.viewport().mapFromGlobal(event.globalPosition().toPoint())
+                        self.zoom_in(step=2.0, cursor_pos=vp_pos)
+                    return True
+        return super().eventFilter(watched, event)
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta == 0:
+            delta = event.angleDelta().x()
+        if delta != 0:
+            vp_pos = self.scroll_area.viewport().mapFromGlobal(event.globalPosition().toPoint())
+            if delta > 0:
+                self.zoom_in(cursor_pos=vp_pos)
+            else:
+                self.zoom_out(cursor_pos=vp_pos)
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
@@ -306,6 +589,14 @@ class ImagePreviewDialog(QDialog):
                 return
         if key in (Qt.Key.Key_Escape, Qt.Key.Key_Return, Qt.Key.Key_Space):
             self.close()
+        elif key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            self.zoom_in()
+        elif key in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+            self.zoom_out()
+        elif key == Qt.Key.Key_0:
+            self.reset_zoom()
+        elif key == Qt.Key.Key_1:
+            self.zoom_original()
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_A, Qt.Key.Key_PageUp):
             if len(self._images) > 1 and self._current_index > 0:
                 self._on_prev_clicked()
@@ -318,17 +609,21 @@ class ImagePreviewDialog(QDialog):
     def _on_prev_clicked(self) -> None:
         if self._current_index > 0:
             self._current_index -= 1
+            self._zoom_factor = 1.0
             self._load_current_image()
 
     def _on_next_clicked(self) -> None:
         if self._current_index < len(self._images) - 1:
             self._current_index += 1
+            self._zoom_factor = 1.0
             self._load_current_image()
 
     def _load_current_image(self) -> None:
         if not self._images:
             return
         self._current_pixmap = None
+        self._base_size = None
+        self._zoom_factor = 1.0
         total = len(self._images)
         self.counter_lbl.setText(f"{self._current_index + 1} / {total}")
         self.counter_lbl.setVisible(total > 1)
@@ -336,7 +631,6 @@ class ImagePreviewDialog(QDialog):
         self.next_btn.setVisible(total > 1)
         self.prev_btn.setEnabled(self._current_index > 0)
         self.next_btn.setEnabled(self._current_index < total - 1)
-        self.shortcut_hint_lbl.setVisible(total > 1)
 
         item = self._images[self._current_index]
         if isinstance(item, QPixmap):

@@ -278,6 +278,77 @@ class UICommonTests(unittest.TestCase):
         self.assertFalse(QApplication.clipboard().pixmap().isNull())
         dlg.close()
 
+    def test_lightbox_mouse_wheel_zoom_and_toolbar(self):
+        """Verify lightbox supports mouse wheel zoom, zoom toolbar buttons, and pan reset."""
+        from PySide6.QtGui import QWheelEvent
+        from PySide6.QtCore import QPointF, QPoint
+
+        pix = QPixmap(200, 200)
+        pix.fill(Qt.GlobalColor.cyan)
+        dlg = ImagePreviewDialog(pixmap=pix, title="缩放测试")
+
+        # Initial zoom should be 100%
+        self.assertEqual(dlg._zoom_factor, 1.0)
+        self.assertEqual(dlg.zoom_lbl.text(), "100%")
+
+        # Test wheel zoom in (angleDelta y > 0)
+        wheel_in = QWheelEvent(
+            QPointF(100, 100),
+            QPointF(100, 100),
+            QPoint(0, 0),
+            QPoint(0, 120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+        dlg.eventFilter(dlg.img_lbl, wheel_in)
+        self.assertGreater(dlg._zoom_factor, 1.0)
+        self.assertIn("%", dlg.zoom_lbl.text())
+
+        # Test zoom out button
+        old_factor = dlg._zoom_factor
+        dlg.zoom_out_btn.click()
+        self.assertLess(dlg._zoom_factor, old_factor)
+
+        # Test reset zoom button
+        dlg.zoom_reset_btn.click()
+        self.assertEqual(dlg._zoom_factor, 1.0)
+        self.assertEqual(dlg.zoom_lbl.text(), "100%")
+
+        # Test zoom in button
+        dlg.zoom_in_btn.click()
+        self.assertGreater(dlg._zoom_factor, 1.0)
+
+        # Test double click to reset
+        from PySide6.QtGui import QMouseEvent
+        from PySide6.QtCore import QEvent
+        dbl_click = QMouseEvent(QEvent.Type.MouseButtonDblClick, QPointF(50, 50), Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        dlg.eventFilter(dlg.img_lbl, dbl_click)
+        self.assertEqual(dlg._zoom_factor, 1.0)
+
+        dlg.close()
+
+    def test_lightbox_context_menu_pure_copy_action_text(self):
+        """Verify context menu action text is '复制' rather than '复制图片'."""
+        pix = QPixmap(100, 100)
+        pix.fill(Qt.GlobalColor.blue)
+        dlg = ImagePreviewDialog(pixmap=pix, title="右键菜单测试")
+
+        # 1. 验证图片右键菜单文字为纯粹的“复制”
+        menu = dlg._show_image_context_menu(QPoint(10, 10), popup=True)
+        self.assertIsNotNone(menu)
+        self.assertEqual(len(menu.actions()), 1)
+        self.assertEqual(menu.actions()[0].text(), "复制")
+        self.assertTrue(menu.actions()[0].isEnabled())
+
+        # 2. 验证弹窗外框右键菜单也是“复制”
+        menu_card = dlg._show_card_context_menu(QPoint(5, 5), popup=True)
+        self.assertIsNotNone(menu_card)
+        self.assertEqual(menu_card.actions()[0].text(), "复制")
+
+        dlg.close()
+
 
 if __name__ == "__main__":
     unittest.main()
