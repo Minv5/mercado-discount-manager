@@ -848,10 +848,8 @@ class TestOrdersPageUI(unittest.TestCase):
         self.assertEqual(badge_lbl.width(), 74)
         self.assertEqual(badge_lbl.height(), 22)
 
-        # Check print status badge in row 1
-        print_lbl = row1.itemAt(5).widget()
-        self.assertIn(print_lbl.text(), ("未打单", "已打单"))
-        self.assertEqual(print_lbl.height(), 22)
+        # Unprinted orders do not have an extra print label in row 1 (clean UI)
+        self.assertIsNone(row1.itemAt(5))
 
         # Row 2 is title
         title_lbl = info_layout.itemAt(1).widget()
@@ -1551,9 +1549,9 @@ class TestOrdersPageUI(unittest.TestCase):
         self.assertEqual(all_audits.get("TEST_AUDIT_ORDER_999"), "22 × 17 × 10 cm · 259 g")
 
     def test_print_status_tracking_and_filtering(self):
-        """Verify that print status is tracked, reflected in badges, and filterable."""
+        """Verify that print status is tracked and only displayed when printed."""
         import tempfile
-        from orders.print_tracker import mark_order_ids_printed, is_order_printed, set_printed_file_for_test
+        from orders.print_tracker import mark_order_ids_printed, set_printed_file_for_test
         tmp_f = Path(tempfile.mktemp(suffix=".json"))
         set_printed_file_for_test(tmp_f)
 
@@ -1578,37 +1576,31 @@ class TestOrdersPageUI(unittest.TestCase):
             self.assertFalse(o1.is_printed)
             self.assertTrue(o2.is_printed)
 
+            # Detail when not printed: badge is hidden
+            self.page._render_order_detail(o1)
+            self.assertTrue(self.page.det_print_status_badge.isHidden())
+            self.assertEqual(self.page.btn_print_single.text(), "🖨️ 打印面单")
+
             # Mark o1 printed
             mark_order_ids_printed(["ORD_PRINT_1"])
             self.assertTrue(o1.is_printed)
 
-            # Render detail for o1
+            # Render detail for o1 after printing: badge is shown with "已打单"
             self.page._render_order_detail(o1)
+            self.assertFalse(self.page.det_print_status_badge.isHidden())
             self.assertIn("已打单", self.page.det_print_status_badge.text())
-            self.assertEqual(self.page.btn_print_single.text(), "🖨️ 重新打印面单")
+            self.assertEqual(self.page.btn_print_single.text(), "🖨️ 打印面单")
 
-            # Set page orders and test unprinted / printed filters
-            o3 = OrderModel(
-                order_id="ORD_PRINT_3",
-                account_id="ACC1",
-                store_name="店1",
-                status="paid",
-                shipping=ShippingInfoModel(shipment_id="SHIP_3", substatus="ready_to_print"),
-                items=[OrderItemModel(item_id="MLB3", title="商品3")],
-            )
-            self.page._all_orders = [o1, o2, o3]
+            # Check card rendering: only printed order gets "已打单" badge
+            card_unprinted = self.page._create_order_card(OrderModel(order_id="ORD_UNPRINTED", account_id="ACC1", store_name="店1", status="paid"))
+            badges_unprinted = [lbl.text() for lbl in card_unprinted.findChildren(QLabel)]
+            self.assertNotIn("未打单", badges_unprinted)
+            self.assertNotIn("已打单", badges_unprinted)
 
-            # Filter: unprinted
-            self.page._current_status_filter = "unprinted"
-            self.page._apply_filters()
-            self.assertEqual(len(self.page._filtered_orders), 1)
-            self.assertEqual(self.page._filtered_orders[0].order_id, "ORD_PRINT_3")
-
-            # Filter: printed
-            self.page._current_status_filter = "printed"
-            self.page._apply_filters()
-            self.assertEqual(len(self.page._filtered_orders), 2)
-            self.assertEqual({o.order_id for o in self.page._filtered_orders}, {"ORD_PRINT_1", "ORD_PRINT_2"})
+            card_printed = self.page._create_order_card(o1)
+            badges_printed = [lbl.text() for lbl in card_printed.findChildren(QLabel)]
+            self.assertIn("已打单", badges_printed)
+            self.assertNotIn("未打单", badges_printed)
         finally:
             set_printed_file_for_test(None)
             if tmp_f.exists():

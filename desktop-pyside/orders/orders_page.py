@@ -289,9 +289,7 @@ class OrdersPage(QWidget):
 
         self.status_combo = QComboBox()
         self.status_combo.addItem("全部状态", "ALL")
-        self.status_combo.addItem("待发货 (全部)", "paid")
-        self.status_combo.addItem("待发货 (未打单)", "unprinted")
-        self.status_combo.addItem("待发货 (已打单)", "printed")
+        self.status_combo.addItem("待发货", "paid")
         self.status_combo.addItem("运送中", "shipped")
         self.status_combo.addItem("已送达", "delivered")
         self.status_combo.addItem("待付款", "payment_required")
@@ -954,13 +952,7 @@ class OrdersPage(QWidget):
             # 2. Status Filter
             if self._current_status_filter != "ALL":
                 _, _, cat = o.status_badge_info
-                if self._current_status_filter == "unprinted":
-                    if cat != "paid" or o.is_printed:
-                        continue
-                elif self._current_status_filter == "printed":
-                    if cat != "paid" or not o.is_printed:
-                        continue
-                elif cat != self._current_status_filter and o.status != self._current_status_filter:
+                if cat != self._current_status_filter and o.status != self._current_status_filter:
                     continue
 
             # 3. Time Filter
@@ -1121,19 +1113,14 @@ class OrdersPage(QWidget):
         badge.setStyleSheet(badge_style)
         row1.addWidget(badge)
 
-        _, _, filter_cat = order.status_badge_info
-        if filter_cat != "cancelled":
-            is_pr = order.is_printed
-            print_lbl = QLabel("已打单" if is_pr else "未打单")
+        if order.is_printed:
+            print_lbl = QLabel("已打单")
             print_lbl.setFixedSize(48, 22)
             print_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            print_style = (
+            print_lbl.setStyleSheet(
                 "background: rgba(16, 185, 129, 0.16); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); font-size: 10px; font-weight: 500; border-radius: 4px;"
-                if is_pr
-                else "background: rgba(245, 158, 11, 0.16); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); font-size: 10px; font-weight: 500; border-radius: 4px;"
             )
-            print_lbl.setStyleSheet(print_style)
-            print_lbl.setToolTip("面单已打印" if is_pr else "面单未打印 (点击打印面单)")
+            print_lbl.setToolTip("面单已打印")
             row1.addWidget(print_lbl)
 
         info_layout.addLayout(row1)
@@ -1714,21 +1701,17 @@ class OrdersPage(QWidget):
         self.det_ship_meta_lbl.setText("\n".join(meta_parts))
 
         if hasattr(self, "det_print_status_badge"):
-            self.det_print_status_badge.setVisible(True)
             if order.is_printed:
+                self.det_print_status_badge.setVisible(True)
                 p_time = order.print_time
                 time_suffix = f" · {p_time}" if p_time else ""
                 self.det_print_status_badge.setText(f"✅ 已打单{time_suffix}")
                 self.det_print_status_badge.setStyleSheet(
                     "background: rgba(16, 185, 129, 0.16); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px; padding: 2px 8px;"
                 )
-                self.btn_print_single.setText("🖨️ 重新打印面单")
             else:
-                self.det_print_status_badge.setText("⏳ 未打单")
-                self.det_print_status_badge.setStyleSheet(
-                    "background: rgba(245, 158, 11, 0.16); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px; padding: 2px 8px;"
-                )
-                self.btn_print_single.setText("🖨️ 打印面单")
+                self.det_print_status_badge.setVisible(False)
+        self.btn_print_single.setText("🖨️ 打印面单")
 
         if order.pack_id and str(order.pack_id).startswith("20000"):
             self.det_pack_chip.setText(f"销售主单: #{order.pack_id}")
