@@ -289,7 +289,9 @@ class OrdersPage(QWidget):
 
         self.status_combo = QComboBox()
         self.status_combo.addItem("全部状态", "ALL")
-        self.status_combo.addItem("待发货", "paid")
+        self.status_combo.addItem("待发货 (全部)", "paid")
+        self.status_combo.addItem("待发货 (未打单)", "unprinted")
+        self.status_combo.addItem("待发货 (已打单)", "printed")
         self.status_combo.addItem("运送中", "shipped")
         self.status_combo.addItem("已送达", "delivered")
         self.status_combo.addItem("待付款", "payment_required")
@@ -676,6 +678,12 @@ class OrdersPage(QWidget):
         ship_title = QLabel("🚚 物流与配送追踪")
         ship_title.setStyleSheet("color: #F6F3EA; font-size: 13px; font-weight: bold;")
         ship_hdr.addWidget(ship_title)
+
+        self.det_print_status_badge = QLabel("⏳ 未打单")
+        self.det_print_status_badge.setStyleSheet(
+            "background: rgba(245, 158, 11, 0.16); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px; padding: 2px 8px;"
+        )
+        ship_hdr.addWidget(self.det_print_status_badge)
         ship_hdr.addStretch()
 
         self.btn_print_single = QPushButton("🖨️ 打印面单")
@@ -946,7 +954,13 @@ class OrdersPage(QWidget):
             # 2. Status Filter
             if self._current_status_filter != "ALL":
                 _, _, cat = o.status_badge_info
-                if cat != self._current_status_filter and o.status != self._current_status_filter:
+                if self._current_status_filter == "unprinted":
+                    if cat != "paid" or o.is_printed:
+                        continue
+                elif self._current_status_filter == "printed":
+                    if cat != "paid" or not o.is_printed:
+                        continue
+                elif cat != self._current_status_filter and o.status != self._current_status_filter:
                     continue
 
             # 3. Time Filter
@@ -1033,6 +1047,7 @@ class OrdersPage(QWidget):
         thumb_lbl.setFixedSize(50, 50)
         thumb_lbl.setStyleSheet("background: #121614; border: 1px solid #4E472F; border-radius: 6px;")
         thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumb_lbl.setPixmap(get_placeholder_pixmap(QSize(48, 48), "📦", radius=6))
         self._load_async_thumbnail(order.primary_thumbnail, thumb_lbl)
         thumb_lbl.setToolTip("右键可复制")
         thumb_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1105,6 +1120,21 @@ class OrdersPage(QWidget):
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         badge.setStyleSheet(badge_style)
         row1.addWidget(badge)
+
+        _, _, filter_cat = order.status_badge_info
+        if filter_cat != "cancelled":
+            is_pr = order.is_printed
+            print_lbl = QLabel("已打单" if is_pr else "未打单")
+            print_lbl.setFixedSize(48, 22)
+            print_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            print_style = (
+                "background: rgba(16, 185, 129, 0.16); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); font-size: 10px; font-weight: 500; border-radius: 4px;"
+                if is_pr
+                else "background: rgba(245, 158, 11, 0.16); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); font-size: 10px; font-weight: 500; border-radius: 4px;"
+            )
+            print_lbl.setStyleSheet(print_style)
+            print_lbl.setToolTip("面单已打印" if is_pr else "面单未打印 (点击打印面单)")
+            row1.addWidget(print_lbl)
 
         info_layout.addLayout(row1)
 
@@ -1408,19 +1438,31 @@ class OrdersPage(QWidget):
         except Exception as e:
             logger.error("Failed saving/opening PDF labels: %s", e)
             QMessageBox.critical(self, "打开面单失败", f"面单保存或预览启动失败：\n{e}")
-        except Exception as e:
-            logger.error("Failed saving/opening PDF labels: %s", e)
-            QMessageBox.critical(self, "打开面单失败", f"面单保存或预览启动失败：\n{e}")
+            return
+
+        # Mark printed locally and reflect immediately
+        from orders.print_tracker import mark_order_ids_printed
+        printed_ids = [o.order_id for o in valid_orders]
+        mark_order_ids_printed(printed_ids)
+        for o in valid_orders:
+            o.shipping.substatus = "printed"
+
+        if self._current_order and self._current_order.order_id in printed_ids:
+            self._render_order_detail(self._current_order)
+
+        self._render_order_list()
 
     def _load_async_thumbnail(self, url: str, label: QLabel) -> None:
         """Load and scale product thumbnail smoothly with disk & memory cache."""
         clean_url = str(url or "").strip()
-        if not clean_url:
+        if not label.pixmap() or label.pixmap().isNull():
             label.setPixmap(get_placeholder_pixmap(QSize(48, 48), "📦", radius=6))
+        if not clean_url:
             return
 
         def _on_loaded(pix: QPixmap) -> None:
-            label.setPixmap(pix)
+            if not pix.isNull():
+                label.setPixmap(pix)
 
         load_image_async(clean_url, QSize(48, 48), _on_loaded, radius=6, crop=True)
 
@@ -1490,6 +1532,7 @@ class OrdersPage(QWidget):
             t_lbl.setFixedSize(48, 48)
             t_lbl.setStyleSheet("background: #121614; border: 1px solid #4E472F; border-radius: 4px;")
             t_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            t_lbl.setPixmap(get_placeholder_pixmap(QSize(48, 48), "📦", radius=4))
             t_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
             t_lbl.setToolTip("点击放大查看大图 (右键可复制)")
             pic_url = it.thumbnail or order.primary_thumbnail
@@ -1669,6 +1712,23 @@ class OrdersPage(QWidget):
         if timeline_parts:
             meta_parts.append("  ·  ".join(timeline_parts))
         self.det_ship_meta_lbl.setText("\n".join(meta_parts))
+
+        if hasattr(self, "det_print_status_badge"):
+            self.det_print_status_badge.setVisible(True)
+            if order.is_printed:
+                p_time = order.print_time
+                time_suffix = f" · {p_time}" if p_time else ""
+                self.det_print_status_badge.setText(f"✅ 已打单{time_suffix}")
+                self.det_print_status_badge.setStyleSheet(
+                    "background: rgba(16, 185, 129, 0.16); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px; padding: 2px 8px;"
+                )
+                self.btn_print_single.setText("🖨️ 重新打印面单")
+            else:
+                self.det_print_status_badge.setText("⏳ 未打单")
+                self.det_print_status_badge.setStyleSheet(
+                    "background: rgba(245, 158, 11, 0.16); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px; padding: 2px 8px;"
+                )
+                self.btn_print_single.setText("🖨️ 打印面单")
 
         if order.pack_id and str(order.pack_id).startswith("20000"):
             self.det_pack_chip.setText(f"销售主单: #{order.pack_id}")
@@ -1850,6 +1910,11 @@ class OrdersPage(QWidget):
         self.det_buyer_info_lbl.setText("收件人: - · 电话: -")
         self.det_address_lbl.setText("详细地址: -")
         self.det_ship_meta_lbl.setText("物流方式: -")
+        if hasattr(self, "det_print_status_badge"):
+            self.det_print_status_badge.setText("")
+            self.det_print_status_badge.setVisible(False)
+        if hasattr(self, "btn_print_single"):
+            self.btn_print_single.setText("🖨️ 打印面单")
         self.det_pack_chip.setText("包裹号: -")
         self.det_track_chip.setText("运单号: -")
         self.det_dimensions_chip.setText("📦 出单包装尺重: -")

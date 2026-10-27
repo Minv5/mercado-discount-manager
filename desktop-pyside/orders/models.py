@@ -294,6 +294,21 @@ class OrderModel:
         return format_order_date(self.date_created)
 
     @property
+    def is_printed(self) -> bool:
+        from orders.print_tracker import is_order_printed
+        return is_order_printed(
+            self.order_id,
+            pack_id=self.pack_id,
+            shipping_status=self.shipping.status,
+            shipping_substatus=self.shipping.substatus,
+        )
+
+    @property
+    def print_time(self) -> str:
+        from orders.print_tracker import get_order_print_time
+        return get_order_print_time(self.order_id, pack_id=self.pack_id)
+
+    @property
     def status_badge_info(self) -> tuple[str, str, str]:
         return get_order_status_badge_info(self.status, self.shipping.status, self.shipping.substatus)
 

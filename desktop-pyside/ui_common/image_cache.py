@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 _MEM_CACHE: dict[str, QPixmap] = {}
 _DISK_CACHE_DIR = get_data_dir() / "image_cache"
 _LOCK = threading.Lock()
-_IMG_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="img_dl")
+_IMG_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="img_dl")
 
 
 def _get_cache_path(url: str) -> Path:
@@ -141,6 +141,26 @@ def load_image_async(
         if cache_key in _MEM_CACHE:
             callback(_MEM_CACHE[cache_key])
             return
+
+    # 2.5 Fast Disk Cache Check (bypass network thread pool for downloaded images)
+    if not is_local_file and clean_url.startswith(("http://", "https://")):
+        disk_path = _get_cache_path(clean_url)
+        if disk_path.exists():
+            try:
+                cached_data = disk_path.read_bytes()
+                if len(cached_data) > 100:
+                    img = QImage()
+                    if img.loadFromData(cached_data) and not img.isNull():
+                        aspect = Qt.AspectRatioMode.KeepAspectRatioByExpanding if crop else Qt.AspectRatioMode.KeepAspectRatio
+                        scaled = img.scaled(target_size, aspect, Qt.TransformationMode.SmoothTransformation)
+                        pix = QPixmap.fromImage(scaled)
+                        rounded = make_rounded_pixmap(pix, target_size, radius=radius) if crop else make_contain_pixmap(pix, target_size, radius=radius)
+                        with _LOCK:
+                            _MEM_CACHE[cache_key] = rounded
+                        callback(rounded)
+                        return
+            except Exception as e:
+                logger.debug("Fast disk cache read failed for %s: %s", clean_url, e)
 
     # 3. For local files, process asynchronously via event loop without waiting in network thread pool
     if is_local_file:

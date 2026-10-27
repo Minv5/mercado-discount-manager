@@ -848,6 +848,11 @@ class TestOrdersPageUI(unittest.TestCase):
         self.assertEqual(badge_lbl.width(), 74)
         self.assertEqual(badge_lbl.height(), 22)
 
+        # Check print status badge in row 1
+        print_lbl = row1.itemAt(5).widget()
+        self.assertIn(print_lbl.text(), ("未打单", "已打单"))
+        self.assertEqual(print_lbl.height(), 22)
+
         # Row 2 is title
         title_lbl = info_layout.itemAt(1).widget()
         self.assertEqual(title_lbl.text(), "Pantorrillas Y Piernas Con Máquina De Ejercicio Sentada")
@@ -1544,6 +1549,70 @@ class TestOrdersPageUI(unittest.TestCase):
 
         all_audits = get_all_shipping_audits()
         self.assertEqual(all_audits.get("TEST_AUDIT_ORDER_999"), "22 × 17 × 10 cm · 259 g")
+
+    def test_print_status_tracking_and_filtering(self):
+        """Verify that print status is tracked, reflected in badges, and filterable."""
+        import tempfile
+        from orders.print_tracker import mark_order_ids_printed, is_order_printed, set_printed_file_for_test
+        tmp_f = Path(tempfile.mktemp(suffix=".json"))
+        set_printed_file_for_test(tmp_f)
+
+        try:
+            o1 = OrderModel(
+                order_id="ORD_PRINT_1",
+                account_id="ACC1",
+                store_name="店1",
+                status="paid",
+                shipping=ShippingInfoModel(shipment_id="SHIP_1", substatus="ready_to_print"),
+                items=[OrderItemModel(item_id="MLB1", title="商品1")],
+            )
+            o2 = OrderModel(
+                order_id="ORD_PRINT_2",
+                account_id="ACC1",
+                store_name="店1",
+                status="paid",
+                shipping=ShippingInfoModel(shipment_id="SHIP_2", substatus="printed"),
+                items=[OrderItemModel(item_id="MLB2", title="商品2")],
+            )
+
+            self.assertFalse(o1.is_printed)
+            self.assertTrue(o2.is_printed)
+
+            # Mark o1 printed
+            mark_order_ids_printed(["ORD_PRINT_1"])
+            self.assertTrue(o1.is_printed)
+
+            # Render detail for o1
+            self.page._render_order_detail(o1)
+            self.assertIn("已打单", self.page.det_print_status_badge.text())
+            self.assertEqual(self.page.btn_print_single.text(), "🖨️ 重新打印面单")
+
+            # Set page orders and test unprinted / printed filters
+            o3 = OrderModel(
+                order_id="ORD_PRINT_3",
+                account_id="ACC1",
+                store_name="店1",
+                status="paid",
+                shipping=ShippingInfoModel(shipment_id="SHIP_3", substatus="ready_to_print"),
+                items=[OrderItemModel(item_id="MLB3", title="商品3")],
+            )
+            self.page._all_orders = [o1, o2, o3]
+
+            # Filter: unprinted
+            self.page._current_status_filter = "unprinted"
+            self.page._apply_filters()
+            self.assertEqual(len(self.page._filtered_orders), 1)
+            self.assertEqual(self.page._filtered_orders[0].order_id, "ORD_PRINT_3")
+
+            # Filter: printed
+            self.page._current_status_filter = "printed"
+            self.page._apply_filters()
+            self.assertEqual(len(self.page._filtered_orders), 2)
+            self.assertEqual({o.order_id for o in self.page._filtered_orders}, {"ORD_PRINT_1", "ORD_PRINT_2"})
+        finally:
+            set_printed_file_for_test(None)
+            if tmp_f.exists():
+                tmp_f.unlink()
 
 
 class TestSlaCalendarAndDeadline(unittest.TestCase):
