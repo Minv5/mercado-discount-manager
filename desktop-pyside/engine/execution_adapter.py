@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,6 +20,15 @@ from .policy import (
     extract_dimensions_and_weight,
 )
 from .pricing import extract_item_net_proceeds
+
+
+@dataclass(frozen=True)
+class ShippingReenrollRecord:
+    """Record of a recent shipping reenrollment action for debouncing."""
+
+    net_proceeds: float
+    shipping_cost: float
+    timestamp: float
 
 
 class PolicyExecutionAdapter:
@@ -47,7 +57,7 @@ class PolicyExecutionAdapter:
         self._item_locks_guard = threading.Lock()
 
         self._recently_exited_promos: dict[tuple[str, str], float] = {}
-        self._recent_shipping_reenrolls: dict[str, tuple[float, float, float]] = {}
+        self._recent_shipping_reenrolls: dict[str, ShippingReenrollRecord] = {}
         self._recent_cbt_cascades: dict[str, float] = {}
         self._exits_lock = threading.Lock()
 
@@ -101,21 +111,24 @@ class PolicyExecutionAdapter:
         with self._exits_lock:
             rec = self._recent_shipping_reenrolls.get(item_id)
             if rec is not None:
-                prev_net, prev_ship, ts = rec
-                if (now - ts) < ttl_sec and abs(prev_net - key_net) < 0.01 and abs(prev_ship - key_ship) < 0.01:
+                if (
+                    (now - rec.timestamp) < ttl_sec
+                    and abs(rec.net_proceeds - key_net) < 0.01
+                    and abs(rec.shipping_cost - key_ship) < 0.01
+                ):
                     return True
             if len(self._recent_shipping_reenrolls) > 500:
                 self._recent_shipping_reenrolls = {
-                    k: v for k, v in self._recent_shipping_reenrolls.items() if (now - v[2]) < ttl_sec
+                    k: v for k, v in self._recent_shipping_reenrolls.items() if (now - v.timestamp) < ttl_sec
                 }
             return False
 
     def mark_shipping_reenrolled(self, item_id: str, net_proceeds: float, shipping_cost: float) -> None:
         with self._exits_lock:
-            self._recent_shipping_reenrolls[item_id] = (
-                round(net_proceeds, 2),
-                round(shipping_cost, 2),
-                time.time(),
+            self._recent_shipping_reenrolls[item_id] = ShippingReenrollRecord(
+                net_proceeds=round(net_proceeds, 2),
+                shipping_cost=round(shipping_cost, 2),
+                timestamp=time.time(),
             )
 
     def should_cascade_cbt(self, cbt_id: str, cooldown_sec: float = 60.0) -> bool:

@@ -68,6 +68,8 @@ class CleanerPage(QFrame):
         self.gui_dispatcher = gui_dispatcher
         self.log_cb = log_cb
         self.accounts: list[Any] = []
+        self.operating_rows: list[dict[str, Any]] = []
+        self.operating_sites_cfg: dict[str, list[str]] = {}
         self.cleaner_records: list[ScannedItemRecord] = []
         self.cleaner_scan_stop_event = threading.Event()
         self.cleaner_delete_stop_event = threading.Event()
@@ -406,6 +408,18 @@ class CleanerPage(QFrame):
             self.cleaner_account_combo.blockSignals(False)
             self._refresh_cleaner_sites()
 
+    def update_operating_context(
+        self,
+        operating_rows: list[dict[str, Any]] | None = None,
+        operating_sites_cfg: dict[str, list[str]] | None = None,
+    ) -> None:
+        """从上层控制器注入店铺经营站点与配置，消除子页面越级强耦合。"""
+        if operating_rows is not None:
+            self.operating_rows = list(operating_rows)
+        if operating_sites_cfg is not None:
+            self.operating_sites_cfg = dict(operating_sites_cfg)
+        self._refresh_cleaner_sites()
+
     def _refresh_cleaner_sites(self) -> None:
         if not hasattr(self, "cleaner_site_combo") or not hasattr(self, "cleaner_account_combo"):
             return
@@ -417,8 +431,13 @@ class CleanerPage(QFrame):
         else:
             target_account_ids = {selected_account}
 
-        parent_win = self.parent()
-        for row in getattr(parent_win, "operating_rows_cache", []):
+        # 优先读取显式注入的上下文；为兼容未注入时的独立测试，尝试安全回退
+        rows = self.operating_rows
+        if not rows:
+            parent_win = self.parent()
+            rows = getattr(parent_win, "operating_rows_cache", []) if parent_win else []
+
+        for row in rows:
             acc_id = str(row.get("account_id") or "")
             if acc_id in target_account_ids:
                 sid = str(row.get("site_id") or "").upper()
@@ -441,8 +460,12 @@ class CleanerPage(QFrame):
                     seen_sites.add(acc.site_id.upper())
 
         # 联动过滤经营站点配置
-        settings = getattr(parent_win, "settings", {}) or {}
-        operating_cfg = settings.get("operatingSites") or {}
+        operating_cfg = self.operating_sites_cfg
+        if not operating_cfg:
+            parent_win = self.parent()
+            settings = getattr(parent_win, "settings", {}) or {} if parent_win else {}
+            operating_cfg = settings.get("operatingSites") or {}
+
         allowed_sites_for_targets: set[str] = set()
         has_cfg = False
         for aid in target_account_ids:

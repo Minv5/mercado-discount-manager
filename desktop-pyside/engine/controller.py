@@ -142,7 +142,7 @@ class EngineController:
             "service": "native-python-engine",
             "product": "mercado-discount-manager",
             "protocol_version": "3",
-            "build_fingerprint": "native-python-v2.2.52",
+            "build_fingerprint": "native-python-v2.2.53",
         }
 
     # -------------------------------------------------------------------------
@@ -257,6 +257,16 @@ class EngineController:
                 except Exception:
                     pass
         return total
+
+    def get_initial_bundle(self) -> dict[str, Any]:
+        """聚合返回客户端启动时必需的基础数据，消除多路 HTTP 字符串往返。"""
+        return {
+            "settings": self.get_settings(),
+            "accounts": self.list_accounts(),
+            "discount": self.get_global_discount(),
+            "execution": self.get_active_group(),
+            "submission": self.get_active_submission(),
+        }
 
     # -------------------------------------------------------------------------
     # 5. Global Discount & Decision

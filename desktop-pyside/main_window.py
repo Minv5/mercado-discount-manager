@@ -109,6 +109,7 @@ from engine.item_cleaner import (
 from engine.client import MercadoClient
 from engine.auth import AuthManager
 from cleaner import CleanerPage, CleanerTableModel, CLEANER_HEADERS
+from activities import ActivityPage, ACTIVITY_HEADERS, promotion_type_text, status_text
 from ui_common import (
     CheckableComboBox,
     ElidedLabel,
@@ -276,8 +277,18 @@ class MainWindow(QMainWindow):
         self.enrollment_page.addWidget(self.records_page)
         self.enrollment_page.setSizes([340, 960])
 
-        # 1: 活动管理页面；2: 商品清理页面（各自作为独立全宽视图）
-        self.activity_page, self.activity_table = self._build_activity_page()
+        # 1: 活动管理页面 (独立模块)
+        self.activity_page = ActivityPage(parent=self)
+        self.activity_table = self.activity_page.activity_table
+        self.activity_log_box = self.activity_page.activity_log_box
+        self.activity_refresh_local_btn = self.activity_page.activity_refresh_local_btn
+        self.activity_reload_live_btn = self.activity_page.activity_reload_live_btn
+        self.full_get_button = self.activity_page.full_get_button
+        self.activity_page.refreshClicked.connect(self._on_activity_refresh_clicked)
+        self.activity_page.reloadLiveClicked.connect(self._reload_live_promotions)
+        self.activity_page.fullGetClicked.connect(self._on_full_get_clicked)
+
+        # 2: 商品清理页面 (独立模块)
         self.cleaner_page = CleanerPage(
             engine=self.cleaner_engine,
             gui_dispatcher=self.gui_dispatcher,
@@ -715,61 +726,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(records_splitter, 1)
         return surface, table
 
-    def _build_activity_page(self) -> tuple[QFrame, QTableWidget]:
-        surface = self._surface()
-        layout = QVBoxLayout(surface)
-        layout.setContentsMargins(12, 10, 12, 12)
-        layout.setSpacing(6)
-
-        top_frame = QFrame()
-        top_layout = QVBoxLayout(top_frame)
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.setSpacing(6)
-
-        top = QHBoxLayout()
-        top.addWidget(section_label("活动管理"))
-        top.addStretch(1)
-        self.activity_refresh_local_btn = QPushButton("刷新列表")
-        self.activity_refresh_local_btn.setFixedHeight(32)
-        self.activity_reload_live_btn = QPushButton("重新读取活动")
-        self.activity_reload_live_btn.setFixedHeight(32)
-        self.full_get_button = QPushButton("全量GET数据")
-        self.full_get_button.setFixedHeight(32)
-        self.activity_refresh_local_btn.clicked.connect(self._on_activity_refresh_clicked)
-        self.activity_reload_live_btn.clicked.connect(self._reload_live_promotions)
-        self.full_get_button.clicked.connect(self._on_full_get_clicked)
-        top.addWidget(self.activity_refresh_local_btn)
-        top.addWidget(self.activity_reload_live_btn)
-        top.addWidget(self.full_get_button)
-        top_layout.addLayout(top)
-
-        table = make_table(ACTIVITY_HEADERS)
-        header = table.horizontalHeader()
-        header.setMinimumSectionSize(54)
-        for column in (0, 1, 2, 4, 5):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        top_layout.addWidget(table, 1)
-
-        # 独立运行日志框
-        log_frame = QFrame()
-        log_layout = QVBoxLayout(log_frame)
-        log_layout.setContentsMargins(0, 4, 0, 0)
-        log_layout.setSpacing(4)
-        log_layout.addWidget(section_label("活动运行日志"))
-        self.activity_log_box = LogViewer()
-        self.activity_log_box.append_log_line(f"[{datetime.now():%H:%M:%S}] [活动管理] 活动管理引擎就绪。点击上方按钮可刷新或全量读取美客多活动。")
-        log_layout.addWidget(self.activity_log_box, 1)
-
-        activity_splitter = QSplitter(Qt.Orientation.Vertical)
-        activity_splitter.setChildrenCollapsible(False)
-        activity_splitter.addWidget(top_frame)
-        activity_splitter.addWidget(log_frame)
-        activity_splitter.setSizes([380, 180])
-
-        layout.addWidget(activity_splitter, 1)
-        return surface, table
-
     def _on_activity_refresh_clicked(self) -> None:
         self.log("[活动管理] 正在刷新活动列表...")
         self.refresh_scope()
@@ -970,6 +926,9 @@ class MainWindow(QMainWindow):
         self._request_initial_bundle(self.initial_bundle_retry_token)
 
     def _load_initial_bundle(self) -> dict[str, Any]:
+        bridge = getattr(self.api, "bridge", None)
+        if bridge and hasattr(bridge, "get_initial_bundle"):
+            return bridge.get_initial_bundle()
         return {
             "settings": self.api.get("/api/settings").get("settings", {}),
             "accounts": self.api.get("/api/accounts").get("accounts", []),
@@ -1453,7 +1412,10 @@ class MainWindow(QMainWindow):
 
     def _refresh_cleaner_sites(self) -> None:
         if hasattr(self, "cleaner_page"):
-            self.cleaner_page._refresh_cleaner_sites()
+            self.cleaner_page.update_operating_context(
+                operating_rows=getattr(self, "operating_rows_cache", []),
+                operating_sites_cfg=(getattr(self, "settings", {}) or {}).get("operatingSites") or {},
+            )
 
     def selected_account_ids(self) -> list[str]:
         return list(self.store_map.get(str(self.store_combo.currentData() or "all"), []))
@@ -2070,30 +2032,8 @@ class MainWindow(QMainWindow):
         self.records_table.resizeRowsToContents()
 
     def _populate_activities(self) -> None:
-        self.activity_table.setRowCount(0)
-        account_map = {account.account_id: account for account in self.accounts}
-        for promotion in self.promotions:
-            row = self.activity_table.rowCount()
-            self.activity_table.insertRow(row)
-            account = account_map.get(str(promotion.get("account_id") or ""))
-            s_id = str(promotion.get("site_id") or "").strip()
-            if not s_id:
-                p_id = str(promotion.get("id") or promotion.get("promotion_id") or "").upper()
-                for code in ("MLB", "MLM", "MLC", "MCO", "MLA", "MLU", "MPE", "MEC"):
-                    if code in p_id:
-                        s_id = code
-                        break
-            p_type = str(promotion.get("promotion_type") or promotion.get("type") or "").strip()
-            values = [
-                account.store_name if account else "当前店铺",
-                site_name(s_id),
-                promotion_type_text(p_type),
-                promotion_display_name(promotion),
-                status_text(str(promotion.get("status") or "")),
-                str(promotion.get("total") or promotion.get("items_total") or 0),
-            ]
-            for column, value in enumerate(values):
-                self.activity_table.setItem(row, column, QTableWidgetItem(value))
+        if hasattr(self, "activity_page") and hasattr(self.activity_page, "populate"):
+            self.activity_page.populate(self.promotions, self.accounts)
 
     def _update_nav_selection(self, active_button: QPushButton | None) -> None:
         buttons = [
@@ -2451,9 +2391,14 @@ class MainWindow(QMainWindow):
 
         def reload() -> list[tuple[str, int]]:
             result: list[tuple[str, int]] = []
+            controller = getattr(self.api, "bridge", None)
             for account_id in account_ids:
-                payload = self.api.post(f"/api/accounts/{account_id}/promotions/fetch", {}, timeout=120)
-                result.append((account_id, int(payload.get("total") or 0)))
+                if controller and hasattr(controller, "fetch_promotions"):
+                    total = controller.fetch_promotions(account_id)
+                else:
+                    payload = self.api.post(f"/api/accounts/{account_id}/promotions/fetch", {}, timeout=120)
+                    total = int(payload.get("total") or 0)
+                result.append((account_id, total))
             return result
 
         def done(rows: object) -> None:
@@ -4137,7 +4082,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.52"
+    return "2.2.53"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.
@@ -4594,34 +4539,6 @@ def execution_result_text(result: dict[str, Any], action: str) -> str:
         f"{common}，{success_label} {success}{pending_text}，{failed_text}，"
         f"活动失败 {count_or_marker(activity_failures)}，跳过 {skipped}"
     )
-
-
-def promotion_type_text(value: str) -> str:
-    key = str(value or "").strip().upper()
-    return {
-        "SELLER_CAMPAIGN": "自建活动",
-        "CUSTOM": "自建活动",
-        "PRICE_DISCOUNT": "单品折扣",
-        "DEAL": "官方活动",
-        "MARKETPLACE_CAMPAIGN": "官方活动",
-        "SMART": "SMART",
-        "LIGHTNING": "限时活动",
-    }.get(key, key or "其它活动")
-
-
-def status_text(value: str) -> str:
-    return {
-        "started": "进行中",
-        "pending": "待开始",
-        "candidate": "可报名",
-        "completed": "已完成",
-        "partial_or_failed": "部分完成",
-        "failed": "未完整完成",
-        "cancelled": "已停止",
-        "cancelling": "停止中",
-        "interrupted": "意外中断",
-        "running": "执行中",
-    }.get(value.lower(), value or "-")
 
 
 def execution_log_message(value: object) -> str:
