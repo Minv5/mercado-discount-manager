@@ -1113,16 +1113,6 @@ class OrdersPage(QWidget):
         badge.setStyleSheet(badge_style)
         row1.addWidget(badge)
 
-        if order.is_printed:
-            print_lbl = QLabel("已打单")
-            print_lbl.setFixedSize(48, 22)
-            print_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            print_lbl.setStyleSheet(
-                "background: rgba(16, 185, 129, 0.16); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); font-size: 10px; font-weight: 500; border-radius: 4px;"
-            )
-            print_lbl.setToolTip("面单已打印")
-            row1.addWidget(print_lbl)
-
         info_layout.addLayout(row1)
 
         # Row 2: [商品标题]
@@ -1278,6 +1268,17 @@ class OrdersPage(QWidget):
             row3.addWidget(adj_chip)
 
         row3.addStretch(1)
+
+        if order.is_printed:
+            print_lbl = QLabel("已打单")
+            print_lbl.setFixedSize(48, 20)
+            print_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            print_lbl.setStyleSheet(
+                "background: rgba(16, 185, 129, 0.16); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); font-size: 10px; font-weight: 500; border-radius: 4px;"
+            )
+            print_lbl.setToolTip("面单已打印")
+            row3.addWidget(print_lbl)
+
         info_layout.addLayout(row3)
 
         card_layout.addLayout(info_layout, 1)

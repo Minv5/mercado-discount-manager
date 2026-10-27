@@ -1601,6 +1601,14 @@ class TestOrdersPageUI(unittest.TestCase):
             badges_printed = [lbl.text() for lbl in card_printed.findChildren(QLabel)]
             self.assertIn("已打单", badges_printed)
             self.assertNotIn("未打单", badges_printed)
+
+            # Verify row1 only has main badge, and row3 has print badge right-aligned
+            info_layout = card_printed.layout().itemAt(2).layout()
+            row1 = info_layout.itemAt(0).layout()
+            self.assertIsNone(row1.itemAt(5))
+            row3 = info_layout.itemAt(2).layout()
+            print_w = row3.itemAt(row3.count() - 1).widget()
+            self.assertEqual(print_w.text(), "已打单")
         finally:
             set_printed_file_for_test(None)
             if tmp_f.exists():
