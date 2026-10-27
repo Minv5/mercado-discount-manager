@@ -393,6 +393,13 @@ class OrderModel:
         skus = [it.sku for it in self.items if it.sku]
         return ", ".join(skus) if skus else ""
 
+    @property
+    def display_order_id(self) -> str:
+        """Return the seller-facing master order id (e.g. 2000015679334027 from pack_id or order_id)."""
+        if self.pack_id and str(self.pack_id).strip().startswith("20000"):
+            return str(self.pack_id).strip()
+        return str(self.order_id or self.pack_id or "").strip()
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "order_id": self.order_id,
@@ -488,8 +495,20 @@ class OrderModel:
 
         created_ts = float(data.get("created_timestamp") or 0.0)
         date_created = str(data.get("date_created") or "")
+        if not date_created and sh.get("date_created"):
+            date_created = str(sh.get("date_created"))
         if not created_ts and date_created:
             created_ts = parse_order_timestamp(date_created)
+
+        resolved_site = str(data.get("site_id") or "")
+        if not resolved_site and items:
+            pfx = str(items[0].item_id or "")[:3].upper()
+            if pfx in ("MLA", "MLM", "MLB", "MLC", "MCO", "MLU", "MPE"):
+                resolved_site = pfx
+
+        buyer_nick = str(data.get("buyer_nickname") or "")
+        if shipping.receiver_name and (not buyer_nick or buyer_nick.startswith("买家")):
+            buyer_nick = shipping.receiver_name
 
         items_fee = round(sum(it.sale_fee * it.quantity for it in items), 2)
         raw_sale_fee = float(data.get("sale_fee") or 0.0)
@@ -499,14 +518,14 @@ class OrderModel:
             order_id=str(data.get("order_id") or ""),
             account_id=str(data.get("account_id") or ""),
             store_name=str(data.get("store_name") or ""),
-            site_id=str(data.get("site_id") or ""),
+            site_id=resolved_site,
             pack_id=str(data.get("pack_id") or ""),
             date_created=date_created,
             date_closed=str(data.get("date_closed") or ""),
             status=str(data.get("status") or "paid"),
             status_detail=str(data.get("status_detail") or ""),
             buyer_id=str(data.get("buyer_id") or ""),
-            buyer_nickname=str(data.get("buyer_nickname") or ""),
+            buyer_nickname=buyer_nick,
             buyer_full_name=str(data.get("buyer_full_name") or ""),
             total_amount=float(data.get("total_amount") or 0.0),
             paid_amount=float(data.get("paid_amount") or 0.0),
@@ -652,16 +671,45 @@ def parse_order_from_dict(
     log_type = str(shipping_dict.get("logistic_type") or shipping_dict.get("shipping_mode") or "官方物流")
     ship_status = str(shipping_dict.get("status") or "")
     ship_substatus = str(shipping_dict.get("substatus") or "")
-    rec_addr = shipping_dict.get("receiver_address") or {}
-    rec_name = str(rec_addr.get("receiver_name") or buyer_full or "")
+
+    # Date backfill from shipping if order level date was omitted
+    if not date_created or ts == 0.0:
+        ship_date = str(shipping_dict.get("date_created") or "").strip()
+        if ship_date:
+            date_created = ship_date
+            ts = parse_order_timestamp(date_created)
+
+    # Site backfill from shipping source or item prefix
+    if not resolved_site:
+        ship_source_site = str((shipping_dict.get("source") or {}).get("site_id") or "").strip()
+        if ship_source_site:
+            resolved_site = ship_source_site
+        elif items:
+            pfx = str(items[0].item_id or "")[:3].upper()
+            if pfx in ("MLA", "MLM", "MLB", "MLC", "MCO", "MLU", "MPE"):
+                resolved_site = pfx
+
+    rec_addr = shipping_dict.get("receiver_address") or (shipping_dict.get("destination") or {}).get("shipping_address") or {}
+    rec_dest = shipping_dict.get("destination") or {}
+    rec_name = str(rec_addr.get("receiver_name") or rec_dest.get("receiver_name") or buyer_full or "")
+    if rec_name and (not buyer_nickname or buyer_nickname.startswith("买家")):
+        buyer_nickname = rec_name
+
     rec_phone = str(rec_addr.get("receiver_phone") or "")
-    country_id = str((rec_addr.get("country") or {}).get("id") or "")
-    state_name = str((rec_addr.get("state") or {}).get("name") or "")
-    city_name = str((rec_addr.get("city") or {}).get("name") or "")
+    country_id = str((rec_addr.get("country") or {}).get("id") or (rec_addr.get("country") if isinstance(rec_addr.get("country"), str) else "") or "")
+    state_name = str((rec_addr.get("state") or {}).get("name") or (rec_addr.get("state") if isinstance(rec_addr.get("state"), str) else "") or "")
+    city_name = str((rec_addr.get("city") or {}).get("name") or (rec_addr.get("city") if isinstance(rec_addr.get("city"), str) else "") or "")
     street_name = str(rec_addr.get("street_name") or "")
     street_number = str(rec_addr.get("street_number") or "")
     comment = str(rec_addr.get("comment") or "")
     zip_code = str(rec_addr.get("zip_code") or "")
+
+    # Backfill amount if total was 0
+    if total_amount <= 0.0:
+        dec_val = float(shipping_dict.get("declared_value") or 0.0)
+        if dec_val > 0.0:
+            total_amount = dec_val
+            paid_amount = dec_val
     ship_dims = format_dimensions_display(shipping_dict.get("dimensions") or shipping_dict.get("shipping_dimensions") or "")
     raw_handling_limit = str(
         (shipping_dict.get("estimated_handling_limit") or {}).get("date")

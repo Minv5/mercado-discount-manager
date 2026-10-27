@@ -1663,6 +1663,76 @@ class TestSlaCalendarAndDeadline(unittest.TestCase):
             rate_lat, src_lat = get_cny_exchange_rate(cur)
             self.assertGreater(rate_lat, 0.0)
 
+    def test_cbt_master_order_id_and_shipment_backfill(self) -> None:
+        """Verify CBT master order ID display and automatic backfill from shipment data."""
+        # 1. display_order_id priority
+        ord_cbt = OrderModel(
+            order_id="2000019143299056",
+            account_id="3408885754",
+            store_name="湖南店",
+            pack_id="2000015679334027",
+            status="paid",
+            site_id="MLA",
+        )
+        self.assertEqual(ord_cbt.display_order_id, "2000015679334027")
+
+        ord_std = OrderModel(
+            order_id="2000019999999999",
+            account_id="3408885754",
+            store_name="湖南店",
+            status="paid",
+        )
+        self.assertEqual(ord_std.display_order_id, "2000019999999999")
+
+        # 2. parse_order_from_dict backfills from shipment when date/site missing
+        raw_cbt = {
+            "id": 2000015679334027,
+            "orders": [{"id": 2000019143299056}],
+            "config": {"items": [{"id": "MLA3654551362"}]},
+            "shipment": {
+                "id": 48336180220,
+                "date_created": "2026-10-23T19:23:19.341-04:00",
+                "source": {"site_id": "MLA"},
+                "declared_value": 49.44,
+                "destination": {
+                    "receiver_name": "Claudia dominguez",
+                    "shipping_address": {"city": {"name": "Nordelta"}, "state": {"name": "Buenos Aires"}},
+                },
+            },
+        }
+        parsed = parse_order_from_dict(raw_cbt, "3408885754", "湖南店")
+        self.assertEqual(parsed.order_id, "2000019143299056")
+        self.assertEqual(parsed.pack_id, "2000015679334027")
+        self.assertEqual(parsed.display_order_id, "2000015679334027")
+        self.assertEqual(parsed.site_id, "MLA")
+        self.assertEqual(parsed.date_created, "2026-10-23T19:23:19.341-04:00")
+        self.assertGreater(parsed.created_timestamp, 0.0)
+        self.assertEqual(parsed.buyer_nickname, "Claudia dominguez")
+        self.assertEqual(parsed.total_amount, 49.44)
+
+        # 3. from_dict backfills site from item prefix
+        dict_data = {
+            "order_id": "2000019143299056",
+            "account_id": "3408885754",
+            "store_name": "湖南店",
+            "site_id": "",
+            "pack_id": "2000015679334027",
+            "date_created": "",
+            "created_timestamp": 0.0,
+            "status": "paid",
+            "items": [{"item_id": "MLA3654551362", "title": "Test Paper Holder"}],
+            "shipping": {
+                "shipment_id": "48336180220",
+                "date_created": "2026-10-23T19:23:19.341-04:00",
+                "receiver_name": "Claudia dominguez",
+            },
+        }
+        restored = OrderModel.from_dict(dict_data)
+        self.assertEqual(restored.site_id, "MLA")
+        self.assertEqual(restored.date_created, "2026-10-23T19:23:19.341-04:00")
+        self.assertGreater(restored.created_timestamp, 0.0)
+        self.assertEqual(restored.buyer_nickname, "Claudia dominguez")
+
 
 if __name__ == "__main__":
     unittest.main()

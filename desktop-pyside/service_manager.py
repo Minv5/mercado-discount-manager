@@ -67,8 +67,8 @@ class NodeServiceManager:
 
     def _read_health(self, timeout: float = 1.0) -> dict[str, object] | None:
         try:
-            from engine.bridge import EngineBridge
-            health = EngineBridge.dispatch_sync("GET", "/api/health")
+            from engine.controller import EngineController
+            health = EngineController.get_instance().get_health()
             if isinstance(health, dict) and health.get("ok"):
                 return {
                     "ok": True,

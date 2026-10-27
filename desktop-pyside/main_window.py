@@ -588,8 +588,8 @@ class MainWindow(QMainWindow):
         bridge = getattr(self.api, "bridge", None)
         if not bridge:
             try:
-                from engine.bridge import EngineBridge
-                bridge = EngineBridge.get_instance()
+                from engine.controller import EngineController
+                bridge = EngineController.get_instance()
             except Exception:
                 bridge = None
         cs_client = getattr(bridge, "client", None) or MercadoClient(AuthManager())
@@ -5214,7 +5214,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.47"
+    return "2.2.49"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.

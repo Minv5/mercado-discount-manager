@@ -443,6 +443,56 @@ class OrdersFetchWorker(QThread):
                         ord_model.shipping.shipping_adjustment_reason = adj_reason
                         ord_model.shipping.shipping_cost = final_ship_cost
                         ord_model.shipping_cost = final_ship_cost
+
+                        # Smart backfill core order attributes from shipment if missing
+                        ship_date = str(ship_det.get("date_created") or "").strip()
+                        if ship_date and (not ord_model.date_created or ord_model.created_timestamp == 0.0):
+                            ord_model.date_created = ship_date
+                            ord_model.created_timestamp = parse_order_timestamp(ship_date)
+
+                        ship_site = str((ship_det.get("source") or {}).get("site_id") or "").strip()
+                        if not ship_site and ord_model.items:
+                            pfx = str(ord_model.items[0].item_id or "")[:3].upper()
+                            if pfx in ("MLA", "MLM", "MLB", "MLC", "MCO", "MLU", "MPE"):
+                                ship_site = pfx
+                        if ship_site and not ord_model.site_id:
+                            ord_model.site_id = ship_site
+                            if not ord_model.store_name or ord_model.store_name == aid:
+                                ord_model.store_name = get_store_alias(self.auth_mgr, aid, ship_site) or ord_model.store_name
+
+                        dest = ship_det.get("destination") or {}
+                        rec_name = str(dest.get("receiver_name") or "").strip()
+                        if rec_name:
+                            ord_model.shipping.receiver_name = rec_name
+                            if not ord_model.buyer_nickname or ord_model.buyer_nickname.startswith("买家"):
+                                ord_model.buyer_nickname = rec_name
+                        dest_addr = dest.get("shipping_address") or {}
+                        if dest_addr:
+                            if not ord_model.shipping.city_name:
+                                ord_model.shipping.city_name = str((dest_addr.get("city") or {}).get("name") or "")
+                            if not ord_model.shipping.state_name:
+                                ord_model.shipping.state_name = str((dest_addr.get("state") or {}).get("name") or "")
+                            if not ord_model.shipping.country_id:
+                                ord_model.shipping.country_id = str((dest_addr.get("country") or {}).get("id") or "")
+                            if not ord_model.shipping.street_name:
+                                ord_model.shipping.street_name = str(dest_addr.get("street_name") or "")
+                            if not ord_model.shipping.street_number:
+                                ord_model.shipping.street_number = str(dest_addr.get("street_number") or "")
+                            if not ord_model.shipping.zip_code:
+                                ord_model.shipping.zip_code = str(dest_addr.get("zip_code") or "")
+
+                        dec_val = float(ship_det.get("declared_value") or 0.0)
+                        if dec_val > 0.0:
+                            if ord_model.total_amount <= 0.0:
+                                ord_model.total_amount = dec_val
+                            if ord_model.paid_amount <= 0.0:
+                                ord_model.paid_amount = dec_val
+                            if not ord_model.currency_id:
+                                ord_model.currency_id = str(ship_det.get("currency_id") or "USD")
+
+                        ext_ref = str(ship_det.get("external_reference") or "").strip()
+                        if ext_ref and not ord_model.pack_id:
+                            ord_model.pack_id = ext_ref
             except Exception:
                 pass
 
@@ -839,6 +889,10 @@ class OrdersPage(QWidget):
                         continue
                     if "order_id" in item:
                         o = OrderModel.from_dict(item)
+                        if not o.site_id and o.items:
+                            pfx = str(o.items[0].item_id or "")[:3].upper()
+                            if pfx in ("MLA", "MLM", "MLB", "MLC", "MCO", "MLU", "MPE"):
+                                o.site_id = pfx
                         if o.account_id:
                             alias = get_store_alias(self.auth_mgr, o.account_id, o.site_id)
                             if alias:
@@ -1186,7 +1240,7 @@ class OrdersPage(QWidget):
         """)
         make_selectable_label(
             self.det_order_id_lbl,
-            fallback_getter=lambda: self._current_order.order_id if self._current_order else "",
+            fallback_getter=lambda: self._current_order.display_order_id if self._current_order else "",
             tooltip="鼠标选择即可复制 (或右键/快捷键复制纯订单号)",
         )
         ov_mid.addWidget(self.det_order_id_lbl)
@@ -1911,10 +1965,14 @@ class OrdersPage(QWidget):
         widget.setMinimumWidth(0)
         widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
-        widget.setToolTip(f"订单号: {order.order_id} (右键可快速复制订单号)")
+        disp_oid = order.display_order_id
+        if disp_oid != order.order_id:
+            widget.setToolTip(f"销售主单: #{disp_oid}\n内部子单: {order.order_id}\n(右键可快速复制订单号)")
+        else:
+            widget.setToolTip(f"订单号: {order.order_id} (右键可快速复制订单号)")
         widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         widget.customContextMenuRequested.connect(
-            lambda pos, oid=order.order_id, w=widget: show_pure_copy_menu(w, pos, lambda: oid)
+            lambda pos, oid=disp_oid, w=widget: show_pure_copy_menu(w, pos, lambda: oid)
         )
 
         def _on_card_click(event, oid=order.order_id):
@@ -2099,7 +2157,11 @@ class OrdersPage(QWidget):
         elif hasattr(self, "det_sla_badge"):
             self.det_sla_badge.hide()
 
-        self.det_order_id_lbl.setText(f"订单号: {order.order_id}")
+        disp_oid = order.display_order_id
+        if order.pack_id and order.pack_id != order.order_id and str(order.pack_id).startswith("20000"):
+            self.det_order_id_lbl.setText(f"总订单号: {order.pack_id}  (子单号: {order.order_id})")
+        else:
+            self.det_order_id_lbl.setText(f"订单号: {disp_oid}")
         created_str = order.display_time or "未知"
         self.det_dates_lbl.setText(f"下单时间: {created_str}")
 
@@ -2305,8 +2367,11 @@ class OrdersPage(QWidget):
             meta_parts.append("  ·  ".join(timeline_parts))
         self.det_ship_meta_lbl.setText("\n".join(meta_parts))
 
-        pid_text = order.pack_id or "无包裹号"
-        self.det_pack_chip.setText(f"包裹号: {pid_text}")
+        if order.pack_id and str(order.pack_id).startswith("20000"):
+            self.det_pack_chip.setText(f"销售主单: #{order.pack_id}")
+        else:
+            pid_text = order.pack_id or "无包裹号"
+            self.det_pack_chip.setText(f"包裹号: {pid_text}")
 
         tid_text = order.shipping.tracking_number or "暂无运单号"
         self.det_track_chip.setText(f"运单号: {tid_text}")
