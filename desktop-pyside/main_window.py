@@ -108,6 +108,7 @@ from engine.item_cleaner import (
 )
 from engine.client import MercadoClient
 from engine.auth import AuthManager
+from cleaner import CleanerPage, CleanerTableModel, CLEANER_HEADERS
 from ui_common import (
     CheckableComboBox,
     ElidedLabel,
@@ -120,7 +121,6 @@ from ui_common import (
 
 TASK_HEADERS = ["时间", "动作", "折扣", "活动", "类型", "商品 / 处理项", "结果", "失败", "失败原因"]
 ACTIVITY_HEADERS = ["店铺", "站点", "类型", "活动", "状态", "商品数"]
-CLEANER_HEADERS = ["选择", "店铺", "商品ID", "站点", "商品标题", "刊登评分", "浏览量", "销售量", "上架时间", "状态", "不达标原因"]
 RECORD_VIEW_LIMITS = {"recent": 20, "all": 300}
 STARTUP_PHASE_LABELS = {
     "service_connect": "程序组件连接",
@@ -131,297 +131,6 @@ STARTUP_PHASE_LABELS = {
 }
 
 # CheckableComboBox is extracted to ui_common.widgets and imported above.
-
-
-class CleanerTableModel(QAbstractTableModel):
-    def __init__(self, headers: list[str], parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.headers = list(headers)
-        self._records: list[ScannedItemRecord] = []
-        self._id_to_row: dict[str, int] = {}
-        self.on_selection_changed_cb: Callable[[], None] | None = None
-
-    @property
-    def records(self) -> list[ScannedItemRecord]:
-        return self._records
-
-    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        if parent.isValid():
-            return 0
-        return len(self._records)
-
-    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        if parent.isValid():
-            return 0
-        return len(self.headers)
-
-    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
-        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            if 0 <= section < len(self.headers):
-                return self.headers[section]
-        return None
-
-    def flags(self, index: QModelIndex) -> Qt.ItemFlags:
-        if not index.isValid():
-            return Qt.ItemFlag.NoItemFlags
-        default_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        if index.column() == 0:
-            return default_flags | Qt.ItemFlag.ItemIsUserCheckable
-        return default_flags
-
-    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
-        if not index.isValid() or not (0 <= index.row() < len(self._records)):
-            return None
-        rec = self._records[index.row()]
-        col = index.column()
-
-        if role == Qt.ItemDataRole.CheckStateRole:
-            if col == 0:
-                return Qt.CheckState.Checked if rec.is_selected_for_delete else Qt.CheckState.Unchecked
-            return None
-
-        if role == Qt.ItemDataRole.DisplayRole:
-            if col == 0:
-                return ""
-            elif col == 1:
-                return rec.store_name or rec.account_id
-            elif col == 2:
-                return rec.item_id
-            elif col == 3:
-                return rec.site_id
-            elif col == 4:
-                return rec.title
-            elif col == 5:
-                return f"{rec.score} 分 ({rec.level_wording})" if rec.score is not None else "未评估"
-            elif col == 6:
-                return str(rec.visits)
-            elif col == 7:
-                if rec.has_sales:
-                    if "在售" in rec.status or rec.status == "active":
-                        return f"⚠️ 已售 {rec.sold_quantity} 件 (在售保护)"
-                    return f"已售 {rec.sold_quantity} 件 (已下架)"
-                return "0"
-            elif col == 8:
-                return f"{rec.date_created} ({rec.days_on_sale}天前)" if rec.date_created else "-"
-            elif col == 9:
-                return rec.status
-            elif col == 10:
-                return ", ".join(rec.unmet_reasons)
-            return None
-
-        if role == Qt.ItemDataRole.ForegroundRole:
-            if col == 7 and rec.has_sales:
-                if "在售" in rec.status or rec.status == "active":
-                    return QBrush(QColor("#ff8a65"))
-                return QBrush(QColor("#C8C3B7"))
-            if col == 9:
-                if rec.status == "已删除":
-                    return QBrush(QColor("#188038"))
-                elif "失败" in rec.status or "err" in rec.status.lower() or "fail" in rec.status.lower():
-                    return QBrush(QColor("#d93025"))
-            return None
-
-        if role == Qt.ItemDataRole.BackgroundRole:
-            if rec.has_sales and ("在售" in rec.status or rec.status == "active"):
-                return QBrush(QColor("#2d2019"))
-            return None
-
-        if role == Qt.ItemDataRole.ToolTipRole:
-            if col == 4:
-                return rec.title
-            elif col == 7 and rec.has_sales:
-                if "在售" in rec.status or rec.status == "active":
-                    return f"该商品为在售出单核心资产（已售 {rec.sold_quantity} 件），系统默认排除在批量删除之外！"
-                return f"该商品历史曾出单 {rec.sold_quantity} 件，但已被平台明确下架/封禁，默认纳入批量清理范围。"
-            elif col == 8:
-                return f"官方上架时间: {rec.date_created} (已在架 {rec.days_on_sale} 天)"
-            elif col == 9:
-                return f"当前状态: {rec.status}"
-            elif col == 10:
-                return ", ".join(rec.unmet_reasons)
-            return None
-
-        return None
-
-    def sort(self, column: int, order: Qt.SortOrder = Qt.SortOrder.AscendingOrder) -> None:
-        """支持点击表头对任意指标列进行原生升序/降序重排。"""
-        self.beginResetModel()
-        reverse = (order == Qt.SortOrder.DescendingOrder)
-        if column == 1:
-            self._records.sort(key=lambda r: (r.store_name or ""), reverse=reverse)
-        elif column == 2:
-            self._records.sort(key=lambda r: r.item_id, reverse=reverse)
-        elif column == 3:
-            self._records.sort(key=lambda r: r.site_id, reverse=reverse)
-        elif column == 4:
-            self._records.sort(key=lambda r: r.title, reverse=reverse)
-        elif column == 5:
-            self._records.sort(key=lambda r: (r.score if r.score is not None else -1), reverse=reverse)
-        elif column == 6:  # 浏览量 (整数数值排序)
-            self._records.sort(key=lambda r: r.visits, reverse=reverse)
-        elif column == 7:  # 销售量 (整数数值排序)
-            self._records.sort(key=lambda r: r.sold_quantity, reverse=reverse)
-        elif column == 8:  # 上架时间 (按上架天数数值排序)
-            self._records.sort(key=lambda r: (r.days_on_sale, r.date_created), reverse=reverse)
-        elif column == 9:  # 状态
-            self._records.sort(key=lambda r: r.status, reverse=reverse)
-        elif column == 10:  # 不达标原因
-            self._records.sort(key=lambda r: (", ".join(r.unmet_reasons)), reverse=reverse)
-        self._id_to_row = {r.item_id: idx for idx, r in enumerate(self._records)}
-        self.endResetModel()
-
-    def setData(self, index: QModelIndex, value: Any, role: int = Qt.ItemDataRole.EditRole) -> bool:
-        if not index.isValid() or not (0 <= index.row() < len(self._records)):
-            return False
-        rec = self._records[index.row()]
-        if index.column() == 0 and role == Qt.ItemDataRole.CheckStateRole:
-            checked = (value == Qt.CheckState.Checked or value == Qt.CheckState.Checked.value or value == 2)
-            if rec.is_selected_for_delete != checked:
-                rec.is_selected_for_delete = checked
-                self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
-                if self.on_selection_changed_cb:
-                    self.on_selection_changed_cb()
-            return True
-        return False
-
-    def set_records(self, records: list[ScannedItemRecord]) -> None:
-        self.beginResetModel()
-        self._records = list(records)
-        self._id_to_row = {r.item_id: idx for idx, r in enumerate(self._records)}
-        self.endResetModel()
-
-    def upsert_records(self, new_records: list[ScannedItemRecord]) -> None:
-        if not new_records:
-            return
-        truly_new: list[ScannedItemRecord] = []
-        for rec in new_records:
-            row = self._id_to_row.get(rec.item_id)
-            if row is not None and 0 <= row < len(self._records):
-                old_rec = self._records[row]
-                # 1. 增量合并未达标原因（unmet_reasons），保持顺序去重
-                merged_reasons = list(old_rec.unmet_reasons or [])
-                for r in (rec.unmet_reasons or []):
-                    if r not in merged_reasons:
-                        merged_reasons.append(r)
-                old_rec.unmet_reasons = merged_reasons
-
-                # 2. 增量合并 sub_status
-                merged_sub_st = list(old_rec.sub_status or [])
-                for s in (rec.sub_status or []):
-                    if s not in merged_sub_st:
-                        merged_sub_st.append(s)
-                old_rec.sub_status = merged_sub_st
-
-                # 3. 刷新最新指标
-                if rec.score is not None:
-                    old_rec.score = rec.score
-                    old_rec.level_wording = rec.level_wording
-                old_rec.visits = rec.visits
-                old_rec.sold_quantity = rec.sold_quantity
-                old_rec.has_sales = rec.has_sales
-                if rec.title:
-                    old_rec.title = rec.title
-                if rec.store_name:
-                    old_rec.store_name = rec.store_name
-                if rec.days_on_sale:
-                    old_rec.days_on_sale = rec.days_on_sale
-                if rec.date_created:
-                    old_rec.date_created = rec.date_created
-
-                # 4. 状态保护：已处于已删除终态的商品绝不倒退
-                if is_item_confirmed_deleted(old_rec):
-                    old_rec.status = "已删除"
-                    old_rec.is_selected_for_delete = False
-                else:
-                    if rec.status:
-                        old_rec.status = rec.status
-                    is_active_sale = old_rec.has_sales and ("在售" in (rec.status or old_rec.status) or (rec.status or old_rec.status) == "active")
-                    if is_active_sale:
-                        old_rec.is_selected_for_delete = False
-                    elif rec.is_selected_for_delete:
-                        old_rec.is_selected_for_delete = True
-
-                self.dataChanged.emit(
-                    self.index(row, 0),
-                    self.index(row, len(self.headers) - 1),
-                    [
-                        Qt.ItemDataRole.DisplayRole,
-                        Qt.ItemDataRole.ForegroundRole,
-                        Qt.ItemDataRole.CheckStateRole,
-                        Qt.ItemDataRole.BackgroundRole,
-                        Qt.ItemDataRole.ToolTipRole,
-                    ],
-                )
-            else:
-                truly_new.append(rec)
-
-        if truly_new:
-            first = len(self._records)
-            last = first + len(truly_new) - 1
-            self.beginInsertRows(QModelIndex(), first, last)
-            self._records.extend(truly_new)
-            for idx, r in enumerate(truly_new, start=first):
-                self._id_to_row[r.item_id] = idx
-            self.endInsertRows()
-
-    def append_records(self, new_records: list[ScannedItemRecord]) -> None:
-        self.upsert_records(new_records)
-
-    def clear(self) -> None:
-        self.beginResetModel()
-        self._records.clear()
-        self._id_to_row.clear()
-        self.endResetModel()
-
-    def update_item_status(self, item_id: str, new_status: str, succ: bool) -> None:
-        row = self._id_to_row.get(item_id)
-        if row is not None and 0 <= row < len(self._records):
-            rec = self._records[row]
-            rec.status = new_status
-            if succ:
-                rec.is_selected_for_delete = False
-                sub_st = list(rec.sub_status or [])
-                if "deleted" not in sub_st:
-                    sub_st.append("deleted")
-                rec.sub_status = sub_st
-            self.dataChanged.emit(
-                self.index(row, 0),
-                self.index(row, len(self.headers) - 1),
-                [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ForegroundRole, Qt.ItemDataRole.CheckStateRole],
-            )
-
-    def select_all_safe(self) -> int:
-        skipped = 0
-        for rec in self._records:
-            if rec.has_sales:
-                rec.is_selected_for_delete = False
-                skipped += 1
-            elif is_item_confirmed_deleted(rec):
-                rec.is_selected_for_delete = False
-                skipped += 1
-            else:
-                rec.is_selected_for_delete = True
-        if self._records:
-            self.dataChanged.emit(
-                self.index(0, 0),
-                self.index(len(self._records) - 1, 0),
-                [Qt.ItemDataRole.CheckStateRole],
-            )
-        if self.on_selection_changed_cb:
-            self.on_selection_changed_cb()
-        return skipped
-
-    def unselect_all(self) -> None:
-        for rec in self._records:
-            rec.is_selected_for_delete = False
-        if self._records:
-            self.dataChanged.emit(
-                self.index(0, 0),
-                self.index(len(self._records) - 1, 0),
-                [Qt.ItemDataRole.CheckStateRole],
-            )
-        if self.on_selection_changed_cb:
-            self.on_selection_changed_cb()
 
 
 class MainWindow(QMainWindow):
@@ -498,16 +207,6 @@ class MainWindow(QMainWindow):
         self._service_progress_key = ""
         self._closing = False
         self.cleaner_engine = ItemCleanerEngine(MercadoClient(AuthManager(), max_concurrency=64))
-        self.cleaner_records: list[ScannedItemRecord] = []
-        self.cleaner_scan_stop_event = threading.Event()
-        self.cleaner_delete_stop_event = threading.Event()
-        self.cleaner_is_scanning = False
-        self.cleaner_is_deleting = False
-        self.cleaner_model: CleanerTableModel | None = None
-        self._cleaner_save_timer = QTimer(self)
-        self._cleaner_save_timer.setSingleShot(True)
-        self._cleaner_save_timer.setInterval(1200)
-        self._cleaner_save_timer.timeout.connect(self._save_cleaner_draft_async)
         self.enrollment_log_box: LogViewer | None = None
         self.activity_log_box: LogViewer | None = None
         self.cleaner_log_box: LogViewer | None = None
@@ -517,7 +216,6 @@ class MainWindow(QMainWindow):
         self._log_auto_scroll = True
         self._latest_release_info: ReleaseInfo | None = None
         self._build_ui()
-        self._load_cleaner_draft()
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(900)
         self.poll_timer.timeout.connect(self._poll_group)
@@ -580,7 +278,34 @@ class MainWindow(QMainWindow):
 
         # 1: 活动管理页面；2: 商品清理页面（各自作为独立全宽视图）
         self.activity_page, self.activity_table = self._build_activity_page()
-        self.cleaner_page, self.cleaner_table = self._build_cleaner_page()
+        self.cleaner_page = CleanerPage(
+            engine=self.cleaner_engine,
+            gui_dispatcher=self.gui_dispatcher,
+            log_cb=self.log,
+            parent=self,
+        )
+        self.cleaner_table = self.cleaner_page.cleaner_table
+        self.cleaner_model = self.cleaner_page.cleaner_model
+        self.cleaner_log_box = self.cleaner_page.cleaner_log_box
+        self.cleaner_scan_btn = self.cleaner_page.cleaner_scan_btn
+        self.cleaner_batch_delete_btn = self.cleaner_page.cleaner_batch_delete_btn
+        self.cleaner_copy_zero_visits_btn = self.cleaner_page.cleaner_copy_zero_visits_btn
+        self.cleaner_clear_draft_btn = self.cleaner_page.cleaner_clear_draft_btn
+        self.cleaner_wipe_store_check = self.cleaner_page.cleaner_wipe_store_check
+        self.cleaner_account_combo = self.cleaner_page.cleaner_account_combo
+        self.cleaner_site_combo = self.cleaner_page.cleaner_site_combo
+        self.cleaner_visits_check = self.cleaner_page.cleaner_visits_check
+        self.cleaner_visits_threshold_combo = self.cleaner_page.cleaner_visits_threshold_combo
+        self.cleaner_score_check = self.cleaner_page.cleaner_score_check
+        self.cleaner_score_spin = self.cleaner_page.cleaner_score_spin
+        self.cleaner_grace_check = self.cleaner_page.cleaner_grace_check
+        self.cleaner_grace_spin = self.cleaner_page.cleaner_grace_spin
+        self.cleaner_policy_check = self.cleaner_page.cleaner_policy_check
+        self.cleaner_filter_mode_combo = self.cleaner_page.cleaner_filter_mode_combo
+        self.cleaner_wipe_notice = self.cleaner_page.cleaner_wipe_notice
+        self.cleaner_scan_stop_event = self.cleaner_page.cleaner_scan_stop_event
+        self.cleaner_delete_stop_event = self.cleaner_page.cleaner_delete_stop_event
+        self._cleaner_save_timer = self.cleaner_page._cleaner_save_timer
 
         # 3: 客服与售后中心页面
         from service_center.service_center_page import ServiceCenterPage
@@ -1049,845 +774,83 @@ class MainWindow(QMainWindow):
         self.log("[活动管理] 正在刷新活动列表...")
         self.refresh_scope()
 
-    def _build_cleaner_page(self) -> tuple[QFrame, QTableWidget]:
-        surface = self._surface()
-        layout = QVBoxLayout(surface)
-        layout.setContentsMargins(12, 10, 12, 12)
-        layout.setSpacing(8)
+    @property
+    def cleaner_records(self) -> list[ScannedItemRecord]:
+        return self.cleaner_page.cleaner_records
 
-        # 顶栏：标题 + 清店模式专属醒目标签 + 店铺选择与扫描上限
-        top_bar = QHBoxLayout()
-        top_bar.addWidget(section_label("商品合规风控与清理"))
-        top_bar.addStretch(1)
+    @cleaner_records.setter
+    def cleaner_records(self, val: list[ScannedItemRecord]) -> None:
+        self.cleaner_page.cleaner_records = val
 
-        mode_badge = QFrame()
-        mode_badge.setStyleSheet("background: rgba(224, 108, 117, 0.12); border: 1px solid #e06c75; border-radius: 6px;")
-        mode_badge_layout = QHBoxLayout(mode_badge)
-        mode_badge_layout.setContentsMargins(8, 3, 8, 3)
-        self.cleaner_wipe_store_check = QCheckBox("⚠️ 清店模式（清空全店商品）")
-        self.cleaner_wipe_store_check.setChecked(False)
-        self.cleaner_wipe_store_check.setToolTip("开启后将忽略常规过滤条件，极速检索全店铺所有商品并设为待删除")
-        self.cleaner_wipe_store_check.setStyleSheet("color: #ff7b85; font-weight: bold; border: none; background: transparent;")
-        self.cleaner_wipe_store_check.toggled.connect(self._on_cleaner_wipe_store_toggled)
-        mode_badge_layout.addWidget(self.cleaner_wipe_store_check)
-        top_bar.addWidget(mode_badge)
-        top_bar.addSpacing(16)
+    @property
+    def cleaner_is_scanning(self) -> bool:
+        return self.cleaner_page.cleaner_is_scanning
 
-        top_bar.addWidget(QLabel("选择店铺:"))
-        self.cleaner_account_combo = QComboBox()
-        self.cleaner_account_combo.setFixedWidth(240)
-        self.cleaner_account_combo.setFixedHeight(32)
-        self.cleaner_account_combo.addItem("全部店铺（合并分析所有店铺）", "all")
-        self.cleaner_account_combo.currentIndexChanged.connect(self._refresh_cleaner_sites)
-        top_bar.addWidget(self.cleaner_account_combo)
-        top_bar.addSpacing(16)
+    @cleaner_is_scanning.setter
+    def cleaner_is_scanning(self, val: bool) -> None:
+        self.cleaner_page.cleaner_is_scanning = val
 
-        top_bar.addWidget(QLabel("选择站点:"))
-        self.cleaner_site_combo = CheckableComboBox()
-        self.cleaner_site_combo.setFixedWidth(180)
-        self.cleaner_site_combo.setFixedHeight(32)
-        top_bar.addWidget(self.cleaner_site_combo)
-        top_bar.addSpacing(12)
-        top_bar.addStretch()
-        layout.addLayout(top_bar)
+    @property
+    def cleaner_is_deleting(self) -> bool:
+        return self.cleaner_page.cleaner_is_deleting
 
-        # 过滤控制面板（黑金卡片规范 + 4列精准栅格对齐）
-        filter_box = QFrame()
-        filter_box.setObjectName("cleanerFilterSection")
-        fb_layout = QVBoxLayout(filter_box)
-        fb_layout.setContentsMargins(12, 10, 12, 10)
-        fb_layout.setSpacing(8)
-
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(8)
-
-        # Row 0: 浏览量过滤 + 刊登质量评分过滤
-        self.cleaner_visits_check = QCheckBox("浏览量过滤:")
-        self.cleaner_visits_check.setChecked(True)
-        self.cleaner_visits_check.setToolTip("开启后过滤上架至今总浏览量低于门槛的商品（结合上架时长门槛可精准筛选上架超期且无流量的商品）")
-        grid.addWidget(self.cleaner_visits_check, 0, 0)
-
-        self.cleaner_visits_threshold_combo = QComboBox()
-        self.cleaner_visits_threshold_combo.setFixedHeight(32)
-        self.cleaner_visits_threshold_combo.setFixedWidth(210)
-        self.cleaner_visits_threshold_combo.addItem("等于 0 次 (至今无流量)", 0)
-        self.cleaner_visits_threshold_combo.addItem("≤ 5 次 (几乎无流量)", 5)
-        self.cleaner_visits_threshold_combo.addItem("≤ 10 次 (极低流量)", 10)
-        self.cleaner_visits_threshold_combo.addItem("≤ 20 次 (低流量)", 20)
-        grid.addWidget(self.cleaner_visits_threshold_combo, 0, 1)
-
-        self.cleaner_score_check = QCheckBox("刊登质量评分过滤:")
-        self.cleaner_score_check.setChecked(True)
-        grid.addWidget(self.cleaner_score_check, 0, 2)
-
-        self.cleaner_score_spin = QSpinBox()
-        self.cleaner_score_spin.setFixedHeight(32)
-        self.cleaner_score_spin.setFixedWidth(136)
-        self.cleaner_score_spin.setRange(0, 100)
-        self.cleaner_score_spin.setValue(60)
-        self.cleaner_score_spin.setPrefix("低于 ")
-        self.cleaner_score_spin.setSuffix(" 分")
-        grid.addWidget(self.cleaner_score_spin, 0, 3)
-
-        # Row 1: 上架时长门槛 (老品筛选/新品保护) + 违规失效品 + 判定模式
-        self.cleaner_grace_check = QCheckBox("上架时长门槛:")
-        self.cleaner_grace_check.setChecked(True)
-        self.cleaner_grace_check.setToolTip("开启后仅处理上架时长超过指定天数的商品（自动保护未满天数的新品不被清理）")
-        grid.addWidget(self.cleaner_grace_check, 1, 0)
-
-        grace_h = QHBoxLayout()
-        grace_h.setSpacing(14)
-        grace_h.setContentsMargins(0, 0, 0, 0)
-        self.cleaner_grace_spin = QSpinBox()
-        self.cleaner_grace_spin.setFixedHeight(32)
-        self.cleaner_grace_spin.setRange(1, 180)
-        self.cleaner_grace_spin.setValue(30)
-        self.cleaner_grace_spin.setPrefix("仅处理超过 ")
-        self.cleaner_grace_spin.setSuffix(" 天商品 (保护新品)")
-        grace_h.addWidget(self.cleaner_grace_spin)
-        self.cleaner_policy_check = QCheckBox("违规失效品 (因违反政策失效 / 举报停用)")
-        self.cleaner_policy_check.setChecked(True)
-        grace_h.addWidget(self.cleaner_policy_check)
-        grace_h.addStretch(1)
-        grid.addLayout(grace_h, 1, 1)
-
-        grid.addWidget(QLabel("判定模式:"), 1, 2)
-
-        self.cleaner_filter_mode_combo = QComboBox()
-        self.cleaner_filter_mode_combo.setFixedHeight(32)
-        self.cleaner_filter_mode_combo.setFixedWidth(172)
-        self.cleaner_filter_mode_combo.addItem("全部满足 (AND)", "and")
-        self.cleaner_filter_mode_combo.addItem("任一满足 (OR)", "or")
-        self.cleaner_filter_mode_combo.setCurrentIndex(0)
-        grid.addWidget(self.cleaner_filter_mode_combo, 1, 3)
-        grid.setColumnStretch(4, 1)
-
-        # 联动控制：勾选状态与子参数可用性同步
-        self.cleaner_visits_check.toggled.connect(self._sync_cleaner_filter_states)
-        self.cleaner_score_check.toggled.connect(self._sync_cleaner_filter_states)
-        self.cleaner_grace_check.toggled.connect(self._sync_cleaner_filter_states)
-        self._sync_cleaner_filter_states()
-
-        fb_layout.addLayout(grid)
-
-        # 清店模式专属动态横幅
-        self.cleaner_wipe_notice = QLabel("⚠️ 当前处于【清店模式】：已自动忽略上方常规风控条件，点击「扫描」将检索全店铺商品并全选为待删除。")
-        self.cleaner_wipe_notice.setStyleSheet("color: #ff7b85; font-weight: bold; padding: 4px 8px; background: rgba(224, 108, 117, 0.12); border-radius: 4px;")
-        self.cleaner_wipe_notice.setVisible(False)
-        fb_layout.addWidget(self.cleaner_wipe_notice)
-
-        layout.addWidget(filter_box)
-
-        table = QTableView()
-        self.cleaner_model = CleanerTableModel(CLEANER_HEADERS, self)
-        self.cleaner_model.on_selection_changed_cb = self._on_cleaner_selection_changed
-        table.setModel(self.cleaner_model)
-        table.setAlternatingRowColors(True)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        table.setShowGrid(True)
-        table.setSortingEnabled(True)
-        table.verticalHeader().setVisible(False)
-        table.verticalHeader().setDefaultSectionSize(32)
-        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        header = table.horizontalHeader()
-        header.setStretchLastSection(True)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        table.setColumnWidth(0, 48)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(1, 110)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(2, 130)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(3, 70)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(4, 250)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(5, 110)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(6, 85)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(7, 120)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(8, 165)
-        header.setSectionResizeMode(9, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(9, 115)
-        header.setSectionResizeMode(10, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(10, 280)
-
-        # 独立运行日志框与商品表格垂直分割（操作按钮整合至日志标题行右侧，消除底部留白）
-        log_frame = QFrame()
-        log_layout = QVBoxLayout(log_frame)
-        log_layout.setContentsMargins(0, 4, 0, 0)
-        log_layout.setSpacing(6)
-
-        log_header_row = QHBoxLayout()
-        log_header_row.addWidget(section_label("商品清理运行日志"))
-        log_header_row.addStretch(1)
-
-        self.cleaner_scan_btn = QPushButton("扫描待清理商品")
-        self.cleaner_scan_btn.setFixedSize(140, 34)
-        self.cleaner_scan_btn.setStyleSheet("font-weight: bold; padding: 6px 10px;")
-        self.cleaner_scan_btn.clicked.connect(self._on_start_cleaner_scan)
-
-        self.cleaner_batch_delete_btn = QPushButton("批量删除")
-        self.cleaner_batch_delete_btn.setFixedSize(110, 34)
-        self.cleaner_batch_delete_btn.setStyleSheet("font-weight: bold; padding: 6px 10px;")
-        self.cleaner_batch_delete_btn.clicked.connect(self._on_cleaner_batch_delete)
-
-        self.cleaner_copy_zero_visits_btn = QPushButton("复制0浏览ID")
-        self.cleaner_copy_zero_visits_btn.setFixedSize(130, 34)
-        self.cleaner_copy_zero_visits_btn.setStyleSheet("font-weight: bold; padding: 6px 10px;")
-        self.cleaner_copy_zero_visits_btn.clicked.connect(self._on_copy_zero_visits_ids)
-
-        self.cleaner_clear_draft_btn = QPushButton("清除记录")
-        self.cleaner_clear_draft_btn.setFixedSize(110, 34)
-        self.cleaner_clear_draft_btn.setStyleSheet("font-weight: bold; padding: 6px 10px;")
-        self.cleaner_clear_draft_btn.clicked.connect(self._on_cleaner_clear_records)
-
-        log_header_row.addWidget(self.cleaner_scan_btn)
-        log_header_row.addWidget(self.cleaner_batch_delete_btn)
-        log_header_row.addWidget(self.cleaner_copy_zero_visits_btn)
-        log_header_row.addWidget(self.cleaner_clear_draft_btn)
-        log_layout.addLayout(log_header_row)
-
-        self.cleaner_log_box = LogViewer()
-        self.cleaner_log_box.append_log_line(f"[{datetime.now():%H:%M:%S}] [商品清理] 风控与清理引擎就绪。支持常规风控筛选或清店模式。")
-        log_layout.addWidget(self.cleaner_log_box, 1)
-
-        cleaner_splitter = QSplitter(Qt.Orientation.Vertical)
-        cleaner_splitter.setChildrenCollapsible(False)
-        cleaner_splitter.addWidget(table)
-        cleaner_splitter.addWidget(log_frame)
-        cleaner_splitter.setSizes([350, 180])
-        layout.addWidget(cleaner_splitter, 1)
-        return surface, table
+    @cleaner_is_deleting.setter
+    def cleaner_is_deleting(self, val: bool) -> None:
+        self.cleaner_page.cleaner_is_deleting = val
 
     def _sync_cleaner_filter_states(self) -> None:
-        if getattr(self, "cleaner_wipe_store_check", None) and self.cleaner_wipe_store_check.isChecked():
-            return
-        v_enabled = self.cleaner_visits_check.isChecked()
-        self.cleaner_visits_threshold_combo.setEnabled(v_enabled)
-
-        s_enabled = self.cleaner_score_check.isChecked()
-        self.cleaner_score_spin.setEnabled(s_enabled)
-
-        g_enabled = self.cleaner_grace_check.isChecked()
-        self.cleaner_grace_spin.setEnabled(g_enabled)
+        self.cleaner_page._sync_cleaner_filter_states()
 
     def _on_cleaner_wipe_store_toggled(self, checked: bool) -> None:
-        disabled = checked
-        if hasattr(self, "cleaner_wipe_notice") and self.cleaner_wipe_notice is not None:
-            self.cleaner_wipe_notice.setVisible(checked)
-        self.cleaner_visits_check.setEnabled(not disabled)
-        self.cleaner_score_check.setEnabled(not disabled)
-        self.cleaner_policy_check.setEnabled(not disabled)
-        self.cleaner_grace_check.setEnabled(not disabled)
-        self.cleaner_filter_mode_combo.setEnabled(not disabled)
-        if not disabled:
-            self._sync_cleaner_filter_states()
-        else:
-            self.cleaner_visits_threshold_combo.setEnabled(False)
-            self.cleaner_score_spin.setEnabled(False)
-            self.cleaner_grace_spin.setEnabled(False)
-        if checked:
-            self.log("[清店] ⚠️ 已切换至【清店模式】（清空全店商品）。点击扫描将极速检索店铺所有在售/下架商品并设为待删除。")
-        else:
-            self.log("[商品清理] 已切回【常规风控过滤模式】。")
+        self.cleaner_page._on_cleaner_wipe_store_toggled(checked)
 
     def _cleaner_append_log(self, text: str) -> None:
-        if hasattr(self, "cleaner_log_box") and self.cleaner_log_box is not None:
-            self.cleaner_log_box.append_log_line(f"[{datetime.now():%H:%M:%S}] {text}")
-        else:
-            self.log(text)
+        self.cleaner_page._cleaner_append_log(text)
 
     def _load_cleaner_draft(self) -> None:
-        try:
-            records = load_cleaner_draft()
-            if not records:
-                return
-            valid_records = [r for r in records if r.item_id and r.account_id]
-            if not valid_records:
-                return
-            self.cleaner_records = valid_records
-            if hasattr(self, "cleaner_model") and self.cleaner_model is not None:
-                self.cleaner_model.set_records(valid_records)
-            self._update_cleaner_stats()
-            self.log(f"[商品清理] 发现上次暂存的扫描草稿，已自动恢复 {len(valid_records)} 件商品（支持直接批量删除，或点击「清除记录」）。")
-        except Exception as e:
-            self.log(f"[商品清理] 加载未完成草稿异常: {e}")
+        self.cleaner_page._load_cleaner_draft()
 
     def _on_cleaner_clear_records(self) -> None:
-        if self.cleaner_is_scanning or self.cleaner_is_deleting:
-            QMessageBox.warning(self, "商品清理", "任务正在执行中，请先停止当前任务！")
-            return
-        if not self.cleaner_records:
-            QMessageBox.information(self, "清除记录", "当前暂无任何扫描商品记录，无需清除。")
-            return
-        reply = QMessageBox.question(
-            self,
-            "清除记录确认",
-            "确定要清除当前所有扫描商品记录吗？\n\n操作将清空本地列表与草稿缓存，此操作不可恢复。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        clear_cleaner_draft()
-        self.cleaner_records.clear()
-        if hasattr(self, "cleaner_model") and self.cleaner_model is not None:
-            self.cleaner_model.clear()
-        self._update_cleaner_stats()
-        self.log("[商品清理] 已清除本地所有扫描商品记录与草稿缓存。")
+        self.cleaner_page._on_cleaner_clear_records()
 
     def _on_cleaner_rescan(self) -> None:
-        self._on_cleaner_clear_records()
+        self.cleaner_page._on_cleaner_rescan()
 
     def _on_start_cleaner_scan(self, bypass_confirm: bool = False) -> None:
-        if self.cleaner_is_scanning:
-            self.cleaner_scan_stop_event.set()
-            self.cleaner_scan_btn.setText("正在停止...")
-            self.cleaner_scan_btn.setEnabled(False)
-            self.log("[商品清理] 已请求中止扫描，正在等待当前请求结束...")
-            return
-
-        selected_key = str(self.cleaner_account_combo.currentData() or "all")
-        if selected_key == "all":
-            target_accounts = list(self.accounts)
-        else:
-            target_accounts = [a for a in self.accounts if a.account_id == selected_key]
-
-        if not target_accounts:
-            QMessageBox.warning(self, "商品扫描", "未找到可扫描的已授权店铺，请先添加店铺授权！")
-            return
-
-        is_wipe = hasattr(self, "cleaner_wipe_store_check") and self.cleaner_wipe_store_check.isChecked()
-        if is_wipe and not bypass_confirm:
-            store_str = "全部店铺" if selected_key == "all" else (target_accounts[0].store_name or target_accounts[0].account_id)
-            confirm = QMessageBox.question(
-                self,
-                "清店模式扫描确认",
-                f"当前已开启【清店（清空全店商品）】模式！\n\n"
-                f"将检索【{store_str}】的全量商品并将其全部标记为待删除。\n\n"
-                f"确认开始扫描全店商品吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes,
-            )
-            if confirm != QMessageBox.StandardButton.Yes:
-                return
-
-        # 站点多选校验
-        selected_sites: list[str] = []
-        if hasattr(self, "cleaner_site_combo"):
-            selected_sites = self.cleaner_site_combo.checked_keys()
-            all_sites = self.cleaner_site_combo.all_keys()
-            if all_sites and not selected_sites:
-                QMessageBox.warning(self, "商品扫描", "请至少勾选一个需要扫描的站点！")
-                return
-
-        scan_limit = 100000
-
-        target_account_ids = {acc.account_id for acc in target_accounts}
-        is_all = (selected_key == "all")
-        if is_all or not self.cleaner_records:
-            self.cleaner_records.clear()
-            if hasattr(self, "cleaner_model") and self.cleaner_model is not None:
-                self.cleaner_model.clear()
-            clear_cleaner_draft()
-        else:
-            self.cleaner_records = [r for r in self.cleaner_records if r.account_id not in target_account_ids]
-            if hasattr(self, "cleaner_model") and self.cleaner_model is not None:
-                self.cleaner_model.set_records(self.cleaner_records)
-            save_cleaner_draft(self.cleaner_records)
-
-        self.cleaner_scan_stop_event.clear()
-        self.cleaner_is_scanning = True
-        self.cleaner_scan_btn.setText("停止扫描")
-        self.cleaner_scan_btn.setEnabled(True)
-        self.cleaner_batch_delete_btn.setEnabled(False)
-        self.cleaner_clear_draft_btn.setEnabled(False)
-        self.log("[商品扫描] 正在准备扫描分析（已重置目标店铺旧有记录，开启全新权威排查）...")
-
-        def _worker():
-            try:
-                tot_accs = len(target_accounts)
-                is_all = (selected_key == "all")
-
-                site_desc = "全部站点" if not selected_sites or (hasattr(self, "cleaner_site_combo") and len(selected_sites) == len(self.cleaner_site_combo.all_keys())) else "、".join(selected_sites)
-                self.gui_dispatcher.dispatch(lambda: self.log(
-                    f"[商品扫描] ==================== 开始多店铺并发商品合规扫描 ===================="
-                ))
-                self.gui_dispatcher.dispatch(lambda: self.log(
-                    f"[商品扫描] 扫描范围: {'【全部店铺】(' + str(tot_accs) + '个店铺全并发扫描)' if is_all else ('【' + (target_accounts[0].store_name or target_accounts[0].account_id) + '】')} | "
-                    f"目标站点: {site_desc} | "
-                    f"单店上限: 无限制"
-                ))
-
-                def _scan_single_store(acc_item: tuple[int, Any]):
-                    acc_idx, acc = acc_item
-                    if self.cleaner_scan_stop_event.is_set():
-                        return
-
-                    store_name = acc.store_name or acc.account_id
-                    self.gui_dispatcher.dispatch(lambda i=acc_idx, n=store_name, t=tot_accs: (
-                        self.log(f"[商品扫描] 🚀 店铺并发启动 [{i}/{t}]: 【{n}】(ID: {acc.account_id})")
-                    ))
-
-                    crit = CleanerFilterCriteria(
-                        account_id=acc.account_id,
-                        store_name=store_name,
-                        selected_site_ids=selected_sites,
-                        filter_mode=str(self.cleaner_filter_mode_combo.currentData() or "and"),
-                        enable_grace_period=self.cleaner_grace_check.isChecked(),
-                        grace_period_days=self.cleaner_grace_spin.value(),
-                        enable_visits_filter=self.cleaner_visits_check.isChecked(),
-                        visits_mode="total",
-                        visits_days=30,
-                        visits_is_zero_only=(self.cleaner_visits_threshold_combo.currentIndex() == 0),
-                        visits_threshold=int(self.cleaner_visits_threshold_combo.currentData() or 0),
-                        enable_score_filter=self.cleaner_score_check.isChecked(),
-                        score_threshold=self.cleaner_score_spin.value(),
-                        enable_policy_filter=self.cleaner_policy_check.isChecked(),
-                        max_scan_limit=scan_limit,
-                        is_wipe_store_mode=is_wipe,
-                    )
-
-                    matched_buffer: list[ScannedItemRecord] = []
-                    buf_lock = threading.Lock()
-                    last_flush = [time.monotonic()]
-
-                    def _flush_buffer(force: bool = False):
-                        with buf_lock:
-                            if not matched_buffer:
-                                return
-                            now_m = time.monotonic()
-                            if force or len(matched_buffer) >= 200 or (now_m - last_flush[0]) >= 0.5:
-                                batch = list(matched_buffer)
-                                matched_buffer.clear()
-                                last_flush[0] = now_m
-                                self.gui_dispatcher.dispatch(lambda b=batch: self._cleaner_add_table_rows_batch(b))
-
-                    def _on_matched(rec: ScannedItemRecord):
-                        with buf_lock:
-                            matched_buffer.append(rec)
-                        _flush_buffer(force=False)
-
-                    def _on_prog(cur: int, tot: int, step: str):
-                        pass
-
-                    def _on_lg(msg: str):
-                        self.gui_dispatcher.dispatch(lambda m=msg: self.log(m))
-
-                    self.cleaner_engine.scan_shop_items(
-                        crit,
-                        on_item_matched=_on_matched,
-                        on_progress=_on_prog,
-                        on_log=_on_lg,
-                        stop_event=self.cleaner_scan_stop_event,
-                    )
-                    _flush_buffer(force=True)
-
-                with ThreadPoolExecutor(max_workers=max(1, tot_accs)) as scan_executor:
-                    futures = [
-                        scan_executor.submit(_scan_single_store, (idx, acc))
-                        for idx, acc in enumerate(target_accounts, 1)
-                    ]
-                    wait(futures)
-
-                from collections import Counter
-                valid_records = list(self.cleaner_records)
-                store_counts = Counter(r.store_name or r.account_id for r in valid_records)
-                store_breakdown = " | ".join(f"【{name}】: {cnt:,}件" for name, cnt in store_counts.items()) if store_counts else "无"
-                tot_unmet = len(valid_records)
-                tot_sold_protect = sum(1 for r in valid_records if r.has_sales)
-                tot_for_delete = sum(1 for r in valid_records if r.is_selected_for_delete)
-                tot_unselected = tot_unmet - tot_sold_protect - tot_for_delete
-                if tot_unselected > 0:
-                    summary_details = f"其中 {tot_sold_protect:,} 件已出单自动保护，{tot_for_delete:,} 件待清理删除，{tot_unselected:,} 件未勾选"
-                else:
-                    summary_details = f"其中 {tot_sold_protect:,} 件已出单自动保护，{tot_for_delete:,} 件待清理删除"
-                summary_lines = [
-                    "[商品扫描] ==================== 扫描分析全部完成 ====================",
-                    f"[商品扫描] 店铺分项统计: {store_breakdown}",
-                    f"[商品扫描] 全局汇总: 发现不达标商品 {tot_unmet:,} 件 ({summary_details})",
-                ]
-                self.gui_dispatcher.dispatch(lambda m="\n".join(summary_lines): self.log(m))
-            except Exception as e:
-                err_msg = str(e)
-                self.gui_dispatcher.dispatch(lambda m=err_msg: self.log(f"[商品扫描] ❌ 扫描过程异常: {m}"))
-            finally:
-                self.gui_dispatcher.dispatch(self._on_cleaner_scan_finished)
-
-        threading.Thread(target=_worker, daemon=True).start()
+        self.cleaner_page._on_start_cleaner_scan(bypass_confirm)
 
     def _on_stop_cleaner_scan(self) -> None:
-        self.cleaner_scan_stop_event.set()
-        self.cleaner_scan_btn.setText("正在停止")
-        self.cleaner_scan_btn.setEnabled(False)
-        self.log("[商品扫描] 已请求中止扫描，正在等待当前请求结束")
+        self.cleaner_page._on_stop_cleaner_scan()
 
     def _on_stop_cleaner_delete(self) -> None:
-        self.cleaner_delete_stop_event.set()
-        self.cleaner_batch_delete_btn.setText("正在停止...")
-        self.cleaner_batch_delete_btn.setEnabled(False)
-        self.log("[商品删除] 🛑 已请求中止批量删除，正在等待当前请求安全收口...")
+        self.cleaner_page._on_stop_cleaner_delete()
 
     def _on_cleaner_scan_finished(self) -> None:
-        self.cleaner_is_scanning = False
-        self.cleaner_scan_btn.setText("扫描待清理商品")
-        self.cleaner_scan_btn.setEnabled(True)
-        self.cleaner_batch_delete_btn.setEnabled(True)
-        self.cleaner_clear_draft_btn.setEnabled(True)
-        save_cleaner_draft(self.cleaner_records)
-        self._update_cleaner_stats()
+        self.cleaner_page._on_cleaner_scan_finished()
 
     def _cleaner_add_table_rows_batch(self, recs: list[ScannedItemRecord]) -> None:
-        if not recs:
-            return
-        if hasattr(self, "cleaner_model") and self.cleaner_model is not None:
-            self.cleaner_model.upsert_records(recs)
-            self.cleaner_records = list(self.cleaner_model.records)
-        else:
-            self.cleaner_records.extend(recs)
-        self._update_cleaner_stats()
+        self.cleaner_page._cleaner_add_table_rows_batch(recs)
 
     def _on_cleaner_selection_changed(self) -> None:
-        self._update_cleaner_stats()
-        self._schedule_cleaner_draft_save()
+        self.cleaner_page._on_cleaner_selection_changed()
 
     def _on_cleaner_table_item_changed(self, item: Any) -> None:
-        self._on_cleaner_selection_changed()
+        self.cleaner_page._on_cleaner_table_item_changed(item)
 
     def _schedule_cleaner_draft_save(self) -> None:
-        timer = getattr(self, "_cleaner_save_timer", None)
-        if timer is not None:
-            timer.start(1200)
+        self.cleaner_page._schedule_cleaner_draft_save()
 
     def _save_cleaner_draft_async(self) -> None:
-        recs_snapshot = list(self.cleaner_records)
-        def _bg():
-            try:
-                save_cleaner_draft(recs_snapshot)
-            except Exception:
-                pass
-        threading.Thread(target=_bg, daemon=True).start()
+        self.cleaner_page._save_cleaner_draft_async()
 
     def _update_cleaner_stats(self) -> None:
-        if hasattr(self, "cleaner_batch_delete_btn"):
-            if getattr(self, "cleaner_is_deleting", False):
-                return
-            self.cleaner_batch_delete_btn.setText("批量删除")
+        self.cleaner_page._update_cleaner_stats()
 
     def _on_cleaner_batch_delete(self) -> None:
-        if self.cleaner_is_deleting:
-            self.cleaner_delete_stop_event.set()
-            self.cleaner_batch_delete_btn.setText("正在停止...")
-            self.cleaner_batch_delete_btn.setEnabled(False)
-            self.log("[商品删除] 已请求中止批量删除，正在等待当前请求安全收口...")
-            return
-
-        if self.cleaner_is_scanning:
-            return
-
-        selected_records = [r for r in self.cleaner_records if r.is_selected_for_delete]
-        if not selected_records:
-            QMessageBox.information(self, "商品清理", "当前未勾选任何待删除商品！")
-            return
-
-        active_sold_selected = [r for r in selected_records if r.has_sales and ("在售" in r.status or r.status == "active")]
-        already_del_selected = [r for r in selected_records if is_item_confirmed_deleted(r)]
-        total_count = len(selected_records)
-
-        if active_sold_selected:
-            msg = (
-                f"在选中的 {total_count} 件商品中，包含 {len(active_sold_selected)} 件【依然在售且有销售出单历史】的核心资产商品！\n"
-                f"出单商品一旦删除不可恢复，确认要删除这 {total_count} 件商品吗？"
-            )
-            reply = QMessageBox.warning(
-                self, "高危删除确认", msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
-            )
-        else:
-            extra_tip = f"\n（其中 {len(already_del_selected)} 件已确认处于删除终态，将直接跳过无需调用 API）" if already_del_selected else ""
-            msg = f"确认要彻底删除选中的 {total_count} 件不达标商品吗？{extra_tip}\n\n操作将在美客多官方平台下架并彻底抹除，不可恢复。"
-            reply = QMessageBox.question(
-                self, "批量删除确认", msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
-            )
-
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        grouped_by_acc: dict[str, list[ScannedItemRecord]] = {}
-        for rec in selected_records:
-            grouped_by_acc.setdefault(rec.account_id, []).append(rec)
-
-        self.cleaner_is_deleting = True
-        self.cleaner_batch_delete_btn.setText("停止删除")
-        self.cleaner_batch_delete_btn.setEnabled(True)
-        self.cleaner_scan_btn.setEnabled(False)
-        self.cleaner_clear_draft_btn.setEnabled(False)
-        self.cleaner_delete_stop_event.clear()
-
-        def _worker():
-            try:
-                total_succ = 0
-                total_skipped = 0
-                total_fail = 0
-                tot_stores = len(grouped_by_acc)
-                del_lock = threading.Lock()
-                deleted_ids: set[str] = set()
-                store_results: list[dict[str, Any]] = []
-
-                def _delete_store_items(pair: tuple[str, list[ScannedItemRecord]]):
-                    acc_id, recs = pair
-                    if self.cleaner_delete_stop_event.is_set():
-                        return
-                    store_name = recs[0].store_name or acc_id
-
-                    # 严格判定硬边界：拆分出 100% 已确认彻底删除的商品 与 真正待向官方发请求的商品
-                    already_del_recs = [r for r in recs if is_item_confirmed_deleted(r)]
-                    pending_recs = [r for r in recs if not is_item_confirmed_deleted(r)]
-
-                    if already_del_recs:
-                        with del_lock:
-                            nonlocal total_skipped
-                            total_skipped += len(already_del_recs)
-                            for r in already_del_recs:
-                                deleted_ids.add(r.item_id)
-                        self.gui_dispatcher.dispatch(lambda s=store_name, n=len(already_del_recs): self.log(
-                            f"[商品删除] ⏩ 【{s}】已直接跳过 {n} 件已确认彻底删除的商品（无需重复调用 API）"
-                        ))
-                        for r in already_del_recs:
-                            self.gui_dispatcher.dispatch(lambda i=r.item_id: (
-                                self.cleaner_model.update_item_status(i, "已删除", True)
-                                if hasattr(self, "cleaner_model") and self.cleaner_model is not None else None
-                            ))
-
-                    if not pending_recs:
-                        with del_lock:
-                            store_results.append({
-                                "account_id": acc_id,
-                                "store_name": store_name,
-                                "success": 0,
-                                "skipped": len(already_del_recs),
-                                "failed": 0,
-                                "total": len(recs),
-                            })
-                        return
-
-                    target_ids = [r.item_id for r in pending_recs]
-
-                    def _on_item_del(iid: str, succ: bool, err: str):
-                        with del_lock:
-                            if succ:
-                                deleted_ids.add(iid)
-                        st_text = "已删除" if succ else f"删除失败: {err}"
-                        self.gui_dispatcher.dispatch(lambda i=iid, st=st_text, s=succ: (
-                            self.cleaner_model.update_item_status(i, st, s)
-                            if hasattr(self, "cleaner_model") and self.cleaner_model is not None else None
-                        ))
-
-                    def _on_prog(cur: int, tot: int, step: str):
-                        pass
-
-                    def _on_lg(msg: str):
-                        self.gui_dispatcher.dispatch(lambda m=msg: self.log(m))
-
-                    res = self.cleaner_engine.execute_batch_delete(
-                        account_id=acc_id,
-                        item_ids=target_ids,
-                        store_name=store_name,
-                        on_item_deleted=_on_item_del,
-                        on_progress=_on_prog,
-                        on_log=_on_lg,
-                        stop_event=self.cleaner_delete_stop_event,
-                    )
-                    with del_lock:
-                        nonlocal total_succ, total_fail
-                        succ_count = res.get("success_count", 0)
-                        fail_count = res.get("failed_count", 0)
-                        total_succ += succ_count
-                        total_fail += fail_count
-                        store_results.append({
-                            "account_id": acc_id,
-                            "store_name": store_name,
-                            "success": succ_count,
-                            "skipped": len(already_del_recs),
-                            "failed": fail_count,
-                            "total": len(recs),
-                        })
-
-                with ThreadPoolExecutor(max_workers=max(1, tot_stores)) as del_executor:
-                    futures = [
-                        del_executor.submit(_delete_store_items, pair)
-                        for pair in grouped_by_acc.items()
-                    ]
-                    wait(futures)
-
-                store_results.sort(key=lambda s: s.get("store_name", ""))
-
-                summary_lines = [
-                    "[商品删除] ==================== 批量删除全部执行完成 ====================",
-                    "[商品删除] 各店铺分项明细：",
-                ]
-                for st in store_results:
-                    s_name = st["store_name"]
-                    s_succ = st["success"]
-                    s_skip = st["skipped"]
-                    s_fail = st["failed"]
-                    summary_lines.append(
-                        f"[商品删除]   - 【{s_name}】: 成功下架删除 {s_succ:,} 件，跳过已删除 {s_skip:,} 件，失败 {s_fail:,} 件"
-                    )
-                summary_lines.append(
-                    f"[商品删除] 全局合计: 成功下架 {total_succ:,} 件，直接跳过 {total_skipped:,} 件，删除失败 {total_fail:,} 件"
-                )
-
-                # 精确分类统计：绝不可把已经处于删除终态的历史记录误统为“受保护商品”
-                all_current_records = list(self.cleaner_records)
-                confirmed_deleted_count = sum(
-                    1 for r in all_current_records
-                    if is_item_confirmed_deleted(r) or r.item_id in deleted_ids
-                )
-                actual_protected_recs = [
-                    r for r in all_current_records
-                    if not is_item_confirmed_deleted(r)
-                    and r.item_id not in deleted_ids
-                    and (
-                        (r.has_sales and ("在售" in r.status or r.status == "active"))
-                        or r.is_protected_new_item
-                    )
-                ]
-                actual_protected_count = len(actual_protected_recs)
-                unselected_pending_count = sum(
-                    1 for r in all_current_records
-                    if not is_item_confirmed_deleted(r)
-                    and r.item_id not in deleted_ids
-                    and r not in actual_protected_recs
-                )
-
-                if actual_protected_count > 0:
-                    summary_lines.append(
-                        f"[商品删除] 本地草稿已同步更新，剩余 {actual_protected_count:,} 件受保护商品安全留存（出单/新品保护）"
-                    )
-                else:
-                    summary_lines.append(
-                        f"[商品删除] 本地草稿已同步更新，列表中当前包含 {confirmed_deleted_count:,} 件已删除终态记录（可随时点击「清除记录」清空）。"
-                    )
-                summary_lines.append(
-                    "[商品删除] ============================================================"
-                )
-
-                self.gui_dispatcher.dispatch(lambda m="\n".join(summary_lines): self.log(m))
-
-                dialog_details = "\n".join(
-                    f"• 【{st['store_name']}】: 成功 {st['success']:,} 件，跳过 {st['skipped']:,} 件，失败 {st['failed']:,} 件"
-                    for st in store_results
-                )
-                info_parts = [
-                    "批量删除已全部执行完毕！\n",
-                    f"【各店铺分项明细】\n{dialog_details}\n",
-                    "【全局合计】",
-                    f"成功下架删除: {total_succ:,} 件",
-                    f"直接跳过(已处于删除终态): {total_skipped:,} 件",
-                    f"删除失败: {total_fail:,} 件",
-                ]
-                if actual_protected_count > 0:
-                    info_parts.append(f"\n剩余受保护商品: {actual_protected_count:,} 件 (在售出单/新品保护)")
-                if unselected_pending_count > 0:
-                    info_parts.append(f"手动未勾选保留: {unselected_pending_count:,} 件")
-
-                info_msg = "\n".join(info_parts)
-                self.gui_dispatcher.dispatch(lambda msg=info_msg: QMessageBox.information(
-                    self, "删除完成", msg
-                ))
-            finally:
-                def _done():
-                    self.cleaner_is_deleting = False
-                    self.cleaner_batch_delete_btn.setText("批量删除")
-                    self.cleaner_batch_delete_btn.setEnabled(True)
-                    self.cleaner_scan_btn.setEnabled(True)
-                    self.cleaner_clear_draft_btn.setEnabled(True)
-
-                    # 取消删除后自动即焚逻辑：已删除商品保留在列表中，由用户人为手动点击「清除记录」清理
-                    if hasattr(self, "cleaner_model") and self.cleaner_model is not None:
-                        for iid in deleted_ids:
-                            self.cleaner_model.update_item_status(iid, "已删除", True)
-                        self.cleaner_records = list(self.cleaner_model.records)
-                    else:
-                        for r in self.cleaner_records:
-                            if r.item_id in deleted_ids:
-                                r.status = "已删除"
-                                r.is_selected_for_delete = False
-                                sub_st = list(r.sub_status or [])
-                                if "deleted" not in sub_st:
-                                    sub_st.append("deleted")
-                                r.sub_status = sub_st
-
-                    if deleted_ids:
-                        mark_cached_items_deleted(list(deleted_ids))
-                    save_cleaner_draft(self.cleaner_records)
-                    self._update_cleaner_stats()
-                    self.log(
-                        f"[商品删除] 批量删除完成：成功下架 {total_succ} 件，直接跳过已删除 {total_skipped} 件，失败 {total_fail} 件。"
-                        f"所有记录已完整保留，您可随时复制ID或点击「清除记录」清空。"
-                    )
-                self.gui_dispatcher.dispatch(_done)
-
-        threading.Thread(target=_worker, daemon=True).start()
+        self.cleaner_page._on_cleaner_batch_delete()
 
     def _on_copy_zero_visits_ids(self) -> None:
-        records = self.cleaner_records
-        if not records:
-            records = load_cleaner_draft()
-        if not records:
-            QMessageBox.information(self, "商品清理", "当前暂无扫描商品，请先点击「扫描待清理商品」！")
-            return
-
-        candidates = []
-        for r in records:
-            visits = getattr(r, "visits", 0) or 0
-            sold = getattr(r, "sold_quantity", 0) or 0
-            has_sales = getattr(r, "has_sales", False)
-            if visits > 0 or sold > 0 or has_sales:
-                continue
-            sub_status = getattr(r, "sub_status", []) or []
-            if "waiting_for_patch" in sub_status or "pending_documentation" in sub_status:
-                continue
-            status = getattr(r, "status", "") or ""
-            if status in ("已暂停", "已关闭", "paused", "closed"):
-                continue
-            candidates.append(r)
-
-        if not candidates:
-            QMessageBox.information(self, "商品清理", "当前暂存商品中未发现符合条件的 0 浏览待删除商品！")
-            return
-
-        site_prio = {"MLM": 0, "MLB": 1, "MCO": 2, "MLC": 3, "MLA": 4, "MLU": 5}
-
-        by_title: dict[str, list[Any]] = {}
-        distinct_ids: list[str] = []
-        for c in candidates:
-            t = (getattr(c, "title", "") or "").strip()
-            if t and "违规停用商品" not in t:
-                by_title.setdefault(t, []).append(c)
-            else:
-                distinct_ids.append(getattr(c, "item_id", ""))
-
-        representative_ids: list[str] = []
-        for t, group in by_title.items():
-            group_sorted = sorted(group, key=lambda x: site_prio.get(getattr(x, "site_id", ""), 99))
-            representative_ids.append(getattr(group_sorted[0], "item_id", ""))
-
-        all_target_ids = representative_ids + distinct_ids
-        all_target_ids_clean = [i for i in all_target_ids if i]
-        all_target_ids_sorted = sorted(all_target_ids_clean, key=lambda iid: site_prio.get(iid[:3], 99))
-        final_ids = list(dict.fromkeys(all_target_ids_sorted))
-
-        chunk_size = 500
-        batches = [final_ids[i : i + chunk_size] for i in range(0, len(final_ids), chunk_size)]
-
-        dlg = CopyZeroVisitIdsDialog(batches, self)
-        dlg.exec()
+        self.cleaner_page._on_copy_zero_visits_ids()
 
     def startup(self) -> None:
         self.startup_attempt_token += 1
@@ -2484,56 +1447,13 @@ class MainWindow(QMainWindow):
                 all_value="all",
                 include_account_id_in_label=True,
             )
+            if hasattr(self, "cleaner_page"):
+                self.cleaner_page.accounts = list(self.accounts)
             self._refresh_cleaner_sites()
 
     def _refresh_cleaner_sites(self) -> None:
-        if not hasattr(self, "cleaner_site_combo") or not hasattr(self, "cleaner_account_combo"):
-            return
-        selected_account = str(self.cleaner_account_combo.currentData() or "all")
-        seen_sites: set[str] = set()
-
-        if selected_account == "all":
-            target_account_ids = {a.account_id for a in self.accounts}
-        else:
-            target_account_ids = {selected_account}
-
-        for row in getattr(self, "operating_rows_cache", []):
-            acc_id = str(row.get("account_id") or "")
-            if acc_id in target_account_ids:
-                sid = str(row.get("site_id") or "").upper()
-                if sid:
-                    seen_sites.add(sid)
-
-        if hasattr(self, "cleaner_engine") and hasattr(self.cleaner_engine.client, "auth"):
-            for acc_id in target_account_ids:
-                try:
-                    for s in self.cleaner_engine.client.auth.list_sites(acc_id):
-                        sid = str(s.get("site_id") or "").upper()
-                        if sid:
-                            seen_sites.add(sid)
-                except Exception:
-                    pass
-
-        if not seen_sites and getattr(self, "accounts", None):
-            for acc in self.accounts:
-                if acc.account_id in target_account_ids and acc.site_id:
-                    seen_sites.add(acc.site_id.upper())
-
-        # 联动过滤经营站点配置
-        operating_cfg = getattr(self, "settings", {}).get("operatingSites") or {}
-        allowed_sites_for_targets: set[str] = set()
-        has_cfg = False
-        for aid in target_account_ids:
-            if aid in operating_cfg and isinstance(operating_cfg[aid], list):
-                has_cfg = True
-                for s in operating_cfg[aid]:
-                    if str(s).strip():
-                        allowed_sites_for_targets.add(str(s).strip().upper())
-        if has_cfg:
-            seen_sites = seen_sites.intersection(allowed_sites_for_targets)
-
-        site_tuples = [(f"{site_name(sid)} ({sid})", sid) for sid in sorted(seen_sites)]
-        self.cleaner_site_combo.set_items(site_tuples)
+        if hasattr(self, "cleaner_page"):
+            self.cleaner_page._refresh_cleaner_sites()
 
     def selected_account_ids(self) -> list[str]:
         return list(self.store_map.get(str(self.store_combo.currentData() or "all"), []))
@@ -5122,13 +4042,16 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
         diagnostic_event("main_window_close_event", running_group=bool(self.running_group), already_closing=self._closing)
-        save_timer = getattr(self, "_cleaner_save_timer", None)
-        if save_timer is not None and save_timer.isActive():
-            save_timer.stop()
-            try:
-                save_cleaner_draft(self.cleaner_records)
-            except Exception:
-                pass
+        if hasattr(self, "cleaner_page"):
+            self.cleaner_page.shutdown()
+        else:
+            save_timer = getattr(self, "_cleaner_save_timer", None)
+            if save_timer is not None and save_timer.isActive():
+                save_timer.stop()
+                try:
+                    save_cleaner_draft(self.cleaner_records)
+                except Exception:
+                    pass
         if self.preparing_submission and not self.running_group and not self.pending_group_payload:
             prepare_id = str(self.preparing_submission.get("prepare_id") or "")
             progress = int(dict(self.preparing_submission.get("progress") or {}).get("percent") or 0)
@@ -5214,7 +4137,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.51"
+    return "2.2.52"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.
