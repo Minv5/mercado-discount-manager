@@ -4133,22 +4133,33 @@ class ServiceCenterPage(QFrame):
                                 self._current_session.summary_translated = zh
                             save_sessions_snapshot(self._all_sessions)
                         def _apply_success():
-                            target_lbl.setText(f"译: {zh}")
-                            target_lbl.setStyleSheet("color: #C8C3B7; font-size: 11px; line-height: 1.4; font-style: normal;")
-                            self._refresh_current_session_card()
-                            self._scroll_chat_to_bottom()
+                            try:
+                                target_lbl.setText(f"译: {zh}")
+                                target_lbl.setStyleSheet("color: #C8C3B7; font-size: 11px; line-height: 1.4; font-style: normal;")
+                                self._refresh_current_session_card()
+                                self._scroll_chat_to_bottom()
+                            except RuntimeError:
+                                pass
                         self.ui_dispatch_signal.emit(_apply_success)
                     else:
-                        self.ui_dispatch_signal.emit(lambda: target_lbl.hide())
+                        def _apply_hide():
+                            try:
+                                target_lbl.hide()
+                            except RuntimeError:
+                                pass
+                        self.ui_dispatch_signal.emit(_apply_hide)
                 except Exception:
                     def _apply_fail():
-                        def _retry_fn(ev):
-                            target_lbl.setText("⏳ 正在重试翻译...")
-                            target_lbl.setStyleSheet("color: #8C877D; font-size: 11px;")
-                            threading.Thread(target=_auto_translate_msg, args=(target_lbl, target_msg), daemon=True).start()
-                        target_lbl.setText("🌐 翻译未完成，点击重试")
-                        target_lbl.setStyleSheet("color: #F59E0B; font-size: 11px; text-decoration: underline; cursor: pointer;")
-                        target_lbl.mousePressEvent = _retry_fn
+                        try:
+                            def _retry_fn(ev):
+                                target_lbl.setText("⏳ 正在重试翻译...")
+                                target_lbl.setStyleSheet("color: #8C877D; font-size: 11px;")
+                                threading.Thread(target=_auto_translate_msg, args=(target_lbl, target_msg), daemon=True).start()
+                            target_lbl.setText("🌐 翻译未完成，点击重试")
+                            target_lbl.setStyleSheet("color: #F59E0B; font-size: 11px; text-decoration: underline; cursor: pointer;")
+                            target_lbl.mousePressEvent = _retry_fn
+                        except RuntimeError:
+                            pass
                     self.ui_dispatch_signal.emit(_apply_fail)
 
             threading.Thread(target=_auto_translate_msg, args=(trans_lbl, msg), daemon=True).start()
