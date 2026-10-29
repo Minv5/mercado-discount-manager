@@ -425,6 +425,7 @@ class LogViewer(QPlainTextEdit):
         self.verticalScrollBar().installEventFilter(self)
 
         self.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
+        self.verticalScrollBar().rangeChanged.connect(self._on_range_changed)
 
     def is_viewport_or_mouse_hovered(self) -> bool:
         """综合判定是否处于悬停保护状态：
@@ -450,6 +451,21 @@ class LogViewer(QPlainTextEdit):
             elif event_type in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
                 self.is_hovered = False
         return super().eventFilter(watched, event)
+
+    def _on_range_changed(self, min_val: int, max_val: int) -> None:
+        if self._is_appending:
+            return
+        scrollbar = self.verticalScrollBar()
+        if self.auto_scroll and not self.textCursor().hasSelection() and not scrollbar.isSliderDown():
+            self._is_appending = True
+            try:
+                scrollbar.setValue(max_val)
+                cursor = self.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self.setTextCursor(cursor)
+                self.ensureCursorVisible()
+            finally:
+                self._is_appending = False
 
     def _on_scroll_changed(self, value: int) -> None:
         # 文本追加期间忽略底层自动滚屏产生的信号，防止冲刷用户的手动滚动状态
@@ -504,6 +520,11 @@ class LogViewer(QPlainTextEdit):
         try:
             if was_at_bottom:
                 self.appendPlainText(line)
+                scrollbar.setValue(scrollbar.maximum())
+                cursor = self.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self.setTextCursor(cursor)
+                self.ensureCursorVisible()
             else:
                 # 非吸底状态（如正在翻看历史或选中文本）：使用独立光标静默在文档末尾追加文本，不移动主光标与视口，杜绝页面跳动
                 doc = self.document()
@@ -511,13 +532,9 @@ class LogViewer(QPlainTextEdit):
                 cursor.movePosition(QTextCursor.MoveOperation.End)
                 cursor.insertBlock()
                 cursor.insertText(line)
+                scrollbar.setValue(prev_value)
         finally:
             self._is_appending = False
-
-        if was_at_bottom:
-            scrollbar.setValue(scrollbar.maximum())
-        else:
-            scrollbar.setValue(prev_value)
 
 
 class TargetedCancelDialog(QDialog):
