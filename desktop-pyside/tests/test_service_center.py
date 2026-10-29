@@ -1104,12 +1104,19 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         self.assertFalse(page.claim_partial_refund_btn.isEnabled())
         self.assertFalse(page.claim_full_refund_btn.isEnabled())
 
-        # 6. Test claim item card displays order_id
+        # 6. Test claim item card displays complaint reason and removes order_id
         item_widget = page._create_session_item_widget(claim_opened)
         self.assertIsNotNone(item_widget)
         labels = [lbl.text() for lbl in item_widget.findChildren(QLabel)]
         order_found = any("2000018676400878" in t for t in labels)
-        self.assertTrue(order_found)
+        self.assertFalse(order_found, "Order ID should be removed from left claim card")
+        reason_found = any("理由:" in t for t in labels)
+        self.assertTrue(reason_found, "Complaint reason should be shown on left claim card")
+
+        # 7. Test context header displays complaint reason badge next to title
+        page._display_session_detail(claim_opened)
+        self.assertFalse(page.context_reason_badge.isHidden())
+        self.assertIn("投诉理由:", page.context_reason_badge.text())
 
         page.close()
 
@@ -1143,6 +1150,15 @@ class TestServiceCenterSnapshot(unittest.TestCase):
             res = client.submit_claim_full_refund("acc_1", "5588")
             mock_req.assert_called_with("acc_1", "POST", "/post-purchase/v1/claims/5588/expected-resolutions/refund", body={})
             self.assertEqual(res, {"status": "refunded"})
+
+        with patch.object(client, "request", return_value={"name": "repentant_buyer", "detail": "test"}) as mock_req:
+            res = client.get_claim_reason("acc_1", "PDD9939")
+            mock_req.assert_called_with("acc_1", "GET", "/post-purchase/v1/claims/reasons/PDD9939")
+            self.assertEqual(res["name"], "repentant_buyer")
+
+        from service_center.service_center_page import resolve_claim_reason
+        self.assertEqual(resolve_claim_reason(client, "acc_1", "PDD9939"), "买家反悔不想要了")
+        self.assertEqual(resolve_claim_reason(client, "acc_1", "PNR9501"), "未送达·买家反悔取消")
 
     def test_display_session_detail_product_link_recovery(self):
         mock_client = MagicMock()

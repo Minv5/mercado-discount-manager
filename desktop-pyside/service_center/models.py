@@ -85,6 +85,8 @@ class ServiceSession:
     blocked_reason: str | None = None
     is_unread: bool = False
     affects_reputation: str = ""  # "not_affected" | "affected" | ""
+    claim_reason: str = ""
+    claim_reason_id: str = ""
     messages: list[ServiceMessage] = field(default_factory=list)
     raw_data: dict[str, Any] = field(default_factory=dict)
 

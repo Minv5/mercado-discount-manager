@@ -112,6 +112,92 @@ CLAIM_STAGE_NAMES: dict[str, str] = {
     "none": "已经结案",
 }
 
+CLAIM_REASON_NAMES: dict[str, str] = {
+    "PDD9939": "买家反悔不想要了",
+    "PDD9940": "型号/颜色/尺寸不符",
+    "PDD9941": "颜色/尺寸/型号不符",
+    "PDD9942": "收到其他类型商品",
+    "PDD9943": "商品与描述不符",
+    "PDD9944": "商品与描述不符",
+    "PDD9945": "商品有瑕疵/破损",
+    "PDD9946": "商品破损/损坏",
+    "PDD9947": "外包装破损导致商品损坏",
+    "PDD9948": "商品无法正常工作",
+    "PDD9949": "商品无法正常工作/故障",
+    "PDD9950": "商品缺少配件/部件",
+    "PDD9951": "商品缺少配件",
+    "PDD9952": "商品缺少配件/部件",
+    "PDD9953": "商品少件/漏发",
+    "PDD9955": "商品少件/漏发",
+    "PDD9959": "包装破损/空箱",
+    "PDD1": "商品存在瑕疵/故障",
+    "PDD2": "商品与描述不符",
+    "PDD3": "商品缺少配件",
+    "PNR9501": "未送达·买家反悔取消",
+    "PNR9502": "未收到商品",
+    "PNR9504": "配送延误/超期",
+    "PNR9508": "未送达·其他原因",
+    "PNR9560": "显示已送达但未收到包裹",
+    "PNR1": "未收到商品/包裹",
+    "PNR4071": "未收到商品/包裹",
+}
+
+CLAIM_REASON_NAME_TRANSLATIONS: dict[str, str] = {
+    "repentant_buyer": "买家反悔不想要了",
+    "different_item_other": "收到其他类型商品",
+    "different_than_published": "商品与描述不符",
+    "damaged_package_broken_item": "外包装破损导致商品损坏",
+    "damaged_package_empty_box": "包装破损/空箱",
+    "missing_accessories": "商品缺少配件/部件",
+    "different_color_or_size": "颜色/尺寸/型号不符",
+    "estimated_delivery_out_of_time": "配送延误/超期",
+    "delivered_but_not_receive_package": "显示已送达但未收到包裹",
+    "not_working_item": "商品无法正常工作/故障",
+    "missing_item": "商品少件/漏发",
+    "undelivered_other": "未送达·其他原因",
+    "broken_item": "商品破损/损坏",
+    "undelivered_repentant_buyer": "未送达·买家反悔取消",
+    "defective_item": "商品存在瑕疵/缺陷",
+    "fake_item": "假冒伪劣商品",
+    "incomplete_item": "商品不完整/少件",
+    "item_not_received": "未收到商品",
+    "package_not_arrived": "包裹未送达",
+    "cancelled_by_buyer": "买家取消订单",
+    "cancelled_by_seller": "卖家取消订单",
+}
+
+_CLAIM_REASON_CACHE: dict[str, str] = {}
+
+
+def resolve_claim_reason(client: Any, aid: str, rid: str) -> str:
+    """Resolve Mercado Libre claim reason code into human-friendly Simplified Chinese."""
+    clean_rid = str(rid or "").strip()
+    if not clean_rid or clean_rid in ("退款索赔", "UNKNOWN"):
+        return "买家投诉"
+    if clean_rid in CLAIM_REASON_NAMES:
+        return CLAIM_REASON_NAMES[clean_rid]
+    if clean_rid in _CLAIM_REASON_CACHE:
+        return _CLAIM_REASON_CACHE[clean_rid]
+
+    try:
+        if client and hasattr(client, "get_claim_reason"):
+            res = client.get_claim_reason(aid, clean_rid)
+            if isinstance(res, dict):
+                name = str(res.get("name") or "").strip().lower()
+                if name in CLAIM_REASON_NAME_TRANSLATIONS:
+                    translated = CLAIM_REASON_NAME_TRANSLATIONS[name]
+                    _CLAIM_REASON_CACHE[clean_rid] = translated
+                    return translated
+                for k, v in CLAIM_REASON_NAME_TRANSLATIONS.items():
+                    if k in name:
+                        _CLAIM_REASON_CACHE[clean_rid] = v
+                        return v
+    except Exception as e:
+        logger.debug("Failed to resolve claim reason %s: %s", clean_rid, e)
+
+    _CLAIM_REASON_CACHE[clean_rid] = "买家投诉"
+    return "买家投诉"
+
 # Pre-compiled style constants for session list cards to eliminate stylesheet parsing overhead
 CARD_STYLE_GOLD = "background: rgba(245, 158, 11, 0.16); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px;"
 CARD_STYLE_GREEN = "background: rgba(16, 185, 129, 0.14); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.30); font-size: 11px; font-weight: 500; border-radius: 4px;"
@@ -241,6 +327,8 @@ def save_sessions_snapshot(sessions: list[ServiceSession]) -> None:
                 "blocked_reason": s.blocked_reason,
                 "is_unread": s.is_unread,
                 "affects_reputation": getattr(s, "affects_reputation", ""),
+                "claim_reason": getattr(s, "claim_reason", ""),
+                "claim_reason_id": getattr(s, "claim_reason_id", ""),
                 "messages": msg_list,
             })
         path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -345,6 +433,13 @@ def load_sessions_snapshot() -> list[ServiceSession]:
                 raw_msgs = item.pop("messages", None) or []
                 clean_item = {k: v for k, v in item.items() if k in valid_fields}
                 sess = ServiceSession(**clean_item)
+                if sess.session_type == "claim" and not sess.claim_reason:
+                    rid = sess.claim_reason_id or (sess.raw_data.get("reason_id") if isinstance(sess.raw_data, dict) else "")
+                    if not rid and "索赔原因: " in (sess.summary or ""):
+                        rid = sess.summary.split("索赔原因: ")[-1].strip()
+                    if rid:
+                        sess.claim_reason_id = rid
+                        sess.claim_reason = CLAIM_REASON_NAMES.get(rid, "买家投诉")
                 for rm in raw_msgs:
                     if isinstance(rm, dict):
                         sess.messages.append(ServiceMessage(**rm))
@@ -990,6 +1085,12 @@ class FetchSessionsWorker(SafeWorkerBase):
                         )
 
                         affects_rep = getattr(cached, "affects_reputation", "") if cached else ""
+                        reason_id_val = str(c.get("reason_id") or (cached.claim_reason_id if cached else "")).strip()
+                        resolved_reason = (
+                            cached.claim_reason
+                            if (cached and cached.claim_reason)
+                            else resolve_claim_reason(self.client, aid, reason_id_val)
+                        )
 
                         sess = ServiceSession(
                             id=sess_id,
@@ -1017,6 +1118,8 @@ class FetchSessionsWorker(SafeWorkerBase):
                             can_reply=is_op,
                             is_unread=is_op,
                             affects_reputation=affects_rep,
+                            claim_reason=resolved_reason,
+                            claim_reason_id=reason_id_val,
                             raw_data=c,
                         )
                         claim_sessions.append(sess)
@@ -2253,17 +2356,45 @@ class ServiceCenterPage(QFrame):
         info_col.setSpacing(3)
         info_col.setContentsMargins(0, 0, 0, 0)
 
-        # 1.2.1 Product Title (Full row, uninterrupted)
+        # 1.2.1 Product Title & Complaint Reason Row
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
+
         self.context_title_lbl = QLabel("暂无选中的会话")
         self.context_title_lbl.setStyleSheet("color: #F6F3EA; font-size: 13px; font-weight: bold;")
         self.context_title_lbl.setWordWrap(False)
-        self.context_title_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.context_title_lbl.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.context_title_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.context_title_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.context_title_lbl.customContextMenuRequested.connect(
             lambda pos, w=self.context_title_lbl: self._show_simple_copy_menu(pos, w)
         )
-        info_col.addWidget(self.context_title_lbl)
+        title_row.addWidget(self.context_title_lbl)
+
+        self.context_reason_badge = QLabel("")
+        self.context_reason_badge.setStyleSheet("""
+            QLabel {
+                background: rgba(239, 68, 68, 0.16);
+                color: #F87171;
+                border: 1px solid rgba(239, 68, 68, 0.35);
+                border-radius: 4px;
+                padding: 1px 7px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+        """)
+        self.context_reason_badge.setFixedHeight(22)
+        self.context_reason_badge.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.context_reason_badge.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.context_reason_badge.customContextMenuRequested.connect(
+            lambda pos, w=self.context_reason_badge: self._show_simple_copy_menu(pos, w)
+        )
+        self.context_reason_badge.hide()
+        title_row.addWidget(self.context_reason_badge)
+        title_row.addStretch(1)
+
+        info_col.addLayout(title_row)
 
         # 1.2.2 Meta Row: Site flag, store, buyer, price, SKU
         self.context_meta_lbl = QLabel("请在左侧列表中点击任意提问或索赔会话")
@@ -3365,12 +3496,18 @@ class ServiceCenterPage(QFrame):
             mid_row.addWidget(badge)
         right_col.addLayout(mid_row)
 
-        # Snippet text or product title / claim order info
+        # Snippet text or product title / claim complaint reason info
         if session.session_type == "claim":
             stage_cn = CLAIM_STAGE_NAMES.get(session.stage, session.stage)
-            oid_str = session.order_id or "无关联订单"
-            snip_lbl = QLabel(f"订单: <b>{oid_str}</b> · {stage_cn}")
+            reason_txt = session.claim_reason or (CLAIM_REASON_NAMES.get(session.claim_reason_id, "") if session.claim_reason_id else "")
+            if not reason_txt and "索赔原因: " in (session.summary or ""):
+                rid = session.summary.split("索赔原因: ")[-1].strip()
+                reason_txt = CLAIM_REASON_NAMES.get(rid, "买家投诉")
+            if not reason_txt:
+                reason_txt = "买家投诉"
+            snip_lbl = QLabel(f"理由: <b>{reason_txt}</b> · {stage_cn}")
             snip_lbl.setStyleSheet(CARD_SNIP_CLAIM_STYLE)
+            snip_lbl.setToolTip(f"投诉理由: {reason_txt}\n索赔阶段: {stage_cn}\n关联订单: {session.order_id or '无'}")
         elif session.session_type == "question":
             if session.summary_translated:
                 display_text = f"问: {session.summary_translated}"
@@ -3594,6 +3731,9 @@ class ServiceCenterPage(QFrame):
             self._clear_chat_bubbles()
             self.context_thumb_lbl.setPixmap(get_placeholder_pixmap(QSize(56, 56), "📦", radius=6))
             self.context_title_lbl.setText("暂无选中的会话")
+            if hasattr(self, "context_reason_badge"):
+                self.context_reason_badge.setText("")
+                self.context_reason_badge.hide()
             self.context_meta_lbl.setText("请在左侧列表中点击任意提问或索赔会话")
             self.context_link_lbl.setText("")
             self.chip_item_lbl.setText("")
@@ -3633,6 +3773,21 @@ class ServiceCenterPage(QFrame):
 
         display_title = session.item_title or (f"商品 {session.item_id}" if session.item_id else "美客多会话商品")
         self.context_title_lbl.setText(display_title)
+
+        if hasattr(self, "context_reason_badge"):
+            if session.session_type == "claim":
+                reason_txt = session.claim_reason or (CLAIM_REASON_NAMES.get(session.claim_reason_id, "") if session.claim_reason_id else "")
+                if not reason_txt and "索赔原因: " in (session.summary or ""):
+                    rid = session.summary.split("索赔原因: ")[-1].strip()
+                    reason_txt = CLAIM_REASON_NAMES.get(rid, "买家投诉")
+                if not reason_txt:
+                    reason_txt = "买家投诉"
+                self.context_reason_badge.setText(f"投诉理由: {reason_txt}")
+                self.context_reason_badge.setToolTip(f"买家投诉理由: {reason_txt}")
+                self.context_reason_badge.show()
+            else:
+                self.context_reason_badge.setText("")
+                self.context_reason_badge.hide()
 
         meta_parts = [
             f"{session.site_display}",
@@ -4281,6 +4436,9 @@ class ServiceCenterPage(QFrame):
                     return target_widget.selectedText().strip()
                 if target_widget == self.context_title_lbl and self._current_session and self._current_session.item_title:
                     return self._current_session.item_title.strip()
+                if hasattr(self, "context_reason_badge") and target_widget == self.context_reason_badge:
+                    if self._current_session and self._current_session.claim_reason:
+                        return self._current_session.claim_reason.strip()
                 return extract_copyable_text(target_widget)
             if self._current_session:
                 return self._current_session.order_id or self._current_session.item_id or self._current_session.item_title or ""

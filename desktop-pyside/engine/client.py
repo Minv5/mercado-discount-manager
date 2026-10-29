@@ -854,6 +854,11 @@ class MercadoClient:
         cid = str(claim_id).strip()
         return self.request(account_id, "GET", f"/post-purchase/v1/claims/{cid}")
 
+    def get_claim_reason(self, account_id: str, reason_id: str) -> dict[str, Any]:
+        """GET /post-purchase/v1/claims/reasons/{reason_id} - Retrieve claim dispute reason metadata."""
+        rid = str(reason_id).strip()
+        return self.request(account_id, "GET", f"/post-purchase/v1/claims/reasons/{rid}")
+
     def get_claim_affects_reputation(self, account_id: str, claim_id: int | str) -> dict[str, Any]:
         """GET /post-purchase/v1/claims/{claim_id}/affects-reputation - Check if claim affects seller reputation."""
         cid = str(claim_id).strip()
