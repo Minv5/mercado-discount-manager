@@ -412,6 +412,122 @@ def is_fallback_title(t: str) -> bool:
     return not title or title == "商品" or title == "美客多会话商品" or title.startswith("商品 ") or (title.startswith("订单 ") and ("售后私信" in title or "纠纷索赔" in title))
 
 
+def resolve_cbt_order_via_buyer(
+    client: Any,
+    account_id: str,
+    pack_id: str,
+    buyer_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve CBT order items and buyer info via buyer search when direct /marketplace/orders/{id} fails with 403."""
+    clean_aid = str(account_id or "").strip()
+    clean_pid = str(pack_id or "").strip()
+    clean_bid = str(buyer_id or "").strip()
+
+    if not clean_aid or not clean_pid:
+        return None
+
+    # 1. If buyer_id is missing, probe pack messages to discover complainant/buyer user_id
+    if not clean_bid:
+        try:
+            seller_ids = {clean_aid}
+            if hasattr(client, "auth") and client.auth:
+                for s in client.auth.list_sites(clean_aid):
+                    c = str(s.get("child_user_id") or "").strip()
+                    if c:
+                        seller_ids.add(c)
+            msg_res = client.get_pack_messages(clean_aid, clean_pid)
+            for r in (msg_res.get("message_resources") or []):
+                if isinstance(r, dict) and r.get("name") == "sellers":
+                    seller_ids.add(str(r.get("id") or "").strip())
+            for m in (msg_res.get("messages") or []):
+                if isinstance(m, dict):
+                    f_uid = str((m.get("from") or {}).get("user_id") or "").strip()
+                    if f_uid and f_uid not in seller_ids:
+                        clean_bid = f_uid
+                        break
+        except Exception as e:
+            logger.debug("Failed probing pack messages for buyer id: %s", e)
+
+    if not clean_bid:
+        return None
+
+    # 2. Query /marketplace/orders/search with seller and buyer
+    try:
+        search_res = client.request(clean_aid, "GET", "/marketplace/orders/search", params={"seller": clean_aid, "buyer": clean_bid})
+        results = search_res.get("results") or []
+        matched_order = None
+        for o in results:
+            oid_str = str(o.get("id") or "")
+            sub_oids = [str(so.get("id") or "") for so in (o.get("orders") or [])]
+            if clean_pid in (oid_str, *sub_oids):
+                matched_order = o
+                break
+        if not matched_order and results:
+            matched_order = results[0]
+
+        if not matched_order:
+            return None
+
+        cfg_items = matched_order.get("config", {}).get("items") or []
+        item_id = str(cfg_items[0].get("id") or "") if cfg_items else ""
+        sub_orders = matched_order.get("orders") or []
+        real_sub_oid = str(sub_orders[0].get("id") or "") if sub_orders else str(matched_order.get("id") or clean_pid)
+
+        # 3. Resolve buyer nickname if possible
+        buyer_nickname = ""
+        try:
+            u_res = client.request(clean_aid, "GET", f"/users/{clean_bid}")
+            if isinstance(u_res, dict):
+                buyer_nickname = str(u_res.get("nickname") or "").strip()
+        except Exception:
+            pass
+
+        # 4. Resolve item details if item_id found
+        item_title = ""
+        item_thumb = ""
+        item_price = ""
+        item_permalink = ""
+        sku = ""
+        variation_id = ""
+        if item_id:
+            try:
+                it_data = client.get_item_detail(clean_aid, item_id)
+                if isinstance(it_data, dict):
+                    item_title = str(it_data.get("title") or "")
+                    item_thumb = str(it_data.get("thumbnail") or "")
+                    item_permalink = str(it_data.get("permalink") or "")
+                    if it_data.get("price"):
+                        cur = str(it_data.get("currency_id") or "$")
+                        item_price = f"{cur} {it_data.get('price')}"
+                    sku = str(it_data.get("seller_custom_field") or "")
+                    vars_list = it_data.get("variations") or []
+                    if vars_list:
+                        variation_id = str(vars_list[0].get("id") or "")
+                        sku_pic = extract_sku_picture_url(it_data, variation_id, sku)
+                        if sku_pic:
+                            item_thumb = sku_pic
+            except Exception:
+                pass
+
+        return {
+            "order_id": real_sub_oid,
+            "pack_id": clean_pid,
+            "buyer_id": clean_bid,
+            "buyer_nickname": buyer_nickname,
+            "item_id": item_id,
+            "item_title": item_title,
+            "item_thumbnail": item_thumb,
+            "item_price": item_price,
+            "item_permalink": item_permalink,
+            "sku": sku,
+            "variation_id": variation_id,
+            "raw_order": matched_order,
+        }
+    except Exception as err:
+        logger.debug("Failed resolve_cbt_order_via_buyer for %s / %s: %s", clean_aid, clean_bid, err)
+        return None
+
+
 def load_sessions_snapshot() -> list[ServiceSession]:
     """Load cached sessions from local disk snapshot for instant 0.05s cold start."""
     try:
@@ -648,6 +764,40 @@ class FetchConversationMessagesWorker(SafeWorkerBase):
                     sorted_raw = list(reversed(raw_msgs))
                 else:
                     sorted_raw = []
+
+                # If session is missing item details or has placeholder title, resolve CBT order via buyer
+                if not self.session.item_id or is_fallback_title(self.session.item_title):
+                    try:
+                        resolved_cbt = resolve_cbt_order_via_buyer(
+                            self.client,
+                            account_id,
+                            pid,
+                            buyer_id=self.session.buyer_id,
+                        )
+                        if resolved_cbt:
+                            if resolved_cbt.get("item_id"):
+                                self.session.item_id = resolved_cbt["item_id"]
+                            if resolved_cbt.get("item_title"):
+                                self.session.item_title = resolved_cbt["item_title"]
+                            if resolved_cbt.get("item_thumbnail"):
+                                self.session.item_thumbnail = resolved_cbt["item_thumbnail"]
+                            if resolved_cbt.get("item_price"):
+                                self.session.item_price = resolved_cbt["item_price"]
+                            if resolved_cbt.get("item_permalink"):
+                                self.session.item_permalink = resolved_cbt["item_permalink"]
+                            if resolved_cbt.get("sku"):
+                                self.session.sku = resolved_cbt["sku"]
+                            if resolved_cbt.get("variation_id"):
+                                self.session.variation_id = resolved_cbt["variation_id"]
+                            if resolved_cbt.get("order_id"):
+                                self.session.order_id = resolved_cbt["order_id"]
+                            if resolved_cbt.get("buyer_id"):
+                                self.session.buyer_id = resolved_cbt["buyer_id"]
+                            if resolved_cbt.get("buyer_nickname"):
+                                self.session.buyer_nickname = resolved_cbt["buyer_nickname"]
+                                detected_buyer_name = resolved_cbt["buyer_nickname"]
+                    except Exception as res_err:
+                        logger.debug("Failed resolving CBT order via buyer in worker: %s", res_err)
 
                 # Pre-fetch associated claim ID if any message contains attachments
                 has_any_att = any(bool(rm.get("message_attachments")) for rm in sorted_raw if isinstance(rm, dict))
@@ -1448,7 +1598,7 @@ class FetchSessionsWorker(SafeWorkerBase):
 
         sessions_needing_enrich = [
             s for s in sessions
-            if s.order_id and (not s.item_title or s.item_title.startswith("商品 ") or not s.item_id)
+            if (s.order_id or s.pack_id) and (not s.item_title or is_fallback_title(s.item_title) or not s.item_id)
         ]
         # Prioritize active/unread/opened sessions first
         sessions_needing_enrich.sort(
@@ -1458,8 +1608,9 @@ class FetchSessionsWorker(SafeWorkerBase):
 
         orders_to_enrich: dict[str, dict[str, Any] | None] = {}
         for s in sessions_needing_enrich:
-            if s.order_id not in self._not_found_orders and s.order_id not in orders_to_enrich:
-                orders_to_enrich[s.order_id] = None
+            target_key = s.order_id or s.pack_id
+            if target_key not in self._not_found_orders and target_key not in orders_to_enrich:
+                orders_to_enrich[target_key] = None
                 if len(orders_to_enrich) >= 10:
                     break
 
@@ -1472,6 +1623,34 @@ class FetchSessionsWorker(SafeWorkerBase):
                     return (oid, ord_res)
                 except Exception as err:
                     err_str = str(err)
+                    # When direct /marketplace/orders/{id} fails with 403 (CBT Pack ID) or 404, fallback to buyer search
+                    matched_s = next((s for s in sessions_needing_enrich if s.order_id == oid or s.pack_id == oid), None)
+                    resolved = resolve_cbt_order_via_buyer(self.client, aid, oid, buyer_id=getattr(matched_s, "buyer_id", None))
+                    if resolved and resolved.get("item_id"):
+                        return (oid, {
+                            "id": oid,
+                            "pack_id": resolved.get("pack_id") or oid,
+                            "buyer": {
+                                "id": resolved.get("buyer_id"),
+                                "nickname": resolved.get("buyer_nickname"),
+                            },
+                            "order_items": [
+                                {
+                                    "item": {
+                                        "id": resolved.get("item_id"),
+                                        "title": resolved.get("item_title"),
+                                        "seller_custom_field": resolved.get("sku"),
+                                        "seller_sku": resolved.get("sku"),
+                                        "variation_id": resolved.get("variation_id"),
+                                    },
+                                    "unit_price": (resolved.get("item_price") or "").split()[-1] if resolved.get("item_price") else "",
+                                }
+                            ],
+                            "resolved_thumbnail": resolved.get("item_thumbnail"),
+                            "resolved_permalink": resolved.get("item_permalink"),
+                            "resolved_price": resolved.get("item_price"),
+                            "real_sub_order_id": resolved.get("order_id"),
+                        })
                     if "404" in err_str or "not found" in err_str.lower() or "不存在" in err_str:
                         self._not_found_orders.add(oid)
                     return (oid, None)
@@ -1488,10 +1667,13 @@ class FetchSessionsWorker(SafeWorkerBase):
                         pass
 
             for sess in sessions:
-                if sess.order_id:
-                    ord_res = orders_to_enrich.get(sess.order_id)
+                target_key = sess.order_id or sess.pack_id
+                if target_key:
+                    ord_res = orders_to_enrich.get(target_key)
                     if ord_res:
                         try:
+                            if ord_res.get("real_sub_order_id"):
+                                sess.order_id = ord_res["real_sub_order_id"]
                             ord_pack_id = str(ord_res.get("pack_id") or "").strip()
                             if ord_pack_id:
                                 sess.pack_id = ord_pack_id
@@ -1512,7 +1694,7 @@ class FetchSessionsWorker(SafeWorkerBase):
                                 it_info = first_oi.get("item") or {}
                                 if not sess.item_id:
                                     sess.item_id = str(it_info.get("id") or "")
-                                if not sess.item_title or sess.item_title.startswith("商品 "):
+                                if not sess.item_title or is_fallback_title(sess.item_title):
                                     sess.item_title = str(it_info.get("title") or "")
                                 if not sess.item_price and first_oi.get("unit_price"):
                                     cur = str(ord_res.get("currency_id") or "$")
@@ -1522,6 +1704,12 @@ class FetchSessionsWorker(SafeWorkerBase):
                                 var_id = str(it_info.get("variation_id") or first_oi.get("variation_id") or "").strip()
                                 if var_id and var_id != "0":
                                     sess.variation_id = var_id
+                            if ord_res.get("resolved_thumbnail") and not sess.item_thumbnail:
+                                sess.item_thumbnail = ord_res["resolved_thumbnail"]
+                            if ord_res.get("resolved_permalink") and not sess.item_permalink:
+                                sess.item_permalink = ord_res["resolved_permalink"]
+                            if ord_res.get("resolved_price") and not sess.item_price:
+                                sess.item_price = ord_res["resolved_price"]
                         except Exception as enrich_err:
                             logger.debug("Error processing enriched order items: %s", enrich_err)
 
@@ -4108,6 +4296,34 @@ class ServiceCenterPage(QFrame):
                 )
                 bubble = self._create_chat_bubble(hint_msg)
                 self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble, 0, Qt.AlignmentFlag.AlignTop)
+
+        display_title = self._current_session.item_title or (f"商品 {self._current_session.item_id}" if self._current_session.item_id else "美客多会话商品")
+        self.context_title_lbl.setText(display_title)
+
+        has_item = bool(self._current_session.item_id or self._current_session.item_url)
+        if has_item:
+            display_id = self._current_session.item_id or "查看商品"
+            self.chip_item_lbl.setText(f"商品链接: <b style='color: #F6F3EA;'>{display_id}</b> <span style='color: #78716C; font-size: 10px;'>↗</span>")
+            self.chip_item_lbl.show()
+        else:
+            self.chip_item_lbl.hide()
+
+        has_order = bool(self._current_session.order_id)
+        if has_order:
+            self.chip_order_lbl.setText(f"关联订单号: <b style='color: #F6F3EA;'>{self._current_session.order_id}</b>")
+            self.chip_order_lbl.show()
+        else:
+            self.chip_order_lbl.hide()
+
+        has_pack = bool(self._current_session.pack_id and self._current_session.pack_id != self._current_session.order_id)
+        if has_pack:
+            self.chip_pack_lbl.setText(f"包裹号: <b style='color: #F6F3EA;'>{self._current_session.pack_id}</b>")
+            self.chip_pack_lbl.show()
+        else:
+            self.chip_pack_lbl.hide()
+
+        self.sep_item_order.setVisible(has_item and (has_order or has_pack))
+        self.sep_order_pack.setVisible(has_order and has_pack)
 
         meta_parts = [
             f"{self._current_session.site_display}",

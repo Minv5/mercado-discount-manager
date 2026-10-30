@@ -1156,9 +1156,37 @@ class TestServiceCenterSnapshot(unittest.TestCase):
             mock_req.assert_called_with("acc_1", "GET", "/post-purchase/v1/claims/reasons/PDD9939")
             self.assertEqual(res["name"], "repentant_buyer")
 
-        from service_center.service_center_page import resolve_claim_reason
+        from service_center.service_center_page import resolve_claim_reason, resolve_cbt_order_via_buyer
         self.assertEqual(resolve_claim_reason(client, "acc_1", "PDD9939"), "买家反悔不想要了")
         self.assertEqual(resolve_claim_reason(client, "acc_1", "PNR9501"), "未送达·买家反悔取消")
+
+        # Test CBT order resolution via buyer search
+        with patch.object(client, "request") as mock_req, \
+             patch.object(client, "get_pack_messages") as mock_pack_msgs, \
+             patch.object(client, "get_item_detail") as mock_item_detail:
+            mock_pack_msgs.return_value = {
+                "message_resources": [{"name": "sellers", "id": "3333531550"}],
+                "messages": [{"from": {"user_id": "325364637"}}],
+            }
+            mock_req.side_effect = [
+                # 1. /marketplace/orders/search
+                {"results": [{"id": 2000014938761471, "config": {"items": [{"id": "MLM3102132801"}]}, "orders": [{"id": 2000018359918956}]}]},
+                # 2. /users/325364637
+                {"nickname": "MOEV5315784"},
+            ]
+            mock_item_detail.return_value = {
+                "title": "Colcha De Verano",
+                "thumbnail": "https://img/thumb.jpg",
+                "price": 22.34,
+                "currency_id": "USD",
+                "permalink": "https://articulo.mercadolibre.com.mx/MLM3102132801",
+            }
+            res_cbt = resolve_cbt_order_via_buyer(client, "acc_1", "2000014938761471")
+            self.assertIsNotNone(res_cbt)
+            self.assertEqual(res_cbt["item_id"], "MLM3102132801")
+            self.assertEqual(res_cbt["order_id"], "2000018359918956")
+            self.assertEqual(res_cbt["buyer_nickname"], "MOEV5315784")
+            self.assertEqual(res_cbt["item_title"], "Colcha De Verano")
 
     def test_display_session_detail_product_link_recovery(self):
         mock_client = MagicMock()
