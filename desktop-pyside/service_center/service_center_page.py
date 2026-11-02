@@ -198,9 +198,97 @@ def resolve_claim_reason(client: Any, aid: str, rid: str) -> str:
     _CLAIM_REASON_CACHE[clean_rid] = "买家投诉"
     return "买家投诉"
 
+
+def resolve_claim_return_info(client: Any, aid: str, claim_data: dict[str, Any]) -> tuple[str, str, dict[str, str]]:
+    """
+    Resolve Mercado Libre claim into exact 4-character return status label and detail info.
+    Returns: (label_4char, status_code, extra_details_dict)
+    
+    Status Labels (Strictly 4 Chinese characters, without bullets):
+      待我同意: Complainant requested return; waiting for seller allow_return action.
+      买家待寄: Return approved / label generated, awaiting buyer dispatch.
+      买家已寄: Return parcel shipped by buyer, in-transit.
+      包裹已到: Return parcel delivered to return warehouse.
+      退款结案: Claim closed, refund issued / resolved.
+      纠纷仲裁: Mediation escalated to platform dispute.
+      常规索赔: Other claims / complaints fallback.
+    """
+    status = str(claim_data.get("status") or "").lower()
+    stage = str(claim_data.get("stage") or "").lower()
+    cl_type = str(claim_data.get("type") or "").lower()
+    cid = str(claim_data.get("id") or "").strip()
+    details = {
+        "shipment_id": "",
+        "tracking_number": "",
+        "destination": "",
+    }
+
+    # 1. Closed claims
+    if status == "closed":
+        return "退款结案", "closed", details
+
+    # 2. Stage is dispute (platform arbitration)
+    if stage == "dispute":
+        return "纠纷仲裁", "dispute", details
+
+    # 3. Check seller actions for allow_return (pending seller consent)
+    has_allow_return = False
+    for p in claim_data.get("players") or []:
+        if p.get("role") in ("respondent", "seller"):
+            for a in p.get("available_actions") or []:
+                act_name = a.get("action") if isinstance(a, dict) else str(a)
+                if act_name == "allow_return":
+                    has_allow_return = True
+                    break
+    if has_allow_return:
+        return "待我同意", "allow_return", details
+
+    # 4. Check return parcel logistics if returns type or related_entities has return
+    rel = claim_data.get("related_entities") or []
+    if cl_type == "returns" or "return" in str(rel).lower():
+        if client and hasattr(client, "get_claim_returns"):
+            try:
+                ret = client.get_claim_returns(aid, cid)
+                if isinstance(ret, dict):
+                    ret_st = str(ret.get("status") or "").lower()
+                    shipments = ret.get("shipments") or []
+                    ship_st = ""
+                    if shipments and isinstance(shipments, list):
+                        sh0 = shipments[0] or {}
+                        ship_st = str(sh0.get("status") or "").lower()
+                        details["shipment_id"] = str(sh0.get("shipment_id") or "")
+                        details["tracking_number"] = str(sh0.get("tracking_number") or "")
+                        dest = (sh0.get("destination") or {}).get("shipping_address") or {}
+                        if dest:
+                            parts = []
+                            city = (dest.get("city") or {}).get("name") if isinstance(dest.get("city"), dict) else dest.get("city")
+                            state = (dest.get("state") or {}).get("name") if isinstance(dest.get("state"), dict) else dest.get("state")
+                            comment = dest.get("comment")
+                            if city:
+                                parts.append(str(city))
+                            if state:
+                                parts.append(str(state))
+                            if comment:
+                                parts.append(str(comment))
+                            details["destination"] = " · ".join(parts)
+
+                    effective_st = ship_st or ret_st
+                    if effective_st == "delivered":
+                        return "包裹已到", "delivered", details
+                    elif effective_st == "shipped":
+                        return "买家已寄", "shipped", details
+                    elif effective_st in ("ready_to_ship", "label_generated"):
+                        return "买家待寄", "ready_to_ship", details
+            except Exception as e:
+                logger.debug("Failed to fetch returns for claim %s: %s", cid, e)
+
+    return "常规索赔", "claim", details
+
+
 # Pre-compiled style constants for session list cards to eliminate stylesheet parsing overhead
 CARD_STYLE_GOLD = "background: rgba(245, 158, 11, 0.16); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px;"
 CARD_STYLE_GREEN = "background: rgba(16, 185, 129, 0.14); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.30); font-size: 11px; font-weight: 500; border-radius: 4px;"
+CARD_STYLE_BLUE = "background: rgba(59, 130, 246, 0.16); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px;"
 CARD_STYLE_GRAY = "background: rgba(100, 116, 139, 0.16); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.28); font-size: 11px; font-weight: 500; border-radius: 4px;"
 CARD_STYLE_RED = "background: rgba(239, 68, 68, 0.16); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); font-size: 11px; font-weight: 500; border-radius: 4px;"
 CARD_PILL_STYLE = "background: rgba(78, 71, 47, 0.5); color: #E6E2D8; font-size: 11px; font-weight: 500; padding: 2px 6px; border-radius: 3px;"
@@ -1242,6 +1330,21 @@ class FetchSessionsWorker(SafeWorkerBase):
                             else resolve_claim_reason(self.client, aid, reason_id_val)
                         )
 
+                        # Synchronous initial resolution (closed, dispute, allow_return)
+                        sync_lbl, sync_code, sync_det = resolve_claim_return_info(None, aid, c)
+                        init_lbl = getattr(cached, "return_status_label", "") if cached else ""
+                        init_code = getattr(cached, "return_status", "") if cached else ""
+                        init_sh_id = getattr(cached, "return_shipment_id", "") if cached else ""
+                        init_tr_no = getattr(cached, "return_tracking_number", "") if cached else ""
+                        init_dest = getattr(cached, "return_destination", "") if cached else ""
+
+                        if not init_lbl:
+                            init_lbl = sync_lbl
+                            init_code = sync_code
+                            init_sh_id = sync_det.get("shipment_id", "")
+                            init_tr_no = sync_det.get("tracking_number", "")
+                            init_dest = sync_det.get("destination", "")
+
                         sess = ServiceSession(
                             id=sess_id,
                             session_type="claim",
@@ -1270,17 +1373,22 @@ class FetchSessionsWorker(SafeWorkerBase):
                             affects_reputation=affects_rep,
                             claim_reason=resolved_reason,
                             claim_reason_id=reason_id_val,
+                            return_status=init_code,
+                            return_status_label=init_lbl,
+                            return_shipment_id=init_sh_id,
+                            return_tracking_number=init_tr_no,
+                            return_destination=init_dest,
                             raw_data=c,
                         )
                         claim_sessions.append(sess)
                 except Exception as err:
                     logger.warning("Error collecting claim results: %s", err)
 
-        # Resolve reputation impact concurrently for any claim sessions missing this field
-        rep_needed = [s for s in claim_sessions if not s.affects_reputation]
-        if rep_needed:
-            def _fetch_rep(s: ServiceSession) -> None:
-                cid = s.id.replace("c_", "").strip()
+        # Resolve reputation impact and return logistics concurrently for claim sessions
+        def _resolve_claim_extras(s: ServiceSession) -> None:
+            cid = s.id.replace("c_", "").strip()
+            # 1. Fetch reputation if needed
+            if not s.affects_reputation:
                 try:
                     r = self.client.get_claim_affects_reputation(s.account_id, cid)
                     if isinstance(r, dict):
@@ -1288,8 +1396,28 @@ class FetchSessionsWorker(SafeWorkerBase):
                 except Exception as r_err:
                     logger.debug("Failed to fetch reputation for claim %s: %s", cid, r_err)
 
-            with ThreadPoolExecutor(max_workers=min(len(rep_needed), 8)) as rep_exec:
-                list(rep_exec.map(_fetch_rep, rep_needed))
+            # 2. Fetch reverse logistics from official returns API if needed (e.g. returns type or pending label)
+            c_raw = s.raw_data or {}
+            c_type = str(c_raw.get("type") or "").lower()
+            rel_entities = str(c_raw.get("related_entities") or "").lower()
+            if (c_type == "returns" or "return" in rel_entities) and s.return_status_label not in ("包裹已到", "退款结案"):
+                try:
+                    lbl, code, det = resolve_claim_return_info(self.client, s.account_id, c_raw)
+                    if lbl:
+                        s.return_status_label = lbl
+                        s.return_status = code
+                        if det.get("shipment_id"):
+                            s.return_shipment_id = det["shipment_id"]
+                        if det.get("tracking_number"):
+                            s.return_tracking_number = det["tracking_number"]
+                        if det.get("destination"):
+                            s.return_destination = det["destination"]
+                except Exception as ret_err:
+                    logger.debug("Failed to resolve return logistics for claim %s: %s", cid, ret_err)
+
+        if claim_sessions:
+            with ThreadPoolExecutor(max_workers=min(len(claim_sessions), 8)) as extras_exec:
+                list(extras_exec.map(_resolve_claim_extras, claim_sessions))
 
         return claim_sessions
 
@@ -2694,7 +2822,7 @@ class ServiceCenterPage(QFrame):
         self.chip_stage_lbl.customContextMenuRequested.connect(
             lambda pos: self._show_target_copy_menu(
                 pos, self.chip_stage_lbl,
-                lambda: CLAIM_STAGE_NAMES.get(self._current_session.stage.lower(), self._current_session.stage) if (self._current_session and self._current_session.stage) else ""
+                lambda: (self._current_session.return_status_label or CLAIM_STAGE_NAMES.get(self._current_session.stage.lower(), self._current_session.stage)) if (self._current_session and (self._current_session.return_status_label or self._current_session.stage)) else ""
             )
         )
         ca_layout.addWidget(self.chip_stage_lbl, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -3646,11 +3774,24 @@ class ServiceCenterPage(QFrame):
                 rep_badge = QLabel("影响信誉: 否")
                 rep_badge.setStyleSheet(CARD_STYLE_GREEN)
 
-            if session.status == "closed":
-                badge = QLabel("● 已结案")
+            # 4-character return/claim status badge without bullets
+            status_text = session.return_status_label
+            if not status_text:
+                if session.status == "closed":
+                    status_text = "退款结案"
+                elif session.stage == "dispute":
+                    status_text = "纠纷仲裁"
+                else:
+                    status_text = "常规索赔"
+
+            badge = QLabel(status_text)
+            if status_text in ("退款结案", "已结案"):
                 badge.setStyleSheet(CARD_STYLE_GRAY)
-            else:
-                badge = QLabel("● 索赔中")
+            elif status_text in ("包裹已到", "买家已寄"):
+                badge.setStyleSheet(CARD_STYLE_BLUE)
+            elif status_text in ("待我同意", "纠纷仲裁"):
+                badge.setStyleSheet(CARD_STYLE_RED)
+            else:  # 买家待寄, 常规索赔
                 badge.setStyleSheet(CARD_STYLE_GOLD)
         elif session.session_type == "question":
             if session.status == "answered":
@@ -4015,10 +4156,18 @@ class ServiceCenterPage(QFrame):
 
         self.sep_order_pack.setVisible((has_item or has_order) and has_pack)
 
-        has_stage = bool(session.stage) and session.session_type == "claim"
+        has_stage = (bool(session.stage) or bool(session.return_status_label)) and session.session_type == "claim"
         if has_stage:
-            stage_cn = CLAIM_STAGE_NAMES.get(session.stage.lower(), session.stage)
-            self.chip_stage_lbl.setText(f"索赔阶段: <b style='color: #FBBF24;'>{stage_cn}</b>")
+            status_cn = session.return_status_label or CLAIM_STAGE_NAMES.get(session.stage.lower(), session.stage)
+            self.chip_stage_lbl.setText(f"售后状态: <b style='color: #FBBF24;'>{status_cn}</b>")
+            tip = f"售后状态: {status_cn}"
+            if session.return_shipment_id:
+                tip += f"\n退货运单号: {session.return_shipment_id}"
+            if session.return_tracking_number:
+                tip += f"\n快递追踪号: {session.return_tracking_number}"
+            if session.return_destination:
+                tip += f"\n退货仓目的地: {session.return_destination}"
+            self.chip_stage_lbl.setToolTip(tip)
             self.chip_stage_lbl.show()
         else:
             self.chip_stage_lbl.hide()
@@ -4044,7 +4193,17 @@ class ServiceCenterPage(QFrame):
             link_parts.append(f"关联订单号: <b>{session.order_id}</b>")
         if session.pack_id and session.pack_id != session.order_id:
             link_parts.append(f"包裹号: <b>{session.pack_id}</b>")
-        if session.stage:
+        if session.session_type == "claim":
+            status_desc = session.return_status_label or (CLAIM_STAGE_NAMES.get(session.stage.lower(), session.stage) if session.stage else "")
+            if status_desc:
+                link_parts.append(f"售后状态: <b>{status_desc}</b>")
+            if session.return_shipment_id:
+                link_parts.append(f"退货包裹号: <b>{session.return_shipment_id}</b>")
+            if session.return_tracking_number:
+                link_parts.append(f"退货追踪号: <b>{session.return_tracking_number}</b>")
+            if session.return_destination:
+                link_parts.append(f"退货仓: <b>{session.return_destination}</b>")
+        elif session.stage:
             stage_cn = CLAIM_STAGE_NAMES.get(session.stage.lower(), session.stage)
             link_parts.append(f"索赔阶段: <b>{stage_cn}</b>")
         if session.affects_reputation and session.session_type == "claim":

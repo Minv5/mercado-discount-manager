@@ -2014,23 +2014,35 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         mock_auth.list_sites.return_value = [{"child_user_id": "c1", "site_id": "MLM"}]
         page = ServiceCenterPage(mock_client, mock_auth)
 
-        # 索赔进行中
+        # 索赔进行中（统一4字纯汉字徽章，无圆点）
         s_claim = ServiceSession(id="c1", session_type="claim", status="opened", account_id="acc1", account_name="湖北店", site_id="MLM", buyer_nickname="BuyerA")
         w_claim = page._create_session_item_widget(s_claim)
         labels = w_claim.findChildren(QLabel)
-        badge_claim = [l for l in labels if "● 索赔中" in l.text()]
+        badge_claim = [l for l in labels if l.text() == "常规索赔"]
         self.assertEqual(len(badge_claim), 1)
         self.assertEqual(badge_claim[0].width(), 74)
         self.assertEqual(badge_claim[0].height(), 22)
+        self.assertNotIn("●", badge_claim[0].text())
         self.assertNotIn("⚠️", badge_claim[0].text())
 
-        # 索赔已结案
+        # 索赔退货各种4字状态验证（待我同意、买家待寄、买家已寄、包裹已到、纠纷仲裁、退款结案）
+        for expected_lbl in ("待我同意", "买家待寄", "买家已寄", "包裹已到", "纠纷仲裁"):
+            s_ret = ServiceSession(id="cr", session_type="claim", status="opened", return_status_label=expected_lbl, account_id="acc1", account_name="湖北店", site_id="MLM", buyer_nickname="BuyerR")
+            w_ret = page._create_session_item_widget(s_ret)
+            b_ret = [l for l in w_ret.findChildren(QLabel) if l.text() == expected_lbl]
+            self.assertEqual(len(b_ret), 1)
+            self.assertEqual(b_ret[0].width(), 74)
+            self.assertEqual(b_ret[0].height(), 22)
+            self.assertNotIn("●", b_ret[0].text())
+
+        # 索赔已结案（对应 4 字“退款结案”）
         s_closed = ServiceSession(id="c2", session_type="claim", status="closed", account_id="acc1", account_name="湖北店", site_id="MLM", buyer_nickname="BuyerB")
         w_closed = page._create_session_item_widget(s_closed)
-        badge_closed = [l for l in w_closed.findChildren(QLabel) if "● 已结案" in l.text()]
+        badge_closed = [l for l in w_closed.findChildren(QLabel) if l.text() == "退款结案"]
         self.assertEqual(len(badge_closed), 1)
         self.assertEqual(badge_closed[0].width(), 74)
         self.assertEqual(badge_closed[0].height(), 22)
+        self.assertNotIn("●", badge_closed[0].text())
         self.assertNotIn("✔️", badge_closed[0].text())
 
         # 提问待回复
@@ -2384,6 +2396,78 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         self.assertIn("c_c_real_2", result_ids)
         self.assertNotIn("c_c_cancel_1", result_ids)
         self.assertNotIn("c_c_cancel_2", result_ids)
+
+    def test_resolve_claim_return_info_and_4char_badges(self):
+        """Verify official Mercado Libre claim & return states map strictly to 4-character Chinese labels without bullets."""
+        from service_center.service_center_page import resolve_claim_return_info
+
+        mock_client = MagicMock()
+
+        # 1. Closed claim -> 退款结案
+        lbl, code, det = resolve_claim_return_info(mock_client, "acc1", {"id": "1", "status": "closed"})
+        self.assertEqual(lbl, "退款结案")
+        self.assertEqual(code, "closed")
+        self.assertEqual(len(lbl), 4)
+
+        # 2. Dispute stage -> 纠纷仲裁
+        lbl, code, det = resolve_claim_return_info(mock_client, "acc1", {"id": "2", "status": "opened", "stage": "dispute"})
+        self.assertEqual(lbl, "纠纷仲裁")
+        self.assertEqual(code, "dispute")
+        self.assertEqual(len(lbl), 4)
+
+        # 3. Seller action contains allow_return -> 待我同意
+        claim_allow = {
+            "id": "3",
+            "status": "opened",
+            "stage": "claim",
+            "type": "mediations",
+            "players": [
+                {"role": "respondent", "available_actions": [{"action": "allow_return"}, {"action": "refund"}]}
+            ],
+        }
+        lbl, code, det = resolve_claim_return_info(mock_client, "acc1", claim_allow)
+        self.assertEqual(lbl, "待我同意")
+        self.assertEqual(code, "allow_return")
+        self.assertEqual(len(lbl), 4)
+
+        # 4. Return label generated / ready_to_ship -> 买家待寄
+        mock_client.get_claim_returns.return_value = {
+            "status": "label_generated",
+            "shipments": [{"status": "ready_to_ship", "shipment_id": 48328196731}],
+        }
+        lbl, code, det = resolve_claim_return_info(mock_client, "acc1", {"id": "4", "status": "opened", "type": "returns"})
+        self.assertEqual(lbl, "买家待寄")
+        self.assertEqual(code, "ready_to_ship")
+        self.assertEqual(det["shipment_id"], "48328196731")
+        self.assertEqual(len(lbl), 4)
+
+        # 5. Return package shipped -> 买家已寄
+        mock_client.get_claim_returns.return_value = {
+            "status": "shipped",
+            "shipments": [{"status": "shipped", "tracking_number": "TRK123"}],
+        }
+        lbl, code, det = resolve_claim_return_info(mock_client, "acc1", {"id": "5", "status": "opened", "type": "returns"})
+        self.assertEqual(lbl, "买家已寄")
+        self.assertEqual(code, "shipped")
+        self.assertEqual(det["tracking_number"], "TRK123")
+        self.assertEqual(len(lbl), 4)
+
+        # 6. Return package delivered to warehouse -> 包裹已到
+        mock_client.get_claim_returns.return_value = {
+            "status": "delivered",
+            "shipments": [{"status": "delivered", "destination": {"shipping_address": {"city": {"name": "Tultepec"}}}}],
+        }
+        lbl, code, det = resolve_claim_return_info(mock_client, "acc1", {"id": "6", "status": "opened", "type": "returns"})
+        self.assertEqual(lbl, "包裹已到")
+        self.assertEqual(code, "delivered")
+        self.assertIn("Tultepec", det["destination"])
+        self.assertEqual(len(lbl), 4)
+
+        # 7. Fallback regular claim -> 常规索赔
+        lbl, code, det = resolve_claim_return_info(mock_client, "acc1", {"id": "7", "status": "opened", "type": "mediations", "players": []})
+        self.assertEqual(lbl, "常规索赔")
+        self.assertEqual(code, "claim")
+        self.assertEqual(len(lbl), 4)
 
 
 if __name__ == "__main__":

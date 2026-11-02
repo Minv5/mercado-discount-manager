@@ -87,6 +87,11 @@ class ServiceSession:
     affects_reputation: str = ""  # "not_affected" | "affected" | ""
     claim_reason: str = ""
     claim_reason_id: str = ""
+    return_status: str = ""
+    return_status_label: str = ""
+    return_shipment_id: str = ""
+    return_tracking_number: str = ""
+    return_destination: str = ""
     messages: list[ServiceMessage] = field(default_factory=list)
     raw_data: dict[str, Any] = field(default_factory=dict)
 
