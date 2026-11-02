@@ -1283,6 +1283,11 @@ class MainWindow(QMainWindow):
             return
         data = dict(bundle or {})
         self.settings = dict(data.get("settings") or {})
+        try:
+            from push_service import PushService
+            PushService.instance().update_config(self.settings)
+        except Exception:
+            pass
         first_session_load = not self.auto_shutdown_session_initialized
         if first_session_load:
             self.auto_shutdown_session_initialized = True
@@ -3404,6 +3409,11 @@ class MainWindow(QMainWindow):
 
     def _settings_saved(self, settings: object) -> None:
         self.settings = dict(settings or self.settings)
+        try:
+            from push_service import PushService
+            PushService.instance().update_config(self.settings)
+        except Exception:
+            pass
         self.log(
             "设置已保存：读取全局上限 {read}，活动目录并发上限 {activity}，商品写入全局上限 {write}。".format(
                 read=self.settings.get("readConcurrency", 125),
@@ -4082,7 +4092,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.61"
+    return "2.2.62"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.

@@ -1621,12 +1621,15 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._stores_tab(), "店铺与站点")
         self.tabs.addTab(self._auth_tab(), "账号授权")
         self.tabs.addTab(self._advanced_tab(benchmark_text), "高  级")
+        self.tabs.addTab(self._push_tab(), "消息推送")
         if initial_tab == "auth":
             self.tabs.setCurrentIndex(2)
         elif initial_tab == "stores":
             self.tabs.setCurrentIndex(1)
         elif initial_tab == "advanced":
             self.tabs.setCurrentIndex(3)
+        elif initial_tab == "push":
+            self.tabs.setCurrentIndex(4)
         root.addWidget(self.tabs)
         if self.embedded:
             corner_container = QWidget()
@@ -1663,6 +1666,8 @@ class SettingsDialog(QDialog):
             self.tabs.setCurrentIndex(2)
         elif tab_name == "advanced":
             self.tabs.setCurrentIndex(3)
+        elif tab_name == "push":
+            self.tabs.setCurrentIndex(4)
 
     def _daily_tab(self) -> QWidget:
         page = QWidget()
@@ -2479,6 +2484,127 @@ class SettingsDialog(QDialog):
         })
         return page
 
+    def _push_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(14)
+
+        card = QFrame()
+        card.setObjectName("settingsSection")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(20, 18, 20, 18)
+        card_layout.setSpacing(14)
+
+        title = QLabel("手机消息推送 (微信服务号 / PushPlus)")
+        title.setObjectName("sectionTitle")
+        card_layout.addWidget(title)
+
+        desc = QLabel(
+            "开启后，当店铺收到新订单、买家售前提问、售后私信或索赔纠纷时，将第一时间推送到你的手机微信，外出时也能实时掌握店铺动向。"
+        )
+        desc.setObjectName("muted")
+        desc.setWordWrap(True)
+        card_layout.addWidget(desc)
+
+        self.push_enabled = QCheckBox("启用手机消息推送")
+        self.push_enabled.setChecked(bool(self.settings.get("pushEnabled", False)))
+        card_layout.addWidget(self.push_enabled)
+
+        token_layout = QHBoxLayout()
+        token_layout.setSpacing(10)
+        token_label = QLabel("PushPlus Token:")
+        token_label.setFixedWidth(120)
+        self.push_token = QLineEdit(str(self.settings.get("pushToken") or ""))
+        self.push_token.setPlaceholderText("请输入你的 PushPlus 用户令牌 (Token)")
+        self.push_token.setFixedHeight(32)
+
+        self.test_push_btn = QPushButton("发送测试消息到手机")
+        self.test_push_btn.setFixedHeight(32)
+        self.test_push_btn.clicked.connect(self._on_test_push_clicked)
+
+        token_layout.addWidget(token_label)
+        token_layout.addWidget(self.push_token, 1)
+        token_layout.addWidget(self.test_push_btn)
+        card_layout.addLayout(token_layout)
+
+        tip_label = QLabel(
+            "💡 <b>获取 Token 方法：</b>微信搜索关注公众号 <b>「PushPlus」</b> 或访问官网 <b>pushplus.plus</b> 微信扫码登录，在首页复制属于你的专属 Token 粘贴至上方即可（完全免费）。"
+        )
+        tip_label.setObjectName("muted")
+        tip_label.setWordWrap(True)
+        card_layout.addWidget(tip_label)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        card_layout.addWidget(sep)
+
+        types_title = QLabel("推送消息类型筛选")
+        types_title.setObjectName("sectionTitle")
+        card_layout.addWidget(types_title)
+
+        self.push_notify_orders = QCheckBox("🛒 订单消息：产生新订单或买家付款时推送")
+        self.push_notify_orders.setChecked(bool(self.settings.get("pushNotifyOrders", True)))
+        card_layout.addWidget(self.push_notify_orders)
+
+        self.push_notify_questions = QCheckBox("❓ 售前咨询：买家在商品下方发表新提问时推送")
+        self.push_notify_questions.setChecked(bool(self.settings.get("pushNotifyQuestions", True)))
+        card_layout.addWidget(self.push_notify_questions)
+
+        self.push_notify_messages = QCheckBox("💬 售后私信：买家在已购订单中发送私信留言时推送")
+        self.push_notify_messages.setChecked(bool(self.settings.get("pushNotifyMessages", True)))
+        card_layout.addWidget(self.push_notify_messages)
+
+        self.push_notify_claims = QCheckBox("⚠️ 索赔纠纷：买家发起售后索赔或退款投诉时紧急告警")
+        self.push_notify_claims.setChecked(bool(self.settings.get("pushNotifyClaims", True)))
+        card_layout.addWidget(self.push_notify_claims)
+
+        card_layout.addStretch(1)
+        layout.addWidget(card)
+
+        self._initial_field_values.update({
+            "pushEnabled": self.push_enabled.isChecked(),
+            "pushToken": self.push_token.text().strip(),
+            "pushNotifyOrders": self.push_notify_orders.isChecked(),
+            "pushNotifyQuestions": self.push_notify_questions.isChecked(),
+            "pushNotifyMessages": self.push_notify_messages.isChecked(),
+            "pushNotifyClaims": self.push_notify_claims.isChecked(),
+        })
+        return page
+
+    def _on_test_push_clicked(self) -> None:
+        token = self.push_token.text().strip()
+        if not token:
+            QMessageBox.warning(self, "推送测试", "请先填写 PushPlus Token 后再进行测试。")
+            return
+        self.test_push_btn.setEnabled(False)
+        self.test_push_btn.setText("正在发送...")
+
+        def _do_send():
+            from push_service import PushService
+            ok, msg = PushService.instance().send_test_push(token)
+            QTimer.singleShot(0, lambda: self._on_test_push_done(ok, msg))
+
+        import threading
+        threading.Thread(target=_do_send, daemon=True).start()
+
+    def _on_test_push_done(self, ok: bool, msg: str) -> None:
+        self.test_push_btn.setEnabled(True)
+        self.test_push_btn.setText("发送测试消息到手机")
+        if ok:
+            QMessageBox.information(
+                self,
+                "推送测试成功",
+                "✅ 测试消息已成功发出！\n\n请查看手机微信是否已收到来自 PushPlus 的通知卡片。"
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "推送测试失败",
+                f"❌ 发送测试消息失败：\n{msg}\n\n请核对 Token 是否正确，或网络是否通畅。"
+            )
+
     def apply_settings_context(self, settings: dict[str, Any]) -> None:
         """Apply the latest normalized settings without overwriting a live edit."""
         if not isinstance(settings, dict):
@@ -2502,6 +2628,12 @@ class SettingsDialog(QDialog):
             ("activityCallbackSecretFile", self.activity_callback_secret_file, str(settings.get("activityCallbackSecretFile") or "")),
             ("activityCallbackClaimUrl", self.activity_callback_claim_url, str(settings.get("activityCallbackClaimUrl") or DEFAULT_ACTIVITY_CALLBACK_CLAIM_URL)),
             ("activityCallbackAckUrl", self.activity_callback_ack_url, str(settings.get("activityCallbackAckUrl") or DEFAULT_ACTIVITY_CALLBACK_ACK_URL)),
+            ("pushEnabled", self.push_enabled, bool(settings.get("pushEnabled", False))),
+            ("pushToken", self.push_token, str(settings.get("pushToken") or "")),
+            ("pushNotifyOrders", self.push_notify_orders, bool(settings.get("pushNotifyOrders", True))),
+            ("pushNotifyQuestions", self.push_notify_questions, bool(settings.get("pushNotifyQuestions", True))),
+            ("pushNotifyMessages", self.push_notify_messages, bool(settings.get("pushNotifyMessages", True))),
+            ("pushNotifyClaims", self.push_notify_claims, bool(settings.get("pushNotifyClaims", True))),
         )
         for key, field, value in fields:
             if isinstance(field, QCheckBox):
@@ -2626,6 +2758,12 @@ class SettingsDialog(QDialog):
             "activityCallbackSecretFile": self.activity_callback_secret_file.text().strip(),
             "activityCallbackClaimUrl": self.activity_callback_claim_url.text().strip(),
             "activityCallbackAckUrl": self.activity_callback_ack_url.text().strip(),
+            "pushEnabled": self.push_enabled.isChecked(),
+            "pushToken": self.push_token.text().strip(),
+            "pushNotifyOrders": self.push_notify_orders.isChecked(),
+            "pushNotifyQuestions": self.push_notify_questions.isChecked(),
+            "pushNotifyMessages": self.push_notify_messages.isChecked(),
+            "pushNotifyClaims": self.push_notify_claims.isChecked(),
             "storeAliases": aliases,
             "operatingSites": operating,
         }

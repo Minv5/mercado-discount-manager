@@ -5122,6 +5122,42 @@ class ServiceCenterPage(QFrame):
             toast.clicked.connect(self._on_toast_clicked)
             toast.show_at_corner(self.window())
 
+            # 手机微信消息实时推送 (PushPlus)
+            try:
+                from push_service import PushService
+                push_svc = PushService.instance()
+                clean_id = resource.split("/")[-1] if "/" in resource else resource
+                if sess_type == "claim":
+                    push_svc.notify_claim(
+                        store_name=store_name,
+                        site_id=site_label,
+                        order_id=clean_id,
+                        claim_id=clean_id,
+                        reason="买家发起了售后索赔/纠纷投诉，请及时进入客服中心处理",
+                    )
+                elif sess_type == "order":
+                    push_svc.notify_order(
+                        store_name=store_name,
+                        site_id=site_label,
+                        order_id=clean_id,
+                    )
+                elif sess_type == "message":
+                    push_svc.notify_message(
+                        store_name=store_name,
+                        site_id=site_label,
+                        order_id=clean_id,
+                        message_text="买家发送了订单售后私信，请及时查看回复",
+                    )
+                elif sess_type == "question":
+                    push_svc.notify_question(
+                        store_name=store_name,
+                        site_id=site_label,
+                        item_id=clean_id,
+                        question_text="买家咨询了商品详情，请尽快前往回复以促成转化",
+                    )
+            except Exception:
+                pass
+
         # Automatically refresh list silently
         self.reload_sessions(silent=True)
 
