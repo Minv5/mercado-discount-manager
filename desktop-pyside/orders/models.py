@@ -335,10 +335,10 @@ class OrderModel:
         if self.shipping.estimated_handling_limit:
             deadline_ts = parse_order_timestamp(self.shipping.estimated_handling_limit)
 
-        # If no explicit limit from ML API, compute using CBT working days + statutory holidays calendar
+        # If no explicit limit from ML API, compute using official site CBT working days + statutory holidays calendar
         if not deadline_ts and self.created_timestamp:
-            from orders.sla_calendar import compute_order_sla_deadline
-            h_days = max(2, self.shipping.handling_hours // 24) if self.shipping.handling_hours else 2
+            from orders.sla_calendar import compute_order_sla_deadline, get_site_default_handling_days
+            h_days = get_site_default_handling_days(self.site_id, self.shipping.handling_hours)
             deadline_dt = compute_order_sla_deadline(self.created_timestamp, handling_days=h_days)
             deadline_ts = deadline_dt.timestamp()
 

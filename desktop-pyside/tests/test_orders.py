@@ -1700,13 +1700,13 @@ class TestSlaCalendarAndDeadline(unittest.TestCase):
         bjt = timezone(timedelta(hours=8))
         ref_now = datetime(2026, 10, 21, 20, 57, 0, tzinfo=bjt)
 
-        # 1. Wednesday 2026-10-21 order -> 2 business days (Thu, Fri) + weekend (Sat, Sun) -> Sun 23:59:59
+        # 1. Wednesday 2026-10-21 order -> 2 business days (Thu, Fri) -> Fri 23:59:59 (no weekend leaking)
         wed_order = datetime(2026, 10, 21, 2, 47, 0, tzinfo=bjt)
         dl_wed = compute_order_sla_deadline(wed_order, handling_days=2)
-        self.assertEqual(dl_wed.strftime("%Y-%m-%d %H:%M:%S"), "2026-10-25 23:59:59")
+        self.assertEqual(dl_wed.strftime("%Y-%m-%d %H:%M:%S"), "2026-10-23 23:59:59")
         diff_wed = int((dl_wed - ref_now).total_seconds())
-        self.assertEqual(diff_wed // 86400, 4)
-        self.assertEqual((diff_wed % 86400) // 3600, 3)  # 余4天3小时
+        self.assertEqual(diff_wed // 86400, 2)
+        self.assertEqual((diff_wed % 86400) // 3600, 3)  # 余2天3小时
 
         # 2. Tuesday 2026-10-20 order -> 2 business days (Wed, Thu) -> Thu 23:59:59
         tue_order = datetime(2026, 10, 20, 9, 32, 0, tzinfo=bjt)
@@ -1731,6 +1731,18 @@ class TestSlaCalendarAndDeadline(unittest.TestCase):
         diff_sun = int((dl_sun - ref_now).total_seconds())
         self.assertEqual(diff_sun // 86400, 0)
         self.assertEqual((diff_sun % 86400) // 3600, 3)  # 余3小时
+
+        # 5. Site specific defaults & Saturday Argentina order (4 days) -> stops Friday 23:59:59 (no 8 days)
+        from orders.sla_calendar import get_site_default_handling_days
+        self.assertEqual(get_site_default_handling_days("MLM"), 2)
+        self.assertEqual(get_site_default_handling_days("MLB", handling_hours=72), 3)
+        self.assertEqual(get_site_default_handling_days("MLC"), 3)
+        self.assertEqual(get_site_default_handling_days("MCO"), 3)
+        self.assertEqual(get_site_default_handling_days("MLA", handling_hours=96), 4)
+
+        sat_mla_order = datetime(2026, 10, 31, 7, 31, 41, tzinfo=bjt)
+        dl_sat_mla = compute_order_sla_deadline(sat_mla_order, handling_days=get_site_default_handling_days("MLA", 96))
+        self.assertEqual(dl_sat_mla.strftime("%Y-%m-%d %H:%M:%S"), "2026-11-06 23:59:59")
 
     def test_live_exchange_rate_module(self) -> None:
         """Verify that get_cny_exchange_rate resolves live rate and falls back gracefully."""

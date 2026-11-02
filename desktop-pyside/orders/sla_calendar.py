@@ -144,6 +144,38 @@ def add_cbt_business_days(start_dt: datetime, business_days: int = 3) -> datetim
     return curr
 
 
+def get_site_default_handling_days(site_id: str, handling_hours: int = 0) -> int:
+    """Return official Mercado Libre CBT handling/dispatch working days by site.
+
+    Site official standards:
+    - MLM (Mexico): 2 business days (48h)
+    - MLB (Brazil): 2 business days (48h, or 3 days if handling_hours == 72)
+    - MLC (Chile): 3 business days (72h)
+    - MCO (Colombia): 3 business days (72h)
+    - MLA (Argentina): 3 business days (72h, or 4 days if handling_hours >= 96)
+    - Default / Fallback: 2 business days
+    """
+    clean_site = str(site_id or "").strip().upper()
+
+    # If the API returned specific handling_hours from shipment lead_time
+    if handling_hours > 0:
+        api_days = handling_hours // 24
+        if clean_site == "MLM":
+            return min(2, max(1, api_days))  # Mexico strictly 2 days
+        elif clean_site == "MLB":
+            return min(3, max(2, api_days))  # Brazil 2-3 days
+        elif clean_site in ("MLC", "MCO"):
+            return min(3, max(2, api_days))  # Chile & Colombia 3 days
+        elif clean_site == "MLA":
+            return min(4, max(3, api_days))  # Argentina 3-4 days
+        return max(2, min(4, api_days))
+
+    # Standard default baseline if handling_hours not specified
+    if clean_site in ("MLC", "MCO", "MLA"):
+        return 3
+    return 2
+
+
 def compute_order_sla_deadline(
     created_dt_or_ts: datetime | float | str,
     handling_days: int = 2,
@@ -186,9 +218,5 @@ def compute_order_sla_deadline(
         if is_cbt_business_day(curr_date):
             days_counted += 1
 
-    # Extend across consecutive non-business days (weekends / holidays immediately following the deadline day)
-    while not is_cbt_business_day(curr_date + timedelta(days=1)):
-        curr_date += timedelta(days=1)
-
-    # Deadline is 23:59:59 of curr_date in Beijing time
+    # Deadline is 23:59:59 of curr_date in Beijing time (concludes on the final qualifying business day)
     return datetime.combine(curr_date, time(23, 59, 59), tzinfo=bjt_tz)
