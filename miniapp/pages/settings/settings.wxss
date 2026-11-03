@@ -11,7 +11,8 @@
 .avatar {
   width: 90rpx;
   height: 90rpx;
-  background: #E3F2FD;
+  background: #203A2B;
+  border: 1rpx solid #2F6B3F;
   border-radius: 50%;
   display: flex;
   align-items: center;
@@ -28,12 +29,13 @@
 .profile-title {
   font-size: 32rpx;
   font-weight: bold;
-  color: #1A1A1A;
+  color: #F6F3EA;
 }
 
 .profile-appid {
   font-size: 22rpx;
   font-family: monospace;
+  color: #D4AF37;
 }
 
 /* 店铺列表 */
@@ -47,7 +49,7 @@
   justify-content: space-between;
   align-items: center;
   padding: 18rpx 0;
-  border-bottom: 1rpx solid #F5F5F5;
+  border-bottom: 1rpx solid #2B352E;
 }
 
 .store-row:last-child {
@@ -67,16 +69,17 @@
 .store-title {
   font-size: 28rpx;
   font-weight: 500;
-  color: #212121;
+  color: #F6F3EA;
 }
 
 .store-sub {
   font-size: 22rpx;
+  color: #777266;
 }
 
 .status-online {
   font-size: 24rpx;
-  color: #2E7D32;
+  color: #4CAF50;
   font-weight: 500;
 }
 
@@ -96,14 +99,14 @@
 .setting-label {
   display: block;
   font-size: 28rpx;
-  color: #212121;
+  color: #F6F3EA;
   margin-bottom: 4rpx;
 }
 
 .setting-desc {
   display: block;
   font-size: 22rpx;
-  color: #9E9E9E;
+  color: #C8C3B7;
 }
 
 /* 信息条目 */
@@ -111,16 +114,16 @@
   display: flex;
   justify-content: space-between;
   padding: 14rpx 0;
-  border-bottom: 1rpx solid #F9F9F9;
+  border-bottom: 1rpx solid #2B352E;
   font-size: 26rpx;
 }
 
 .info-label {
-  color: #757575;
+  color: #C8C3B7;
 }
 
 .info-val {
-  color: #212121;
+  color: #D4AF37;
   font-weight: 500;
 }
 
@@ -130,9 +133,9 @@
 }
 
 .clear-btn {
-  background: #FFFFFF;
-  color: #D32F2F;
-  border: 1rpx solid #FFCDD2;
+  background: #2D1717;
+  color: #EF5350;
+  border: 1rpx solid #6E2A2A;
   font-size: 28rpx;
   border-radius: 40rpx;
 }

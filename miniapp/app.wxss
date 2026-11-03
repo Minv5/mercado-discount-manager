@@ -1,8 +1,9 @@
-/** 全局统一样式规范 **/
+/** 美客多桌面端专属：高端黑金墨绿暗黑视觉系统 **/
+
 page {
-  background-color: #F5F7FA;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-  color: #333333;
+  background-color: #171B19;
+  font-family: -apple-system, BlinkMacSystemFont, "Microsoft YaHei UI", Roboto, sans-serif;
+  color: #E6E2D8;
   font-size: 28rpx;
   box-sizing: border-box;
 }
@@ -13,21 +14,23 @@ page {
   box-sizing: border-box;
 }
 
-/* 卡片样式 */
+/* 卡片规范：对齐桌面端 QFrame#controlSection / settingsSection */
 .card {
-  background: #FFFFFF;
+  background: #202820;
+  border: 1rpx solid #4E472F;
   border-radius: 16rpx;
   padding: 24rpx;
   margin-bottom: 24rpx;
-  box-shadow: 0 4rpx 16rpx rgba(0, 0, 0, 0.04);
+  box-shadow: 0 4rpx 16rpx rgba(0, 0, 0, 0.25);
+  box-sizing: border-box;
 }
 
 /* 标题规范 */
 .section-title {
-  font-size: 32rpx;
-  font-weight: 600;
-  color: #1A1A1A;
-  margin-bottom: 16rpx;
+  font-size: 30rpx;
+  font-weight: 700;
+  color: #F6F3EA;
+  margin-bottom: 18rpx;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -36,52 +39,75 @@ page {
 /* 徽章 Badge */
 .badge {
   display: inline-block;
-  padding: 4rpx 12rpx;
+  padding: 4rpx 14rpx;
   border-radius: 20rpx;
   font-size: 20rpx;
   font-weight: 500;
 }
 
-.badge-red {
-  background-color: #FFEBEE;
-  color: #D32F2F;
+.badge-green {
+  background-color: #203A2B;
+  color: #4CAF50;
+  border: 1rpx solid #2F6B3F;
 }
 
-.badge-blue {
-  background-color: #E3F2FD;
-  color: #1976D2;
+.badge-gold {
+  background-color: #2D2619;
+  color: #D4AF37;
+  border: 1rpx solid #6E5D2A;
 }
 
 .badge-orange {
-  background-color: #FFF3E0;
-  color: #E65100;
+  background-color: #382415;
+  color: #FF9800;
+  border: 1rpx solid #E65100;
 }
 
-.badge-green {
-  background-color: #E8F5E9;
-  color: #2E7D32;
+.badge-red {
+  background-color: #361717;
+  color: #EF5350;
+  border: 1rpx solid #C62828;
 }
 
-/* 主色按钮 */
+.badge-blue {
+  background-color: #162B3D;
+  color: #42A5F5;
+  border: 1rpx solid #1E88E5;
+}
+
+/* 主色按钮：沉稳军绿渐变 */
 .btn-primary {
-  background: linear-gradient(135deg, #1E88E5, #1565C0);
-  color: #FFFFFF;
+  background: linear-gradient(135deg, #2F6B3F, #235230);
+  color: #F6F3EA;
   font-size: 28rpx;
-  font-weight: 500;
+  font-weight: 600;
+  border: 1rpx solid #4E472F;
   border-radius: 40rpx;
   padding: 16rpx 36rpx;
   text-align: center;
 }
 
 .btn-primary:active {
-  opacity: 0.88;
+  background: #356F45;
+  border-color: #8A7432;
 }
 
 /* 辅助文字 */
 .text-muted {
-  color: #8C8C8C;
+  color: #C8C3B7;
   font-size: 24rpx;
 }
+
+.text-weak {
+  color: #777266;
+  font-size: 22rpx;
+}
+
+/* 常用颜色类 */
+.text-gold { color: #D4AF37; }
+.text-green { color: #4CAF50; }
+.text-red { color: #EF5350; }
+.text-blue { color: #42A5F5; }
 
 /* 单行超出省略 */
 .ellipsis {

@@ -1,11 +1,12 @@
-/* 顶部店铺切换器卡片 */
+/* 顶部店铺切换器卡片：黑金沉稳风格 */
 .store-selector-card {
-  background: linear-gradient(135deg, #1565C0, #0D47A1);
-  color: #FFFFFF;
+  background: linear-gradient(135deg, #202922, #18201C);
+  color: #F6F3EA;
+  border: 1rpx solid #6E5D2A;
   border-radius: 16rpx;
   padding: 28rpx 24rpx;
   margin-bottom: 24rpx;
-  box-shadow: 0 6rpx 20rpx rgba(21, 101, 192, 0.25);
+  box-shadow: 0 6rpx 20rpx rgba(0, 0, 0, 0.4);
 }
 
 .store-info {
@@ -14,7 +15,7 @@
 
 .store-tag {
   font-size: 22rpx;
-  color: #BBDEFB;
+  color: #C8C3B7;
   margin-bottom: 6rpx;
 }
 
@@ -27,12 +28,15 @@
 .store-name {
   font-size: 38rpx;
   font-weight: bold;
+  color: #F6F3EA;
 }
 
 .arrow-down {
-  font-size: 24rpx;
-  background: rgba(255, 255, 255, 0.18);
-  padding: 6rpx 16rpx;
+  font-size: 22rpx;
+  color: #D4AF37;
+  background: #2D2619;
+  border: 1rpx solid #6E5D2A;
+  padding: 6rpx 18rpx;
   border-radius: 30rpx;
 }
 
@@ -43,8 +47,9 @@
 }
 
 .site-chip {
-  background: rgba(255, 255, 255, 0.2);
-  color: #FFFFFF;
+  background: #18201C;
+  border: 1rpx solid #4E472F;
+  color: #D4AF37;
   font-size: 22rpx;
   padding: 4rpx 14rpx;
   border-radius: 8rpx;
@@ -72,12 +77,8 @@
 
 .stat-label {
   font-size: 22rpx;
-  color: #757575;
+  color: #C8C3B7;
 }
-
-.text-blue { color: #1976D2; }
-.text-green { color: #2E7D32; }
-.text-orange { color: #F57C00; }
 
 .refresh-time {
   font-size: 22rpx;
@@ -96,7 +97,7 @@
   align-items: center;
   justify-content: space-between;
   padding: 18rpx 0;
-  border-bottom: 1rpx solid #F0F0F0;
+  border-bottom: 1rpx solid #2B352E;
 }
 
 .todo-item:last-child {
@@ -118,11 +119,12 @@
   align-items: center;
   justify-content: center;
   font-size: 32rpx;
+  border: 1rpx solid #4E472F;
 }
 
-.bg-orange { background: #FFF3E0; }
-.bg-blue { background: #E3F2FD; }
-.bg-red { background: #FFEBEE; }
+.bg-orange { background: #2F2116; }
+.bg-blue { background: #162432; }
+.bg-red { background: #2D1616; }
 
 .todo-info {
   display: flex;
@@ -132,12 +134,12 @@
 .todo-title {
   font-size: 28rpx;
   font-weight: 500;
-  color: #212121;
+  color: #F6F3EA;
 }
 
 .todo-desc {
   font-size: 22rpx;
-  color: #9E9E9E;
+  color: #C8C3B7;
   margin-top: 4rpx;
 }
 
@@ -172,5 +174,5 @@
 
 .grid-text {
   font-size: 24rpx;
-  color: #424242;
+  color: #E6E2D8;
 }

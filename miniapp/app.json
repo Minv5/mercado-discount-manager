@@ -7,16 +7,16 @@
     "pages/settings/settings"
   ],
   "window": {
-    "backgroundTextStyle": "light",
-    "navigationBarBackgroundColor": "#1976D2",
+    "backgroundTextStyle": "dark",
+    "navigationBarBackgroundColor": "#171B19",
     "navigationBarTitleText": "美客多工作台",
     "navigationBarTextStyle": "white",
-    "backgroundColor": "#F4F6F9"
+    "backgroundColor": "#171B19"
   },
   "tabBar": {
-    "color": "#757575",
-    "selectedColor": "#1976D2",
-    "backgroundColor": "#FFFFFF",
+    "color": "#777266",
+    "selectedColor": "#4CAF50",
+    "backgroundColor": "#1C231F",
     "borderStyle": "black",
     "list": [
       {

@@ -1,34 +1,36 @@
 /* 顶部选项卡 */
 .tab-bar {
   display: flex;
-  background: #FFFFFF;
+  background: #1C231F;
+  border: 1rpx solid #4E472F;
   border-radius: 16rpx;
   padding: 8rpx;
   margin-bottom: 24rpx;
-  box-shadow: 0 4rpx 12rpx rgba(0, 0, 0, 0.03);
 }
 
 .tab-item {
   flex: 1;
   text-align: center;
-  padding: 18rpx 0;
+  padding: 16rpx 0;
   font-size: 28rpx;
-  color: #616161;
+  color: #C8C3B7;
   border-radius: 12rpx;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8rpx;
+  transition: all 0.2s ease;
 }
 
 .tab-item.active {
-  background: #1976D2;
-  color: #FFFFFF;
-  font-weight: 500;
+  background: #2F6B3F;
+  color: #F6F3EA;
+  font-weight: bold;
+  border: 1rpx solid #6E5D2A;
 }
 
 .tab-badge {
-  background: #FF5252;
+  background: #D32F2F;
   color: #FFFFFF;
   font-size: 20rpx;
   padding: 2rpx 10rpx;
@@ -36,7 +38,7 @@
 }
 
 .badge-red-bg {
-  background: #D32F2F;
+  background: #C62828;
 }
 
 /* 列表卡片 */
@@ -47,11 +49,11 @@
 }
 
 .item-card:active {
-  transform: scale(0.99);
+  background: #253026;
 }
 
 .claim-border {
-  border-left: 6rpx solid #D32F2F;
+  border-left: 6rpx solid #E53E3E;
 }
 
 .card-header {
@@ -68,8 +70,9 @@
 }
 
 .store-badge {
-  background: #E8EAF6;
-  color: #283593;
+  background: #203A2B;
+  color: #4CAF50;
+  border: 1rpx solid #2F6B3F;
   font-size: 22rpx;
   padding: 4rpx 12rpx;
   border-radius: 6rpx;
@@ -77,8 +80,9 @@
 }
 
 .site-tag {
-  background: #FFF8E1;
-  color: #F57F17;
+  background: #2D2619;
+  color: #D4AF37;
+  border: 1rpx solid #6E5D2A;
   font-size: 22rpx;
   padding: 4rpx 12rpx;
   border-radius: 6rpx;
@@ -86,19 +90,21 @@
 
 .order-tag {
   font-size: 22rpx;
-  color: #616161;
+  color: #C8C3B7;
   font-family: monospace;
 }
 
 .time-text {
   font-size: 22rpx;
+  color: #777266;
 }
 
 /* 商品摘要 */
 .product-snippet {
   display: flex;
   gap: 16rpx;
-  background: #F9F9F9;
+  background: #18201C;
+  border: 1rpx solid #2F3B32;
   padding: 12rpx;
   border-radius: 10rpx;
   margin-bottom: 16rpx;
@@ -108,7 +114,7 @@
   width: 90rpx;
   height: 90rpx;
   border-radius: 8rpx;
-  background: #E0E0E0;
+  background: #2D3A30;
 }
 
 .product-info {
@@ -120,20 +126,20 @@
 
 .product-title {
   font-size: 26rpx;
-  color: #333333;
+  color: #E6E2D8;
   line-height: 1.3;
 }
 
 .item-id-tag {
   font-size: 20rpx;
-  color: #9E9E9E;
+  color: #777266;
   font-family: monospace;
 }
 
 /* 提问内容框 */
 .question-box {
-  background: #FFFDE7;
-  border-left: 4rpx solid #FBC02D;
+  background: #232219;
+  border-left: 4rpx solid #D4AF37;
   padding: 14rpx;
   border-radius: 8rpx;
   margin-bottom: 16rpx;
@@ -141,24 +147,24 @@
 
 .q-lang-es {
   font-size: 28rpx;
-  color: #212121;
+  color: #F6F3EA;
   font-weight: 500;
   margin-bottom: 8rpx;
 }
 
 .q-prefix {
-  color: #E65100;
+  color: #D4AF37;
 }
 
 .q-lang-cn {
   font-size: 24rpx;
-  color: #616161;
-  border-top: 1rpx dashed #E0E0E0;
+  color: #C8C3B7;
+  border-top: 1rpx dashed #3D3728;
   padding-top: 8rpx;
 }
 
 .cn-label {
-  color: #2E7D32;
+  color: #4CAF50;
   font-weight: 500;
 }
 
@@ -173,11 +179,11 @@
 .buyer-name-strong {
   font-size: 28rpx;
   font-weight: bold;
-  color: #212121;
+  color: #F6F3EA;
 }
 
 .unread-dot {
-  background: #E53935;
+  background: #E53E3E;
   color: #FFFFFF;
   font-size: 20rpx;
   padding: 2rpx 10rpx;
@@ -185,7 +191,8 @@
 }
 
 .last-msg-box {
-  background: #E1F5FE;
+  background: #18231C;
+  border: 1rpx solid #2B3A30;
   padding: 12rpx 16rpx;
   border-radius: 12rpx;
   margin-bottom: 14rpx;
@@ -194,22 +201,23 @@
 .msg-es {
   display: block;
   font-size: 28rpx;
-  color: #01579B;
+  color: #E6E2D8;
 }
 
 .msg-cn {
   display: block;
   font-size: 24rpx;
-  color: #546E7A;
+  color: #777266;
   margin-top: 4rpx;
 }
 
 /* 索赔专区 */
 .countdown-badge {
-  background: #FFCDD2;
-  color: #B71C1C;
+  background: #381A1A;
+  color: #EF5350;
+  border: 1rpx solid #C62828;
   font-size: 22rpx;
-  padding: 4rpx 12rpx;
+  padding: 4rpx 14rpx;
   border-radius: 20rpx;
   font-weight: bold;
 }
@@ -225,27 +233,24 @@
 }
 
 .claim-label {
-  color: #757575;
+  color: #C8C3B7;
   width: 150rpx;
 }
 
 .claim-value {
-  color: #212121;
+  color: #E6E2D8;
 }
 
 .mono {
   font-family: monospace;
 }
 
-.text-red {
-  color: #D32F2F;
-}
-
 .claim-reason-box {
-  background: #FFEBEE;
+  background: #2D1717;
+  border: 1rpx solid #5C2323;
   padding: 12rpx;
   border-radius: 8rpx;
-  color: #C62828;
+  color: #EF5350;
   font-size: 26rpx;
   margin-top: 10rpx;
 }
@@ -255,13 +260,14 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  border-top: 1rpx solid #F5F5F5;
+  border-top: 1rpx solid #2B352E;
   padding-top: 16rpx;
 }
 
 .btn-reply {
-  background: #F57C00;
-  color: #FFFFFF;
+  background: #2F6B3F;
+  color: #F6F3EA;
+  border: 1rpx solid #4E472F;
   font-size: 24rpx;
   font-weight: 500;
   padding: 10rpx 20rpx;
@@ -269,11 +275,15 @@
 }
 
 .btn-blue {
-  background: #1976D2;
+  background: #1C3345;
+  border-color: #2F597A;
+  color: #64B5F6;
 }
 
 .btn-red {
-  background: #D32F2F;
+  background: #3A1A1A;
+  border-color: #8C2F2F;
+  color: #EF5350;
 }
 
 /* 空状态 */
@@ -292,5 +302,5 @@
 
 .empty-text {
   font-size: 28rpx;
-  color: #9E9E9E;
+  color: #777266;
 }

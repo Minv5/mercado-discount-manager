@@ -1,30 +1,31 @@
 page {
   height: 100%;
+  background: #171B19;
 }
 
 .chat-container {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  background: #F4F6F9;
+  background: #171B19;
 }
 
 /* 顶部商品卡片 */
 .context-card {
   display: flex;
-  background: #FFFFFF;
+  background: #1C231F;
+  border-bottom: 1rpx solid #4E472F;
   padding: 16rpx 24rpx;
-  border-bottom: 1rpx solid #E5E5E5;
   gap: 16rpx;
   align-items: center;
-  box-shadow: 0 2rpx 8rpx rgba(0,0,0,0.03);
 }
 
 .context-thumb {
   width: 100rpx;
   height: 100rpx;
   border-radius: 8rpx;
-  background: #EEE;
+  background: #202820;
+  border: 1rpx solid #4E472F;
   flex-shrink: 0;
 }
 
@@ -42,16 +43,18 @@ page {
 }
 
 .store-tag {
-  background: #E8EAF6;
-  color: #283593;
+  background: #203A2B;
+  color: #4CAF50;
+  border: 1rpx solid #2F6B3F;
   font-size: 20rpx;
   padding: 2rpx 8rpx;
   border-radius: 4rpx;
 }
 
 .site-tag {
-  background: #FFF8E1;
-  color: #F57F17;
+  background: #2D2619;
+  color: #D4AF37;
+  border: 1rpx solid #6E5D2A;
   font-size: 20rpx;
   padding: 2rpx 8rpx;
   border-radius: 4rpx;
@@ -60,11 +63,12 @@ page {
 .item-id {
   font-size: 20rpx;
   font-family: monospace;
+  color: #777266;
 }
 
 .context-title {
   font-size: 26rpx;
-  color: #333;
+  color: #E6E2D8;
   line-height: 1.3;
 }
 
@@ -80,20 +84,22 @@ page {
   margin-bottom: 24rpx;
   border-radius: 16rpx;
   padding: 18rpx 22rpx;
-  box-shadow: 0 2rpx 10rpx rgba(0,0,0,0.04);
+  box-shadow: 0 4rpx 12rpx rgba(0, 0, 0, 0.3);
 }
 
 .buyer-bubble {
-  background: #FFFFFF;
+  background: #202820;
+  border: 1rpx solid #4E472F;
   align-self: flex-start;
-  border-left: 6rpx solid #1976D2;
+  border-left: 6rpx solid #D4AF37;
 }
 
 .seller-bubble {
-  background: #E3F2FD;
+  background: #1C3325;
+  border: 1rpx solid #2F6B3F;
   align-self: flex-end;
   margin-left: auto;
-  border-right: 6rpx solid #1565C0;
+  border-right: 6rpx solid #4CAF50;
 }
 
 .bubble-header {
@@ -105,13 +111,17 @@ page {
 
 .sender-name {
   font-weight: 500;
-  color: #424242;
+  color: #D4AF37;
+}
+
+.seller-bubble .sender-name {
+  color: #81C784;
 }
 
 .bubble-text {
   font-size: 28rpx;
   line-height: 1.4;
-  color: #212121;
+  color: #F6F3EA;
 }
 
 .es-text {
@@ -121,28 +131,29 @@ page {
 .bubble-translation {
   margin-top: 10rpx;
   padding-top: 8rpx;
-  border-top: 1rpx dashed #DDD;
+  border-top: 1rpx dashed #3D4A3F;
   font-size: 24rpx;
-  color: #555;
+  color: #C8C3B7;
 }
 
 .trans-tag {
-  color: #2E7D32;
+  color: #4CAF50;
   font-weight: 500;
 }
 
 .sent-success-tip {
   text-align: center;
   font-size: 24rpx;
-  color: #2E7D32;
+  color: #4CAF50;
   margin: 16rpx 0;
   font-weight: 500;
 }
 
 /* 索赔专区 */
 .claim-alert-card {
-  background: #FFF;
-  border-left: 8rpx solid #D32F2F;
+  background: #2D1717;
+  border: 1rpx solid #6B2323;
+  border-left: 8rpx solid #E53E3E;
   border-radius: 12rpx;
   padding: 24rpx;
   margin-bottom: 24rpx;
@@ -151,7 +162,7 @@ page {
 .claim-title {
   font-size: 30rpx;
   font-weight: bold;
-  color: #D32F2F;
+  color: #EF5350;
   margin-bottom: 16rpx;
 }
 
@@ -163,12 +174,12 @@ page {
 
 .claim-detail-row .k {
   width: 150rpx;
-  color: #757575;
+  color: #C8C3B7;
 }
 
 .claim-detail-row .v {
   flex: 1;
-  color: #212121;
+  color: #F6F3EA;
 }
 
 .claim-actions {
@@ -184,21 +195,22 @@ page {
 }
 
 .refund-btn {
-  background: #D32F2F;
+  background: #C62828;
+  border: 1rpx solid #EF5350;
   color: #FFF;
 }
 
 /* 底部操作面板 */
 .bottom-panel {
-  background: #FFFFFF;
-  border-top: 1rpx solid #E0E0E0;
+  background: #1C231F;
+  border-top: 1rpx solid #4E472F;
   padding: 16rpx 20rpx 30rpx 20rpx;
-  box-shadow: 0 -4rpx 16rpx rgba(0,0,0,0.03);
+  box-shadow: 0 -4rpx 16rpx rgba(0, 0, 0, 0.4);
 }
 
 .trans-preview {
-  background: #F1F8E9;
-  border: 1rpx solid #C5E1A5;
+  background: #192B1E;
+  border: 1rpx solid #2F6B3F;
   border-radius: 12rpx;
   padding: 12rpx 16rpx;
   margin-bottom: 12rpx;
@@ -208,13 +220,13 @@ page {
   display: flex;
   justify-content: space-between;
   font-size: 22rpx;
-  color: #33691E;
+  color: #81C784;
   margin-bottom: 6rpx;
 }
 
 .trans-body {
   font-size: 26rpx;
-  color: #1B5E20;
+  color: #C8E6C9;
   font-weight: 500;
   line-height: 1.3;
 }
@@ -226,16 +238,16 @@ page {
 }
 
 .quick-btn {
-  background: #F5F5F5;
-  color: #424242;
+  background: #18201C;
+  color: #D4AF37;
+  border: 1rpx solid #4E472F;
   font-size: 22rpx;
-  padding: 8rpx 16rpx;
+  padding: 8rpx 18rpx;
   border-radius: 30rpx;
-  border: 1rpx solid #E0E0E0;
 }
 
 .quick-btn:active {
-  background: #E0E0E0;
+  background: #253329;
 }
 
 .input-bar {
@@ -246,7 +258,9 @@ page {
 
 .reply-input {
   flex: 1;
-  background: #F5F5F5;
+  background: #18201C;
+  color: #F6F3EA;
+  border: 1rpx solid #4E472F;
   border-radius: 16rpx;
   padding: 16rpx 20rpx;
   font-size: 28rpx;
@@ -256,20 +270,23 @@ page {
 }
 
 .send-btn {
-  background: #B0BEC5;
-  color: #FFFFFF;
+  background: #334036;
+  color: #777266;
   font-size: 28rpx;
   padding: 0 32rpx;
   height: 72rpx;
   line-height: 72rpx;
   border-radius: 36rpx;
-  font-weight: 500;
+  font-weight: 600;
   margin: 0;
   flex-shrink: 0;
+  border: 1rpx solid #4E472F;
 }
 
 .send-btn.active {
-  background: #1976D2;
+  background: #2F6B3F;
+  color: #F6F3EA;
+  border-color: #6E5D2A;
 }
 
 /* 常用话术抽屉 */
@@ -279,7 +296,7 @@ page {
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(0,0,0,0.5);
+  background: rgba(0, 0, 0, 0.7);
   z-index: 999;
   display: flex;
   flex-direction: column;
@@ -287,7 +304,8 @@ page {
 }
 
 .drawer-content {
-  background: #FFFFFF;
+  background: #1C231F;
+  border-top: 1rpx solid #6E5D2A;
   border-top-left-radius: 24rpx;
   border-top-right-radius: 24rpx;
   max-height: 70vh;
@@ -301,13 +319,14 @@ page {
   align-items: center;
   font-size: 32rpx;
   font-weight: bold;
+  color: #F6F3EA;
   padding-bottom: 16rpx;
-  border-bottom: 1rpx solid #EEE;
+  border-bottom: 1rpx solid #2F3B32;
 }
 
 .close-btn {
   font-size: 36rpx;
-  color: #999;
+  color: #C8C3B7;
   padding: 0 10rpx;
 }
 
@@ -323,29 +342,30 @@ page {
 .category-name {
   font-size: 26rpx;
   font-weight: bold;
-  color: #1976D2;
+  color: #D4AF37;
   margin-bottom: 12rpx;
 }
 
 .template-item {
-  background: #FAFAFA;
+  background: #202820;
   padding: 16rpx;
   border-radius: 12rpx;
   margin-bottom: 12rpx;
-  border: 1rpx solid #EEE;
+  border: 1rpx solid #4E472F;
 }
 
 .template-item:active {
-  background: #E3F2FD;
+  background: #2A362B;
+  border-color: #8A7432;
 }
 
 .tpl-cn {
   font-size: 26rpx;
-  color: #333;
+  color: #F6F3EA;
   margin-bottom: 6rpx;
 }
 
 .tpl-es {
   font-size: 22rpx;
-  color: #757575;
+  color: #C8C3B7;
 }
