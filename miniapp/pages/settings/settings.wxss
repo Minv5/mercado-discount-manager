@@ -1,0 +1,138 @@
+.profile-card {
+  padding: 30rpx 24rpx;
+}
+
+.profile-header {
+  display: flex;
+  align-items: center;
+  gap: 20rpx;
+}
+
+.avatar {
+  width: 90rpx;
+  height: 90rpx;
+  background: #E3F2FD;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 46rpx;
+}
+
+.profile-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6rpx;
+}
+
+.profile-title {
+  font-size: 32rpx;
+  font-weight: bold;
+  color: #1A1A1A;
+}
+
+.profile-appid {
+  font-size: 22rpx;
+  font-family: monospace;
+}
+
+/* 店铺列表 */
+.store-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.store-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 18rpx 0;
+  border-bottom: 1rpx solid #F5F5F5;
+}
+
+.store-row:last-child {
+  border-bottom: none;
+}
+
+.store-row-left {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+}
+
+.store-icon {
+  font-size: 32rpx;
+}
+
+.store-title {
+  font-size: 28rpx;
+  font-weight: 500;
+  color: #212121;
+}
+
+.store-sub {
+  font-size: 22rpx;
+}
+
+.status-online {
+  font-size: 24rpx;
+  color: #2E7D32;
+  font-weight: 500;
+}
+
+/* 设置项 */
+.setting-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10rpx 0;
+}
+
+.setting-info {
+  flex: 1;
+  padding-right: 20rpx;
+}
+
+.setting-label {
+  display: block;
+  font-size: 28rpx;
+  color: #212121;
+  margin-bottom: 4rpx;
+}
+
+.setting-desc {
+  display: block;
+  font-size: 22rpx;
+  color: #9E9E9E;
+}
+
+/* 信息条目 */
+.info-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 14rpx 0;
+  border-bottom: 1rpx solid #F9F9F9;
+  font-size: 26rpx;
+}
+
+.info-label {
+  color: #757575;
+}
+
+.info-val {
+  color: #212121;
+  font-weight: 500;
+}
+
+.action-wrap {
+  margin-top: 30rpx;
+  margin-bottom: 40rpx;
+}
+
+.clear-btn {
+  background: #FFFFFF;
+  color: #D32F2F;
+  border: 1rpx solid #FFCDD2;
+  font-size: 28rpx;
+  border-radius: 40rpx;
+}

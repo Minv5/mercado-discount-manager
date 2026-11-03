@@ -1,0 +1,176 @@
+/* 顶部店铺切换器卡片 */
+.store-selector-card {
+  background: linear-gradient(135deg, #1565C0, #0D47A1);
+  color: #FFFFFF;
+  border-radius: 16rpx;
+  padding: 28rpx 24rpx;
+  margin-bottom: 24rpx;
+  box-shadow: 0 6rpx 20rpx rgba(21, 101, 192, 0.25);
+}
+
+.store-info {
+  margin-bottom: 16rpx;
+}
+
+.store-tag {
+  font-size: 22rpx;
+  color: #BBDEFB;
+  margin-bottom: 6rpx;
+}
+
+.store-picker {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.store-name {
+  font-size: 38rpx;
+  font-weight: bold;
+}
+
+.arrow-down {
+  font-size: 24rpx;
+  background: rgba(255, 255, 255, 0.18);
+  padding: 6rpx 16rpx;
+  border-radius: 30rpx;
+}
+
+.store-sites {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12rpx;
+}
+
+.site-chip {
+  background: rgba(255, 255, 255, 0.2);
+  color: #FFFFFF;
+  font-size: 22rpx;
+  padding: 4rpx 14rpx;
+  border-radius: 8rpx;
+}
+
+/* 销售概览网格 */
+.stat-grid {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 10rpx;
+}
+
+.stat-item {
+  flex: 1;
+  text-align: center;
+  padding: 10rpx 0;
+}
+
+.stat-value {
+  display: block;
+  font-size: 40rpx;
+  font-weight: bold;
+  margin-bottom: 8rpx;
+}
+
+.stat-label {
+  font-size: 22rpx;
+  color: #757575;
+}
+
+.text-blue { color: #1976D2; }
+.text-green { color: #2E7D32; }
+.text-orange { color: #F57C00; }
+
+.refresh-time {
+  font-size: 22rpx;
+  font-weight: normal;
+}
+
+/* 待办中心列表 */
+.todo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 20rpx;
+}
+
+.todo-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18rpx 0;
+  border-bottom: 1rpx solid #F0F0F0;
+}
+
+.todo-item:last-child {
+  border-bottom: none;
+}
+
+.todo-left {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+  flex: 1;
+}
+
+.todo-icon {
+  width: 68rpx;
+  height: 68rpx;
+  border-radius: 16rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 32rpx;
+}
+
+.bg-orange { background: #FFF3E0; }
+.bg-blue { background: #E3F2FD; }
+.bg-red { background: #FFEBEE; }
+
+.todo-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.todo-title {
+  font-size: 28rpx;
+  font-weight: 500;
+  color: #212121;
+}
+
+.todo-desc {
+  font-size: 22rpx;
+  color: #9E9E9E;
+  margin-top: 4rpx;
+}
+
+.todo-badge {
+  font-size: 22rpx;
+  padding: 6rpx 16rpx;
+  border-radius: 30rpx;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* 快捷导航矩阵 */
+.grid-nav {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16rpx;
+  padding: 10rpx 0;
+}
+
+.grid-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 16rpx 0;
+}
+
+.grid-icon {
+  font-size: 46rpx;
+  margin-bottom: 10rpx;
+}
+
+.grid-text {
+  font-size: 24rpx;
+  color: #424242;
+}

@@ -1,0 +1,143 @@
+<view class="chat-container">
+  <!-- 顶部商品/订单上下文信息卡片 -->
+  <view class="context-card" wx:if="{{itemData.item_title}}">
+    <image class="context-thumb" src="{{itemData.item_thumbnail}}" mode="aspectFill" />
+    <view class="context-info">
+      <view class="context-top">
+        <text class="store-tag">{{itemData.store_name}}</text>
+        <text class="site-tag">{{itemData.site_id}}</text>
+        <text class="item-id text-muted">{{itemData.item_id}}</text>
+      </view>
+      <text class="context-title ellipsis-2">{{itemData.item_title}}</text>
+    </view>
+  </view>
+
+  <!-- 对话消息气泡流 -->
+  <scroll-view class="chat-scroll" scroll-y="true" scroll-into-view="{{scrollToView}}">
+    <!-- 1. 售前咨询形态 -->
+    <view class="qa-view" wx:if="{{chatType === 'question'}}">
+      <view class="chat-bubble buyer-bubble">
+        <view class="bubble-header">
+          <text class="sender-name">{{itemData.buyer_name}}</text>
+          <text class="bubble-time text-muted">{{itemData.created_at}}</text>
+        </view>
+        <view class="bubble-text es-text">{{itemData.text_es}}</view>
+        <view class="bubble-translation cn-text">
+          <text class="trans-tag">中文参考：</text>{{itemData.text_cn || '正在解析中文释义...'}}
+        </view>
+      </view>
+
+      <view class="reply-notice" wx:if="{{replied}}">
+        <view class="chat-bubble seller-bubble">
+          <view class="bubble-header">
+            <text class="sender-name">我 (商家回复)</text>
+            <text class="bubble-time text-muted">刚刚</text>
+          </view>
+          <view class="bubble-text es-text">{{repliedTextEs}}</view>
+          <view class="bubble-translation cn-text">
+            <text class="trans-tag">输入原文：</text>{{repliedTextCn}}
+          </view>
+        </view>
+        <view class="sent-success-tip">✅ 回复已成功同步至美客多官方平台！</view>
+      </view>
+    </view>
+
+    <!-- 2. 售后私信多轮形态 -->
+    <view class="messages-view" wx:if="{{chatType === 'message'}}">
+      <view class="msg-history">
+        <block wx:for="{{itemData.history}}" wx:key="index">
+          <view class="chat-bubble {{item.sender === 'buyer' ? 'buyer-bubble' : 'seller-bubble'}}">
+            <view class="bubble-header">
+              <text class="sender-name">{{item.sender === 'buyer' ? itemData.buyer_name : '我 (商家)'}}</text>
+              <text class="bubble-time text-muted">{{item.time}}</text>
+            </view>
+            <view class="bubble-text es-text">{{item.text}}</view>
+            <view class="bubble-translation cn-text" wx:if="{{item.text_cn}}">
+              <text class="trans-tag">释义：</text>{{item.text_cn}}
+            </view>
+          </view>
+        </block>
+
+        <view class="chat-bubble seller-bubble" wx:if="{{replied}}">
+          <view class="bubble-header">
+            <text class="sender-name">我 (刚刚发送)</text>
+            <text class="bubble-time text-muted">刚刚</text>
+          </view>
+          <view class="bubble-text es-text">{{repliedTextEs}}</view>
+          <view class="bubble-translation cn-text">
+            <text class="trans-tag">输入原文：</text>{{repliedTextCn}}
+          </view>
+        </view>
+      </view>
+    </view>
+
+    <!-- 3. 索赔处理形态 -->
+    <view class="claim-view" wx:if="{{chatType === 'claim'}}">
+      <view class="claim-alert-card">
+        <view class="claim-title">⚠️ 买家索赔详情</view>
+        <view class="claim-detail-row"><text class="k">关联订单：</text><text class="v mono">{{itemData.order_id}}</text></view>
+        <view class="claim-detail-row"><text class="k">索赔原因：</text><text class="v">{{itemData.reason}}</text></view>
+        <view class="claim-detail-row"><text class="k">涉及金额：</text><text class="v text-red font-bold">{{itemData.amount}}</text></view>
+        <view class="claim-detail-row"><text class="k">截止时限：</text><text class="v text-orange">还剩 {{itemData.deadline_hours}} 小时</text></view>
+      </view>
+
+      <view class="claim-actions">
+        <button class="action-btn refund-btn" bindtap="handleRefund">一键全额退款给买家</button>
+      </view>
+    </view>
+
+    <view id="chat-bottom-anchor" style="height: 20rpx;"></view>
+  </scroll-view>
+
+  <!-- 底部双语输入与回复操作面板 (对标智赢核心) -->
+  <view class="bottom-panel">
+    <!-- 双语实时翻译对照预览条 -->
+    <view class="trans-preview" wx:if="{{translatedText}}">
+      <view class="trans-header">
+        <text class="trans-title">🌐 即将发送给买家 ({{targetLangName}}):</text>
+        <text class="trans-tip">已自动转换</text>
+      </view>
+      <view class="trans-body">{{translatedText}}</view>
+    </view>
+
+    <!-- 快捷话术按钮栏 -->
+    <view class="quick-toolbar">
+      <view class="quick-btn" bindtap="openTemplateDrawer">⚡ 常用话术库 (点选秒回)</view>
+      <view class="quick-btn" bindtap="translateNow" wx:if="{{inputCn && !translatedText}}">🔄 立即翻译</view>
+    </view>
+
+    <!-- 输入与发送框 -->
+    <view class="input-bar">
+      <textarea
+        class="reply-input"
+        placeholder="输入中文，系统将自动翻译为{{targetLangName}}回复买家..."
+        value="{{inputCn}}"
+        bindinput="onInputCn"
+        maxlength="500"
+        auto-height
+      />
+      <button class="send-btn {{canSend ? 'active' : ''}}" bindtap="sendReplyAction">发 送</button>
+    </view>
+  </view>
+
+  <!-- 常用话术快捷抽屉弹窗 -->
+  <view class="drawer-mask" wx:if="{{showDrawer}}" bindtap="closeDrawer">
+    <view class="drawer-content" catchtap="preventProp">
+      <view class="drawer-header">
+        <text class="drawer-title">📖 美客多常用客服话术库</text>
+        <text class="close-btn" bindtap="closeDrawer">✕</text>
+      </view>
+      <scroll-view class="drawer-scroll" scroll-y="true">
+        <block wx:for="{{templates}}" wx:key="category">
+          <view class="category-group">
+            <view class="category-name">{{item.category}}</view>
+            <view class="template-item" wx:for="{{item.items}}" wx:key="cn" wx:for-item="tpl" bindtap="selectTemplate" data-tpl="{{tpl}}">
+              <view class="tpl-cn">🇨🇳 {{tpl.cn}}</view>
+              <view class="tpl-es">🇪🇸 {{tpl.es}}</view>
+            </view>
+          </view>
+        </block>
+      </scroll-view>
+    </view>
+  </view>
+</view>

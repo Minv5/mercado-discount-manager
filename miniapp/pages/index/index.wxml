@@ -1,0 +1,110 @@
+<view class="container">
+  <!-- 顶部店铺切换导航条 -->
+  <view class="store-selector-card">
+    <view class="store-info">
+      <view class="store-tag">当前管理店铺</view>
+      <picker bindchange="onStoreChange" value="{{storeIndex}}" range="{{stores}}" range-key="alias">
+        <view class="store-picker">
+          <text class="store-name">{{currentStore.name}}</text>
+          <text class="arrow-down">▼ 切换店铺</text>
+        </view>
+      </picker>
+    </view>
+    <view class="store-sites">
+      <block wx:for="{{currentStore.sites}}" wx:key="*this">
+        <text class="site-chip">{{item}}</text>
+      </block>
+    </view>
+  </view>
+
+  <!-- 今日业绩大盘 -->
+  <view class="card stat-card">
+    <view class="section-title">
+      <text>📊 今日销售概览</text>
+      <text class="refresh-time text-muted">{{refreshTime}} 更新</text>
+    </view>
+    <view class="stat-grid">
+      <view class="stat-item" bindtap="goToOrders">
+        <text class="stat-value text-blue">{{todayStats.orderCount}}</text>
+        <text class="stat-label">今日新订单 (单)</text>
+      </view>
+      <view class="stat-item">
+        <text class="stat-value text-green">${{todayStats.salesAmount}}</text>
+        <text class="stat-label">今日预估销售额</text>
+      </view>
+      <view class="stat-item" bindtap="goToOrders">
+        <text class="stat-value text-orange">{{todayStats.pendingShipCount}}</text>
+        <text class="stat-label">待打单发货</text>
+      </view>
+    </view>
+  </view>
+
+  <!-- 待办消息红点提醒区 (核心对标智赢) -->
+  <view class="card todo-card">
+    <view class="section-title">
+      <text>🚨 待处理事项 (待办中心)</text>
+    </view>
+    <view class="todo-list">
+      <view class="todo-item" bindtap="goToQuestions">
+        <view class="todo-left">
+          <view class="todo-icon bg-orange">❓</view>
+          <view class="todo-info">
+            <text class="todo-title">买家售前咨询 (QA)</text>
+            <text class="todo-desc">及时回复可显著提升出单转化率</text>
+          </view>
+        </view>
+        <view class="todo-badge badge-orange" wx:if="{{todo.questions > 0}}">{{todo.questions}} 条待回复</view>
+        <view class="todo-badge badge-green" wx:else>已全部回复</view>
+      </view>
+
+      <view class="todo-item" bindtap="goToMessages">
+        <view class="todo-left">
+          <view class="todo-icon bg-blue">💬</view>
+          <view class="todo-info">
+            <text class="todo-title">买家售后私信 (Messages)</text>
+            <text class="todo-desc">订单留言沟通，避免买家发起索赔</text>
+          </view>
+        </view>
+        <view class="todo-badge badge-blue" wx:if="{{todo.messages > 0}}">{{todo.messages}} 条未读</view>
+        <view class="todo-badge badge-green" wx:else>已全部回复</view>
+      </view>
+
+      <view class="todo-item" bindtap="goToClaims">
+        <view class="todo-left">
+          <view class="todo-icon bg-red">⚠️</view>
+          <view class="todo-info">
+            <text class="todo-title">售后纠纷与索赔 (Claims)</text>
+            <text class="todo-desc">平台时限倒计时，请尽快介入处理</text>
+          </view>
+        </view>
+        <view class="todo-badge badge-red" wx:if="{{todo.claims > 0}}">{{todo.claims}} 起紧急待办</view>
+        <view class="todo-badge badge-green" wx:else>无进行中索赔</view>
+      </view>
+    </view>
+  </view>
+
+  <!-- 快捷功能矩阵 -->
+  <view class="card shortcut-card">
+    <view class="section-title">
+      <text>⚡ 常用快捷功能</text>
+    </view>
+    <view class="grid-nav">
+      <view class="grid-item" bindtap="goToMessages">
+        <view class="grid-icon">📨</view>
+        <text class="grid-text">智能客服</text>
+      </view>
+      <view class="grid-item" bindtap="goToOrders">
+        <view class="grid-icon">📦</view>
+        <text class="grid-text">订单管理</text>
+      </view>
+      <view class="grid-item" bindtap="openQuickTemplates">
+        <view class="grid-icon">📖</view>
+        <text class="grid-text">话术字典</text>
+      </view>
+      <view class="grid-item" bindtap="goToSettings">
+        <view class="grid-icon">⚙️</view>
+        <text class="grid-text">系统设置</text>
+      </view>
+    </view>
+  </view>
+</view>

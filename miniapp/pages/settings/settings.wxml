@@ -1,0 +1,69 @@
+<view class="container">
+  <!-- 用户与AppID卡片 -->
+  <view class="card profile-card">
+    <view class="profile-header">
+      <view class="avatar">🏬</view>
+      <view class="profile-meta">
+        <text class="profile-title">美客多移动工作台</text>
+        <text class="profile-appid text-muted">小程序 AppID: {{appid}}</text>
+      </view>
+    </view>
+  </view>
+
+  <!-- 店铺授权概览 -->
+  <view class="card">
+    <view class="section-title">
+      <text>🏪 已授权店铺列表</text>
+      <text class="badge badge-green">3家全在线</text>
+    </view>
+    <view class="store-list">
+      <view class="store-row" wx:for="{{stores}}" wx:key="id">
+        <view class="store-row-left">
+          <text class="store-icon">📍</text>
+          <view class="store-text">
+            <text class="store-title">{{item.name}}</text>
+            <text class="store-sub text-muted">ID: {{item.id}}</text>
+          </view>
+        </view>
+        <text class="status-online">正常授权</text>
+      </view>
+    </view>
+  </view>
+
+  <!-- 消息推送联动设置 -->
+  <view class="card">
+    <view class="section-title">
+      <text>🔔 微信服务通知联动</text>
+    </view>
+    <view class="setting-item">
+      <view class="setting-info">
+        <text class="setting-label">微信消息推送 (PushPlus)</text>
+        <text class="setting-desc">收到新提问、私信或索赔时手机微信弹出服务通知</text>
+      </view>
+      <switch checked="{{pushEnabled}}" bindchange="togglePush" color="#1976D2" />
+    </view>
+  </view>
+
+  <!-- 关于与技术信息 -->
+  <view class="card">
+    <view class="section-title">
+      <text>ℹ️ 版本与技术支持</text>
+    </view>
+    <view class="info-row">
+      <text class="info-label">系统版本</text>
+      <text class="info-val">v2.2.62 (正式工程)</text>
+    </view>
+    <view class="info-row">
+      <text class="info-label">核心对标</text>
+      <text class="info-val">智赢跨境移动端客服体系</text>
+    </view>
+    <view class="info-row">
+      <text class="info-label">双语互译引擎</text>
+      <text class="info-val">拉美西语 / 巴西葡语智能直译</text>
+    </view>
+  </view>
+
+  <view class="action-wrap">
+    <button class="clear-btn" bindtap="clearStorage">清除本地缓存</button>
+  </view>
+</view>

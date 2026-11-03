@@ -1,0 +1,42 @@
+{
+  "pages": [
+    "pages/index/index",
+    "pages/messages/messages",
+    "pages/chat/chat",
+    "pages/orders/orders",
+    "pages/settings/settings"
+  ],
+  "window": {
+    "backgroundTextStyle": "light",
+    "navigationBarBackgroundColor": "#1976D2",
+    "navigationBarTitleText": "美客多工作台",
+    "navigationBarTextStyle": "white",
+    "backgroundColor": "#F4F6F9"
+  },
+  "tabBar": {
+    "color": "#757575",
+    "selectedColor": "#1976D2",
+    "backgroundColor": "#FFFFFF",
+    "borderStyle": "black",
+    "list": [
+      {
+        "pagePath": "pages/index/index",
+        "text": "工作台"
+      },
+      {
+        "pagePath": "pages/messages/messages",
+        "text": "客服消息"
+      },
+      {
+        "pagePath": "pages/orders/orders",
+        "text": "订单中心"
+      },
+      {
+        "pagePath": "pages/settings/settings",
+        "text": "设置"
+      }
+    ]
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json"
+}

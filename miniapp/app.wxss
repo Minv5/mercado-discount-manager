@@ -1,0 +1,99 @@
+/** 全局统一样式规范 **/
+page {
+  background-color: #F5F7FA;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  color: #333333;
+  font-size: 28rpx;
+  box-sizing: border-box;
+}
+
+/* 通用容器 */
+.container {
+  padding: 24rpx;
+  box-sizing: border-box;
+}
+
+/* 卡片样式 */
+.card {
+  background: #FFFFFF;
+  border-radius: 16rpx;
+  padding: 24rpx;
+  margin-bottom: 24rpx;
+  box-shadow: 0 4rpx 16rpx rgba(0, 0, 0, 0.04);
+}
+
+/* 标题规范 */
+.section-title {
+  font-size: 32rpx;
+  font-weight: 600;
+  color: #1A1A1A;
+  margin-bottom: 16rpx;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* 徽章 Badge */
+.badge {
+  display: inline-block;
+  padding: 4rpx 12rpx;
+  border-radius: 20rpx;
+  font-size: 20rpx;
+  font-weight: 500;
+}
+
+.badge-red {
+  background-color: #FFEBEE;
+  color: #D32F2F;
+}
+
+.badge-blue {
+  background-color: #E3F2FD;
+  color: #1976D2;
+}
+
+.badge-orange {
+  background-color: #FFF3E0;
+  color: #E65100;
+}
+
+.badge-green {
+  background-color: #E8F5E9;
+  color: #2E7D32;
+}
+
+/* 主色按钮 */
+.btn-primary {
+  background: linear-gradient(135deg, #1E88E5, #1565C0);
+  color: #FFFFFF;
+  font-size: 28rpx;
+  font-weight: 500;
+  border-radius: 40rpx;
+  padding: 16rpx 36rpx;
+  text-align: center;
+}
+
+.btn-primary:active {
+  opacity: 0.88;
+}
+
+/* 辅助文字 */
+.text-muted {
+  color: #8C8C8C;
+  font-size: 24rpx;
+}
+
+/* 单行超出省略 */
+.ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 两行超出省略 */
+.ellipsis-2 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}

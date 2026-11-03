@@ -1,0 +1,296 @@
+/* 顶部选项卡 */
+.tab-bar {
+  display: flex;
+  background: #FFFFFF;
+  border-radius: 16rpx;
+  padding: 8rpx;
+  margin-bottom: 24rpx;
+  box-shadow: 0 4rpx 12rpx rgba(0, 0, 0, 0.03);
+}
+
+.tab-item {
+  flex: 1;
+  text-align: center;
+  padding: 18rpx 0;
+  font-size: 28rpx;
+  color: #616161;
+  border-radius: 12rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8rpx;
+}
+
+.tab-item.active {
+  background: #1976D2;
+  color: #FFFFFF;
+  font-weight: 500;
+}
+
+.tab-badge {
+  background: #FF5252;
+  color: #FFFFFF;
+  font-size: 20rpx;
+  padding: 2rpx 10rpx;
+  border-radius: 20rpx;
+}
+
+.badge-red-bg {
+  background: #D32F2F;
+}
+
+/* 列表卡片 */
+.item-card {
+  padding: 24rpx;
+  margin-bottom: 20rpx;
+  transition: all 0.2s ease;
+}
+
+.item-card:active {
+  transform: scale(0.99);
+}
+
+.claim-border {
+  border-left: 6rpx solid #D32F2F;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16rpx;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12rpx;
+}
+
+.store-badge {
+  background: #E8EAF6;
+  color: #283593;
+  font-size: 22rpx;
+  padding: 4rpx 12rpx;
+  border-radius: 6rpx;
+  font-weight: 500;
+}
+
+.site-tag {
+  background: #FFF8E1;
+  color: #F57F17;
+  font-size: 22rpx;
+  padding: 4rpx 12rpx;
+  border-radius: 6rpx;
+}
+
+.order-tag {
+  font-size: 22rpx;
+  color: #616161;
+  font-family: monospace;
+}
+
+.time-text {
+  font-size: 22rpx;
+}
+
+/* 商品摘要 */
+.product-snippet {
+  display: flex;
+  gap: 16rpx;
+  background: #F9F9F9;
+  padding: 12rpx;
+  border-radius: 10rpx;
+  margin-bottom: 16rpx;
+}
+
+.thumb {
+  width: 90rpx;
+  height: 90rpx;
+  border-radius: 8rpx;
+  background: #E0E0E0;
+}
+
+.product-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.product-title {
+  font-size: 26rpx;
+  color: #333333;
+  line-height: 1.3;
+}
+
+.item-id-tag {
+  font-size: 20rpx;
+  color: #9E9E9E;
+  font-family: monospace;
+}
+
+/* 提问内容框 */
+.question-box {
+  background: #FFFDE7;
+  border-left: 4rpx solid #FBC02D;
+  padding: 14rpx;
+  border-radius: 8rpx;
+  margin-bottom: 16rpx;
+}
+
+.q-lang-es {
+  font-size: 28rpx;
+  color: #212121;
+  font-weight: 500;
+  margin-bottom: 8rpx;
+}
+
+.q-prefix {
+  color: #E65100;
+}
+
+.q-lang-cn {
+  font-size: 24rpx;
+  color: #616161;
+  border-top: 1rpx dashed #E0E0E0;
+  padding-top: 8rpx;
+}
+
+.cn-label {
+  color: #2E7D32;
+  font-weight: 500;
+}
+
+/* 售后私信样式 */
+.buyer-header {
+  display: flex;
+  align-items: center;
+  gap: 10rpx;
+  margin-bottom: 10rpx;
+}
+
+.buyer-name-strong {
+  font-size: 28rpx;
+  font-weight: bold;
+  color: #212121;
+}
+
+.unread-dot {
+  background: #E53935;
+  color: #FFFFFF;
+  font-size: 20rpx;
+  padding: 2rpx 10rpx;
+  border-radius: 20rpx;
+}
+
+.last-msg-box {
+  background: #E1F5FE;
+  padding: 12rpx 16rpx;
+  border-radius: 12rpx;
+  margin-bottom: 14rpx;
+}
+
+.msg-es {
+  display: block;
+  font-size: 28rpx;
+  color: #01579B;
+}
+
+.msg-cn {
+  display: block;
+  font-size: 24rpx;
+  color: #546E7A;
+  margin-top: 4rpx;
+}
+
+/* 索赔专区 */
+.countdown-badge {
+  background: #FFCDD2;
+  color: #B71C1C;
+  font-size: 22rpx;
+  padding: 4rpx 12rpx;
+  border-radius: 20rpx;
+  font-weight: bold;
+}
+
+.claim-body {
+  margin-bottom: 16rpx;
+}
+
+.claim-row {
+  display: flex;
+  font-size: 26rpx;
+  margin-bottom: 6rpx;
+}
+
+.claim-label {
+  color: #757575;
+  width: 150rpx;
+}
+
+.claim-value {
+  color: #212121;
+}
+
+.mono {
+  font-family: monospace;
+}
+
+.text-red {
+  color: #D32F2F;
+}
+
+.claim-reason-box {
+  background: #FFEBEE;
+  padding: 12rpx;
+  border-radius: 8rpx;
+  color: #C62828;
+  font-size: 26rpx;
+  margin-top: 10rpx;
+}
+
+/* 卡片底栏 */
+.card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1rpx solid #F5F5F5;
+  padding-top: 16rpx;
+}
+
+.btn-reply {
+  background: #F57C00;
+  color: #FFFFFF;
+  font-size: 24rpx;
+  font-weight: 500;
+  padding: 10rpx 20rpx;
+  border-radius: 30rpx;
+}
+
+.btn-blue {
+  background: #1976D2;
+}
+
+.btn-red {
+  background: #D32F2F;
+}
+
+/* 空状态 */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 100rpx 0;
+}
+
+.empty-icon {
+  font-size: 72rpx;
+  margin-bottom: 16rpx;
+}
+
+.empty-text {
+  font-size: 28rpx;
+  color: #9E9E9E;
+}
