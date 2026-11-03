@@ -139,3 +139,20 @@
   font-size: 28rpx;
   border-radius: 40rpx;
 }
+
+.test-btn {
+  background: #203A2B;
+  color: #D4AF37;
+  border: 1rpx solid #4E472F;
+  font-size: 26rpx;
+  font-weight: 500;
+  border-radius: 36rpx;
+  padding: 12rpx 0;
+  text-align: center;
+}
+
+.badge-gold {
+  background: #3B331A;
+  color: #D4AF37;
+  border: 1rpx solid #6E5C24;
+}

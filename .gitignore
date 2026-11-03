@@ -24,3 +24,5 @@ dist-win/
 tools/license_private_key.pem
 *.pem
 
+scripts/bin/
+miniapp/project.private.config.json

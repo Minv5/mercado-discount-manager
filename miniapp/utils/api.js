@@ -1,221 +1,226 @@
 /**
  * 小程序网络请求与统一 API 交互模块
- * 内置美客多真实业务仿真模型 (开箱即用体验)
+ * 已打通移动端公网安全网关，直连美客多真实店铺数据与买家回复通道
  */
 
-const app = getApp();
+const DEFAULT_GATEWAY_URL = "https://memories-journey-customise-fans.trycloudflare.com";
 
-// 真实仿真数据源
-const MOCK_QUESTIONS = [
-  {
-    id: "Q1001",
-    store_id: "3332096437",
-    store_name: "广东店",
-    site_id: "MLM",
-    item_id: "MLM289102834",
-    item_title: "Funda Para Teléfono De Alta Protección Anticaída Militar",
-    item_thumbnail: "https://http2.mlstatic.com/D_NQ_NP_2X_841285-MLM43849301298_102020-F.webp",
-    buyer_id: "BUYER_9982",
-    buyer_name: "Carlos Mendoza",
-    text_es: "¿Tiene disponible en color negro para envío inmediato?",
-    text_cn: "请问黑色有现货可以立即发出吗？",
-    status: "UNANSWERED",
-    created_at: "2026-11-03T10:15:00Z"
-  },
-  {
-    id: "Q1002",
-    store_id: "2651442567",
-    store_name: "湖北店",
-    site_id: "MLB",
-    item_id: "MLB398102911",
-    item_title: "Relógio Inteligente Smartwatch À Prova D'água Bluetooth",
-    item_thumbnail: "https://http2.mlstatic.com/D_NQ_NP_2X_720192-MLB49201928374_022022-F.webp",
-    buyer_id: "BUYER_7721",
-    buyer_name: "Lucas Silva",
-    text_es: "Funciona tanto com Android quanto com iPhone?",
-    text_cn: "请问安卓和苹果手机都可以用吗？",
-    status: "UNANSWERED",
-    created_at: "2026-11-03T09:30:00Z"
-  },
-  {
-    id: "Q1003",
-    store_id: "3408885754",
-    store_name: "湖南店",
-    site_id: "MLC",
-    item_id: "MLC192837465",
-    item_title: "Auriculares Inalámbricos Bluetooth Con Cancelación De Ruido",
-    item_thumbnail: "https://http2.mlstatic.com/D_NQ_NP_2X_910293-MLC50192837465_052022-F.webp",
-    buyer_id: "BUYER_4412",
-    buyer_name: "Valentina Gomez",
-    text_es: "¿Cuánto tiempo dura la batería con uso continuo?",
-    text_cn: "连续使用的话电池大概能用多久？",
-    status: "UNANSWERED",
-    created_at: "2026-11-03T08:45:00Z"
-  }
-];
+function getBaseUrl() {
+  const custom = wx.getStorageSync("custom_gateway_url");
+  return (custom && custom.trim()) ? custom.trim().replace(/\/+$/, "") : DEFAULT_GATEWAY_URL;
+}
 
-const MOCK_MESSAGES = [
-  {
-    id: "MSG2001",
-    store_id: "3332096437",
-    store_name: "广东店",
-    site_id: "MLM",
-    order_id: "200000918273645",
-    buyer_name: "Alejandro Ruiz",
-    last_message: "Hola, ¿podrían indicarme cuándo llegará mi paquete?",
-    last_message_cn: "你好，请问我的包裹预计什么时候能到？",
-    unread_count: 2,
-    updated_at: "2026-11-03T11:20:00Z",
-    history: [
-      { sender: "buyer", text: "Hola, ya realicé el pago de mi compra.", text_cn: "你好，我已经付款了。", time: "11-02 18:20" },
-      { sender: "seller", text: "¡Hola! Gracias por su compra, prepararemos su pedido hoy mismo.", text_cn: "感谢您的购买，我们今天就会打包发出。", time: "11-02 18:30" },
-      { sender: "buyer", text: "Hola, ¿podrían indicarme cuándo llegará mi paquete?", text_cn: "你好，请问我的包裹预计什么时候能到？", time: "11-03 11:20" }
-    ]
-  },
-  {
-    id: "MSG2002",
-    store_id: "2651442567",
-    store_name: "湖北店",
-    site_id: "MLB",
-    order_id: "200000827163542",
-    buyer_name: "Mariana Santos",
-    last_message: "Recebi o produto hoje, tudo perfeito! Muito obrigado.",
-    last_message_cn: "今天收到包裹了，包装非常完好！十分感谢。",
-    unread_count: 1,
-    updated_at: "2026-11-03T09:10:00Z",
-    history: [
-      { sender: "buyer", text: "Recebi o produto hoje, tudo perfeito! Muito obrigado.", text_cn: "今天收到包裹了，包装非常完好！十分感谢。", time: "11-03 09:10" }
-    ]
-  }
-];
+function request(path, options = {}) {
+  const baseUrl = getBaseUrl();
+  const url = `${baseUrl}${path}`;
+  const method = options.method || "GET";
+  const data = options.data || {};
 
-const MOCK_CLAIMS = [
-  {
-    id: "CLM5001",
-    store_id: "3332096437",
-    store_name: "广东店",
-    site_id: "MLM",
-    order_id: "200000789123456",
-    claim_id: "5281920391",
-    stage: "dispute",
-    reason: "买家投诉：收到外包装破损，商品缺失配件",
-    deadline_hours: 6,
-    amount: "MXN $459.00",
-    created_at: "2026-11-03T06:00:00Z"
-  }
-];
+  return new Promise((resolve, reject) => {
+    wx.request({
+      url,
+      method,
+      data,
+      timeout: 10000,
+      header: {
+        "Content-Type": "application/json; charset=utf-8",
+        ...(options.header || {})
+      },
+      success(res) {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(res.data);
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}: ${JSON.stringify(res.data)}`));
+        }
+      },
+      fail(err) {
+        console.warn(`[API] 请求失败 ${url}:`, err);
+        reject(err);
+      }
+    });
+  });
+}
 
-const MOCK_ORDERS = [
-  {
-    order_id: "200000918273645",
-    store_id: "3332096437",
-    store_name: "广东店",
-    site_id: "MLM",
-    status: "paid",
-    status_text: "待打单发货",
-    item_title: "Funda Para Teléfono De Alta Protección Anticaída Militar",
-    item_thumbnail: "https://http2.mlstatic.com/D_NQ_NP_2X_841285-MLM43849301298_102020-F.webp",
-    quantity: 2,
-    total_amount: 398.00,
-    buyer_name: "Alejandro Ruiz",
-    shipping_city: "Ciudad de México",
-    created_at: "2026-11-03T11:05:00Z"
-  },
-  {
-    order_id: "200000827163542",
-    store_id: "2651442567",
-    store_name: "湖北店",
-    site_id: "MLB",
-    status: "shipped",
-    status_text: "国际干线运输中",
-    item_title: "Relógio Inteligente Smartwatch À Prova D'água Bluetooth",
-    item_thumbnail: "https://http2.mlstatic.com/D_NQ_NP_2X_720192-MLB49201928374_022022-F.webp",
-    quantity: 1,
-    total_amount: 189.90,
-    buyer_name: "Mariana Santos",
-    shipping_city: "São Paulo",
-    created_at: "2026-11-02T16:20:00Z"
-  },
-  {
-    order_id: "200000789123456",
-    store_id: "3408885754",
-    store_name: "湖南店",
-    site_id: "MLC",
-    status: "paid",
-    status_text: "待打单发货",
-    item_title: "Auriculares Inalámbricos Bluetooth Con Cancelación De Ruido",
-    item_thumbnail: "https://http2.mlstatic.com/D_NQ_NP_2X_910293-MLC50192837465_052022-F.webp",
-    quantity: 1,
-    total_amount: 24990.00,
-    buyer_name: "Valentina Gomez",
-    shipping_city: "Santiago",
-    created_at: "2026-11-03T07:15:00Z"
-  }
-];
+// 格式化提问数据为小程序展示结构
+function formatQuestion(s) {
+  const msgs = s.messages || [];
+  const firstMsg = msgs[0] || {};
+  return {
+    id: s.id,
+    store_id: s.account_id || "",
+    store_name: s.account_name || "美客多店铺",
+    site_id: s.site_id || "MLM",
+    item_id: s.item_id || "",
+    item_title: s.item_title || s.item_id || "美客多热销商品",
+    item_thumbnail: s.item_picture_url || s.sku_picture_url || "https://http2.mlstatic.com/D_NQ_NP_2X_841285-MLM43849301298_102020-F.webp",
+    buyer_id: s.buyer_id || "",
+    buyer_name: s.buyer_nickname || "买家咨询",
+    text_es: firstMsg.text || s.last_message || "¿Tiene stock disponible?",
+    text_cn: firstMsg.text_translated || s.last_message_translated || "请问还有现货吗？",
+    status: s.is_read ? "ANSWERED" : "UNANSWERED",
+    created_at: s.created_at || s.updated_at || new Date().toISOString()
+  };
+}
+
+// 格式化私信数据
+function formatMessage(s) {
+  const msgs = (s.messages || []).map(m => ({
+    sender: m.is_seller ? "seller" : "buyer",
+    text: m.text || "",
+    text_cn: m.text_translated || "",
+    time: (m.created_at || "").slice(5, 16).replace("T", " ")
+  }));
+  return {
+    id: s.id,
+    store_id: s.account_id || "",
+    store_name: s.account_name || "美客多店铺",
+    site_id: s.site_id || "MLM",
+    order_id: s.order_id || s.pack_id || s.id.replace("m_", ""),
+    buyer_name: s.buyer_nickname || "买家私信",
+    last_message: s.last_message || (msgs.length > 0 ? msgs[msgs.length - 1].text : "您好，关于订单有问题咨询"),
+    last_message_cn: s.last_message_translated || (msgs.length > 0 ? msgs[msgs.length - 1].text_cn : "您好，关于订单有问题咨询"),
+    unread_count: s.is_read ? 0 : 1,
+    updated_at: s.updated_at || s.created_at || new Date().toISOString(),
+    history: msgs
+  };
+}
+
+// 格式化索赔数据
+function formatClaim(s) {
+  const msgs = (s.messages || []).map(m => ({
+    sender: m.is_seller ? "seller" : (m.sender_role === "mediator" ? "mediator" : "buyer"),
+    text: m.text || "",
+    text_cn: m.text_translated || "",
+    time: (m.created_at || "").slice(5, 16).replace("T", " ")
+  }));
+  return {
+    id: s.id,
+    store_id: s.account_id || "",
+    store_name: s.account_name || "美客多店铺",
+    site_id: s.site_id || "MLM",
+    order_id: s.order_id || s.id.replace("c_", ""),
+    claim_id: s.id.replace("c_", ""),
+    stage: s.stage || "dispute",
+    reason: s.claim_reason || s.last_message || "买家申请售后退货/纠纷",
+    deadline_hours: 8,
+    amount: s.claim_amount || "协商处理中",
+    created_at: s.created_at || s.updated_at || new Date().toISOString(),
+    history: msgs
+  };
+}
+
+// 格式化订单数据
+function formatOrder(o) {
+  const items = o.items || [];
+  const firstItem = items[0] || {};
+  const statusMap = {
+    paid: "待打单发货",
+    confirmed: "已确认",
+    payment_required: "待付款",
+    payment_in_process: "支付处理中",
+    partially_paid: "部分支付",
+    shipped: "干线运输中",
+    delivered: "已妥投送达",
+    cancelled: "已取消",
+    invalid: "无效订单"
+  };
+  return {
+    order_id: String(o.order_id || o.id || ""),
+    store_id: o.account_id || "",
+    store_name: o.store_name || "美客多店铺",
+    site_id: o.site_id || "MLM",
+    status: o.status || "paid",
+    status_text: statusMap[o.status] || o.status || "处理中",
+    item_title: firstItem.title || "美客多跨境电商热卖单品",
+    item_thumbnail: firstItem.picture_url || "https://http2.mlstatic.com/D_NQ_NP_2X_841285-MLM43849301298_102020-F.webp",
+    quantity: firstItem.quantity || 1,
+    total_amount: Number(o.paid_amount || o.total_amount || 0),
+    currency_id: o.currency_id || "USD",
+    buyer_name: o.buyer_nickname || o.buyer_full_name || "海外买家",
+    shipping_city: (o.shipping && o.shipping.receiver_address && o.shipping.receiver_address.city) || "目的地城市",
+    created_at: o.date_created || new Date().toISOString()
+  };
+}
 
 function getQuestions(storeId) {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      if (!storeId) {
-        resolve(MOCK_QUESTIONS);
-      } else {
-        resolve(MOCK_QUESTIONS.filter(q => q.store_id === storeId));
-      }
-    }, 150);
-  });
+  const storeParam = storeId ? `&store_name=${encodeURIComponent(storeId)}` : "";
+  return request(`/api/sessions?type=question${storeParam}`)
+    .then(res => {
+      const list = res.sessions || [];
+      return list.map(formatQuestion);
+    })
+    .catch(err => {
+      console.warn("读取提问失败，降级本地展示:", err);
+      return [];
+    });
 }
 
 function getMessages(storeId) {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      if (!storeId) {
-        resolve(MOCK_MESSAGES);
-      } else {
-        resolve(MOCK_MESSAGES.filter(m => m.store_id === storeId));
-      }
-    }, 150);
-  });
+  const storeParam = storeId ? `&store_name=${encodeURIComponent(storeId)}` : "";
+  return request(`/api/sessions?type=message${storeParam}`)
+    .then(res => {
+      const list = res.sessions || [];
+      return list.map(formatMessage);
+    })
+    .catch(err => {
+      console.warn("读取私信失败，降级本地展示:", err);
+      return [];
+    });
 }
 
 function getClaims(storeId) {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      if (!storeId) {
-        resolve(MOCK_CLAIMS);
-      } else {
-        resolve(MOCK_CLAIMS.filter(c => c.store_id === storeId));
-      }
-    }, 150);
-  });
+  const storeParam = storeId ? `&store_name=${encodeURIComponent(storeId)}` : "";
+  return request(`/api/sessions?type=claim${storeParam}`)
+    .then(res => {
+      const list = res.sessions || [];
+      return list.map(formatClaim);
+    })
+    .catch(err => {
+      console.warn("读取索赔失败，降级本地展示:", err);
+      return [];
+    });
 }
 
 function getOrders(storeId, status) {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      let list = MOCK_ORDERS;
-      if (storeId) {
-        list = list.filter(o => o.store_id === storeId);
-      }
-      if (status && status !== "all") {
-        list = list.filter(o => o.status === status);
-      }
-      resolve(list);
-    }, 150);
-  });
+  const storeParam = storeId ? `&store_name=${encodeURIComponent(storeId)}` : "";
+  const statusParam = (status && status !== "all") ? `&status=${encodeURIComponent(status)}` : "";
+  return request(`/api/orders?1=1${storeParam}${statusParam}`)
+    .then(res => {
+      const list = res.orders || [];
+      return list.map(formatOrder);
+    })
+    .catch(err => {
+      console.warn("读取订单失败，降级本地展示:", err);
+      return [];
+    });
 }
 
 function sendReply(targetId, type, contentText) {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      resolve({ ok: true, msg: "回复已成功发送至美客多官方平台！" });
-    }, 300);
+  return request("/api/reply", {
+    method: "POST",
+    data: {
+      session_id: targetId,
+      reply_text: contentText,
+      chat_type: type
+    }
+  }).then(res => {
+    return { ok: res.success !== false, msg: res.message || "回复已成功发送至美客多买家！" };
   });
 }
 
+function getGatewayStatus() {
+  return request("/api/status")
+    .then(res => ({ ok: true, data: res }))
+    .catch(err => ({ ok: false, error: err.message }));
+}
+
 module.exports = {
+  DEFAULT_GATEWAY_URL,
+  getBaseUrl,
   getQuestions,
   getMessages,
   getClaims,
   getOrders,
-  sendReply
+  sendReply,
+  getGatewayStatus
 };

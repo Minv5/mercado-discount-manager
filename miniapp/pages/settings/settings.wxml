@@ -10,6 +10,25 @@
     </view>
   </view>
 
+  <!-- 云端安全同步网关 -->
+  <view class="card">
+    <view class="section-title">
+      <text>🌐 云端安全同步网关</text>
+      <text class="badge {{gatewayOnline ? 'badge-green' : 'badge-gold'}}">{{gatewayOnline ? '已连接 (在线)' : '检查中'}}</text>
+    </view>
+    <view class="info-row">
+      <text class="info-label">网关接入地址</text>
+      <text class="info-val text-muted" style="font-size: 20rpx; word-break: break-all;">{{gatewayUrl}}</text>
+    </view>
+    <view class="info-row">
+      <text class="info-label">连接网络模式</text>
+      <text class="info-val">4G/5G 移动公网直连 (Cloudflare)</text>
+    </view>
+    <view style="margin-top: 20rpx;">
+      <button class="test-btn" bindtap="checkGateway">一键检测网关连接</button>
+    </view>
+  </view>
+
   <!-- 店铺授权概览 -->
   <view class="card">
     <view class="section-title">
@@ -17,12 +36,12 @@
       <text class="badge badge-green">3家全在线</text>
     </view>
     <view class="store-list">
-      <view class="store-row" wx:for="{{stores}}" wx:key="id">
+      <view class="store-row" wx:for="{{stores}}" wx:key="id" wx:if="{{item.id}}">
         <view class="store-row-left">
           <text class="store-icon">📍</text>
           <view class="store-text">
             <text class="store-title">{{item.name}}</text>
-            <text class="store-sub text-muted">ID: {{item.id}}</text>
+            <text class="store-sub text-muted">店铺归属: {{item.alias}}</text>
           </view>
         </view>
         <text class="status-online">正常授权</text>
@@ -40,7 +59,7 @@
         <text class="setting-label">微信消息推送 (PushPlus)</text>
         <text class="setting-desc">收到新提问、私信或索赔时手机微信弹出服务通知</text>
       </view>
-      <switch checked="{{pushEnabled}}" bindchange="togglePush" color="#1976D2" />
+      <switch checked="{{pushEnabled}}" bindchange="togglePush" color="#2F6B3F" />
     </view>
   </view>
 

@@ -1,29 +1,29 @@
 App({
   globalData: {
-    apiUrl: "https://minv5.trade",
+    apiUrl: "https://memories-journey-customise-fans.trycloudflare.com",
     token: "",
-    // 三大主力店铺
+    // 店铺列表：支持全部店铺大盘汇总与单店过滤
     stores: [
-      { id: "3332096437", name: "广东店", alias: "广东店 (3332096437)", sites: ["MLM", "MLB", "MLC", "MCO", "MLA"] },
-      { id: "2651442567", name: "湖北店", alias: "湖北店 (2651442567)", sites: ["MLC", "MLB", "MCO", "MLM", "MLA"] },
-      { id: "3408885754", name: "湖南店", alias: "湖南店 (3408885754)", sites: ["MCO", "MLC", "MLM", "MLA", "MLB"] }
+      { id: "", name: "全部店铺", alias: "全部店铺汇总 (3店已同步)", sites: ["MLM", "MLB", "MLC", "MCO", "MLA"] },
+      { id: "广东店", name: "广东店", alias: "广东店 (3332096437)", sites: ["MLM", "MLB", "MLC", "MCO", "MLA"] },
+      { id: "湖北店", name: "湖北店", alias: "湖北店 (2651442567)", sites: ["MLC", "MLB", "MCO", "MLM", "MLA"] },
+      { id: "湖南店", name: "湖南店", alias: "湖南店 (3408885754)", sites: ["MCO", "MLC", "MLM", "MLA", "MLB"] }
     ],
     currentStoreIndex: 0,
     unreadCounts: {
-      questions: 3,
-      messages: 5,
-      claims: 1,
-      orders: 8
+      questions: 22,
+      messages: 3,
+      claims: 71,
+      orders: 18
     }
   },
 
   onLaunch() {
-    // 恢复本地存储的配置与选中店铺
     const savedStoreIdx = wx.getStorageSync("currentStoreIndex");
     if (savedStoreIdx !== "" && savedStoreIdx !== null) {
       this.globalData.currentStoreIndex = Number(savedStoreIdx);
     }
-    const savedApiUrl = wx.getStorageSync("apiUrl");
+    const savedApiUrl = wx.getStorageSync("custom_gateway_url");
     if (savedApiUrl) {
       this.globalData.apiUrl = savedApiUrl;
     }

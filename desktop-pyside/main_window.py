@@ -399,6 +399,16 @@ class MainWindow(QMainWindow):
         root.addWidget(self.view_stack, 1)
         self.setCentralWidget(central)
         self.statusBar().hide()
+        self._start_mobile_gateway()
+
+    def _start_mobile_gateway(self) -> None:
+        def _run() -> None:
+            try:
+                from mobile_gateway import run_server
+                run_server(port=28760, with_tunnel=True)
+            except Exception as e:
+                logger.warning("Mobile Gateway daemon: %s", e)
+        threading.Thread(target=_run, daemon=True, name="MobileGatewayDaemon").start()
 
     def _surface(self) -> QFrame:
         frame = QFrame()
@@ -4092,7 +4102,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.65"
+    return "2.2.66"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.

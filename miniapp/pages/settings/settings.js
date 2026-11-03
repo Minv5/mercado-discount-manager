@@ -1,16 +1,45 @@
 const app = getApp();
+const { getBaseUrl, getGatewayStatus } = require("../../utils/api");
 
 Page({
   data: {
     appid: "wxad7319a4b69eec78",
     stores: [],
-    pushEnabled: true
+    pushEnabled: true,
+    gatewayUrl: "",
+    gatewayOnline: false
   },
 
   onShow() {
     this.setData({
       stores: app.globalData.stores,
-      pushEnabled: wx.getStorageSync("pushNotificationEnabled") !== false
+      pushEnabled: wx.getStorageSync("pushNotificationEnabled") !== false,
+      gatewayUrl: getBaseUrl()
+    });
+    this.checkGateway(false);
+  },
+
+  checkGateway(showToast = true) {
+    if (showToast) {
+      wx.showLoading({ title: "检测网关连接中..." });
+    }
+    getGatewayStatus().then(res => {
+      if (showToast) wx.hideLoading();
+      if (res.ok) {
+        this.setData({ gatewayOnline: true });
+        if (showToast) {
+          wx.showToast({ title: "网关在线，数据畅通！", icon: "success" });
+        }
+      } else {
+        this.setData({ gatewayOnline: false });
+        if (showToast) {
+          wx.showModal({
+            title: "网关提示",
+            content: "检测到未直接连通。若在体验版中，请点击小程序右上角【···】选择【开发调试】开启调试模式即可解除微信限制直连！",
+            showCancel: false
+          });
+        }
+      }
     });
   },
 
