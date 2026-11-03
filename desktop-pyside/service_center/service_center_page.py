@@ -207,7 +207,7 @@ def resolve_claim_return_info(client: Any, aid: str, claim_data: dict[str, Any])
     Status Labels (Strictly 4 Chinese characters, without bullets):
       待我同意: Complainant requested return; waiting for seller allow_return action.
       买家待寄: Return approved / label generated, awaiting buyer dispatch.
-      买家已寄: Return parcel shipped by buyer, in-transit.
+      退货在途: Return parcel shipped by buyer, in-transit (matches official portal "退货运输中").
       包裹已到: Return parcel delivered to return warehouse.
       退款结案: Claim closed, refund issued / resolved.
       纠纷仲裁: Mediation escalated to platform dispute.
@@ -223,15 +223,49 @@ def resolve_claim_return_info(client: Any, aid: str, claim_data: dict[str, Any])
         "destination": "",
     }
 
-    # 1. Closed claims
-    if status == "closed":
-        return "退款结案", "closed", details
+    # 1. Reverse logistics check (PRIORITY: official /returns endpoint)
+    # Note: On CBT returns, Mercado Libre closes the claim object when refunding upon carrier scan,
+    # but the physical parcel is actively in transit (official portal displays "退货运输中").
+    # Therefore, checking return parcel logistics takes precedence over claim dispute closure status.
+    rel = claim_data.get("related_entities") or []
+    is_return_related = (cl_type == "returns") or ("return" in str(rel).lower())
+    if is_return_related and client and hasattr(client, "get_claim_returns"):
+        try:
+            ret = client.get_claim_returns(aid, cid)
+            if isinstance(ret, dict) and ret:
+                ret_st = str(ret.get("status") or "").lower()
+                shipments = ret.get("shipments") or []
+                ship_st = ""
+                if shipments and isinstance(shipments, list):
+                    sh0 = shipments[0] or {}
+                    ship_st = str(sh0.get("status") or "").lower()
+                    details["shipment_id"] = str(sh0.get("shipment_id") or "")
+                    details["tracking_number"] = str(sh0.get("tracking_number") or "")
+                    dest = (sh0.get("destination") or {}).get("shipping_address") or {}
+                    if dest:
+                        parts = []
+                        city = (dest.get("city") or {}).get("name") if isinstance(dest.get("city"), dict) else dest.get("city")
+                        state = (dest.get("state") or {}).get("name") if isinstance(dest.get("state"), dict) else dest.get("state")
+                        comment = dest.get("comment")
+                        if city:
+                            parts.append(str(city))
+                        if state:
+                            parts.append(str(state))
+                        if comment:
+                            parts.append(str(comment))
+                        details["destination"] = " · ".join(parts)
 
-    # 2. Stage is dispute (platform arbitration)
-    if stage == "dispute":
-        return "纠纷仲裁", "dispute", details
+                effective_st = ship_st or ret_st
+                if effective_st == "delivered":
+                    return "包裹已到", "delivered", details
+                elif effective_st in ("shipped", "in_transit"):
+                    return "退货在途", "shipped", details
+                elif effective_st in ("ready_to_ship", "label_generated"):
+                    return "买家待寄", "ready_to_ship", details
+        except Exception as e:
+            logger.debug("Failed to fetch returns for claim %s: %s", cid, e)
 
-    # 3. Check seller actions for allow_return (pending seller consent)
+    # 2. Check seller actions for allow_return (pending seller consent)
     has_allow_return = False
     for p in claim_data.get("players") or []:
         if p.get("role") in ("respondent", "seller"):
@@ -243,44 +277,17 @@ def resolve_claim_return_info(client: Any, aid: str, claim_data: dict[str, Any])
     if has_allow_return:
         return "待我同意", "allow_return", details
 
-    # 4. Check return parcel logistics if returns type or related_entities has return
-    rel = claim_data.get("related_entities") or []
-    if cl_type == "returns" or "return" in str(rel).lower():
-        if client and hasattr(client, "get_claim_returns"):
-            try:
-                ret = client.get_claim_returns(aid, cid)
-                if isinstance(ret, dict):
-                    ret_st = str(ret.get("status") or "").lower()
-                    shipments = ret.get("shipments") or []
-                    ship_st = ""
-                    if shipments and isinstance(shipments, list):
-                        sh0 = shipments[0] or {}
-                        ship_st = str(sh0.get("status") or "").lower()
-                        details["shipment_id"] = str(sh0.get("shipment_id") or "")
-                        details["tracking_number"] = str(sh0.get("tracking_number") or "")
-                        dest = (sh0.get("destination") or {}).get("shipping_address") or {}
-                        if dest:
-                            parts = []
-                            city = (dest.get("city") or {}).get("name") if isinstance(dest.get("city"), dict) else dest.get("city")
-                            state = (dest.get("state") or {}).get("name") if isinstance(dest.get("state"), dict) else dest.get("state")
-                            comment = dest.get("comment")
-                            if city:
-                                parts.append(str(city))
-                            if state:
-                                parts.append(str(state))
-                            if comment:
-                                parts.append(str(comment))
-                            details["destination"] = " · ".join(parts)
+    # 3. Stage is dispute (platform arbitration)
+    if stage == "dispute":
+        return "纠纷仲裁", "dispute", details
 
-                    effective_st = ship_st or ret_st
-                    if effective_st == "delivered":
-                        return "包裹已到", "delivered", details
-                    elif effective_st == "shipped":
-                        return "买家已寄", "shipped", details
-                    elif effective_st in ("ready_to_ship", "label_generated"):
-                        return "买家待寄", "ready_to_ship", details
-            except Exception as e:
-                logger.debug("Failed to fetch returns for claim %s: %s", cid, e)
+    # 4. Closed claims (if not in active return transit)
+    if status == "closed":
+        return "退款结案", "closed", details
+
+    # 5. Fallback for return claim without client yet
+    if is_return_related and client is None:
+        return "买家待寄", "ready_to_ship", details
 
     return "常规索赔", "claim", details
 
@@ -417,6 +424,12 @@ def save_sessions_snapshot(sessions: list[ServiceSession]) -> None:
                 "affects_reputation": getattr(s, "affects_reputation", ""),
                 "claim_reason": getattr(s, "claim_reason", ""),
                 "claim_reason_id": getattr(s, "claim_reason_id", ""),
+                "return_status": getattr(s, "return_status", ""),
+                "return_status_label": getattr(s, "return_status_label", ""),
+                "return_shipment_id": getattr(s, "return_shipment_id", ""),
+                "return_tracking_number": getattr(s, "return_tracking_number", ""),
+                "return_destination": getattr(s, "return_destination", ""),
+                "raw_data": getattr(s, "raw_data", None) or {},
                 "messages": msg_list,
             })
         path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -637,13 +650,26 @@ def load_sessions_snapshot() -> list[ServiceSession]:
                 raw_msgs = item.pop("messages", None) or []
                 clean_item = {k: v for k, v in item.items() if k in valid_fields}
                 sess = ServiceSession(**clean_item)
-                if sess.session_type == "claim" and not sess.claim_reason:
-                    rid = sess.claim_reason_id or (sess.raw_data.get("reason_id") if isinstance(sess.raw_data, dict) else "")
-                    if not rid and "索赔原因: " in (sess.summary or ""):
-                        rid = sess.summary.split("索赔原因: ")[-1].strip()
-                    if rid:
-                        sess.claim_reason_id = rid
-                        sess.claim_reason = CLAIM_REASON_NAMES.get(rid, "买家投诉")
+                if sess.session_type == "claim":
+                    if not sess.claim_reason:
+                        rid = sess.claim_reason_id or (sess.raw_data.get("reason_id") if isinstance(sess.raw_data, dict) else "")
+                        if not rid and "索赔原因: " in (sess.summary or ""):
+                            rid = sess.summary.split("索赔原因: ")[-1].strip()
+                        if rid:
+                            sess.claim_reason_id = rid
+                            sess.claim_reason = CLAIM_REASON_NAMES.get(rid, "买家投诉")
+                    if not sess.return_status_label:
+                        raw_c = sess.raw_data if isinstance(sess.raw_data, dict) else {}
+                        if raw_c:
+                            lbl, code, det = resolve_claim_return_info(None, sess.account_id, raw_c)
+                            sess.return_status_label = lbl
+                            sess.return_status = code
+                            if det.get("shipment_id") and not sess.return_shipment_id:
+                                sess.return_shipment_id = det["shipment_id"]
+                            if det.get("tracking_number") and not sess.return_tracking_number:
+                                sess.return_tracking_number = det["tracking_number"]
+                            if det.get("destination") and not sess.return_destination:
+                                sess.return_destination = det["destination"]
                 for rm in raw_msgs:
                     if isinstance(rm, dict):
                         sess.messages.append(ServiceMessage(**rm))
@@ -740,6 +766,26 @@ class FetchConversationMessagesWorker(SafeWorkerBase):
                             self.session.affects_reputation = str(rep_res.get("affects_reputation") or "")
                     except Exception as rep_err:
                         logger.debug("Failed to get reputation impact for claim %s: %s", cid, rep_err)
+
+                # Fetch return reverse logistics if return-related and missing or not delivered yet
+                c_raw = self.session.raw_data or {}
+                c_type = str(c_raw.get("type") or "").lower()
+                rel = c_raw.get("related_entities") or []
+                is_ret = (c_type == "returns" or "return" in str(rel).lower() or bool(self.session.return_shipment_id))
+                if is_ret and (self.session.return_status_label not in ("包裹已到", "退款结案") or not self.session.return_tracking_number):
+                    try:
+                        lbl, code, det = resolve_claim_return_info(self.client, account_id, c_raw)
+                        if lbl and lbl != "常规索赔":
+                            self.session.return_status_label = lbl
+                            self.session.return_status = code
+                            if det.get("shipment_id"):
+                                self.session.return_shipment_id = det["shipment_id"]
+                            if det.get("tracking_number"):
+                                self.session.return_tracking_number = det["tracking_number"]
+                            if det.get("destination"):
+                                self.session.return_destination = det["destination"]
+                    except Exception as ret_err:
+                        logger.debug("Failed to resolve return logistics in worker for claim %s: %s", cid, ret_err)
 
                 raw_msgs = self.client.get_claim_messages(account_id, cid)
                 if isinstance(raw_msgs, list):
@@ -1400,7 +1446,7 @@ class FetchSessionsWorker(SafeWorkerBase):
             c_raw = s.raw_data or {}
             c_type = str(c_raw.get("type") or "").lower()
             rel_entities = str(c_raw.get("related_entities") or "").lower()
-            if (c_type == "returns" or "return" in rel_entities) and s.return_status_label not in ("包裹已到", "退款结案"):
+            if (c_type == "returns" or "return" in rel_entities or s.return_status_label in ("", "常规索赔", "退款结案")) and s.return_status_label != "包裹已到":
                 try:
                     lbl, code, det = resolve_claim_return_info(self.client, s.account_id, c_raw)
                     if lbl:
@@ -3787,7 +3833,7 @@ class ServiceCenterPage(QFrame):
             badge = QLabel(status_text)
             if status_text in ("退款结案", "已结案"):
                 badge.setStyleSheet(CARD_STYLE_GRAY)
-            elif status_text in ("包裹已到", "买家已寄"):
+            elif status_text in ("包裹已到", "退货在途", "买家已寄"):
                 badge.setStyleSheet(CARD_STYLE_BLUE)
             elif status_text in ("待我同意", "纠纷仲裁"):
                 badge.setStyleSheet(CARD_STYLE_RED)
@@ -4404,6 +4450,12 @@ class ServiceCenterPage(QFrame):
             target_sess.messages = messages
             if detected_buyer_name and (not target_sess.buyer_nickname or target_sess.buyer_nickname == "买家"):
                 target_sess.buyer_nickname = detected_buyer_name
+            for idx in range(self.session_list.count()):
+                it = self.session_list.item(idx)
+                if it and it.data(Qt.ItemDataRole.UserRole) == session_id:
+                    self.session_list.setItemWidget(it, self._create_session_item_widget(target_sess))
+                    break
+            self._update_tab_counts()
             save_sessions_snapshot(self._all_sessions)
 
         if not self._current_session or self._current_session.id != session_id:
@@ -4411,6 +4463,19 @@ class ServiceCenterPage(QFrame):
 
         if detected_buyer_name and (not self._current_session.buyer_nickname or self._current_session.buyer_nickname == "买家"):
             self._current_session.buyer_nickname = detected_buyer_name
+
+        if self._current_session.session_type == "claim":
+            status_cn = self._current_session.return_status_label or CLAIM_STAGE_NAMES.get(self._current_session.stage.lower(), self._current_session.stage)
+            self.chip_stage_lbl.setText(f"售后状态: <b style='color: #FBBF24;'>{status_cn}</b>")
+            tip = f"售后状态: {status_cn}"
+            if self._current_session.return_shipment_id:
+                tip += f"\n退货运单号: {self._current_session.return_shipment_id}"
+            if self._current_session.return_tracking_number:
+                tip += f"\n快递追踪号: {self._current_session.return_tracking_number}"
+            if self._current_session.return_destination:
+                tip += f"\n退货仓目的地: {self._current_session.return_destination}"
+            self.chip_stage_lbl.setToolTip(tip)
+            self.chip_stage_lbl.show()
 
         self._clear_chat_bubbles()
 

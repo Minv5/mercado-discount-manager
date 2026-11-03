@@ -2025,8 +2025,8 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         self.assertNotIn("●", badge_claim[0].text())
         self.assertNotIn("⚠️", badge_claim[0].text())
 
-        # 索赔退货各种4字状态验证（待我同意、买家待寄、买家已寄、包裹已到、纠纷仲裁、退款结案）
-        for expected_lbl in ("待我同意", "买家待寄", "买家已寄", "包裹已到", "纠纷仲裁"):
+        # 索赔退货各种4字状态验证（待我同意、买家待寄、退货在途、买家已寄、包裹已到、纠纷仲裁、退款结案）
+        for expected_lbl in ("待我同意", "买家待寄", "退货在途", "买家已寄", "包裹已到", "纠纷仲裁"):
             s_ret = ServiceSession(id="cr", session_type="claim", status="opened", return_status_label=expected_lbl, account_id="acc1", account_name="湖北店", site_id="MLM", buyer_nickname="BuyerR")
             w_ret = page._create_session_item_widget(s_ret)
             b_ret = [l for l in w_ret.findChildren(QLabel) if l.text() == expected_lbl]
@@ -2441,15 +2441,26 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         self.assertEqual(det["shipment_id"], "48328196731")
         self.assertEqual(len(lbl), 4)
 
-        # 5. Return package shipped -> 买家已寄
+        # 5. Return package shipped -> 退货在途 (matches official portal "退货运输中")
         mock_client.get_claim_returns.return_value = {
             "status": "shipped",
             "shipments": [{"status": "shipped", "tracking_number": "TRK123"}],
         }
         lbl, code, det = resolve_claim_return_info(mock_client, "acc1", {"id": "5", "status": "opened", "type": "returns"})
-        self.assertEqual(lbl, "买家已寄")
+        self.assertEqual(lbl, "退货在途")
         self.assertEqual(code, "shipped")
         self.assertEqual(det["tracking_number"], "TRK123")
+        self.assertEqual(len(lbl), 4)
+
+        # 5b. Closed claim with active return in-transit -> 退货在途 (CBT refund-on-scan case)
+        mock_client.get_claim_returns.return_value = {
+            "status": "shipped",
+            "shipments": [{"status": "shipped", "tracking_number": "AP653929805BR"}],
+        }
+        lbl, code, det = resolve_claim_return_info(mock_client, "acc1", {"id": "5599667871", "status": "closed", "type": "returns"})
+        self.assertEqual(lbl, "退货在途")
+        self.assertEqual(code, "shipped")
+        self.assertEqual(det["tracking_number"], "AP653929805BR")
         self.assertEqual(len(lbl), 4)
 
         # 6. Return package delivered to warehouse -> 包裹已到

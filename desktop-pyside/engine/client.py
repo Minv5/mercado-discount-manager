@@ -867,7 +867,13 @@ class MercadoClient:
     def get_claim_returns(self, account_id: str, claim_id: int | str) -> dict[str, Any]:
         """GET /post-purchase/v2/claims/{claim_id}/returns - Retrieve reverse logistics and return parcel status."""
         cid = str(claim_id).strip()
-        return self.request(account_id, "GET", f"/post-purchase/v2/claims/{cid}/returns")
+        try:
+            res = self.request(account_id, "GET", f"/post-purchase/v2/claims/{cid}/returns")
+            return res if isinstance(res, dict) else {}
+        except Exception as e:
+            if "404" in str(e):
+                return {}
+            raise
 
     def get_claim_messages(self, account_id: str, claim_id: int | str) -> list[dict[str, Any]]:
         """GET /post-purchase/v1/claims/{claim_id}/messages - Fetch mediation conversation stream."""

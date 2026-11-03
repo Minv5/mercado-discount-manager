@@ -124,6 +124,8 @@ class ServiceSession:
             st = (self.status or "").lower()
             return st == "unanswered" or (self.can_reply and st != "answered")
         elif self.session_type == "claim":
+            if self.return_status_label in ("退货在途", "买家待寄", "待我同意"):
+                return True
             return (self.status or "").lower() == "opened"
         elif self.session_type == "message":
             return bool(self.is_unread)
