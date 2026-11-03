@@ -265,7 +265,15 @@ def resolve_claim_return_info(client: Any, aid: str, claim_data: dict[str, Any])
         except Exception as e:
             logger.debug("Failed to fetch returns for claim %s: %s", cid, e)
 
-    # 2. Check seller actions for allow_return (pending seller consent)
+    # 2. Closed claims (if not in active reverse logistics transit)
+    if status == "closed":
+        resolution = claim_data.get("resolution") or {}
+        closed_by = str(resolution.get("closed_by") or "").lower()
+        if stage == "dispute" or closed_by == "mediator":
+            return "调解完成", "dispute_resolved", details
+        return "退款结案", "closed", details
+
+    # 3. Check seller actions for allow_return (pending seller consent)
     has_allow_return = False
     for p in claim_data.get("players") or []:
         if p.get("role") in ("respondent", "seller"):
@@ -277,13 +285,9 @@ def resolve_claim_return_info(client: Any, aid: str, claim_data: dict[str, Any])
     if has_allow_return:
         return "待我同意", "allow_return", details
 
-    # 3. Stage is dispute (platform arbitration)
+    # 4. Active dispute stage (platform arbitration in progress)
     if stage == "dispute":
         return "纠纷仲裁", "dispute", details
-
-    # 4. Closed claims (if not in active return transit)
-    if status == "closed":
-        return "退款结案", "closed", details
 
     # 5. Fallback for return claim without client yet
     if is_return_related and client is None:
@@ -767,12 +771,24 @@ class FetchConversationMessagesWorker(SafeWorkerBase):
                     except Exception as rep_err:
                         logger.debug("Failed to get reputation impact for claim %s: %s", cid, rep_err)
 
-                # Fetch return reverse logistics if return-related and missing or not delivered yet
+                # Ensure fresh claim metadata if missing or unpopulated
                 c_raw = self.session.raw_data or {}
+                if not c_raw or not c_raw.get("type") or not self.session.return_status_label or self.session.return_status_label in ("常规索赔", "纠纷仲裁"):
+                    try:
+                        fresh_dt = self.client.get_claim_detail(account_id, cid)
+                        if isinstance(fresh_dt, dict) and fresh_dt.get("id"):
+                            c_raw = fresh_dt
+                            self.session.raw_data = fresh_dt
+                            self.session.status = str(fresh_dt.get("status") or self.session.status)
+                            self.session.stage = str(fresh_dt.get("stage") or self.session.stage)
+                    except Exception as dt_err:
+                        logger.debug("Failed to fetch claim detail for claim %s: %s", cid, dt_err)
+
+                # Fetch return reverse logistics or update claim status if needed
                 c_type = str(c_raw.get("type") or "").lower()
                 rel = c_raw.get("related_entities") or []
                 is_ret = (c_type == "returns" or "return" in str(rel).lower() or bool(self.session.return_shipment_id))
-                if is_ret and (self.session.return_status_label not in ("包裹已到", "退款结案") or not self.session.return_tracking_number):
+                if is_ret or not self.session.return_status_label or self.session.return_status_label in ("常规索赔", "纠纷仲裁"):
                     try:
                         lbl, code, det = resolve_claim_return_info(self.client, account_id, c_raw)
                         if lbl and lbl != "常规索赔":
@@ -1296,11 +1312,10 @@ class FetchSessionsWorker(SafeWorkerBase):
                         break
                     for item in c_list:
                         results.append((item, s_id, c_uid, status_val))
-                    if status_val == "closed":
-                        break
                     total = c_res.get("paging", {}).get("total", 0)
                     offset += len(c_list)
-                    if offset >= total or len(c_list) < page_size or offset >= 100:
+                    max_offset = 100
+                    if offset >= total or len(c_list) < page_size or offset >= max_offset:
                         break
                 except Exception as c_err:
                     logger.warning("Error fetching %s claims for %s %s: %s", status_val, aid, c_uid, c_err)
@@ -1446,7 +1461,7 @@ class FetchSessionsWorker(SafeWorkerBase):
             c_raw = s.raw_data or {}
             c_type = str(c_raw.get("type") or "").lower()
             rel_entities = str(c_raw.get("related_entities") or "").lower()
-            if (c_type == "returns" or "return" in rel_entities or s.return_status_label in ("", "常规索赔", "退款结案")) and s.return_status_label != "包裹已到":
+            if (c_type == "returns" or "return" in rel_entities or s.return_status_label in ("", "常规索赔", "退款结案", "纠纷仲裁")) and s.return_status_label != "包裹已到":
                 try:
                     lbl, code, det = resolve_claim_return_info(self.client, s.account_id, c_raw)
                     if lbl:
@@ -3824,14 +3839,18 @@ class ServiceCenterPage(QFrame):
             status_text = session.return_status_label
             if not status_text:
                 if session.status == "closed":
-                    status_text = "退款结案"
+                    resolution = (session.raw_data or {}).get("resolution") or {}
+                    if session.stage == "dispute" or resolution.get("closed_by") == "mediator":
+                        status_text = "调解完成"
+                    else:
+                        status_text = "退款结案"
                 elif session.stage == "dispute":
                     status_text = "纠纷仲裁"
                 else:
                     status_text = "常规索赔"
 
             badge = QLabel(status_text)
-            if status_text in ("退款结案", "已结案"):
+            if status_text in ("退款结案", "调解完成", "已结案"):
                 badge.setStyleSheet(CARD_STYLE_GRAY)
             elif status_text in ("包裹已到", "退货在途", "买家已寄"):
                 badge.setStyleSheet(CARD_STYLE_BLUE)
@@ -3874,6 +3893,12 @@ class ServiceCenterPage(QFrame):
         # Snippet text or product title / claim complaint reason info
         if session.session_type == "claim":
             stage_cn = CLAIM_STAGE_NAMES.get(session.stage, session.stage)
+            if session.status == "closed":
+                resolution = (session.raw_data or {}).get("resolution") or {}
+                if session.stage == "dispute" or resolution.get("closed_by") == "mediator":
+                    stage_cn = "调解完成"
+                else:
+                    stage_cn = "售后结案"
             reason_txt = session.claim_reason or (CLAIM_REASON_NAMES.get(session.claim_reason_id, "") if session.claim_reason_id else "")
             if not reason_txt and "索赔原因: " in (session.summary or ""):
                 rid = session.summary.split("索赔原因: ")[-1].strip()
@@ -4240,7 +4265,9 @@ class ServiceCenterPage(QFrame):
         if session.pack_id and session.pack_id != session.order_id:
             link_parts.append(f"包裹号: <b>{session.pack_id}</b>")
         if session.session_type == "claim":
-            status_desc = session.return_status_label or (CLAIM_STAGE_NAMES.get(session.stage.lower(), session.stage) if session.stage else "")
+            status_desc = session.return_status_label
+            if not status_desc or status_desc == "常规索赔":
+                status_desc = CLAIM_STAGE_NAMES.get(session.stage.lower(), session.stage) if session.stage else "常规索赔"
             if status_desc:
                 link_parts.append(f"售后状态: <b>{status_desc}</b>")
             if session.return_shipment_id:

@@ -2025,8 +2025,8 @@ class TestServiceCenterSnapshot(unittest.TestCase):
         self.assertNotIn("●", badge_claim[0].text())
         self.assertNotIn("⚠️", badge_claim[0].text())
 
-        # 索赔退货各种4字状态验证（待我同意、买家待寄、退货在途、买家已寄、包裹已到、纠纷仲裁、退款结案）
-        for expected_lbl in ("待我同意", "买家待寄", "退货在途", "买家已寄", "包裹已到", "纠纷仲裁"):
+        # 索赔退货各种4字状态验证（待我同意、买家待寄、退货在途、买家已寄、包裹已到、纠纷仲裁、调解完成、退款结案）
+        for expected_lbl in ("待我同意", "买家待寄", "退货在途", "买家已寄", "包裹已到", "纠纷仲裁", "调解完成"):
             s_ret = ServiceSession(id="cr", session_type="claim", status="opened", return_status_label=expected_lbl, account_id="acc1", account_name="湖北店", site_id="MLM", buyer_nickname="BuyerR")
             w_ret = page._create_session_item_widget(s_ret)
             b_ret = [l for l in w_ret.findChildren(QLabel) if l.text() == expected_lbl]
@@ -2403,10 +2403,16 @@ class TestServiceCenterSnapshot(unittest.TestCase):
 
         mock_client = MagicMock()
 
-        # 1. Closed claim -> 退款结案
+        # 1. Closed claim without dispute -> 退款结案
         lbl, code, det = resolve_claim_return_info(mock_client, "acc1", {"id": "1", "status": "closed"})
         self.assertEqual(lbl, "退款结案")
         self.assertEqual(code, "closed")
+        self.assertEqual(len(lbl), 4)
+
+        # 1b. Closed claim with dispute / mediator coverage -> 调解完成
+        lbl, code, det = resolve_claim_return_info(mock_client, "acc1", {"id": "1b", "status": "closed", "stage": "dispute"})
+        self.assertEqual(lbl, "调解完成")
+        self.assertEqual(code, "dispute_resolved")
         self.assertEqual(len(lbl), 4)
 
         # 2. Dispute stage -> 纠纷仲裁

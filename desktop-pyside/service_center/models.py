@@ -126,6 +126,8 @@ class ServiceSession:
         elif self.session_type == "claim":
             if self.return_status_label in ("退货在途", "买家待寄", "待我同意"):
                 return True
+            if self.return_status_label in ("调解完成", "退款结案", "包裹已到"):
+                return False
             return (self.status or "").lower() == "opened"
         elif self.session_type == "message":
             return bool(self.is_unread)
