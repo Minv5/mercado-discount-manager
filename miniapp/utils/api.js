@@ -3,7 +3,7 @@
  * 已打通移动端公网安全网关，直连美客多真实店铺数据与买家回复通道
  */
 
-const DEFAULT_GATEWAY_URL = "https://traditional-signature-rooms-blocks.trycloudflare.com";
+const DEFAULT_GATEWAY_URL = "https://awareness-reid-benchmark-army.trycloudflare.com";
 
 function getBaseUrl() {
   const custom = wx.getStorageSync("custom_gateway_url");

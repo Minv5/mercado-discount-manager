@@ -127,16 +127,27 @@ def compute_overview(store_name: str | None = None) -> dict[str, Any]:
         and not s.get("is_read")
     )
 
-    # 统计真实订单总数与金额
+    # 严格按当天日期（本地与UTC匹配）统计【今日实时】新单与销售额
+    now_date_str = time.strftime("%Y-%m-%d", time.localtime())
+    today_orders_list = [
+        o for o in orders
+        if str(o.get("date_created", "")).startswith(now_date_str)
+    ]
+    today_order_count = len(today_orders_list)
+    today_sales = sum(float(o.get("paid_amount") or o.get("total_amount") or 0.0) for o in today_orders_list)
+
+    # 统计历史累计与当前待打单发货
     total_orders = len(orders)
     pending_ship = sum(1 for o in orders if str(o.get("status", "")).lower() in ("paid", "confirmed"))
     total_sales = sum(float(o.get("paid_amount") or o.get("total_amount") or 0.0) for o in orders)
 
     return {
         "store_name": store_name or "全部店铺",
-        "today_orders": total_orders,
-        "today_sales": round(total_sales, 2),
+        "today_orders": today_order_count,
+        "today_sales": round(today_sales, 2),
         "pending_ship": pending_ship,
+        "total_orders": total_orders,
+        "total_sales": round(total_sales, 2),
         "pending_questions": pending_questions,
         "pending_messages": message_count,
         "pending_claims": claim_count,

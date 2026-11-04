@@ -20,22 +20,26 @@
   <!-- 今日业绩大盘 -->
   <view class="card stat-card">
     <view class="section-title">
-      <text>📊 今日销售概览</text>
+      <text>📊 今日实时销售概览</text>
       <text class="refresh-time text-muted">{{refreshTime}} 更新</text>
     </view>
     <view class="stat-grid">
       <view class="stat-item" bindtap="goToOrders">
-        <text class="stat-value text-blue">{{todayStats.orderCount}}</text>
+        <text class="stat-value text-blue">{{todayStats.todayOrderCount}}</text>
         <text class="stat-label">今日新订单 (单)</text>
       </view>
       <view class="stat-item">
-        <text class="stat-value text-green">${{todayStats.salesAmount}}</text>
-        <text class="stat-label">今日预估销售额</text>
+        <text class="stat-value text-green">${{todayStats.todaySalesAmount}}</text>
+        <text class="stat-label">今日新增销售额</text>
       </view>
       <view class="stat-item" bindtap="goToOrders">
         <text class="stat-value text-orange">{{todayStats.pendingShipCount}}</text>
-        <text class="stat-label">待打单发货</text>
+        <text class="stat-label">待打单发货 (待办)</text>
       </view>
+    </view>
+    <view class="stat-sub-bar" bindtap="goToOrders">
+      <text class="sub-text text-muted">📦 店铺已同步订单: <text class="text-gold font-bold">{{todayStats.totalOrderCount}}</text> 单 · 累计流水: <text class="text-gold font-bold">${{todayStats.totalSalesAmount}}</text></text>
+      <text class="sub-arrow">全部订单 ➔</text>
     </view>
   </view>
 

@@ -8,9 +8,11 @@ Page({
     currentStore: {},
     refreshTime: "刚刚",
     todayStats: {
-      orderCount: 12,
-      salesAmount: "3,820.50",
-      pendingShipCount: 5
+      todayOrderCount: 0,
+      todaySalesAmount: "0.00",
+      pendingShipCount: 0,
+      totalOrderCount: 0,
+      totalSalesAmount: "0.00"
     },
     todo: {
       questions: 3,
@@ -70,6 +72,11 @@ Page({
     ]).then(([qList, mList, cList, oList]) => {
       const pendingQuestions = qList.filter(q => q.status === "UNANSWERED" || q.status === "unanswered").length;
       const pendingClaims = cList.filter(c => c.stage !== "closed" && c.status !== "closed").length;
+      // 严格统计今日（当天）实时新单与销售额
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayOrders = oList.filter(o => (o.created_at || "").slice(0, 10) === todayStr);
+      const todaySales = todayOrders.reduce((acc, o) => acc + (Number(o.total_amount) || 0), 0);
+
       const totalSales = oList.reduce((acc, o) => acc + (Number(o.total_amount) || 0), 0);
       const pendingShip = oList.filter(o => o.status === "paid" || o.status === "confirmed").length;
 
@@ -78,9 +85,11 @@ Page({
         "todo.questions": pendingQuestions,
         "todo.messages": mList.reduce((acc, m) => acc + (m.unread_count || 0), 0),
         "todo.claims": pendingClaims,
-        "todayStats.orderCount": oList.length,
-        "todayStats.salesAmount": totalSales.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-        "todayStats.pendingShipCount": pendingShip
+        "todayStats.todayOrderCount": todayOrders.length,
+        "todayStats.todaySalesAmount": todaySales.toFixed(2),
+        "todayStats.pendingShipCount": pendingShip,
+        "todayStats.totalOrderCount": oList.length,
+        "todayStats.totalSalesAmount": totalSales.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
       });
       if (typeof callback === "function") callback();
     }).catch(() => {

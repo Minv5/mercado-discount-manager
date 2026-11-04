@@ -176,3 +176,21 @@
   font-size: 24rpx;
   color: #E6E2D8;
 }
+
+.stat-sub-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #18201C;
+  border: 1rpx solid #2B352E;
+  margin-top: 16rpx;
+  padding: 12rpx 14rpx;
+  border-radius: 8rpx;
+  font-size: 20rpx;
+}
+
+.sub-arrow {
+  color: #D4AF37;
+  font-size: 20rpx;
+  flex-shrink: 0;
+}
