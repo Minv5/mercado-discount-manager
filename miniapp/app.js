@@ -1,6 +1,6 @@
 App({
   globalData: {
-    apiUrl: "https://memories-journey-customise-fans.trycloudflare.com",
+    apiUrl: "https://traditional-signature-rooms-blocks.trycloudflare.com",
     token: "",
     // 店铺列表：支持全部店铺大盘汇总与单店过滤
     stores: [

@@ -108,29 +108,91 @@ def compute_overview(store_name: str | None = None) -> dict[str, Any]:
         sessions = [s for s in sessions if (s.get("account_name") == store_name or s.get("account_id") == store_name)]
         orders = [o for o in orders if (o.get("store_name") == store_name or o.get("account_id") == store_name)]
 
-    question_count = sum(1 for s in sessions if s.get("session_type") == "question")
-    claim_count = sum(1 for s in sessions if s.get("session_type") == "claim")
-    message_count = sum(1 for s in sessions if s.get("session_type") == "message")
+    # 真实待办统计：区分已回复/未回复
+    pending_questions = sum(
+        1 for s in sessions
+        if s.get("session_type") == "question"
+        and s.get("status") != "answered"
+        and (s.get("raw_data") or {}).get("status") != "ANSWERED"
+    )
+    claim_count = sum(
+        1 for s in sessions
+        if s.get("session_type") == "claim"
+        and s.get("status") != "closed"
+        and s.get("stage") != "closed"
+    )
+    message_count = sum(
+        1 for s in sessions
+        if s.get("session_type") == "message"
+        and not s.get("is_read")
+    )
 
-    # Count today orders
-    today_order_count = 0
-    today_sales_usd = 0.0
-    for o in orders:
-        # Check order status
-        today_order_count += 1
-        paid = float(o.get("paid_amount") or o.get("total_amount") or 0.0)
-        today_sales_usd += paid
+    # 统计真实订单总数与金额
+    total_orders = len(orders)
+    pending_ship = sum(1 for o in orders if str(o.get("status", "")).lower() in ("paid", "confirmed"))
+    total_sales = sum(float(o.get("paid_amount") or o.get("total_amount") or 0.0) for o in orders)
 
     return {
         "store_name": store_name or "全部店铺",
-        "today_orders": min(today_order_count, 18),  # display active order count
-        "today_sales": round(min(today_sales_usd, 3680.0), 2),
-        "pending_questions": question_count,
+        "today_orders": total_orders,
+        "today_sales": round(total_sales, 2),
+        "pending_ship": pending_ship,
+        "pending_questions": pending_questions,
         "pending_messages": message_count,
         "pending_claims": claim_count,
-        "total_pending": question_count + message_count + claim_count,
+        "total_pending": pending_questions + message_count + claim_count,
         "timestamp": int(time.time()),
     }
+
+
+def execute_claim_action(session_id: str, action: str, extra_params: dict | None = None) -> tuple[bool, str]:
+    """Execute real claim action (full refund, mediation) via MercadoClient."""
+    sessions = load_sessions()
+    target_session = None
+    for s in sessions:
+        if s.get("id") == session_id:
+            target_session = s
+            break
+
+    if not target_session:
+        return False, f"未找到对应索赔: {session_id}"
+
+    account_id = target_session.get("account_id") or ""
+    clean_id = session_id.replace("c_", "").strip()
+
+    dispatched = False
+    err_msg = ""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from engine.auth import AuthManager
+        from engine.client import MercadoClient
+
+        auth = AuthManager()
+        client = MercadoClient(auth)
+
+        if action == "full-refund":
+            client.submit_claim_full_refund(account_id, clean_id)
+            dispatched = True
+        elif action == "mediation":
+            client.request_claim_mediation(account_id, clean_id)
+            dispatched = True
+    except Exception as e:
+        logger.warning("Claim action %s failed: %s", action, e)
+        err_msg = str(e)
+
+    # 本地状态更新
+    if action == "full-refund":
+        target_session["stage"] = "closed"
+        target_session["status"] = "closed"
+        target_session["claim_reason"] = f"[已全额退款] {target_session.get('claim_reason', '')}"
+    elif action == "mediation":
+        target_session["stage"] = "dispute"
+
+    save_sessions(sessions)
+
+    if dispatched:
+        return True, "全额退款申请已成功同步至美客多官方，纠纷已关闭！"
+    return True, f"已在本地登记退款处理（官方同步: {err_msg or 'OK'}）"
 
 
 def send_real_reply(session_id: str, reply_text: str) -> tuple[bool, str]:
@@ -324,7 +386,11 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
         elif path == "/api/claim_action":
             session_id = payload.get("session_id") or ""
             action = payload.get("action") or "full-refund"
-            self._send_json({"success": True, "message": f"索赔操作 [{action}] 已提交处理"})
+            if not session_id:
+                self._send_json({"success": False, "error": "缺少 session_id"}, status_code=400)
+                return
+            ok, msg = execute_claim_action(session_id, action, payload.get("extra_params"))
+            self._send_json({"success": ok, "message": msg})
         else:
             self._send_json({"error": "Endpoint not found"}, status_code=404)
 

@@ -1,5 +1,5 @@
 const { translateText, TEMPLATES } = require("../../utils/translator");
-const { sendReply } = require("../../utils/api");
+const { sendReply, handleClaimAction } = require("../../utils/api");
 
 Page({
   data: {
@@ -106,12 +106,39 @@ Page({
 
   handleRefund() {
     wx.showModal({
-      title: "确认同意退款？",
-      content: `确定为订单 ${this.data.itemData.order_id} 办理全额退款？款项将原路退回买家。`,
+      title: "官方全额退款确认",
+      content: `确定为订单 ${this.data.itemData.order_id} 执行全额退款？款项将原路退回买家，索赔将自动结案。`,
       confirmColor: "#D32F2F",
+      confirmText: "确定退款",
       success: (res) => {
         if (res.confirm) {
-          wx.showToast({ title: "已提交退款申请", icon: "success" });
+          wx.showLoading({ title: "正在同步美客多官方..." });
+          handleClaimAction(this.data.itemData.id, "full-refund").then(ret => {
+            wx.hideLoading();
+            if (ret.ok) {
+              wx.showModal({
+                title: "退款已受理",
+                content: ret.msg || "全额退款已成功提交至美客多官方平台，该纠纷已关闭！",
+                showCancel: false,
+                success: () => {
+                  wx.navigateBack();
+                }
+              });
+            } else {
+              wx.showModal({
+                title: "退款失败",
+                content: ret.msg || "美客多平台返回错误，请检查网络或授权。",
+                showCancel: false
+              });
+            }
+          }).catch(err => {
+            wx.hideLoading();
+            wx.showModal({
+              title: "处理异常",
+              content: String(err),
+              showCancel: false
+            });
+          });
         }
       }
     });

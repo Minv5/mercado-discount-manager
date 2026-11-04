@@ -304,3 +304,16 @@
   font-size: 28rpx;
   color: #777266;
 }
+
+.btn-answered {
+  background: #202820 !important;
+  color: #8C877B !important;
+  border: 1rpx solid #353022 !important;
+}
+
+.btn-urgent {
+  background: #2F6B3F !important;
+  color: #F6F3EA !important;
+  border: 1rpx solid #6E5D2A !important;
+  box-shadow: 0 4rpx 12rpx rgba(47, 107, 63, 0.4);
+}

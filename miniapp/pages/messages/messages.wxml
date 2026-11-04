@@ -49,7 +49,9 @@
 
         <view class="card-footer">
           <text class="buyer-name text-muted">提问买家: {{item.buyer_name}}</text>
-          <view class="btn-reply">立即回复 (带双语翻译) ➔</view>
+          <view class="btn-reply {{item.status === 'ANSWERED' || item.status === 'answered' ? 'btn-answered' : 'btn-urgent'}}">
+            {{item.status === 'ANSWERED' || item.status === 'answered' ? '✅ 已回复 (查看记录)' : '⚡ 立即回复 (双语翻译) ➔'}}
+          </view>
         </view>
       </view>
 

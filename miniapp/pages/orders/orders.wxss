@@ -163,3 +163,185 @@
   font-size: 28rpx;
   color: #777266;
 }
+
+/* 订单全景抽屉 */
+.drawer-mask {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.7);
+  z-index: 999;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.drawer-content {
+  background: #1C231F;
+  border-top: 1rpx solid #4E472F;
+  border-top-left-radius: 28rpx;
+  border-top-right-radius: 28rpx;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  padding: 30rpx 28rpx;
+}
+
+.drawer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 20rpx;
+  border-bottom: 1rpx solid #2B352E;
+}
+
+.drawer-title-row {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+}
+
+.drawer-badge {
+  background: #203A2B;
+  color: #4CAF50;
+  border: 1rpx solid #2F6B3F;
+  font-size: 22rpx;
+  padding: 4rpx 14rpx;
+  border-radius: 6rpx;
+}
+
+.drawer-status {
+  font-size: 26rpx;
+  font-weight: bold;
+}
+
+.close-btn {
+  font-size: 36rpx;
+  color: #C8C3B7;
+  padding: 10rpx;
+}
+
+.drawer-scroll {
+  flex: 1;
+  max-height: 65vh;
+  margin-top: 20rpx;
+}
+
+.section-box {
+  background: #171B19;
+  border: 1rpx solid #353022;
+  border-radius: 16rpx;
+  padding: 20rpx;
+  margin-bottom: 20rpx;
+}
+
+.box-title {
+  font-size: 26rpx;
+  font-weight: bold;
+  color: #D4AF37;
+  margin-bottom: 16rpx;
+  border-bottom: 1rpx dashed #2B352E;
+  padding-bottom: 10rpx;
+}
+
+.box-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  padding: 10rpx 0;
+  font-size: 24rpx;
+}
+
+.box-row .k {
+  color: #C8C3B7;
+  flex-shrink: 0;
+  width: 170rpx;
+}
+
+.box-row .v {
+  color: #F6F3EA;
+  word-break: break-all;
+}
+
+.v-btn-row {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+}
+
+.v-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  flex: 1;
+}
+
+.mini-copy-btn {
+  background: #2D2619;
+  color: #D4AF37;
+  border: 1rpx solid #6E5D2A;
+  font-size: 20rpx;
+  padding: 4rpx 16rpx;
+  border-radius: 20rpx;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.product-item-row {
+  display: flex;
+  gap: 16rpx;
+  padding: 12rpx 0;
+  border-bottom: 1rpx solid #202820;
+}
+
+.product-item-row:last-child {
+  border-bottom: none;
+}
+
+.p-thumb {
+  width: 90rpx;
+  height: 90rpx;
+  border-radius: 8rpx;
+  background: #202820;
+  border: 1rpx solid #353022;
+  flex-shrink: 0;
+}
+
+.p-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4rpx;
+}
+
+.p-title {
+  font-size: 24rpx;
+  color: #F6F3EA;
+  line-height: 1.3;
+}
+
+.p-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 20rpx;
+}
+
+.p-price {
+  font-size: 24rpx;
+  font-weight: 500;
+}
+
+.drawer-footer {
+  margin-top: 20rpx;
+  padding-top: 10rpx;
+}
+
+.btn-primary {
+  background: #2F6B3F;
+  color: #F6F3EA;
+  font-size: 28rpx;
+  border-radius: 36rpx;
+  border: 1rpx solid #6E5D2A;
+}

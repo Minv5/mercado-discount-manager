@@ -7,7 +7,9 @@ Page({
     orders: [],
     filteredOrders: [],
     filterStatus: "all",
-    searchQuery: ""
+    searchQuery: "",
+    showOrderDrawer: false,
+    currentOrder: {}
   },
 
   onShow() {
@@ -60,18 +62,37 @@ Page({
     const filtered = this.data.orders.filter(o => 
       o.order_id.toLowerCase().includes(q) ||
       (o.buyer_name && o.buyer_name.toLowerCase().includes(q)) ||
-      (o.item_title && o.item_title.toLowerCase().includes(q))
+      (o.item_title && o.item_title.toLowerCase().includes(q)) ||
+      (o.tracking_number && o.tracking_number.toLowerCase().includes(q))
     );
     this.setData({ filteredOrders: filtered });
   },
 
   openOrderDetail(e) {
     const order = e.currentTarget.dataset.order;
-    wx.showModal({
-      title: `订单 #${order.order_id}`,
-      content: `店铺: ${order.store_name} (${order.site_id})\n买家: ${order.buyer_name}\n收件城市: ${order.shipping_city}\n总金额: ${order.amount_formatted}\n状态: ${order.status_text}`,
-      showCancel: false,
-      confirmText: "知道了"
+    this.setData({
+      currentOrder: order,
+      showOrderDrawer: true
+    });
+  },
+
+  closeOrderDrawer() {
+    this.setData({ showOrderDrawer: false });
+  },
+
+  preventProp() {},
+
+  copyText(e) {
+    const text = e.currentTarget.dataset.text;
+    if (!text) return;
+    wx.setClipboardData({
+      data: String(text),
+      success() {
+        wx.showToast({
+          title: "已复制到剪贴板",
+          icon: "success"
+        });
+      }
     });
   }
 });

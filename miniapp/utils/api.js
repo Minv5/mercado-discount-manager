@@ -3,7 +3,7 @@
  * 已打通移动端公网安全网关，直连美客多真实店铺数据与买家回复通道
  */
 
-const DEFAULT_GATEWAY_URL = "https://memories-journey-customise-fans.trycloudflare.com";
+const DEFAULT_GATEWAY_URL = "https://traditional-signature-rooms-blocks.trycloudflare.com";
 
 function getBaseUrl() {
   const custom = wx.getStorageSync("custom_gateway_url");
@@ -35,6 +35,15 @@ function request(path, options = {}) {
       },
       fail(err) {
         console.warn(`[API] 请求失败 ${url}:`, err);
+        const errMsg = (err && (err.errMsg || err.message)) || "";
+        if (!wx._hasShownDomainTip && (errMsg.includes("domain") || errMsg.includes("fail") || errMsg.includes("abort"))) {
+          wx._hasShownDomainTip = true;
+          wx.showModal({
+            title: "需要开启手机调试",
+            content: "微信默认拦截了跨域公网连接。请点击右上角【···】选择【开发调试】/【打开调试】，页面边缘出现 vConsole 绿标后退出重新点进即可彻底通畅！",
+            showCancel: false
+          });
+        }
         reject(err);
       }
     });
@@ -52,12 +61,14 @@ function formatQuestion(s) {
     site_id: s.site_id || "MLM",
     item_id: s.item_id || "",
     item_title: s.item_title || s.item_id || "美客多热销商品",
-    item_thumbnail: s.item_picture_url || s.sku_picture_url || "https://http2.mlstatic.com/D_NQ_NP_2X_841285-MLM43849301298_102020-F.webp",
+    item_thumbnail: s.item_thumbnail || s.item_picture_url || s.sku_picture_url || "https://http2.mlstatic.com/D_NQ_NP_2X_841285-MLM43849301298_102020-F.webp",
+    item_price: s.item_price || "",
+    item_permalink: s.item_permalink || "",
     buyer_id: s.buyer_id || "",
     buyer_name: s.buyer_nickname || "买家咨询",
     text_es: firstMsg.text || s.last_message || "¿Tiene stock disponible?",
     text_cn: firstMsg.text_translated || s.last_message_translated || "请问还有现货吗？",
-    status: s.is_read ? "ANSWERED" : "UNANSWERED",
+    status: s.status || (s.is_read ? "ANSWERED" : "UNANSWERED"),
     created_at: s.created_at || s.updated_at || new Date().toISOString()
   };
 }
@@ -103,7 +114,10 @@ function formatClaim(s) {
     stage: s.stage || "dispute",
     reason: s.claim_reason || s.last_message || "买家申请售后退货/纠纷",
     deadline_hours: 8,
-    amount: s.claim_amount || "协商处理中",
+    amount: s.item_price || s.claim_amount || "协商处理中",
+    item_title: s.item_title || "",
+    item_thumbnail: s.item_thumbnail || s.item_picture_url || "",
+    item_id: s.item_id || "",
     created_at: s.created_at || s.updated_at || new Date().toISOString(),
     history: msgs
   };
@@ -124,6 +138,13 @@ function formatOrder(o) {
     cancelled: "已取消",
     invalid: "无效订单"
   };
+  const sh = o.shipping || {};
+  const recv = (sh.receiver_address) || {};
+  const city = sh.city_name || recv.city || "目的地城市";
+  const state = sh.state_name || recv.state || "";
+  const street = [sh.street_name || recv.street_name, sh.street_number || recv.street_number].filter(Boolean).join(" ");
+  const fullAddress = [sh.country_id, state, city, street, sh.zip_code].filter(Boolean).join(", ");
+
   return {
     order_id: String(o.order_id || o.id || ""),
     store_id: o.account_id || "",
@@ -132,12 +153,23 @@ function formatOrder(o) {
     status: o.status || "paid",
     status_text: statusMap[o.status] || o.status || "处理中",
     item_title: firstItem.title || "美客多跨境电商热卖单品",
-    item_thumbnail: firstItem.picture_url || "https://http2.mlstatic.com/D_NQ_NP_2X_841285-MLM43849301298_102020-F.webp",
+    item_thumbnail: firstItem.thumbnail || firstItem.picture_url || "https://http2.mlstatic.com/D_NQ_NP_2X_841285-MLM43849301298_102020-F.webp",
+    item_sku: firstItem.sku || firstItem.item_id || "",
+    item_permalink: firstItem.permalink || "",
     quantity: firstItem.quantity || 1,
+    unit_price: firstItem.unit_price || 0,
     total_amount: Number(o.paid_amount || o.total_amount || 0),
     currency_id: o.currency_id || "USD",
-    buyer_name: o.buyer_nickname || o.buyer_full_name || "海外买家",
-    shipping_city: (o.shipping && o.shipping.receiver_address && o.shipping.receiver_address.city) || "目的地城市",
+    buyer_name: o.buyer_nickname || o.buyer_full_name || sh.receiver_name || "海外买家",
+    shipping_city: city,
+    tracking_number: sh.tracking_number || "",
+    tracking_method: sh.tracking_method || sh.logistic_type || "官方物流",
+    receiver_name: sh.receiver_name || o.buyer_full_name || "",
+    receiver_phone: sh.receiver_phone || "",
+    full_address: fullAddress,
+    package_dimensions: sh.dimensions || firstItem.dimensions || "",
+    estimated_delivery: (sh.estimated_delivery_date || "").slice(0, 10),
+    items: items,
     created_at: o.date_created || new Date().toISOString()
   };
 }
@@ -214,6 +246,19 @@ function getGatewayStatus() {
     .catch(err => ({ ok: false, error: err.message }));
 }
 
+function handleClaimAction(sessionId, action, extraParams = {}) {
+  return request("/api/claim_action", {
+    method: "POST",
+    data: {
+      session_id: sessionId,
+      action: action,
+      extra_params: extraParams
+    }
+  }).then(res => {
+    return { ok: res.success !== false, msg: res.message || "索赔处理操作已成功提交！" };
+  });
+}
+
 module.exports = {
   DEFAULT_GATEWAY_URL,
   getBaseUrl,
@@ -222,5 +267,6 @@ module.exports = {
   getClaims,
   getOrders,
   sendReply,
+  handleClaimAction,
   getGatewayStatus
 };

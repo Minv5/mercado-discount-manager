@@ -68,13 +68,19 @@ Page({
       getClaims(store.id),
       getOrders(store.id)
     ]).then(([qList, mList, cList, oList]) => {
+      const pendingQuestions = qList.filter(q => q.status === "UNANSWERED" || q.status === "unanswered").length;
+      const pendingClaims = cList.filter(c => c.stage !== "closed" && c.status !== "closed").length;
+      const totalSales = oList.reduce((acc, o) => acc + (Number(o.total_amount) || 0), 0);
+      const pendingShip = oList.filter(o => o.status === "paid" || o.status === "confirmed").length;
+
       this.setData({
         refreshTime: timeStr,
-        "todo.questions": qList.filter(q => q.status === "UNANSWERED").length,
+        "todo.questions": pendingQuestions,
         "todo.messages": mList.reduce((acc, m) => acc + (m.unread_count || 0), 0),
-        "todo.claims": cList.length,
+        "todo.claims": pendingClaims,
         "todayStats.orderCount": oList.length,
-        "todayStats.pendingShipCount": oList.filter(o => o.status === "paid").length
+        "todayStats.salesAmount": totalSales.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+        "todayStats.pendingShipCount": pendingShip
       });
       if (typeof callback === "function") callback();
     }).catch(() => {

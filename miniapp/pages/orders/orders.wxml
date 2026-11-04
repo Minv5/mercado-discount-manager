@@ -1,7 +1,7 @@
 <view class="container">
   <!-- 搜索栏与状态筛选 -->
   <view class="search-box">
-    <input class="search-input" placeholder="输入订单号 / 买家姓名搜索..." bindinput="onSearchInput" value="{{searchQuery}}" />
+    <input class="search-input" placeholder="输入订单号 / 买家姓名 / 商品搜索..." bindinput="onSearchInput" value="{{searchQuery}}" />
   </view>
 
   <view class="filter-tabs">
@@ -19,7 +19,7 @@
           <text class="site-tag">{{item.site_id}}</text>
           <text class="order-id-mono">#{{item.order_id}}</text>
         </view>
-        <text class="status-badge {{item.status === 'paid' ? 'badge-orange' : 'badge-green'}}">{{item.status_text}}</text>
+        <text class="status-badge {{item.status === 'paid' ? 'badge-orange' : (item.status === 'shipped' ? 'badge-green' : 'badge-gold')}}">{{item.status_text}}</text>
       </view>
 
       <view class="order-body">
@@ -45,6 +45,100 @@
     <view class="empty-state" wx:if="{{filteredOrders.length === 0}}">
       <text class="empty-icon">📦</text>
       <text class="empty-text">未查找到匹配的订单记录</text>
+    </view>
+  </view>
+
+  <!-- 订单全景详情操作弹窗抽屉 -->
+  <view class="drawer-mask" wx:if="{{showOrderDrawer}}" bindtap="closeOrderDrawer">
+    <view class="drawer-content" catchtap="preventProp">
+      <view class="drawer-header">
+        <view class="drawer-title-row">
+          <text class="drawer-badge">{{currentOrder.store_name}} · {{currentOrder.site_id}}</text>
+          <text class="drawer-status {{currentOrder.status === 'paid' ? 'text-orange' : 'text-green'}}">{{currentOrder.status_text}}</text>
+        </view>
+        <text class="close-btn" bindtap="closeOrderDrawer">✕</text>
+      </view>
+
+      <scroll-view class="drawer-scroll" scroll-y="true">
+        <!-- 订单基本信息 -->
+        <view class="section-box">
+          <view class="box-row">
+            <text class="k">美客多订单号</text>
+            <view class="v-btn-row">
+              <text class="v mono font-bold">#{{currentOrder.order_id}}</text>
+              <button class="mini-copy-btn" bindtap="copyText" data-text="{{currentOrder.order_id}}">复制</button>
+            </view>
+          </view>
+          <view class="box-row">
+            <text class="k">下单时间</text>
+            <text class="v text-muted">{{currentOrder.created_at}}</text>
+          </view>
+          <view class="box-row">
+            <text class="k">订单总计</text>
+            <text class="v text-gold font-bold" style="font-size: 32rpx;">{{currentOrder.amount_formatted}}</text>
+          </view>
+        </view>
+
+        <!-- 物流与运单号 -->
+        <view class="section-box" wx:if="{{currentOrder.tracking_number || currentOrder.tracking_method}}">
+          <view class="box-title">🚚 国际物流与发货</view>
+          <view class="box-row" wx:if="{{currentOrder.tracking_number}}">
+            <text class="k">运单追踪号</text>
+            <view class="v-btn-row">
+              <text class="v mono text-green font-bold">{{currentOrder.tracking_number}}</text>
+              <button class="mini-copy-btn" bindtap="copyText" data-text="{{currentOrder.tracking_number}}">复制单号</button>
+            </view>
+          </view>
+          <view class="box-row" wx:if="{{currentOrder.tracking_method}}">
+            <text class="k">承运方式</text>
+            <text class="v">{{currentOrder.tracking_method}}</text>
+          </view>
+          <view class="box-row" wx:if="{{currentOrder.package_dimensions}}">
+            <text class="k">包裹规格</text>
+            <text class="v text-muted">{{currentOrder.package_dimensions}}</text>
+          </view>
+          <view class="box-row" wx:if="{{currentOrder.estimated_delivery}}">
+            <text class="k">预计妥投</text>
+            <text class="v text-muted">{{currentOrder.estimated_delivery}}</text>
+          </view>
+        </view>
+
+        <!-- 收件人与地址 -->
+        <view class="section-box">
+          <view class="box-title">📍 海外买家收件信息</view>
+          <view class="box-row">
+            <text class="k">收件人</text>
+            <text class="v font-bold">{{currentOrder.receiver_name || currentOrder.buyer_name}}</text>
+          </view>
+          <view class="box-row" wx:if="{{currentOrder.full_address}}">
+            <text class="k">完整地址</text>
+            <view class="v-col">
+              <text class="v text-muted" style="line-height: 1.4;">{{currentOrder.full_address}}</text>
+              <button class="mini-copy-btn" style="margin-top: 10rpx; width: 160rpx;" bindtap="copyText" data-text="{{currentOrder.full_address}}">复制地址</button>
+            </view>
+          </view>
+        </view>
+
+        <!-- 商品清单 -->
+        <view class="section-box">
+          <view class="box-title">🛍️ 购买商品清单</view>
+          <view class="product-item-row" wx:for="{{currentOrder.items}}" wx:key="item_id">
+            <image class="p-thumb" src="{{item.thumbnail || currentOrder.item_thumbnail}}" mode="aspectFill" />
+            <view class="p-info">
+              <text class="p-title">{{item.title}}</text>
+              <view class="p-meta">
+                <text class="p-sku text-muted" wx:if="{{item.sku}}">SKU: {{item.sku}}</text>
+                <text class="p-qty">×{{item.quantity}}</text>
+              </view>
+              <text class="p-price text-gold">单价: ${{item.unit_price || 0}}</text>
+            </view>
+          </view>
+        </view>
+      </scroll-view>
+
+      <view class="drawer-footer">
+        <button class="btn-primary" bindtap="closeOrderDrawer">完成浏览</button>
+      </view>
     </view>
   </view>
 </view>
