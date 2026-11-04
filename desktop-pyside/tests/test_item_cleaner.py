@@ -473,6 +473,22 @@ class TestItemCleanerEngine(unittest.TestCase):
         self.assertEqual(res.get("status"), "paused")
         self.assertIn("deleted", res.get("sub_status", []))
 
+    def test_client_delete_item_404_chinese_idempotent(self):
+        """测试 CBT 删除接口遇到中文本地化 404 (非全球CBT商品 / 商品或活动不存在) 时幂等返回已删除状态"""
+        from engine.client import MercadoClient
+        mock_auth = MagicMock()
+        client = MercadoClient(mock_auth)
+
+        client.request = MagicMock(side_effect=RuntimeError("非全球CBT商品 (404)"))
+        res = client.delete_item("3408885754", "MCO4200590930")
+        self.assertIsInstance(res, dict)
+        self.assertTrue(res.get("already_deleted"))
+
+        client.request = MagicMock(side_effect=RuntimeError("商品或活动不存在 (404)"))
+        res2 = client.delete_item("3408885754", "MCO4200590930")
+        self.assertIsInstance(res2, dict)
+        self.assertTrue(res2.get("already_deleted"))
+
     def test_client_delete_item_active_two_phase_transition(self):
         """测试在售商品遇到 (deleted is not modifiable) 拦截时自动执行先 paused 再 deleted 的两阶段流转"""
         from engine.client import MercadoClient
@@ -495,6 +511,29 @@ class TestItemCleanerEngine(unittest.TestCase):
         self.assertEqual(calls[0], ("PUT", "/global/items/MLM3235218275", {"deleted": True}))
         self.assertEqual(calls[1], ("PUT", "/global/items/MLM3235218275", {"status": "paused"}))
         self.assertEqual(calls[2], ("PUT", "/global/items/MLM3235218275", {"deleted": True}))
+        self.assertTrue(res.get("deleted"))
+
+    def test_client_delete_item_active_chinese_error_two_phase_transition(self):
+        """测试在售商品遇到中文报错 (商品活跃/出单中，禁止删除) 时自动执行两阶段流转下架删除"""
+        from engine.client import MercadoClient
+        mock_auth = MagicMock()
+        client = MercadoClient(mock_auth)
+
+        calls = []
+        def fake_request(account_id, method, path, **kwargs):
+            calls.append((method, path, kwargs.get("body")))
+            if len(calls) == 1:
+                raise RuntimeError("商品活跃/出单中，禁止删除")
+            if len(calls) == 2:
+                return {"id": "MCO4537069234", "status": "paused"}
+            return {"id": "MCO4537069234", "deleted": True}
+
+        client.request = MagicMock(side_effect=fake_request)
+        res = client.delete_item("3408885754", "MCO4537069234")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0], ("PUT", "/global/items/MCO4537069234", {"deleted": True}))
+        self.assertEqual(calls[1], ("PUT", "/global/items/MCO4537069234", {"status": "paused"}))
+        self.assertEqual(calls[2], ("PUT", "/global/items/MCO4537069234", {"deleted": True}))
         self.assertTrue(res.get("deleted"))
 
     def test_batch_delete_handles_already_deleted_as_success(self):
