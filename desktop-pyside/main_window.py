@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import re
 import threading
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 from datetime import datetime
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -4102,7 +4105,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.66"
+    return "2.2.67"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.

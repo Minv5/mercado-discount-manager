@@ -371,16 +371,44 @@ def parse_iso_timestamp(date_val: Any) -> float:
 # resolve_store_name and get_store_alias are unified in core.py
 
 
+def is_valid_official_session(session: ServiceSession | dict[str, Any]) -> bool:
+    """Validate that session conforms to official platform structure and reject dummy or corrupted objects."""
+    if isinstance(session, dict):
+        sess_type = str(session.get("session_type") or "")
+        sess_id = str(session.get("id") or "")
+        created_at = str(session.get("created_at") or "").strip()
+        stage = str(session.get("stage") or "").lower()
+        raw_d = session.get("raw_data")
+        cl_type = str(raw_d.get("type") or "").lower() if isinstance(raw_d, dict) else ""
+        buyer_nick = str(session.get("buyer_nickname") or "").strip()
+    else:
+        sess_type = str(getattr(session, "session_type", "") or "")
+        sess_id = str(getattr(session, "id", "") or "")
+        created_at = str(getattr(session, "created_at", "") or "").strip()
+        stage = str(getattr(session, "stage", "") or "").lower()
+        raw_d = getattr(session, "raw_data", None)
+        cl_type = str(raw_d.get("type") or "").lower() if isinstance(raw_d, dict) else ""
+        buyer_nick = str(getattr(session, "buyer_nickname", "") or "").strip()
+
+    if sess_type == "claim":
+        if stage == "none" or cl_type in ("cancel_sale", "cancel_purchase"):
+            return False
+        # Filter out dummy/corrupted claims lacking all essential lifecycle attributes
+        has_msg = bool(session.get("messages") if isinstance(session, dict) else getattr(session, "messages", None))
+        has_summary = bool(str(session.get("summary") if isinstance(session, dict) else getattr(session, "summary", "") or "").strip())
+        has_rep = bool(str(session.get("affects_reputation") if isinstance(session, dict) else getattr(session, "affects_reputation", "") or "").strip())
+        if not created_at and not buyer_nick and not stage and not has_msg and not has_summary and not has_rep and not (isinstance(raw_d, dict) and raw_d):
+            return False
+
+    return bool(sess_id)
+
+
 def save_sessions_snapshot(sessions: list[ServiceSession]) -> None:
     """Save sessions metadata and enriched product info to local disk snapshot."""
     try:
         from engine.crypto import get_data_dir
         path = get_data_dir() / "sessions_snapshot.json"
-        # Protect user data from being polluted by dummy test sessions and pure order cancellations
-        filtered_sessions = [
-            s for s in sessions
-            if s and s.id != "c_998877" and not (s.session_type == "claim" and str(getattr(s, "stage", "")).lower() == "none")
-        ]
+        filtered_sessions = [s for s in sessions if s and is_valid_official_session(s)]
         data = []
         for s in filtered_sessions:
             msg_list = []
@@ -645,12 +673,8 @@ def load_sessions_snapshot() -> list[ServiceSession]:
         valid_fields = set(ServiceSession.__dataclass_fields__.keys())
         for item in data:
             if isinstance(item, dict):
-                # Filter out pure order cancellations from historical cache
-                if item.get("session_type") == "claim":
-                    stage_val = str(item.get("stage") or "").lower()
-                    claim_type = str(item.get("raw_data", {}).get("type") or "").lower() if isinstance(item.get("raw_data"), dict) else ""
-                    if stage_val == "none" or claim_type in ("cancel_sale", "cancel_purchase"):
-                        continue
+                if not is_valid_official_session(item):
+                    continue
                 raw_msgs = item.pop("messages", None) or []
                 clean_item = {k: v for k, v in item.items() if k in valid_fields}
                 sess = ServiceSession(**clean_item)
@@ -3384,6 +3408,18 @@ class ServiceCenterPage(QFrame):
                         self._all_sessions[idx] = s
                         break
 
+        # 权威数据对齐：针对本次全量同步涉及的账号，清理不在官方返回列表中的无效或非官方假索赔
+        valid_aids = {a["account_id"] for a in self.auth.list_accounts() if isinstance(a, dict) and "account_id" in a} if getattr(self, "auth", None) else set()
+        if sessions:
+            synced_aids = {s.account_id for s in sessions if s.account_id}
+            official_claim_ids = {s.id for s in sessions if s.session_type == "claim"}
+            self._all_sessions = [
+                s for s in self._all_sessions
+                if is_valid_official_session(s)
+                and (not valid_aids or s.account_id in valid_aids)
+                and not (s.session_type == "claim" and s.account_id in synced_aids and s.id not in official_claim_ids)
+            ]
+
         self._all_sessions.sort(key=lambda s: parse_iso_timestamp(s.created_at), reverse=True)
         self._update_tab_counts()
         self._apply_filter(preserve_selection=True)
@@ -3905,7 +3941,8 @@ class ServiceCenterPage(QFrame):
                 reason_txt = CLAIM_REASON_NAMES.get(rid, "买家投诉")
             if not reason_txt:
                 reason_txt = "买家投诉"
-            snip_lbl = QLabel(f"理由: <b>{reason_txt}</b> · {stage_cn}")
+            stage_suffix = f" · {stage_cn}" if stage_cn else ""
+            snip_lbl = QLabel(f"理由: <b>{reason_txt}</b>{stage_suffix}")
             snip_lbl.setStyleSheet(CARD_SNIP_CLAIM_STYLE)
             snip_lbl.setToolTip(f"投诉理由: {reason_txt}\n索赔阶段: {stage_cn}\n关联订单: {session.order_id or '无'}")
         elif session.session_type == "question":
