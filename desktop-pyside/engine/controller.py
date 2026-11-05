@@ -142,7 +142,7 @@ class EngineController:
             "service": "native-python-engine",
             "product": "mercado-discount-manager",
             "protocol_version": "3",
-            "build_fingerprint": "native-python-v2.2.69",
+            "build_fingerprint": "native-python-v2.2.70",
         }
 
     # -------------------------------------------------------------------------

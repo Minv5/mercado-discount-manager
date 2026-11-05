@@ -210,7 +210,7 @@ class MainWindow(QMainWindow):
         self._startup_phase_started_at: dict[str, float] = {}
         self._service_progress_key = ""
         self._closing = False
-        self.cleaner_engine = ItemCleanerEngine(MercadoClient(AuthManager(), max_concurrency=64))
+        self.cleaner_engine = ItemCleanerEngine(MercadoClient(AuthManager(), max_concurrency=0))
         self.enrollment_log_box: LogViewer | None = None
         self.activity_log_box: LogViewer | None = None
         self.cleaner_log_box: LogViewer | None = None
@@ -4105,7 +4105,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.69"
+    return "2.2.70"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.

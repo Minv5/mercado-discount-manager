@@ -2,6 +2,7 @@ import concurrent.futures
 import contextlib
 import datetime
 import json
+import queue
 import sqlite3
 import threading
 import time
@@ -62,23 +63,21 @@ class ScannedItemRecord:
 
 
 class RateLimiter:
-    """线程安全自适应动态探顶限流器（Adaptive AIMD Rate Limiter）。
-    采用加性增（Additive Increase）与乘性减（Multiplicative Decrease）算法：
+    """线程安全自适应动态探顶限流器（Adaptive AIMD Rate Limiter），上不封顶。
     1. 锁内仅进行微秒级原子时间预约，锁外独立休眠，彻底消除多线程锁争用；
-    2. 随着删除连续成功，自动逐步向上探顶加压（最高至 ceiling_qps）；
+    2. 随着删除连续成功，自动逐步向上探顶加压（上不封顶，彻底跑满服务器性能）；
     3. 一旦遭遇 429 频控，自动乘性回退并插入毫秒级避让，锁定店铺当前真实网络与平台的稳态极速。
     """
     def __init__(
         self,
         max_qps: float = 35.0,
         min_qps: float = 15.0,
-        ceiling_qps: float = 120.0,
-        step_up: float = 2.5,
+        step_up: float = 3.0,
         backoff_factor: float = 0.85,
+        **kwargs: Any,
     ):
         self.current_qps = max(1.0, float(max_qps))
         self.min_qps = max(1.0, float(min_qps))
-        self.ceiling_qps = max(self.current_qps, float(ceiling_qps))
         self.step_up = max(0.5, float(step_up))
         self.backoff_factor = min(0.95, max(0.5, float(backoff_factor)))
         self.interval = 1.0 / self.current_qps
@@ -99,14 +98,13 @@ class RateLimiter:
             time.sleep(sleep_duration)
 
     def on_success(self) -> None:
-        """调用成功时自动向上探顶加速"""
+        """调用成功时自动向上探顶加速（上不封顶，零人工限制）"""
         with self.lock:
             self._success_streak += 1
-            if self._success_streak >= 8:
+            if self._success_streak >= 5:
                 self._success_streak = 0
-                if self.current_qps < self.ceiling_qps:
-                    self.current_qps = min(self.ceiling_qps, self.current_qps + self.step_up)
-                    self.interval = 1.0 / self.current_qps
+                self.current_qps += self.step_up
+                self.interval = 1.0 / self.current_qps
 
     def on_rate_limit(self) -> None:
         """触发 429 频控时自动乘性回退避让"""
@@ -114,7 +112,7 @@ class RateLimiter:
             self._success_streak = 0
             self.current_qps = max(self.min_qps, self.current_qps * self.backoff_factor)
             self.interval = 1.0 / self.current_qps
-            self.next_allowed_time = max(self.next_allowed_time, time.monotonic() + 0.35)
+            self.next_allowed_time = max(self.next_allowed_time, time.monotonic() + 0.3)
 
 
 AdaptiveRateLimiter = RateLimiter
@@ -1291,77 +1289,91 @@ class ItemCleanerEngine:
         successful_ids: list[str] = []
         del_lock = threading.Lock()
         processed_count = 0
-        rate_limiter = RateLimiter(max_qps=40.0, min_qps=20.0, ceiling_qps=100.0, step_up=3.0)
+        rate_limiter = RateLimiter(max_qps=40.0, min_qps=15.0, step_up=3.0)
 
         start_time = time.monotonic()
         last_log_time = start_time
 
-        def _delete_single_item(item_id: str) -> tuple[str, bool, str]:
-            if stop_event and stop_event.is_set():
-                return item_id, False, "用户手动中止"
-            rate_limiter.acquire()
-            success = False
-            err_msg = ""
-            try:
-                if total <= 20:
-                    log(f"[商品删除] 【{store_display}】正在执行 CBT 跨境自发货全局下架删除 {item_id}")
-                res = self.client.delete_item(account_id, item_id, direct_pipeline=True)
-                rate_limiter.on_success()
-                success = True
-                if total <= 20:
-                    if isinstance(res, dict) and res.get("already_deleted"):
-                        log(f"[商品删除] ✅ 【{store_display}】商品 {item_id} 在美客多官方平台已是彻底下架/删除状态，已自动同步")
-                    else:
-                        log(f"[商品删除] ✅ 【{store_display}】商品 {item_id} 已成功从美客多平台下架删除")
-            except Exception as e:
-                err_msg = str(e)
-                if any(k in err_msg.lower() for k in ("429", "限流", "rate limit", "too many requests")):
-                    rate_limiter.on_rate_limit()
-                log(f"[商品删除] ❌ 【{store_display}】商品 {item_id} 下架删除失败: {err_msg}")
+        item_queue: queue.Queue[str] = queue.Queue()
+        for iid in item_ids:
+            item_queue.put(iid)
 
-            return item_id, success, err_msg
+        workers_lock = threading.Lock()
+        threads: list[threading.Thread] = []
 
-        if total > 0:
-            max_workers = min(50, max(1, total))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_item = {executor.submit(_delete_single_item, iid): iid for iid in item_ids}
-                for future in concurrent.futures.as_completed(future_to_item):
-                    if stop_event and stop_event.is_set():
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        log(f"[商品删除] 【{store_display}】批量删除已被用户手动中止")
-                        break
+        def _worker_loop() -> None:
+            nonlocal processed_count, success_count, failed_count, last_log_time
+            while not (stop_event and stop_event.is_set()):
+                try:
+                    iid = item_queue.get_nowait()
+                except queue.Empty:
+                    break
 
-                    with del_lock:
-                        processed_count += 1
-                        cur_idx = processed_count
-
-                    iid = future_to_item[future]
-                    try:
-                        _, succ, err = future.result()
-                    except Exception as e:
-                        succ, err = False, str(e)
-
-                    with del_lock:
-                        if succ:
-                            success_count += 1
-                            successful_ids.append(iid)
+                rate_limiter.acquire()
+                succ = False
+                err = ""
+                try:
+                    if total <= 20:
+                        log(f"[商品删除] 【{store_display}】正在执行 CBT 跨境自发货全局下架删除 {iid}")
+                    res = self.client.delete_item(account_id, iid, direct_pipeline=True)
+                    rate_limiter.on_success()
+                    succ = True
+                    if total <= 20:
+                        if isinstance(res, dict) and res.get("already_deleted"):
+                            log(f"[商品删除] ✅ 【{store_display}】商品 {iid} 在美客多官方平台已是彻底下架/删除状态，已自动同步")
                         else:
-                            failed_count += 1
-                            failures.append({"item_id": iid, "error": err})
+                            log(f"[商品删除] ✅ 【{store_display}】商品 {iid} 已成功从美客多平台下架删除")
+                except Exception as e:
+                    err = str(e)
+                    if any(k in err.lower() for k in ("429", "限流", "rate limit", "too many requests")):
+                        rate_limiter.on_rate_limit()
+                    if total <= 20:
+                        log(f"[商品删除] ❌ 【{store_display}】商品 {iid} 下架删除失败: {err}")
 
-                        if total > 20:
-                            now_mono = time.monotonic()
-                            if cur_idx % 50 == 0 or (now_mono - last_log_time) >= 5.0 or cur_idx == total:
-                                last_log_time = now_mono
-                                elapsed = max(0.1, now_mono - start_time)
-                                speed = cur_idx / elapsed
-                                pct = (cur_idx / total) * 100.0
-                                log(f"[商品删除] 【{store_display}】删除进度: {cur_idx}/{total} ({pct:.1f}%) | 速率: {speed:.1f} 件/s")
+                with del_lock:
+                    processed_count += 1
+                    cur_idx = processed_count
+                    if succ:
+                        success_count += 1
+                        successful_ids.append(iid)
+                    else:
+                        failed_count += 1
+                        failures.append({"item_id": iid, "error": err})
 
                     if on_progress:
-                        on_progress(cur_idx, total, f"删除 {iid}")
+                        try:
+                            on_progress(cur_idx, total, f"删除 {iid}")
+                        except Exception:
+                            pass
                     if on_item_deleted:
-                        on_item_deleted(iid, succ, err)
+                        try:
+                            on_item_deleted(iid, succ, err)
+                        except Exception:
+                            pass
+
+                    if total > 20:
+                        now_mono = time.monotonic()
+                        if cur_idx % 50 == 0 or (now_mono - last_log_time) >= 5.0 or cur_idx == total:
+                            last_log_time = now_mono
+                            elapsed = max(0.1, now_mono - start_time)
+                            speed = cur_idx / elapsed
+                            pct = (cur_idx / total) * 100.0
+                            log(f"[商品删除] 【{store_display}】删除进度: {cur_idx}/{total} ({pct:.1f}%) | 速率: {speed:.1f} 件/s")
+
+        if total > 0:
+            while not item_queue.empty() and not (stop_event and stop_event.is_set()):
+                with workers_lock:
+                    needed = min(item_queue.qsize(), max(12, int(rate_limiter.current_qps * 2.2)))
+                    active = sum(1 for t in threads if t.is_alive())
+                    to_spawn = max(0, needed - active)
+                    for _ in range(to_spawn):
+                        t = threading.Thread(target=_worker_loop, daemon=True)
+                        t.start()
+                        threads.append(t)
+                time.sleep(0.08)
+
+            for t in threads:
+                t.join()
 
         if total > 20 and success_count > 0:
             log(f"[商品删除] ✅ 【{store_display}】共 {success_count} 件商品已成功从美客多平台下架删除")
@@ -1434,6 +1446,25 @@ def is_item_confirmed_deleted(rec: ScannedItemRecord) -> bool:
         return True
     st_lower = st.lower()
     if "404" in st_lower and ("not a cbt item" in st_lower or "非全球cbt" in st_lower or "not_found" in st_lower or "not found" in st_lower or "不存在" in st_lower):
+        return True
+    return False
+
+
+def is_item_locked_by_moderation(rec: ScannedItemRecord) -> bool:
+    """判定商品是否处于美客多官方审查或不可修改的风控锁定状态（锁定不可删，无需重复请求）。
+
+    判定依据（官方契约）：
+    1. 状态中包含 'under_review'、'listing is not modifiable'、'平台审查'；
+    2. 美客多官方 sub_status 权威契约明确包含 'suspended_for_prevention' 或 'under_review'。
+    此类商品被美客多官方强行冻结，任何修改或删除请求均会被网关直接拒绝 (400)，必须直接跳过。
+    """
+    if not rec:
+        return False
+    st = str(getattr(rec, "status", None) or "").lower()
+    if any(k in st for k in ("under_review", "listing is not modifiable", "平台审查")):
+        return True
+    sub_st = [str(s).lower() for s in (getattr(rec, "sub_status", None) or [])]
+    if any(k in sub_st for k in ("suspended_for_prevention", "under_review")):
         return True
     return False
 

@@ -11,10 +11,12 @@ if str(ROOT) not in sys.path:
 from engine.item_cleaner import (
     ItemCleanerEngine,
     CleanerFilterCriteria,
+    RateLimiter,
     ScannedItemRecord,
     clear_cleaner_draft,
     get_cleaner_draft_file,
     is_item_confirmed_deleted,
+    is_item_locked_by_moderation,
     load_cleaner_draft,
     save_cleaner_draft,
 )
@@ -738,6 +740,55 @@ class TestItemCleanerEngine(unittest.TestCase):
         self.assertFalse(any("正在执行 CBT 跨境自发货全局下架删除 MLM0" in log for log in logs))
         self.assertTrue(any("共 25 件商品已成功从美客多平台下架删除" in log for log in logs))
         self.assertTrue(any("删除进度: 25/25" in log for log in logs))
+
+    def test_is_item_locked_by_moderation(self):
+        """测试美客多官方审查与风控锁定商品的快速判定"""
+        # 1. 含有 under_review 错误信息的记录
+        r1 = ScannedItemRecord(
+            item_id="MLB111", account_id="acc1", site_id="MLB", title="Test 1",
+            status="删除失败: 美客多接口异常: Cannot update item MLB111 [status:under_review] (Listing is not modifiable) (400)"
+        )
+        self.assertTrue(is_item_locked_by_moderation(r1))
+
+        # 2. sub_status 含有 suspended_for_prevention
+        r2 = ScannedItemRecord(
+            item_id="MLB222", account_id="acc1", site_id="MLB", title="Test 2",
+            status="active", sub_status=["suspended_for_prevention"]
+        )
+        self.assertTrue(is_item_locked_by_moderation(r2))
+
+        # 3. status 显式包含 平台审查中
+        r3 = ScannedItemRecord(
+            item_id="MLB333", account_id="acc1", site_id="MLB", title="Test 3",
+            status="商品处于平台审查中(锁定不可删)"
+        )
+        self.assertTrue(is_item_locked_by_moderation(r3))
+
+        # 4. 普通在售或下架商品
+        r4 = ScannedItemRecord(
+            item_id="MLB444", account_id="acc1", site_id="MLB", title="Test 4",
+            status="paused", sub_status=[]
+        )
+        self.assertFalse(is_item_locked_by_moderation(r4))
+
+    def test_rate_limiter_unbounded_aimd(self):
+        """测试限流器上不封顶的 AIMD 加速与乘性回退机制"""
+        limiter = RateLimiter(max_qps=30.0, min_qps=10.0, step_up=5.0, backoff_factor=0.8)
+        self.assertEqual(limiter.current_qps, 30.0)
+
+        # 连续 5 次成功后加速 step_up
+        for _ in range(5):
+            limiter.on_success()
+        self.assertEqual(limiter.current_qps, 35.0)
+
+        # 再次连续 5 次成功后继续加速，上不封顶
+        for _ in range(5):
+            limiter.on_success()
+        self.assertEqual(limiter.current_qps, 40.0)
+
+        # 遭遇 429 乘性回退
+        limiter.on_rate_limit()
+        self.assertEqual(limiter.current_qps, 32.0)
 
 
 if __name__ == "__main__":

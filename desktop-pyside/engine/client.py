@@ -150,6 +150,10 @@ def format_clean_api_error(status_code: int | None, raw_msg: str) -> str:
     if "promotion_type is required" in text_lower:
         return "缺少活动类型参数"
 
+    # 10.5 Under review / moderation lock
+    if "under_review" in text_lower or "listing is not modifiable" in text_lower:
+        return "商品处于平台审查中(锁定不可删)"
+
     # 11. Active item not modifiable / deletable
     if "deleted is not modifiable" in text_lower:
         return "商品活跃/出单中，禁止删除"
@@ -229,6 +233,13 @@ def clean_error_message(err: Any) -> str:
     return format_clean_api_error(code, err_str)
 
 
+class _DummyContext:
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
 class MercadoClient:
     API_BASE = "https://api.mercadolibre.com"
 
@@ -239,9 +250,11 @@ class MercadoClient:
         self._sem_lock = threading.Lock()
         parsed = urllib.parse.urlparse(self.API_BASE)
         self._host = parsed.netloc or "api.mercadolibre.com"
-        self._conn_pool = HTTPSConnectionPool(host=self._host, timeout=30, max_size=max(64, max_concurrency * 4))
+        self._conn_pool = HTTPSConnectionPool(host=self._host, timeout=30, max_size=512)
 
-    def _get_semaphore(self, account_id: str) -> threading.Semaphore:
+    def _get_semaphore(self, account_id: str):
+        if self.max_concurrency_per_account is None or self.max_concurrency_per_account <= 0:
+            return _DummyContext()
         clean_acc = str(account_id or "default").strip()
         with self._sem_lock:
             if clean_acc not in self._account_semaphores:
@@ -798,6 +811,8 @@ class MercadoClient:
                 self.request(account_id, "PUT", f"/global/items/{clean_id}", body={"status": "paused"})
             except Exception as e:
                 err_str = str(e).lower()
+                if "under_review" in err_str or "listing is not modifiable" in err_str or "平台审查" in err_str:
+                    raise RuntimeError("商品处于平台审查中(锁定不可删)")
                 if "404" in err_str and any(
                     k in err_str
                     for k in ("not a cbt item", "not_found", "not found", "非全球cbt商品", "商品或活动不存在")
@@ -810,13 +825,17 @@ class MercadoClient:
                     }
                 try:
                     self.request(account_id, "PUT", f"/global/items/{clean_id}", body={"status": "closed"})
-                except Exception:
-                    pass
+                except Exception as close_err:
+                    close_err_str = str(close_err).lower()
+                    if "under_review" in close_err_str or "listing is not modifiable" in close_err_str or "平台审查" in close_err_str:
+                        raise RuntimeError("商品处于平台审查中(锁定不可删)")
 
             try:
                 return self.request(account_id, "PUT", f"/global/items/{clean_id}", body={"deleted": True})
             except Exception as del_err:
                 del_err_str = str(del_err).lower()
+                if "under_review" in del_err_str or "listing is not modifiable" in del_err_str or "平台审查" in del_err_str:
+                    raise RuntimeError("商品处于平台审查中(锁定不可删)")
                 if "404" in del_err_str and any(
                     k in del_err_str
                     for k in ("not a cbt item", "not_found", "not found", "非全球cbt商品", "商品或活动不存在")

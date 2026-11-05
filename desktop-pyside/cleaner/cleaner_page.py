@@ -37,6 +37,7 @@ from engine.item_cleaner import (
     ScannedItemRecord,
     clear_cleaner_draft,
     is_item_confirmed_deleted,
+    is_item_locked_by_moderation,
     load_cleaner_draft,
     mark_cached_items_deleted,
     save_cleaner_draft,
@@ -64,7 +65,7 @@ class CleanerPage(QFrame):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("surface")
-        self.cleaner_engine = engine or ItemCleanerEngine(MercadoClient(AuthManager(), max_concurrency=64))
+        self.cleaner_engine = engine or ItemCleanerEngine(MercadoClient(AuthManager(), max_concurrency=0))
         self.gui_dispatcher = gui_dispatcher
         self.log_cb = log_cb
         self.accounts: list[Any] = []
@@ -356,6 +357,10 @@ class CleanerPage(QFrame):
             valid_records = [r for r in records if r.item_id and r.account_id]
             if not valid_records:
                 return
+            for r in valid_records:
+                if is_item_locked_by_moderation(r):
+                    r.status = "商品处于平台审查中(锁定不可删)"
+                    r.is_selected_for_delete = False
             self.cleaner_records = valid_records
             if hasattr(self, "cleaner_model") and self.cleaner_model is not None:
                 self.cleaner_model.set_records(valid_records)
@@ -735,6 +740,7 @@ class CleanerPage(QFrame):
 
         active_sold_selected = [r for r in selected_records if r.has_sales and ("在售" in r.status or r.status == "active")]
         already_del_selected = [r for r in selected_records if is_item_confirmed_deleted(r)]
+        locked_selected = [r for r in selected_records if not is_item_confirmed_deleted(r) and is_item_locked_by_moderation(r)]
         total_count = len(selected_records)
 
         if active_sold_selected:
@@ -746,7 +752,12 @@ class CleanerPage(QFrame):
                 self, "高危删除确认", msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
             )
         else:
-            extra_tip = f"\n（其中 {len(already_del_selected)} 件已确认处于删除终态，将直接跳过无需调用 API）" if already_del_selected else ""
+            skip_notes = []
+            if already_del_selected:
+                skip_notes.append(f"{len(already_del_selected)} 件已确认处于删除终态")
+            if locked_selected:
+                skip_notes.append(f"{len(locked_selected)} 件处于美客多官方审查锁定中")
+            extra_tip = f"\n（其中 {'、'.join(skip_notes)}，将直接跳过无需调用 API）" if skip_notes else ""
             msg = f"确认要彻底删除选中的 {total_count} 件不达标商品吗？{extra_tip}\n\n操作将在美客多官方平台下架并彻底抹除，不可恢复。"
             reply = QMessageBox.question(
                 self, "批量删除确认", msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
@@ -777,18 +788,20 @@ class CleanerPage(QFrame):
                 store_results: list[dict[str, Any]] = []
 
                 def _delete_store_items(pair: tuple[str, list[ScannedItemRecord]]):
+                    nonlocal total_skipped
                     acc_id, recs = pair
                     if self.cleaner_delete_stop_event.is_set():
                         return
                     store_name = recs[0].store_name or acc_id
 
-                    # 严格判定硬边界：拆分出 100% 已确认彻底删除的商品 与 真正待向官方发请求的商品
+                    # 严格判定硬边界：拆分出 100% 已确认彻底删除的商品、官方审查锁定的商品 与 真正待向官方发请求的商品
                     already_del_recs = [r for r in recs if is_item_confirmed_deleted(r)]
                     pending_recs = [r for r in recs if not is_item_confirmed_deleted(r)]
+                    locked_recs = [r for r in pending_recs if is_item_locked_by_moderation(r)]
+                    actionable_recs = [r for r in pending_recs if not is_item_locked_by_moderation(r)]
 
                     if already_del_recs:
                         with del_lock:
-                            nonlocal total_skipped
                             total_skipped += len(already_del_recs)
                             for r in already_del_recs:
                                 deleted_ids.add(r.item_id)
@@ -801,19 +814,31 @@ class CleanerPage(QFrame):
                                 if hasattr(self, "cleaner_model") and self.cleaner_model is not None else None
                             ))
 
-                    if not pending_recs:
+                    if locked_recs:
+                        with del_lock:
+                            total_skipped += len(locked_recs)
+                        self._dispatch(lambda s=store_name, n=len(locked_recs): self.log(
+                            f"[商品删除] ⏩ 【{s}】已直接跳过 {n} 件处于美客多官方审查锁定中的商品（平台禁止删除，无需重复请求）"
+                        ))
+                        for r in locked_recs:
+                            self._dispatch(lambda i=r.item_id: (
+                                self.cleaner_model.update_item_status(i, "商品处于平台审查中(锁定不可删)", False)
+                                if hasattr(self, "cleaner_model") and self.cleaner_model is not None else None
+                            ))
+
+                    if not actionable_recs:
                         with del_lock:
                             store_results.append({
                                 "account_id": acc_id,
                                 "store_name": store_name,
                                 "success": 0,
-                                "skipped": len(already_del_recs),
+                                "skipped": len(already_del_recs) + len(locked_recs),
                                 "failed": 0,
                                 "total": len(recs),
                             })
                         return
 
-                    target_ids = [r.item_id for r in pending_recs]
+                    target_ids = [r.item_id for r in actionable_recs]
 
                     def _on_item_del(iid: str, succ: bool, err: str):
                         with del_lock:
