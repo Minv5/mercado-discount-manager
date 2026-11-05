@@ -70,7 +70,7 @@
     </view>
     <view class="info-row">
       <text class="info-label">系统版本</text>
-      <text class="info-val">v2.2.62 (正式工程)</text>
+      <text class="info-val">v2.2.69 (正式工程)</text>
     </view>
     <view class="info-row">
       <text class="info-label">核心对标</text>

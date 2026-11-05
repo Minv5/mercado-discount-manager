@@ -8,6 +8,8 @@
     <view class="filter-item {{filterStatus === 'all' ? 'active' : ''}}" bindtap="onFilterChange" data-status="all">全部</view>
     <view class="filter-item {{filterStatus === 'paid' ? 'active' : ''}}" bindtap="onFilterChange" data-status="paid">待打单发货</view>
     <view class="filter-item {{filterStatus === 'shipped' ? 'active' : ''}}" bindtap="onFilterChange" data-status="shipped">运输中</view>
+    <view class="filter-item {{filterStatus === 'delivered' ? 'active' : ''}}" bindtap="onFilterChange" data-status="delivered">已送达</view>
+    <view class="filter-item {{filterStatus === 'cancelled' ? 'active' : ''}}" bindtap="onFilterChange" data-status="cancelled">已取消</view>
   </view>
 
   <!-- 订单列表 -->
@@ -19,7 +21,7 @@
           <text class="site-tag">{{item.site_id}}</text>
           <text class="order-id-mono">#{{item.order_id}}</text>
         </view>
-        <text class="status-badge {{item.status === 'paid' ? 'badge-orange' : (item.status === 'shipped' ? 'badge-green' : 'badge-gold')}}">{{item.status_text}}</text>
+        <text class="status-badge {{item.filter_cat === 'paid' ? 'badge-orange' : (item.filter_cat === 'shipped' ? 'badge-green' : (item.filter_cat === 'delivered' ? 'badge-blue' : 'badge-gray'))}}">{{item.status_text}}</text>
       </view>
 
       <view class="order-body">
@@ -38,6 +40,10 @@
           <text class="city-icon">📍</text>
           <text class="text-muted">{{item.buyer_name}} · {{item.shipping_city}}</text>
         </view>
+        <view class="tracking-pill" wx:if="{{item.tracking_number}}">
+          <text class="tracking-icon">🚚</text>
+          <text class="tracking-mono">{{item.tracking_number}}</text>
+        </view>
         <text class="order-time text-muted">{{item.created_at}}</text>
       </view>
     </view>
@@ -54,7 +60,7 @@
       <view class="drawer-header">
         <view class="drawer-title-row">
           <text class="drawer-badge">{{currentOrder.store_name}} · {{currentOrder.site_id}}</text>
-          <text class="drawer-status {{currentOrder.status === 'paid' ? 'text-orange' : 'text-green'}}">{{currentOrder.status_text}}</text>
+          <text class="drawer-status {{currentOrder.filter_cat === 'paid' ? 'text-orange' : (currentOrder.filter_cat === 'shipped' ? 'text-green' : (currentOrder.filter_cat === 'delivered' ? 'text-blue' : 'text-muted'))}}">{{currentOrder.status_text}}</text>
         </view>
         <text class="close-btn" bindtap="closeOrderDrawer">✕</text>
       </view>

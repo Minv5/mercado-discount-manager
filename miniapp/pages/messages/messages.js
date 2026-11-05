@@ -7,7 +7,10 @@ Page({
     activeTab: 0,
     questions: [],
     messages: [],
-    claims: []
+    claims: [],
+    pendingQuestionsCount: 0,
+    unreadMessagesCount: 0,
+    pendingClaimsCount: 0
   },
 
   onLoad(options) {
@@ -40,18 +43,33 @@ Page({
       getMessages(store.id),
       getClaims(store.id)
     ]).then(([qList, mList, cList]) => {
-      const formattedQ = qList.map(q => ({
+      // 1. 售前咨询：未回复排在最前
+      const sortedQ = [...qList].sort((a, b) => (a.is_answered === b.is_answered ? 0 : (a.is_answered ? 1 : -1)));
+      const formattedQ = sortedQ.map(q => ({
         ...q,
         created_at: formatTime(q.created_at)
       }));
+
+      // 2. 售后私信
       const formattedM = mList.map(m => ({
         ...m,
         updated_at: formatTime(m.updated_at)
       }));
+
+      // 3. 索赔纠纷：进行中紧急排前，已结案归档排后
+      const sortedC = [...cList].sort((a, b) => (a.is_closed === b.is_closed ? 0 : (a.is_closed ? 1 : -1)));
+
+      const pendingQ = qList.filter(q => !q.is_answered).length;
+      const unreadM = mList.reduce((acc, m) => acc + (m.unread_count || 0), 0);
+      const pendingC = cList.filter(c => !c.is_closed).length;
+
       this.setData({
         questions: formattedQ,
         messages: formattedM,
-        claims: cList
+        claims: sortedC,
+        pendingQuestionsCount: pendingQ,
+        unreadMessagesCount: unreadM,
+        pendingClaimsCount: pendingC
       });
       if (typeof callback === "function") callback();
     }).catch(() => {

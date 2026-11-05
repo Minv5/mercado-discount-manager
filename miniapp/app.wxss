@@ -75,6 +75,12 @@ page {
   border: 1rpx solid #1E88E5;
 }
 
+.badge-gray {
+  background-color: #242826;
+  color: #9E9E9E;
+  border: 1rpx solid #3E4742;
+}
+
 /* 主色按钮：沉稳军绿渐变 */
 .btn-primary {
   background: linear-gradient(135deg, #2F6B3F, #235230);

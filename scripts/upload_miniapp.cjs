@@ -10,11 +10,11 @@ const project = new ci.Project({
 });
 
 async function run() {
-  console.log('>>> 正在通过微信官方 CI 上传黑金暗黑版体验包...');
+  console.log('>>> 正在通过微信官方 CI 上传黑金暗黑版体验包 (v1.1.2)...');
   const uploadResult = await ci.upload({
     project,
-    version: '1.1.0',
-    desc: '黑金墨绿暗黑版移动工作台',
+    version: '1.1.2',
+    desc: '黑金暗黑版移动工作台-精准对齐桌面端待办与物流状态',
     setting: {
       es6: true,
       es7: true,
@@ -30,7 +30,21 @@ async function run() {
       }
     },
   });
-  console.log('>>> 上传成功！', uploadResult);
+  console.log('>>> 体验版上传成功！', uploadResult);
+
+  console.log('>>> 正在生成最新真机扫码预览码至桌面...');
+  const previewResult = await ci.preview({
+    project,
+    version: '1.1.2',
+    desc: '真机实时预览码',
+    setting: { es6: true, minify: true },
+    qrcodeFormat: 'image',
+    qrcodeOutputDest: '/Users/minv5/Desktop/小程序黑金版真机预览码.jpg',
+    onProgressUpdate: (msg) => {
+      if (typeof msg === 'string') console.log('[Preview 进度]', msg);
+    }
+  });
+  console.log('>>> 真机预览码已生成并落盘至桌面！');
 }
 
 run().catch((err) => {

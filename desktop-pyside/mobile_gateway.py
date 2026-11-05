@@ -100,6 +100,41 @@ def get_available_stores() -> list[dict[str, Any]]:
     return stores
 
 
+def classify_order_status(order: dict[str, Any]) -> tuple[str, str]:
+    """Return (badge_text, filter_category) aligned with desktop app's get_order_status_badge_info."""
+    sh = order.get("shipping") or {}
+    ship_st = str(sh.get("status") or "").strip().lower()
+    ship_sub = str(sh.get("substatus") or "").strip().lower()
+
+    if ship_st in ("delivered", "completed") or ship_sub in ("delivered",):
+        return ("已送达", "delivered")
+    elif ship_st == "cancelled" or ship_sub in ("cancelled", "returned_to_warehouse", "returning_to_warehouse"):
+        return ("已取消", "cancelled")
+    elif ship_st in ("not_delivered", "failed") or ship_sub in ("not_delivered", "failed"):
+        return ("未送达", "not_delivered")
+    elif ship_st in ("shipped", "in_transit") or ship_sub in (
+        "picked_up", "dropped_off", "in_hub", "forwarded_to_carrier", "in_packing_list", "customs_cleared", "on_carrier"
+    ):
+        return ("运送中", "shipped")
+    elif ship_st in ("ready_to_ship", "to_be_shipped", "handling", "to_ship"):
+        return ("待发货", "paid")
+
+    st = str(order.get("status") or "").strip().lower()
+    if st in ("paid", "confirmed", "to_be_shipped", "ready_to_ship"):
+        return ("待发货", "paid")
+    elif st in ("shipped", "in_transit"):
+        return ("运送中", "shipped")
+    elif st in ("delivered", "completed"):
+        return ("已送达", "delivered")
+    elif st in ("payment_required", "pending"):
+        return ("待付款", "payment_required")
+    elif st in ("payment_in_process", "in_process"):
+        return ("支付中", "payment_in_process")
+    elif st in ("cancelled", "invalid"):
+        return ("已取消", "cancelled")
+    return ("已付款", "paid")
+
+
 def compute_overview(store_name: str | None = None) -> dict[str, Any]:
     sessions = load_sessions()
     orders = load_orders()
@@ -108,18 +143,18 @@ def compute_overview(store_name: str | None = None) -> dict[str, Any]:
         sessions = [s for s in sessions if (s.get("account_name") == store_name or s.get("account_id") == store_name)]
         orders = [o for o in orders if (o.get("store_name") == store_name or o.get("account_id") == store_name)]
 
-    # 真实待办统计：区分已回复/未回复
+    # 真实待办统计：严格区分已回复/未回复、已结案/未结案
     pending_questions = sum(
         1 for s in sessions
         if s.get("session_type") == "question"
-        and s.get("status") != "answered"
+        and str(s.get("status", "")).lower() != "answered"
         and (s.get("raw_data") or {}).get("status") != "ANSWERED"
     )
     claim_count = sum(
         1 for s in sessions
         if s.get("session_type") == "claim"
-        and s.get("status") != "closed"
-        and s.get("stage") != "closed"
+        and str(s.get("status", "")).lower() != "closed"
+        and str(s.get("stage", "")).lower() != "closed"
     )
     message_count = sum(
         1 for s in sessions
@@ -127,7 +162,7 @@ def compute_overview(store_name: str | None = None) -> dict[str, Any]:
         and not s.get("is_read")
     )
 
-    # 严格按当天日期（本地与UTC匹配）统计【今日实时】新单与销售额
+    # 严格按当天日期（本地时间）统计【今日实时】新单与销售额
     now_date_str = time.strftime("%Y-%m-%d", time.localtime())
     today_orders_list = [
         o for o in orders
@@ -136,11 +171,11 @@ def compute_overview(store_name: str | None = None) -> dict[str, Any]:
     today_order_count = len(today_orders_list)
     today_sales = sum(float(o.get("paid_amount") or o.get("total_amount") or 0.0) for o in today_orders_list)
 
-    # 统计历史累计与当前真实待打单发货（必须以物流 ready_to_ship 状态为准，绝不能把已发货 shipped 算进去）
+    # 统计历史累计与当前真实待打单发货（必须与桌面端一致以物流 ready_to_ship 状态为准，绝不能把已发货 shipped 算进去）
     total_orders = len(orders)
     pending_ship = sum(
         1 for o in orders
-        if str((o.get("shipping") or {}).get("status", "")).lower() in ("ready_to_ship", "handling", "to_ship")
+        if classify_order_status(o)[1] == "paid"
         and str(o.get("status", "")).lower() != "cancelled"
     )
     total_sales = sum(float(o.get("paid_amount") or o.get("total_amount") or 0.0) for o in orders)
@@ -343,7 +378,23 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
                     or search_kw in str(s.get("last_message", "")).lower()
                 ]
 
-            self._send_json({"success": True, "total": len(sessions), "sessions": sessions})
+            # Enrich sessions with clean display flags and status
+            enriched_sessions = []
+            for s in sessions:
+                s_copy = dict(s)
+                stype = s_copy.get("session_type")
+                if stype == "claim":
+                    is_closed = str(s_copy.get("status", "")).lower() == "closed" or str(s_copy.get("stage", "")).lower() == "closed"
+                    s_copy["is_closed"] = is_closed
+                    s_copy["is_urgent"] = not is_closed
+                    s_copy["stage_text"] = "已结案" if is_closed else ("平台调解" if s_copy.get("stage") == "dispute" else "待处理纠纷")
+                elif stype == "question":
+                    is_answered = str(s_copy.get("status", "")).lower() == "answered" or (s_copy.get("raw_data") or {}).get("status") == "ANSWERED"
+                    s_copy["is_answered"] = is_answered
+                    s_copy["status_text"] = "已回复" if is_answered else "待回复"
+                enriched_sessions.append(s_copy)
+
+            self._send_json({"success": True, "total": len(enriched_sessions), "sessions": enriched_sessions})
         elif path == "/api/session_detail":
             session_id = q_first("session_id", "")
             sessions = load_sessions()
@@ -364,17 +415,38 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
             orders = load_orders()
             if store_name and store_name != "全部" and store_name != "all":
                 orders = [o for o in orders if (o.get("store_name") == store_name or o.get("account_id") == store_name)]
+
+            # Enrich with desktop-aligned status classification
+            enriched_orders = []
+            for o in orders:
+                badge_text, filter_cat = classify_order_status(o)
+                o_dict = dict(o)
+                o_dict["status_text"] = badge_text
+                o_dict["filter_cat"] = filter_cat
+                enriched_orders.append(o_dict)
+
             if status_filter and status_filter != "all":
-                orders = [o for o in orders if str(o.get("status", "")).lower() == status_filter.lower()]
+                sf = status_filter.lower()
+                if sf in ("paid", "ready_to_ship", "待发货", "待打单发货"):
+                    enriched_orders = [o for o in enriched_orders if o.get("filter_cat") == "paid"]
+                elif sf in ("shipped", "运输中", "运送中"):
+                    enriched_orders = [o for o in enriched_orders if o.get("filter_cat") == "shipped"]
+                elif sf in ("delivered", "已送达", "已妥投"):
+                    enriched_orders = [o for o in enriched_orders if o.get("filter_cat") == "delivered"]
+                elif sf in ("cancelled", "已取消"):
+                    enriched_orders = [o for o in enriched_orders if o.get("filter_cat") == "cancelled"]
+                else:
+                    enriched_orders = [o for o in enriched_orders if o.get("filter_cat") == sf or str(o.get("status", "")).lower() == sf]
+
             if keyword:
-                orders = [
-                    o for o in orders
+                enriched_orders = [
+                    o for o in enriched_orders
                     if keyword in str(o.get("order_id", "")).lower()
                     or keyword in str(o.get("buyer_nickname", "")).lower()
                     or keyword in str(o.get("buyer_full_name", "")).lower()
                 ]
 
-            self._send_json({"success": True, "total": len(orders), "orders": orders})
+            self._send_json({"success": True, "total": len(enriched_orders), "orders": enriched_orders})
         else:
             self._send_json({"error": "Endpoint not found"}, status_code=404)
 

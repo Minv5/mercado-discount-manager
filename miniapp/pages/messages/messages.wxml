@@ -3,15 +3,15 @@
   <view class="tab-bar">
     <view class="tab-item {{activeTab === 0 ? 'active' : ''}}" bindtap="onTabChange" data-tab="0">
       <text>售前提问</text>
-      <text class="tab-badge" wx:if="{{questions.length > 0}}">{{questions.length}}</text>
+      <text class="tab-badge" wx:if="{{pendingQuestionsCount > 0}}">{{pendingQuestionsCount}}</text>
     </view>
     <view class="tab-item {{activeTab === 1 ? 'active' : ''}}" bindtap="onTabChange" data-tab="1">
       <text>售后私信</text>
-      <text class="tab-badge" wx:if="{{messages.length > 0}}">{{messages.length}}</text>
+      <text class="tab-badge" wx:if="{{unreadMessagesCount > 0}}">{{unreadMessagesCount}}</text>
     </view>
     <view class="tab-item {{activeTab === 2 ? 'active' : ''}}" bindtap="onTabChange" data-tab="2">
       <text>索赔纠纷</text>
-      <text class="tab-badge badge-red-bg" wx:if="{{claims.length > 0}}">{{claims.length}}</text>
+      <text class="tab-badge badge-red-bg" wx:if="{{pendingClaimsCount > 0}}">{{pendingClaimsCount}}</text>
     </view>
   </view>
 
@@ -99,14 +99,15 @@
 
     <!-- 3. 索赔与纠纷列表 (Claims) -->
     <block wx:if="{{activeTab === 2}}">
-      <view class="card item-card claim-border" wx:for="{{claims}}" wx:key="id" bindtap="openChat" data-type="claim" data-id="{{item.id}}" data-item="{{item}}">
+      <view class="card item-card {{item.is_closed ? '' : 'claim-border'}}" wx:for="{{claims}}" wx:key="id" bindtap="openChat" data-type="claim" data-id="{{item.id}}" data-item="{{item}}">
         <view class="card-header">
           <view class="header-left">
-            <text class="badge badge-red">🚨 索赔纠纷</text>
+            <text class="badge {{item.is_closed ? 'badge-gray' : 'badge-red'}}">{{item.is_closed ? '✅ ' + item.stage_text : '🚨 ' + item.stage_text}}</text>
             <text class="store-badge">{{item.store_name}}</text>
             <text class="site-tag">{{item.site_id}}</text>
           </view>
-          <view class="countdown-badge">剩 {{item.deadline_hours}} 小时超时</view>
+          <view class="countdown-badge" wx:if="{{!item.is_closed}}">剩 {{item.deadline_hours}} 小时超时</view>
+          <view class="closed-pill text-muted" wx:if="{{item.is_closed}}">已完结归档</view>
         </view>
 
         <view class="claim-body">
@@ -120,7 +121,7 @@
           </view>
           <view class="claim-row">
             <text class="claim-label">涉及金额：</text>
-            <text class="claim-value font-bold text-red">{{item.amount}}</text>
+            <text class="claim-value font-bold {{item.is_closed ? 'text-muted' : 'text-red'}}">{{item.amount}}</text>
           </view>
           <view class="claim-reason-box">
             <text class="reason-text">{{item.reason}}</text>
@@ -128,8 +129,8 @@
         </view>
 
         <view class="card-footer">
-          <text class="text-muted">超时未回将被判罚</text>
-          <view class="btn-reply btn-red">立即处理索赔 ➔</view>
+          <text class="text-muted">{{item.is_closed ? '已退款结案/官方闭环' : '超时未回将被判罚'}}</text>
+          <view class="btn-reply {{item.is_closed ? 'btn-answered' : 'btn-red'}}">{{item.is_closed ? '查看纠纷记录 ➔' : '立即处理索赔 ➔'}}</view>
         </view>
       </view>
 

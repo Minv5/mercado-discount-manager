@@ -1,6 +1,6 @@
 App({
   globalData: {
-    apiUrl: "https://awareness-reid-benchmark-army.trycloudflare.com",
+    apiUrl: "https://experienced-greensboro-vice-pie.trycloudflare.com",
     token: "",
     // 店铺列表：支持全部店铺大盘汇总与单店过滤
     stores: [

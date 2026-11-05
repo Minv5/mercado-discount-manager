@@ -3,7 +3,7 @@
  * 已打通移动端公网安全网关，直连美客多真实店铺数据与买家回复通道
  */
 
-const DEFAULT_GATEWAY_URL = "https://awareness-reid-benchmark-army.trycloudflare.com";
+const DEFAULT_GATEWAY_URL = "https://experienced-greensboro-vice-pie.trycloudflare.com";
 
 function getBaseUrl() {
   const custom = wx.getStorageSync("custom_gateway_url");
@@ -54,6 +54,7 @@ function request(path, options = {}) {
 function formatQuestion(s) {
   const msgs = s.messages || [];
   const firstMsg = msgs[0] || {};
+  const isAnswered = s.is_answered !== undefined ? s.is_answered : (String(s.status || "").toLowerCase() === "answered" || (s.raw_data && s.raw_data.status === "ANSWERED"));
   return {
     id: s.id,
     store_id: s.account_id || "",
@@ -68,7 +69,9 @@ function formatQuestion(s) {
     buyer_name: s.buyer_nickname || "买家咨询",
     text_es: firstMsg.text || s.last_message || "¿Tiene stock disponible?",
     text_cn: firstMsg.text_translated || s.last_message_translated || "请问还有现货吗？",
-    status: s.status || (s.is_read ? "ANSWERED" : "UNANSWERED"),
+    status: isAnswered ? "ANSWERED" : "UNANSWERED",
+    is_answered: isAnswered,
+    status_text: isAnswered ? "已回复" : "待回复",
     created_at: s.created_at || s.updated_at || new Date().toISOString()
   };
 }
@@ -104,6 +107,7 @@ function formatClaim(s) {
     text_cn: m.text_translated || "",
     time: (m.created_at || "").slice(5, 16).replace("T", " ")
   }));
+  const isClosed = s.is_closed !== undefined ? s.is_closed : (String(s.status || "").toLowerCase() === "closed" || String(s.stage || "").toLowerCase() === "closed");
   return {
     id: s.id,
     store_id: s.account_id || "",
@@ -111,9 +115,12 @@ function formatClaim(s) {
     site_id: s.site_id || "MLM",
     order_id: s.order_id || s.id.replace("c_", ""),
     claim_id: s.id.replace("c_", ""),
-    stage: s.stage || "dispute",
+    stage: s.stage || (isClosed ? "closed" : "dispute"),
+    status: isClosed ? "closed" : "opened",
+    is_closed: isClosed,
+    stage_text: s.stage_text || (isClosed ? "已结案" : (s.stage === "dispute" ? "平台调解" : "待处理纠纷")),
     reason: s.claim_reason || s.last_message || "买家申请售后退货/纠纷",
-    deadline_hours: 8,
+    deadline_hours: isClosed ? 0 : 8,
     amount: s.item_price || s.claim_amount || "协商处理中",
     item_title: s.item_title || "",
     item_thumbnail: s.item_thumbnail || s.item_picture_url || "",
@@ -123,21 +130,10 @@ function formatClaim(s) {
   };
 }
 
-// 格式化订单数据
+// 格式化订单数据（与桌面端 get_order_status_badge_info 规则对齐）
 function formatOrder(o) {
   const items = o.items || [];
   const firstItem = items[0] || {};
-  const statusMap = {
-    paid: "待打单发货",
-    confirmed: "已确认",
-    payment_required: "待付款",
-    payment_in_process: "支付处理中",
-    partially_paid: "部分支付",
-    shipped: "干线运输中",
-    delivered: "已妥投送达",
-    cancelled: "已取消",
-    invalid: "无效订单"
-  };
   const sh = o.shipping || {};
   const recv = (sh.receiver_address) || {};
   const city = sh.city_name || recv.city || "目的地城市";
@@ -145,13 +141,43 @@ function formatOrder(o) {
   const street = [sh.street_name || recv.street_name, sh.street_number || recv.street_number].filter(Boolean).join(" ");
   const fullAddress = [sh.country_id, state, city, street, sh.zip_code].filter(Boolean).join(", ");
 
+  const shipSt = String(sh.status || "").toLowerCase();
+  const shipSub = String(sh.substatus || "").toLowerCase();
+  const orderSt = String(o.status || "").toLowerCase();
+
+  let statusText = o.status_text || "";
+  let filterCat = o.filter_cat || "";
+
+  if (!statusText || !filterCat) {
+    if (["delivered", "completed"].includes(shipSt) || shipSub === "delivered") {
+      statusText = "已送达";
+      filterCat = "delivered";
+    } else if (shipSt === "cancelled" || shipSub.includes("cancelled") || orderSt === "cancelled") {
+      statusText = "已取消";
+      filterCat = "cancelled";
+    } else if (["not_delivered", "failed"].includes(shipSt) || shipSub.includes("not_delivered")) {
+      statusText = "未送达";
+      filterCat = "not_delivered";
+    } else if (["shipped", "in_transit"].includes(shipSt) || ["picked_up", "dropped_off", "in_hub", "forwarded_to_carrier"].includes(shipSub)) {
+      statusText = "运送中";
+      filterCat = "shipped";
+    } else if (["ready_to_ship", "handling", "to_ship", "to_be_shipped"].includes(shipSt) || ["paid", "confirmed"].includes(orderSt)) {
+      statusText = "待发货";
+      filterCat = "paid";
+    } else {
+      statusText = "处理中";
+      filterCat = orderSt;
+    }
+  }
+
   return {
     order_id: String(o.order_id || o.id || ""),
     store_id: o.account_id || "",
     store_name: o.store_name || "美客多店铺",
     site_id: o.site_id || "MLM",
     status: o.status || "paid",
-    status_text: statusMap[o.status] || o.status || "处理中",
+    filter_cat: filterCat,
+    status_text: statusText,
     item_title: firstItem.title || "美客多跨境电商热卖单品",
     item_thumbnail: firstItem.thumbnail || firstItem.picture_url || "https://http2.mlstatic.com/D_NQ_NP_2X_841285-MLM43849301298_102020-F.webp",
     item_sku: firstItem.sku || firstItem.item_id || "",
@@ -246,6 +272,11 @@ function getGatewayStatus() {
     .catch(err => ({ ok: false, error: err.message }));
 }
 
+function getOverview(storeId) {
+  const storeParam = storeId ? `?store_name=${encodeURIComponent(storeId)}` : "";
+  return request(`/api/overview${storeParam}`);
+}
+
 function handleClaimAction(sessionId, action, extraParams = {}) {
   return request("/api/claim_action", {
     method: "POST",
@@ -262,6 +293,7 @@ function handleClaimAction(sessionId, action, extraParams = {}) {
 module.exports = {
   DEFAULT_GATEWAY_URL,
   getBaseUrl,
+  getOverview,
   getQuestions,
   getMessages,
   getClaims,

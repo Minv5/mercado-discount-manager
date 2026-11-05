@@ -136,6 +136,23 @@
   padding-top: 14rpx;
   font-size: 22rpx;
   color: #777266;
+  gap: 12rpx;
+}
+
+.tracking-pill {
+  display: flex;
+  align-items: center;
+  gap: 6rpx;
+  background: #18281E;
+  border: 1rpx solid #2F6B3F;
+  border-radius: 12rpx;
+  padding: 4rpx 12rpx;
+  font-size: 20rpx;
+  color: #4CAF50;
+}
+
+.tracking-mono {
+  font-family: monospace;
 }
 
 .buyer-city {
