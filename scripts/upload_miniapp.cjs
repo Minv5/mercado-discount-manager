@@ -10,11 +10,11 @@ const project = new ci.Project({
 });
 
 async function run() {
-  console.log('>>> 正在通过微信官方 CI 上传体验版 (v1.2.1)...');
+  console.log('>>> 正在通过微信官方 CI 上传体验版 (v1.2.2)...');
   const uploadResult = await ci.upload({
     project,
-    version: '1.2.1',
-    desc: '底栏换位先订单后消息-首页本月流水-索赔黑金去冗余',
+    version: '1.2.2',
+    desc: '索赔元数据整合至顶部3行-彻底移除中间大卡空出聊天流',
     setting: {
       es6: true,
       es7: true,
@@ -35,7 +35,7 @@ async function run() {
   console.log('>>> 正在生成最新真机扫码预览码至桌面...');
   const previewResult = await ci.preview({
     project,
-    version: '1.2.1',
+    version: '1.2.2',
     desc: '真机实时预览码',
     setting: { es6: true, minify: true },
     qrcodeFormat: 'image',

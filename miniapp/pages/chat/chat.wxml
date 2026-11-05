@@ -1,14 +1,35 @@
 <view class="chat-container">
   <!-- 顶部商品/订单上下文信息卡片 -->
-  <view class="context-card" wx:if="{{itemData.item_title}}">
+  <view class="context-card" wx:if="{{itemData.item_title || itemData.order_id}}">
     <image class="context-thumb" src="{{itemData.item_thumbnail}}" mode="aspectFill" />
     <view class="context-info">
-      <view class="context-top">
-        <text class="store-tag">{{itemData.store_name}}</text>
-        <text class="site-tag">{{itemData.site_id}}</text>
-        <text class="item-id text-muted">{{itemData.item_id}}</text>
-      </view>
-      <text class="context-title ellipsis-2">{{itemData.item_title}}</text>
+      <!-- 索赔专属紧凑3行全量元数据整合排版 -->
+      <block wx:if="{{chatType === 'claim'}}">
+        <view class="context-top space-between">
+          <view class="context-tags">
+            <text class="store-tag" wx:if="{{itemData.store_name}}">{{itemData.store_name}}</text>
+            <text class="site-tag" wx:if="{{itemData.site_id}}">{{itemData.site_id}}</text>
+            <text class="item-id text-muted" wx:if="{{itemData.order_id}}">#{{itemData.order_id}}</text>
+          </view>
+          <text class="claim-top-amount" wx:if="{{itemData.amount}}">{{itemData.amount}}</text>
+        </view>
+        <text class="context-title ellipsis">{{itemData.item_title || '美客多售后索赔商品'}}</text>
+        <view class="claim-meta-row">
+          <text class="claim-pill {{itemData.status_class || 'badge-status-blue'}}">{{itemData.return_status_label || itemData.status_text || '待处理'}}</text>
+          <text class="claim-pill {{itemData.rep_badge_class || (itemData.affects_reputation === 'affected' ? 'badge-rep-red' : 'badge-rep-green')}}">{{itemData.rep_badge_text || (itemData.affects_reputation === 'affected' ? '影响信誉: 是' : '影响信誉: 否')}}</text>
+          <text class="claim-meta-reason ellipsis" wx:if="{{itemData.reason}}">原因: {{itemData.reason}}</text>
+        </view>
+      </block>
+
+      <!-- 普通问答 / 售后私信排版 -->
+      <block wx:else>
+        <view class="context-top">
+          <text class="store-tag">{{itemData.store_name}}</text>
+          <text class="site-tag">{{itemData.site_id}}</text>
+          <text class="item-id text-muted">{{itemData.item_id}}</text>
+        </view>
+        <text class="context-title ellipsis-2">{{itemData.item_title}}</text>
+      </block>
     </view>
   </view>
 
@@ -86,20 +107,6 @@
 
     <!-- 3. 索赔处理形态 -->
     <view class="claim-view" wx:if="{{chatType === 'claim'}}">
-      <view class="claim-alert-card {{itemData.affects_reputation === 'affected' ? 'affects-rep' : ''}}">
-        <view class="claim-title-row">
-          <text class="claim-title">⚠️ 买家索赔详情</text>
-          <text class="claim-status-pill" wx:if="{{itemData.stage_text}}">{{itemData.stage_text}}</text>
-        </view>
-        <view class="claim-detail-row"><text class="k">关联订单：</text><text class="v mono">#{{itemData.order_id}}</text></view>
-        <view class="claim-detail-row" wx:if="{{itemData.reason}}"><text class="k">索赔原因：</text><text class="v">{{itemData.reason}}</text></view>
-        <view class="claim-detail-row"><text class="k">涉及金额：</text><text class="v text-gold font-bold">{{itemData.amount}}</text></view>
-        <view class="claim-detail-row"><text class="k">退货状态：</text><text class="v text-blue font-bold">{{itemData.return_status_label || '平台调解处理中'}}</text></view>
-        <view class="claim-detail-row" wx:if="{{itemData.return_shipment_id}}"><text class="k">退货单号：</text><text class="v mono text-green font-bold">{{itemData.return_shipment_id}}</text></view>
-        <view class="claim-detail-row"><text class="k">信誉影响：</text><text class="v {{itemData.affects_reputation === 'affected' ? 'text-red' : 'text-green'}} font-bold">{{itemData.affects_reputation === 'affected' ? '是 (影响信誉)' : '否'}}</text></view>
-        <view class="claim-detail-row" wx:if="{{itemData.deadline_hours > 0}}"><text class="k">处理时限：</text><text class="v text-orange">还剩 {{itemData.deadline_hours}} 小时</text></view>
-      </view>
-
       <!-- 双方协商沟通历史流 -->
       <view class="claim-chat-section">
         <block wx:if="{{itemData.history && itemData.history.length > 0}}">
