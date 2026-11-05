@@ -1,5 +1,5 @@
-const { translateText, TEMPLATES } = require("../../utils/translator");
-const { sendReply, handleClaimAction } = require("../../utils/api");
+const { translateText } = require("../../utils/translator");
+const { sendReply, getSessionDetail } = require("../../utils/api");
 
 Page({
   data: {
@@ -13,14 +13,13 @@ Page({
     replied: false,
     repliedTextEs: "",
     repliedTextCn: "",
-    showDrawer: false,
-    templates: TEMPLATES,
     scrollToView: "chat-bottom-anchor"
   },
 
   onLoad(options) {
     const chatType = (options && options.type) || "question";
-    const itemData = wx.getStorageSync("activeChatItem") || {};
+    const sessionId = (options && options.id) || "";
+    let itemData = wx.getStorageSync("activeChatItem") || {};
 
     const isBrazil = (itemData.site_id || "").toUpperCase() === "MLB";
     const targetLang = isBrazil ? "pt" : "es";
@@ -39,6 +38,21 @@ Page({
       targetLang,
       targetLangName
     });
+
+    // 权威拉取最新会话详情（包含全部双方历史记录与官方最新消息）
+    const targetId = itemData.id || sessionId;
+    if (targetId) {
+      getSessionDetail(targetId, chatType).then(detail => {
+        if (detail && detail.id) {
+          const detailBrazil = (detail.site_id || "").toUpperCase() === "MLB";
+          this.setData({
+            itemData: detail,
+            targetLang: detailBrazil ? "pt" : "es",
+            targetLangName: detailBrazil ? "葡萄牙语(巴西)" : "西班牙语(拉美)"
+          });
+        }
+      });
+    }
   },
 
   onInputCn(e) {
@@ -65,12 +79,6 @@ Page({
         translatedText: res
       });
     });
-  },
-
-  translateNow() {
-    if (this.data.inputCn) {
-      this.doTranslate(this.data.inputCn);
-    }
   },
 
   sendReplyAction() {
@@ -101,71 +109,6 @@ Page({
         content: String(err),
         showCancel: false
       });
-    });
-  },
-
-  handleRefund() {
-    wx.showModal({
-      title: "官方全额退款确认",
-      content: `确定为订单 ${this.data.itemData.order_id} 执行全额退款？款项将原路退回买家，索赔将自动结案。`,
-      confirmColor: "#D32F2F",
-      confirmText: "确定退款",
-      success: (res) => {
-        if (res.confirm) {
-          wx.showLoading({ title: "正在同步美客多官方..." });
-          handleClaimAction(this.data.itemData.id, "full-refund").then(ret => {
-            wx.hideLoading();
-            if (ret.ok) {
-              wx.showModal({
-                title: "退款已受理",
-                content: ret.msg || "全额退款已成功提交至美客多官方平台，该纠纷已关闭！",
-                showCancel: false,
-                success: () => {
-                  wx.navigateBack();
-                }
-              });
-            } else {
-              wx.showModal({
-                title: "退款失败",
-                content: ret.msg || "美客多平台返回错误，请检查网络或授权。",
-                showCancel: false
-              });
-            }
-          }).catch(err => {
-            wx.hideLoading();
-            wx.showModal({
-              title: "处理异常",
-              content: String(err),
-              showCancel: false
-            });
-          });
-        }
-      }
-    });
-  },
-
-  openTemplateDrawer() {
-    this.setData({ showDrawer: true });
-  },
-
-  closeDrawer() {
-    this.setData({ showDrawer: false });
-  },
-
-  preventProp() {},
-
-  selectTemplate(e) {
-    const tpl = e.currentTarget.dataset.tpl;
-    const esOrPt = this.data.targetLang === "pt" ? tpl.pt : tpl.es;
-    this.setData({
-      inputCn: tpl.cn,
-      translatedText: esOrPt,
-      canSend: true,
-      showDrawer: false
-    });
-    wx.showToast({
-      title: "已填入话术并自动转译",
-      icon: "none"
     });
   }
 });

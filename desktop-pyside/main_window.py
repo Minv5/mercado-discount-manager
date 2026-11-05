@@ -403,6 +403,14 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.statusBar().hide()
         self._start_mobile_gateway()
+        self._start_mobile_sync()
+
+    def _start_mobile_sync(self) -> None:
+        try:
+            from engine.mobile_sync import full_sync_from_disk_async
+            full_sync_from_disk_async(immediate=True)
+        except Exception as e:
+            logger.debug("Startup mobile sync error: %s", e)
 
     def _start_mobile_gateway(self) -> None:
         def _run() -> None:
@@ -4105,7 +4113,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.70"
+    return "2.2.71"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.

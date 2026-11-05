@@ -465,6 +465,11 @@ def save_sessions_snapshot(sessions: list[ServiceSession]) -> None:
                 "messages": msg_list,
             })
         path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        try:
+            from engine.mobile_sync import trigger_mobile_sync
+            trigger_mobile_sync(sessions=data)
+        except Exception as sync_err:
+            logger.debug("Failed to trigger mobile sync for sessions: %s", sync_err)
     except Exception as err:
         logger.debug("Failed to save sessions snapshot: %s", err)
 

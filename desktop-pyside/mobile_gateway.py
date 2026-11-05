@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -28,6 +28,9 @@ GATEWAY_PORT = 28760
 
 
 def get_data_dir() -> Path:
+    router_p = Path("/mnt/mmcblk2p4/mdm-gateway/data")
+    if router_p.exists():
+        return router_p
     if "MDM_DATA_DIR" in os.environ:
         return Path(os.environ["MDM_DATA_DIR"])
     if sys.platform == "darwin":
@@ -71,6 +74,15 @@ def load_orders() -> list[dict[str, Any]]:
     except Exception as e:
         logger.error("Failed to read orders snapshot: %s", e)
         return []
+
+
+def save_orders(orders: list[dict[str, Any]]) -> None:
+    p = get_data_dir() / "orders_snapshot.json"
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(orders, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error("Failed to write orders snapshot: %s", e)
 
 
 def get_available_stores() -> list[dict[str, Any]]:
@@ -135,13 +147,26 @@ def classify_order_status(order: dict[str, Any]) -> tuple[str, str]:
     return ("已付款", "paid")
 
 
+def is_store_match(target_store: str, item_store_name: Any, item_account_id: Any) -> bool:
+    if not target_store or target_store in ("全部", "all", "全部店铺"):
+        return True
+    s_target = str(target_store).strip()
+    s_name = str(item_store_name or "").strip()
+    s_acc = str(item_account_id or "").strip()
+    if s_target == s_name or s_target == s_acc:
+        return True
+    if s_target in s_name or s_name in s_target:
+        return True
+    return False
+
+
 def compute_overview(store_name: str | None = None) -> dict[str, Any]:
     sessions = load_sessions()
     orders = load_orders()
 
     if store_name and store_name != "全部" and store_name != "all":
-        sessions = [s for s in sessions if (s.get("account_name") == store_name or s.get("account_id") == store_name)]
-        orders = [o for o in orders if (o.get("store_name") == store_name or o.get("account_id") == store_name)]
+        sessions = [s for s in sessions if is_store_match(store_name, s.get("account_name"), s.get("account_id"))]
+        orders = [o for o in orders if is_store_match(store_name, o.get("store_name"), o.get("account_id"))]
 
     # 真实待办统计：严格区分已回复/未回复、已结案/未结案
     pending_questions = sum(
@@ -312,6 +337,7 @@ def send_real_reply(session_id: str, reply_text: str) -> tuple[bool, str]:
 
 
 class MobileGatewayHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: Any) -> None:
         logger.debug(format, *args)
@@ -324,8 +350,10 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+        self.close_connection = True
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
@@ -366,7 +394,7 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
 
             sessions = load_sessions()
             if store_name and store_name != "全部" and store_name != "all":
-                sessions = [s for s in sessions if (s.get("account_name") == store_name or s.get("account_id") == store_name)]
+                sessions = [s for s in sessions if is_store_match(store_name, s.get("account_name"), s.get("account_id"))]
             if sess_type:
                 sessions = [s for s in sessions if s.get("session_type") == sess_type]
             if search_kw:
@@ -414,7 +442,7 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
 
             orders = load_orders()
             if store_name and store_name != "全部" and store_name != "all":
-                orders = [o for o in orders if (o.get("store_name") == store_name or o.get("account_id") == store_name)]
+                orders = [o for o in orders if is_store_match(store_name, o.get("store_name"), o.get("account_id"))]
 
             # Enrich with desktop-aligned status classification
             enriched_orders = []
@@ -478,6 +506,14 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
                 return
             ok, msg = execute_claim_action(session_id, action, payload.get("extra_params"))
             self._send_json({"success": ok, "message": msg})
+        elif path == "/api/sync":
+            orders = payload.get("orders")
+            sessions = payload.get("sessions")
+            if orders is not None:
+                save_orders(orders)
+            if sessions is not None:
+                save_sessions(sessions)
+            self._send_json({"success": True, "message": "数据已成功同步！"})
         else:
             self._send_json({"error": "Endpoint not found"}, status_code=404)
 
@@ -542,8 +578,8 @@ def start_tunnel_in_background(port: int = GATEWAY_PORT) -> None:
 
 
 def run_server(port: int = GATEWAY_PORT, with_tunnel: bool = True) -> None:
-    server = HTTPServer(("0.0.0.0", port), MobileGatewayHandler)
-    logger.info(">>> 移动端网关服务已启动: http://0.0.0.0:%d <<<", port)
+    server = ThreadingHTTPServer(("0.0.0.0", port), MobileGatewayHandler)
+    logger.info(">>> 移动端多线程高并发网关服务已启动: http://0.0.0.0:%d <<<", port)
 
     if with_tunnel:
         start_tunnel_in_background(port)

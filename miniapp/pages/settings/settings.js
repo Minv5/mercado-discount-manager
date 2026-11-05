@@ -7,14 +7,24 @@ Page({
     stores: [],
     pushEnabled: true,
     gatewayUrl: "",
-    gatewayOnline: false
+    gatewayOnline: false,
+    miniappVersion: "v1.2.0"
   },
 
   onShow() {
+    let version = "v1.2.0";
+    try {
+      const accountInfo = wx.getAccountInfoSync();
+      if (accountInfo && accountInfo.miniProgram && accountInfo.miniProgram.version) {
+        version = `v${accountInfo.miniProgram.version}`;
+      }
+    } catch (_) {}
+
     this.setData({
       stores: app.globalData.stores,
       pushEnabled: wx.getStorageSync("pushNotificationEnabled") !== false,
-      gatewayUrl: getBaseUrl()
+      gatewayUrl: getBaseUrl(),
+      miniappVersion: version
     });
     this.checkGateway(false);
   },

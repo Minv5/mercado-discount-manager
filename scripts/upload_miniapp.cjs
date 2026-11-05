@@ -10,11 +10,11 @@ const project = new ci.Project({
 });
 
 async function run() {
-  console.log('>>> 正在通过微信官方 CI 上传黑金暗黑版体验包 (v1.1.2)...');
+  console.log('>>> 正在通过微信官方 CI 上传体验版 (v1.2.0)...');
   const uploadResult = await ci.upload({
     project,
-    version: '1.1.2',
-    desc: '黑金暗黑版移动工作台-精准对齐桌面端待办与物流状态',
+    version: '1.2.0',
+    desc: '彻底移除主页常用功能-补齐售前咨询历史回复气泡与锁定',
     setting: {
       es6: true,
       es7: true,
@@ -35,7 +35,7 @@ async function run() {
   console.log('>>> 正在生成最新真机扫码预览码至桌面...');
   const previewResult = await ci.preview({
     project,
-    version: '1.1.2',
+    version: '1.2.0',
     desc: '真机实时预览码',
     setting: { es6: true, minify: true },
     qrcodeFormat: 'image',

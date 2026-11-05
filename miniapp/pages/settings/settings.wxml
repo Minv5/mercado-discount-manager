@@ -66,15 +66,15 @@
   <!-- 关于与技术信息 -->
   <view class="card">
     <view class="section-title">
-      <text>ℹ️ 版本与技术支持</text>
+      <text>ℹ️ 版本与技术信息</text>
     </view>
     <view class="info-row">
-      <text class="info-label">系统版本</text>
-      <text class="info-val">v2.2.70 (正式工程)</text>
+      <text class="info-label">小程序版本</text>
+      <text class="info-val font-bold text-gold">{{miniappVersion}}</text>
     </view>
     <view class="info-row">
-      <text class="info-label">核心对标</text>
-      <text class="info-val">智赢跨境移动端客服体系</text>
+      <text class="info-label">连接架构</text>
+      <text class="info-val">美客多官方 API 直连</text>
     </view>
     <view class="info-row">
       <text class="info-label">双语互译引擎</text>

@@ -1,5 +1,6 @@
 /**
  * 数据与业务展示格式化辅助工具
+ * 美客多跨境店铺（CBT）官方统一采用美元（USD）结算与展示
  */
 
 const SITE_NAMES = {
@@ -11,24 +12,14 @@ const SITE_NAMES = {
   MLU: "乌拉圭"
 };
 
-const SITE_CURRENCY = {
-  MLM: "MXN $",
-  MLB: "R$",
-  MLC: "CLP $",
-  MCO: "COP $",
-  MLA: "ARS $",
-  MLU: "UYU $"
-};
-
 function formatSiteName(siteId) {
   const code = (siteId || "").toUpperCase();
   return SITE_NAMES[code] ? `${SITE_NAMES[code]} (${code})` : (code || "全站点");
 }
 
-function formatCurrency(amount, siteId = "") {
+function formatCurrency(amount) {
   const num = Number(amount) || 0;
-  const prefix = SITE_CURRENCY[(siteId || "").toUpperCase()] || "$";
-  return `${prefix} ${num.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return `$ ${num.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function formatTime(isoStr) {
@@ -47,3 +38,4 @@ module.exports = {
   formatCurrency,
   formatTime
 };
+

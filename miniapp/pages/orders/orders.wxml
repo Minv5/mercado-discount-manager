@@ -48,9 +48,14 @@
       </view>
     </view>
 
-    <view class="empty-state" wx:if="{{filteredOrders.length === 0}}">
+    <view class="loading-state" wx:if="{{isLoading && filteredOrders.length === 0}}">
+      <view class="loading-spinner"></view>
+      <text class="loading-text">正在极速加载店铺订单...</text>
+    </view>
+
+    <view class="empty-state" wx:elif="{{!isLoading && filteredOrders.length === 0}}">
       <text class="empty-icon">📦</text>
-      <text class="empty-text">未查找到匹配的订单记录</text>
+      <text class="empty-text">当前分类下暂无订单记录</text>
     </view>
   </view>
 

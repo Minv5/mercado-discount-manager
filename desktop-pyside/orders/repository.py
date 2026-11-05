@@ -741,6 +741,11 @@ class OrdersRepository:
             path = self.get_snapshot_path()
             data = [o.to_dict() for o in orders[:limit]]
             path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                from engine.mobile_sync import trigger_mobile_sync
+                trigger_mobile_sync(orders=data)
+            except Exception as sync_err:
+                logger.debug("Failed to trigger mobile sync for orders: %s", sync_err)
             return True
         except Exception as e:
             logger.debug("Failed to save orders snapshot: %s", e)

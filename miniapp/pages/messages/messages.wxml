@@ -1,17 +1,14 @@
 <view class="container">
-  <!-- 顶部分类标签导航 (对标智赢消息TAB) -->
+  <!-- 顶部分类标签导航 (1:1 严格对齐桌面端 Tab 顺序与文案) -->
   <view class="tab-bar">
     <view class="tab-item {{activeTab === 0 ? 'active' : ''}}" bindtap="onTabChange" data-tab="0">
-      <text>售前提问</text>
-      <text class="tab-badge" wx:if="{{pendingQuestionsCount > 0}}">{{pendingQuestionsCount}}</text>
+      <text class="tab-title">售前咨询{{pendingQuestionsCount > 0 ? ' (' + pendingQuestionsCount + '待回复)' : ''}}</text>
     </view>
     <view class="tab-item {{activeTab === 1 ? 'active' : ''}}" bindtap="onTabChange" data-tab="1">
-      <text>售后私信</text>
-      <text class="tab-badge" wx:if="{{unreadMessagesCount > 0}}">{{unreadMessagesCount}}</text>
+      <text class="tab-title">订单索赔{{pendingClaimsCount > 0 ? ' (' + pendingClaimsCount + '进行中)' : ''}}</text>
     </view>
     <view class="tab-item {{activeTab === 2 ? 'active' : ''}}" bindtap="onTabChange" data-tab="2">
-      <text>索赔纠纷</text>
-      <text class="tab-badge badge-red-bg" wx:if="{{pendingClaimsCount > 0}}">{{pendingClaimsCount}}</text>
+      <text class="tab-title">售后私信{{unreadMessagesCount > 0 ? ' (' + unreadMessagesCount + '未读)' : ''}}</text>
     </view>
   </view>
 
@@ -19,125 +16,113 @@
   <view class="list-container">
     <!-- 1. 售前咨询列表 (QA) -->
     <block wx:if="{{activeTab === 0}}">
-      <view class="card item-card" wx:for="{{questions}}" wx:key="id" bindtap="openChat" data-type="question" data-id="{{item.id}}" data-item="{{item}}">
-        <view class="card-header">
-          <view class="header-left">
-            <text class="store-badge">{{item.store_name}}</text>
-            <text class="site-tag">{{item.site_id}}</text>
+      <view class="desktop-card" wx:for="{{questions}}" wx:key="id" bindtap="openChat" data-type="question" data-id="{{item.id}}" data-item="{{item}}">
+        <image class="item-thumb" src="{{item.item_thumbnail || '/images/default_product.png'}}" mode="aspectFill" />
+        <view class="item-content">
+          <view class="row-top">
+            <view class="store-tags">
+              <text class="store-badge">{{item.store_name}}</text>
+              <text class="site-tag">{{item.site_id}}</text>
+            </view>
+            <text class="time-text">{{item.created_at}}</text>
           </view>
-          <text class="time-text text-muted">{{item.created_at}}</text>
-        </view>
 
-        <view class="product-snippet">
-          <image class="thumb" src="{{item.item_thumbnail}}" mode="aspectFill" />
-          <view class="product-info">
-            <text class="product-title ellipsis-2">{{item.item_title}}</text>
-            <text class="item-id-tag">ID: {{item.item_id}}</text>
+          <view class="row-mid">
+            <text class="buyer-name">{{item.buyer_name}}</text>
+            <view class="badge-group">
+              <text class="badge-status {{item.status_class}}">{{item.status_text}}</text>
+            </view>
           </view>
-        </view>
 
-        <view class="question-box">
-          <view class="q-lang-es">
-            <text class="q-prefix">买家提问：</text>
-            <text class="q-content">{{item.text_es}}</text>
-          </view>
-          <view class="q-lang-cn" wx:if="{{item.text_cn}}">
-            <text class="cn-label">中文翻译：</text>
-            <text class="cn-text">{{item.text_cn}}</text>
-          </view>
-        </view>
-
-        <view class="card-footer">
-          <text class="buyer-name text-muted">提问买家: {{item.buyer_name}}</text>
-          <view class="btn-reply {{item.status === 'ANSWERED' || item.status === 'answered' ? 'btn-answered' : 'btn-urgent'}}">
-            {{item.status === 'ANSWERED' || item.status === 'answered' ? '✅ 已回复 (查看记录)' : '⚡ 立即回复 (双语翻译) ➔'}}
+          <view class="row-bottom">
+            <text class="bottom-snip ellipsis-1">问: {{item.text_cn || item.text_es}}</text>
           </view>
         </view>
       </view>
 
-      <view class="empty-state" wx:if="{{questions.length === 0}}">
+      <view class="list-summary" wx:if="{{!isLoading && questions.length > 0}}">共 {{questions.length}} 条提问</view>
+
+      <view class="empty-state" wx:if="{{!isLoading && questions.length === 0}}">
         <text class="empty-icon">🎉</text>
         <text class="empty-text">当前没有待回复的售前咨询</text>
       </view>
     </block>
 
-    <!-- 2. 售后私信列表 (Messages) -->
+    <!-- 2. 订单索赔列表 (Claims，全量 70 笔，1:1 严格对齐桌面端) -->
     <block wx:if="{{activeTab === 1}}">
-      <view class="card item-card" wx:for="{{messages}}" wx:key="id" bindtap="openChat" data-type="message" data-id="{{item.id}}" data-item="{{item}}">
-        <view class="card-header">
-          <view class="header-left">
-            <text class="store-badge">{{item.store_name}}</text>
-            <text class="site-tag">{{item.site_id}}</text>
-            <text class="order-tag">订单: {{item.order_id}}</text>
+      <view class="desktop-card" wx:for="{{claims}}" wx:key="id" bindtap="openChat" data-type="claim" data-id="{{item.id}}" data-item="{{item}}">
+        <image class="item-thumb" src="{{item.item_thumbnail || '/images/default_product.png'}}" mode="aspectFill" />
+        <view class="item-content">
+          <view class="row-top">
+            <view class="store-tags">
+              <text class="store-badge">{{item.store_name}}</text>
+              <text class="site-tag">{{item.site_id}}</text>
+              <text class="order-mono" wx:if="{{item.order_id}}">#{{item.order_id}}</text>
+            </view>
+            <text class="time-text">{{item.created_at}}</text>
           </view>
-          <text class="time-text text-muted">{{item.updated_at}}</text>
-        </view>
 
-        <view class="message-body">
-          <view class="buyer-header">
-            <text class="buyer-avatar">👤</text>
-            <text class="buyer-name-strong">{{item.buyer_name}}</text>
-            <text class="unread-dot" wx:if="{{item.unread_count > 0}}">{{item.unread_count}} 条新消息</text>
+          <view class="row-mid">
+            <text class="buyer-name">{{item.buyer_name}}</text>
+            <view class="badge-group">
+              <text class="badge-rep {{item.rep_badge_class}}">{{item.rep_badge_text}}</text>
+              <text class="badge-status {{item.status_class}}">{{item.status_text}}</text>
+            </view>
           </view>
-          <view class="last-msg-box">
-            <text class="msg-es">{{item.last_message}}</text>
-            <text class="msg-cn" wx:if="{{item.last_message_cn}}">({{item.last_message_cn}})</text>
-          </view>
-        </view>
 
-        <view class="card-footer">
-          <text class="text-muted">已交流多轮对话</text>
-          <view class="btn-reply btn-blue">进入会话聊天 ➔</view>
+          <view class="row-bottom">
+            <text class="bottom-snip ellipsis-1">理由: {{item.reason_display}}</text>
+          </view>
         </view>
       </view>
 
-      <view class="empty-state" wx:if="{{messages.length === 0}}">
-        <text class="empty-icon">✅</text>
-        <text class="empty-text">当前没有待回复的售后私信</text>
-      </view>
-    </block>
+      <view class="list-summary" wx:if="{{!isLoading && claims.length > 0}}">共 {{claims.length}} 笔索赔</view>
 
-    <!-- 3. 索赔与纠纷列表 (Claims) -->
-    <block wx:if="{{activeTab === 2}}">
-      <view class="card item-card {{item.is_closed ? '' : 'claim-border'}}" wx:for="{{claims}}" wx:key="id" bindtap="openChat" data-type="claim" data-id="{{item.id}}" data-item="{{item}}">
-        <view class="card-header">
-          <view class="header-left">
-            <text class="badge {{item.is_closed ? 'badge-gray' : 'badge-red'}}">{{item.is_closed ? '✅ ' + item.stage_text : '🚨 ' + item.stage_text}}</text>
-            <text class="store-badge">{{item.store_name}}</text>
-            <text class="site-tag">{{item.site_id}}</text>
-          </view>
-          <view class="countdown-badge" wx:if="{{!item.is_closed}}">剩 {{item.deadline_hours}} 小时超时</view>
-          <view class="closed-pill text-muted" wx:if="{{item.is_closed}}">已完结归档</view>
-        </view>
-
-        <view class="claim-body">
-          <view class="claim-row">
-            <text class="claim-label">关联订单：</text>
-            <text class="claim-value mono">{{item.order_id}}</text>
-          </view>
-          <view class="claim-row">
-            <text class="claim-label">索赔编号：</text>
-            <text class="claim-value">{{item.claim_id}}</text>
-          </view>
-          <view class="claim-row">
-            <text class="claim-label">涉及金额：</text>
-            <text class="claim-value font-bold {{item.is_closed ? 'text-muted' : 'text-red'}}">{{item.amount}}</text>
-          </view>
-          <view class="claim-reason-box">
-            <text class="reason-text">{{item.reason}}</text>
-          </view>
-        </view>
-
-        <view class="card-footer">
-          <text class="text-muted">{{item.is_closed ? '已退款结案/官方闭环' : '超时未回将被判罚'}}</text>
-          <view class="btn-reply {{item.is_closed ? 'btn-answered' : 'btn-red'}}">{{item.is_closed ? '查看纠纷记录 ➔' : '立即处理索赔 ➔'}}</view>
-        </view>
-      </view>
-
-      <view class="empty-state" wx:if="{{claims.length === 0}}">
+      <view class="empty-state" wx:if="{{!isLoading && claims.length === 0}}">
         <text class="empty-icon">🛡️</text>
-        <text class="empty-text">太棒了！当前没有任何索赔纠纷</text>
+        <text class="empty-text">当前没有进行中的订单索赔</text>
       </view>
     </block>
+
+    <!-- 3. 售后私信列表 (Messages，1:1 严格对齐桌面端) -->
+    <block wx:if="{{activeTab === 2}}">
+      <view class="desktop-card" wx:for="{{messages}}" wx:key="id" bindtap="openChat" data-type="message" data-id="{{item.id}}" data-item="{{item}}">
+        <image class="item-thumb" src="{{item.item_thumbnail || '/images/default_product.png'}}" mode="aspectFill" />
+        <view class="item-content">
+          <view class="row-top">
+            <view class="store-tags">
+              <text class="store-badge">{{item.store_name}}</text>
+              <text class="site-tag">{{item.site_id}}</text>
+              <text class="order-mono" wx:if="{{item.order_id}}">#{{item.order_id}}</text>
+            </view>
+            <text class="time-text">{{item.created_at}}</text>
+          </view>
+
+          <view class="row-mid">
+            <text class="buyer-name">{{item.buyer_name}}</text>
+            <view class="badge-group">
+              <text class="badge-status {{item.status_class}}">{{item.status_text}}</text>
+            </view>
+          </view>
+
+          <view class="row-bottom">
+            <text class="bottom-snip ellipsis-1">{{item.item_title || item.last_message}}</text>
+          </view>
+        </view>
+      </view>
+
+      <view class="list-summary" wx:if="{{!isLoading && messages.length > 0}}">共 {{messages.length}} 条私信</view>
+
+      <view class="empty-state" wx:if="{{!isLoading && messages.length === 0}}">
+        <text class="empty-icon">✅</text>
+        <text class="empty-text">当前没有待处理的售后私信</text>
+      </view>
+    </block>
+
+    <!-- 加载中动画骨架 -->
+    <view class="loading-state" wx:if="{{isLoading && ((activeTab === 0 && questions.length === 0) || (activeTab === 1 && claims.length === 0) || (activeTab === 2 && messages.length === 0))}}">
+      <view class="loading-spinner"></view>
+      <text class="loading-text">正在同步美客多官方数据...</text>
+    </view>
   </view>
 </view>

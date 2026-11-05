@@ -86,29 +86,4 @@
       </view>
     </view>
   </view>
-
-  <!-- 快捷功能矩阵 -->
-  <view class="card shortcut-card">
-    <view class="section-title">
-      <text>⚡ 常用快捷功能</text>
-    </view>
-    <view class="grid-nav">
-      <view class="grid-item" bindtap="goToMessages">
-        <view class="grid-icon">📨</view>
-        <text class="grid-text">智能客服</text>
-      </view>
-      <view class="grid-item" bindtap="goToOrders">
-        <view class="grid-icon">📦</view>
-        <text class="grid-text">订单管理</text>
-      </view>
-      <view class="grid-item" bindtap="openQuickTemplates">
-        <view class="grid-icon">📖</view>
-        <text class="grid-text">话术字典</text>
-      </view>
-      <view class="grid-item" bindtap="goToSettings">
-        <view class="grid-icon">⚙️</view>
-        <text class="grid-text">系统设置</text>
-      </view>
-    </view>
-  </view>
 </view>

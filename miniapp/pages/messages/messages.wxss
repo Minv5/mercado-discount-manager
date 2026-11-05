@@ -1,289 +1,255 @@
-/* 顶部选项卡 */
+/* 顶部分类标签导航 (1:1 对齐桌面端三段式 Tab) */
 .tab-bar {
   display: flex;
-  background: #1C231F;
-  border: 1rpx solid #4E472F;
-  border-radius: 16rpx;
-  padding: 8rpx;
-  margin-bottom: 24rpx;
+  background: #141A16;
+  border: 1rpx solid #332B1C;
+  border-radius: 14rpx;
+  padding: 6rpx;
+  margin-bottom: 20rpx;
+  gap: 6rpx;
 }
 
 .tab-item {
   flex: 1;
   text-align: center;
-  padding: 16rpx 0;
-  font-size: 28rpx;
-  color: #C8C3B7;
-  border-radius: 12rpx;
+  padding: 14rpx 4rpx;
+  font-size: 24rpx;
+  font-weight: 600;
+  color: #A8A29E;
+  background: #1C231F;
+  border: 1rpx solid #4E472F;
+  border-radius: 10rpx;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8rpx;
   transition: all 0.2s ease;
 }
 
 .tab-item.active {
-  background: #2F6B3F;
-  color: #F6F3EA;
-  font-weight: bold;
-  border: 1rpx solid #6E5D2A;
-}
-
-.tab-badge {
-  background: #D32F2F;
-  color: #FFFFFF;
-  font-size: 20rpx;
-  padding: 2rpx 10rpx;
-  border-radius: 20rpx;
-}
-
-.badge-red-bg {
-  background: #C62828;
-}
-
-/* 列表卡片 */
-.item-card {
-  padding: 24rpx;
-  margin-bottom: 20rpx;
-  transition: all 0.2s ease;
-}
-
-.item-card:active {
-  background: #253026;
-}
-
-.claim-border {
-  border-left: 6rpx solid #E53E3E;
-}
-
-.card-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 16rpx;
-}
-
-.header-left {
-  display: flex;
-  align-items: center;
-  gap: 12rpx;
-}
-
-.store-badge {
   background: #203A2B;
-  color: #4CAF50;
-  border: 1rpx solid #2F6B3F;
-  font-size: 22rpx;
-  padding: 4rpx 12rpx;
-  border-radius: 6rpx;
-  font-weight: 500;
+  border: 1rpx solid #3E7B4B;
+  color: #FFFFFF;
+  font-weight: bold;
 }
 
-.site-tag {
-  background: #2D2619;
-  color: #D4AF37;
-  border: 1rpx solid #6E5D2A;
-  font-size: 22rpx;
-  padding: 4rpx 12rpx;
-  border-radius: 6rpx;
+.tab-title {
+  white-space: nowrap;
 }
 
-.order-tag {
-  font-size: 22rpx;
-  color: #C8C3B7;
-  font-family: monospace;
+/* 列表容器 */
+.list-container {
+  padding-bottom: 30rpx;
 }
 
-.time-text {
-  font-size: 22rpx;
-  color: #777266;
-}
-
-/* 商品摘要 */
-.product-snippet {
+/* 桌面端 1:1 复刻单行条目卡片 */
+.desktop-card {
   display: flex;
-  gap: 16rpx;
+  align-items: center;
   background: #18201C;
-  border: 1rpx solid #2F3B32;
-  padding: 12rpx;
+  border: 1rpx solid #2B352E;
+  border-radius: 12rpx;
+  padding: 16rpx 20rpx;
+  margin-bottom: 14rpx;
+  gap: 18rpx;
+  transition: all 0.15s ease;
+}
+
+.desktop-card:active {
+  background: #222C26;
+  border-color: #3E7B4B;
+}
+
+/* 左侧商品主图缩略图 (44x44 对齐桌面端) */
+.item-thumb {
+  width: 88rpx;
+  height: 88rpx;
   border-radius: 10rpx;
-  margin-bottom: 16rpx;
+  background: #232C25;
+  border: 1rpx solid #38453B;
+  flex-shrink: 0;
 }
 
-.thumb {
-  width: 90rpx;
-  height: 90rpx;
-  border-radius: 8rpx;
-  background: #2D3A30;
-}
-
-.product-info {
+/* 右侧内容排版 (三行流式布局) */
+.item-content {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
+  gap: 6rpx;
+}
+
+/* 第一行：店铺、站点、订单号与时间 */
+.row-top {
+  display: flex;
+  align-items: center;
   justify-content: space-between;
 }
 
-.product-title {
-  font-size: 26rpx;
-  color: #E6E2D8;
-  line-height: 1.3;
-}
-
-.item-id-tag {
-  font-size: 20rpx;
-  color: #777266;
-  font-family: monospace;
-}
-
-/* 提问内容框 */
-.question-box {
-  background: #232219;
-  border-left: 4rpx solid #D4AF37;
-  padding: 14rpx;
-  border-radius: 8rpx;
-  margin-bottom: 16rpx;
-}
-
-.q-lang-es {
-  font-size: 28rpx;
-  color: #F6F3EA;
-  font-weight: 500;
-  margin-bottom: 8rpx;
-}
-
-.q-prefix {
-  color: #D4AF37;
-}
-
-.q-lang-cn {
-  font-size: 24rpx;
-  color: #C8C3B7;
-  border-top: 1rpx dashed #3D3728;
-  padding-top: 8rpx;
-}
-
-.cn-label {
-  color: #4CAF50;
-  font-weight: 500;
-}
-
-/* 售后私信样式 */
-.buyer-header {
+.store-tags {
   display: flex;
   align-items: center;
   gap: 10rpx;
-  margin-bottom: 10rpx;
+  flex-wrap: nowrap;
 }
 
-.buyer-name-strong {
-  font-size: 28rpx;
-  font-weight: bold;
-  color: #F6F3EA;
-}
-
-.unread-dot {
-  background: #E53E3E;
-  color: #FFFFFF;
+.store-badge {
+  color: #4CAF50;
   font-size: 20rpx;
-  padding: 2rpx 10rpx;
-  border-radius: 20rpx;
+  font-weight: 600;
 }
 
-.last-msg-box {
-  background: #18231C;
-  border: 1rpx solid #2B3A30;
-  padding: 12rpx 16rpx;
-  border-radius: 12rpx;
-  margin-bottom: 14rpx;
+.site-tag {
+  color: #D4AF37;
+  font-size: 20rpx;
+  font-weight: 600;
 }
 
-.msg-es {
-  display: block;
-  font-size: 28rpx;
-  color: #E6E2D8;
-}
-
-.msg-cn {
-  display: block;
-  font-size: 24rpx;
+.order-mono {
+  font-family: monospace;
+  font-size: 20rpx;
   color: #777266;
-  margin-top: 4rpx;
 }
 
-/* 索赔专区 */
-.countdown-badge {
-  background: #381A1A;
-  color: #EF5350;
-  border: 1rpx solid #C62828;
-  font-size: 22rpx;
-  padding: 4rpx 14rpx;
-  border-radius: 20rpx;
-  font-weight: bold;
-}
-
-.claim-body {
-  margin-bottom: 16rpx;
-}
-
-.claim-row {
-  display: flex;
-  font-size: 26rpx;
-  margin-bottom: 6rpx;
-}
-
-.claim-label {
-  color: #C8C3B7;
-  width: 150rpx;
-}
-
-.claim-value {
-  color: #E6E2D8;
-}
-
-.mono {
+.time-text {
+  font-size: 20rpx;
+  color: #777266;
   font-family: monospace;
 }
 
-.claim-reason-box {
-  background: #2D1717;
-  border: 1rpx solid #5C2323;
-  padding: 12rpx;
-  border-radius: 8rpx;
-  color: #EF5350;
-  font-size: 26rpx;
-  margin-top: 10rpx;
-}
-
-/* 卡片底栏 */
-.card-footer {
+/* 第二行：买家姓名与状态徽章组 */
+.row-mid {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  border-top: 1rpx solid #2B352E;
-  padding-top: 16rpx;
+  gap: 12rpx;
 }
 
-.btn-reply {
-  background: #2F6B3F;
+.buyer-name {
+  font-size: 26rpx;
+  font-weight: bold;
   color: #F6F3EA;
-  border: 1rpx solid #4E472F;
-  font-size: 24rpx;
-  font-weight: 500;
-  padding: 10rpx 20rpx;
-  border-radius: 30rpx;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320rpx;
 }
 
-.btn-blue {
-  background: #1C3345;
-  border-color: #2F597A;
+.badge-group {
+  display: flex;
+  align-items: center;
+  gap: 8rpx;
+  flex-shrink: 0;
+}
+
+/* 通用徽章胶囊 */
+.badge-pill {
+  font-size: 20rpx;
+  padding: 4rpx 10rpx;
+  border-radius: 6rpx;
+  font-weight: 500;
+  line-height: 1.2;
+}
+
+/* 信誉影响徽章 (严格对齐桌面端 CARD_STYLE_GREEN / CARD_STYLE_RED) */
+.badge-rep-green {
+  background: #152E20;
+  border: 1rpx solid #2E7D32;
+  color: #34D399;
+}
+
+.badge-rep-red {
+  background: #331515;
+  border: 1rpx solid #B71C1C;
+  color: #F87171;
+}
+
+/* 官方状态徽章 (严格对齐桌面端) */
+.badge-status-gold,
+.status-gold {
+  background: #2D2619;
+  border: 1rpx solid #6E5D2A;
+  color: #F6C453;
+}
+
+.badge-status-blue {
+  background: #102A3C;
+  border: 1rpx solid #1976D2;
   color: #64B5F6;
 }
 
-.btn-red {
-  background: #3A1A1A;
-  border-color: #8C2F2F;
+.badge-status-red {
+  background: #331515;
+  border: 1rpx solid #B71C1C;
   color: #EF5350;
+}
+
+.badge-status-gray,
+.status-gray {
+  background: #242825;
+  border: 1rpx solid #3E4A42;
+  color: #9E9E9E;
+}
+
+.status-green {
+  background: #152E20;
+  border: 1rpx solid #2E7D32;
+  color: #4CAF50;
+}
+
+/* 第三行：底部摘要 (商品英文名 / 投诉理由 / 提问内容) */
+.row-bottom {
+  display: flex;
+  align-items: center;
+}
+
+.bottom-snip {
+  font-size: 22rpx;
+  color: #A8A29E;
+  line-height: 1.3;
+}
+
+.ellipsis-1 {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 列表底部全量笔数统计 (严格对齐桌面端右下角) */
+.list-summary {
+  text-align: right;
+  padding: 16rpx 10rpx 20rpx 0;
+  font-size: 22rpx;
+  color: #777266;
+  font-family: monospace;
+}
+
+/* 旋转骨架屏 */
+.loading-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 120rpx 0;
+}
+
+.loading-spinner {
+  width: 56rpx;
+  height: 56rpx;
+  border: 4rpx solid #2B352E;
+  border-top-color: #D4AF37;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-bottom: 20rpx;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.loading-text {
+  font-size: 26rpx;
+  color: #A8A29E;
 }
 
 /* 空状态 */
@@ -292,28 +258,15 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 100rpx 0;
+  padding: 120rpx 0;
 }
 
 .empty-icon {
-  font-size: 72rpx;
+  font-size: 64rpx;
   margin-bottom: 16rpx;
 }
 
 .empty-text {
-  font-size: 28rpx;
+  font-size: 26rpx;
   color: #777266;
-}
-
-.btn-answered {
-  background: #202820 !important;
-  color: #8C877B !important;
-  border: 1rpx solid #353022 !important;
-}
-
-.btn-urgent {
-  background: #2F6B3F !important;
-  color: #F6F3EA !important;
-  border: 1rpx solid #6E5D2A !important;
-  box-shadow: 0 4rpx 12rpx rgba(47, 107, 63, 0.4);
 }

@@ -43,6 +43,20 @@ Page({
       storeIndex,
       currentStore: stores[storeIndex] || stores[0]
     });
+
+    // 静默预热订单缓存，确保切换到订单中心 0ms 秒开
+    const store = stores[storeIndex] || stores[0];
+    if (store) {
+      getOrders(store.id, "all").then((list) => {
+        const { formatCurrency, formatTime } = require("../../utils/format");
+        const formatted = list.map(o => ({
+          ...o,
+          amount_formatted: formatCurrency(o.total_amount),
+          created_at: formatTime(o.created_at)
+        }));
+        wx.setStorageSync("cached_orders_list", formatted);
+      }).catch(() => {});
+    }
   },
 
   onStoreChange(e) {
@@ -114,43 +128,29 @@ Page({
   },
 
   goToQuestions() {
-    wx.navigateTo({
-      url: "/pages/messages/messages?tab=0"
-    });
-  },
-
-  goToMessages() {
-    wx.navigateTo({
-      url: "/pages/messages/messages?tab=1"
+    app.globalData.activeMessageTab = 0;
+    wx.switchTab({
+      url: "/pages/messages/messages"
     });
   },
 
   goToClaims() {
-    wx.navigateTo({
-      url: "/pages/messages/messages?tab=2"
+    app.globalData.activeMessageTab = 1;
+    wx.switchTab({
+      url: "/pages/messages/messages"
+    });
+  },
+
+  goToMessages() {
+    app.globalData.activeMessageTab = 2;
+    wx.switchTab({
+      url: "/pages/messages/messages"
     });
   },
 
   goToOrders() {
     wx.switchTab({
       url: "/pages/orders/orders"
-    });
-  },
-
-  openQuickTemplates() {
-    wx.showActionSheet({
-      itemList: ["售前常用话术", "物流查件话术", "售后退换话术"],
-      success(res) {
-        wx.navigateTo({
-          url: "/pages/messages/messages?tab=0"
-        });
-      }
-    });
-  },
-
-  goToSettings() {
-    wx.switchTab({
-      url: "/pages/settings/settings"
     });
   }
 });
