@@ -239,7 +239,7 @@ class MercadoClient:
         self._sem_lock = threading.Lock()
         parsed = urllib.parse.urlparse(self.API_BASE)
         self._host = parsed.netloc or "api.mercadolibre.com"
-        self._conn_pool = HTTPSConnectionPool(host=self._host, timeout=30, max_size=max(36, max_concurrency * 4))
+        self._conn_pool = HTTPSConnectionPool(host=self._host, timeout=30, max_size=max(64, max_concurrency * 4))
 
     def _get_semaphore(self, account_id: str) -> threading.Semaphore:
         clean_acc = str(account_id or "default").strip()
@@ -787,9 +787,48 @@ class MercadoClient:
                 return {"id": clean_id, "status": "paused", "already_deleted": True}
             raise
 
-    def delete_item(self, account_id: str, item_id: str) -> dict[str, Any]:
-        """Permanently delete CBT cross-border listing via official lifecycle protocol."""
+    def delete_item(self, account_id: str, item_id: str, direct_pipeline: bool = False) -> dict[str, Any]:
+        """Permanently delete CBT cross-border listing via official lifecycle protocol.
+        If direct_pipeline=True, skips the doomed initial delete attempt on active listings,
+        directly pausing/closing first and then submitting deleted=True (saving 1 network roundtrip).
+        """
         clean_id = str(item_id).strip()
+        if direct_pipeline:
+            try:
+                self.request(account_id, "PUT", f"/global/items/{clean_id}", body={"status": "paused"})
+            except Exception as e:
+                err_str = str(e).lower()
+                if "404" in err_str and any(
+                    k in err_str
+                    for k in ("not a cbt item", "not_found", "not found", "非全球cbt商品", "商品或活动不存在")
+                ):
+                    return {
+                        "id": clean_id,
+                        "status": "paused",
+                        "sub_status": ["forbidden", "deleted"],
+                        "already_deleted": True,
+                    }
+                try:
+                    self.request(account_id, "PUT", f"/global/items/{clean_id}", body={"status": "closed"})
+                except Exception:
+                    pass
+
+            try:
+                return self.request(account_id, "PUT", f"/global/items/{clean_id}", body={"deleted": True})
+            except Exception as del_err:
+                del_err_str = str(del_err).lower()
+                if "404" in del_err_str and any(
+                    k in del_err_str
+                    for k in ("not a cbt item", "not_found", "not found", "非全球cbt商品", "商品或活动不存在")
+                ):
+                    return {
+                        "id": clean_id,
+                        "status": "paused",
+                        "sub_status": ["forbidden", "deleted"],
+                        "already_deleted": True,
+                    }
+                raise
+
         try:
             return self.request(account_id, "PUT", f"/global/items/{clean_id}", body={"deleted": True})
         except Exception as e:

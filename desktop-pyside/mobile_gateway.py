@@ -136,9 +136,13 @@ def compute_overview(store_name: str | None = None) -> dict[str, Any]:
     today_order_count = len(today_orders_list)
     today_sales = sum(float(o.get("paid_amount") or o.get("total_amount") or 0.0) for o in today_orders_list)
 
-    # 统计历史累计与当前待打单发货
+    # 统计历史累计与当前真实待打单发货（必须以物流 ready_to_ship 状态为准，绝不能把已发货 shipped 算进去）
     total_orders = len(orders)
-    pending_ship = sum(1 for o in orders if str(o.get("status", "")).lower() in ("paid", "confirmed"))
+    pending_ship = sum(
+        1 for o in orders
+        if str((o.get("shipping") or {}).get("status", "")).lower() in ("ready_to_ship", "handling", "to_ship")
+        and str(o.get("status", "")).lower() != "cancelled"
+    )
     total_sales = sum(float(o.get("paid_amount") or o.get("total_amount") or 0.0) for o in orders)
 
     return {

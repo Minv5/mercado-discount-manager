@@ -536,6 +536,41 @@ class TestItemCleanerEngine(unittest.TestCase):
         self.assertEqual(calls[2], ("PUT", "/global/items/MCO4537069234", {"deleted": True}))
         self.assertTrue(res.get("deleted"))
 
+    def test_client_delete_item_direct_pipeline(self):
+        """测试 direct_pipeline=True 直通极速删除：省去第1次无效试探，直接下架并标记删除（仅2次握手）"""
+        from engine.client import MercadoClient
+        mock_auth = MagicMock()
+        client = MercadoClient(mock_auth)
+
+        calls = []
+        def fake_request(account_id, method, path, **kwargs):
+            calls.append((method, path, kwargs.get("body")))
+            if len(calls) == 1:
+                return {"id": "MCO9999", "status": "paused"}
+            return {"id": "MCO9999", "deleted": True}
+
+        client.request = MagicMock(side_effect=fake_request)
+        res = client.delete_item("3408885754", "MCO9999", direct_pipeline=True)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], ("PUT", "/global/items/MCO9999", {"status": "paused"}))
+        self.assertEqual(calls[1], ("PUT", "/global/items/MCO9999", {"deleted": True}))
+        self.assertTrue(res.get("deleted"))
+
+    def test_adaptive_rate_limiter_aimd(self):
+        """测试自适应探顶限流器加性加压与乘性避让（AIMD）机制"""
+        from engine.item_cleaner import RateLimiter
+        rl = RateLimiter(max_qps=30.0, min_qps=10.0, ceiling_qps=50.0, step_up=5.0, backoff_factor=0.8)
+        self.assertEqual(rl.current_qps, 30.0)
+
+        # 连续 8 次成功，自适应向上探顶 +5 QPS
+        for _ in range(8):
+            rl.on_success()
+        self.assertEqual(rl.current_qps, 35.0)
+
+        # 遭遇 429 限流，乘性回退 35 * 0.8 = 28.0 QPS
+        rl.on_rate_limit()
+        self.assertAlmostEqual(rl.current_qps, 28.0)
+
     def test_batch_delete_handles_already_deleted_as_success(self):
         """测试批量删除流程中，对于已在平台删除的商品（already_deleted）自动判定成功并记录日志"""
         self.mock_client.delete_item.return_value = {

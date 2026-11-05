@@ -62,13 +62,29 @@ class ScannedItemRecord:
 
 
 class RateLimiter:
-    """线程安全预约时间片限流器（Reservation-based Rate Limiter）。
-    锁内仅进行微秒级原子时间预约，锁外独立休眠，彻底消除多线程锁争用，确保单店独立跑满 22 QPS。
+    """线程安全自适应动态探顶限流器（Adaptive AIMD Rate Limiter）。
+    采用加性增（Additive Increase）与乘性减（Multiplicative Decrease）算法：
+    1. 锁内仅进行微秒级原子时间预约，锁外独立休眠，彻底消除多线程锁争用；
+    2. 随着删除连续成功，自动逐步向上探顶加压（最高至 ceiling_qps）；
+    3. 一旦遭遇 429 频控，自动乘性回退并插入毫秒级避让，锁定店铺当前真实网络与平台的稳态极速。
     """
-    def __init__(self, max_qps: float = 22.0):
-        self.interval = 1.0 / max(1.0, max_qps)
+    def __init__(
+        self,
+        max_qps: float = 35.0,
+        min_qps: float = 15.0,
+        ceiling_qps: float = 120.0,
+        step_up: float = 2.5,
+        backoff_factor: float = 0.85,
+    ):
+        self.current_qps = max(1.0, float(max_qps))
+        self.min_qps = max(1.0, float(min_qps))
+        self.ceiling_qps = max(self.current_qps, float(ceiling_qps))
+        self.step_up = max(0.5, float(step_up))
+        self.backoff_factor = min(0.95, max(0.5, float(backoff_factor)))
+        self.interval = 1.0 / self.current_qps
         self.lock = threading.Lock()
         self.next_allowed_time = time.monotonic()
+        self._success_streak = 0
 
     def acquire(self) -> None:
         now = time.monotonic()
@@ -81,6 +97,27 @@ class RateLimiter:
         sleep_duration = scheduled_time - now
         if sleep_duration > 0:
             time.sleep(sleep_duration)
+
+    def on_success(self) -> None:
+        """调用成功时自动向上探顶加速"""
+        with self.lock:
+            self._success_streak += 1
+            if self._success_streak >= 8:
+                self._success_streak = 0
+                if self.current_qps < self.ceiling_qps:
+                    self.current_qps = min(self.ceiling_qps, self.current_qps + self.step_up)
+                    self.interval = 1.0 / self.current_qps
+
+    def on_rate_limit(self) -> None:
+        """触发 429 频控时自动乘性回退避让"""
+        with self.lock:
+            self._success_streak = 0
+            self.current_qps = max(self.min_qps, self.current_qps * self.backoff_factor)
+            self.interval = 1.0 / self.current_qps
+            self.next_allowed_time = max(self.next_allowed_time, time.monotonic() + 0.35)
+
+
+AdaptiveRateLimiter = RateLimiter
 
 
 def parse_listing_age_days(date_str: str) -> tuple[str, int]:
@@ -1254,7 +1291,7 @@ class ItemCleanerEngine:
         successful_ids: list[str] = []
         del_lock = threading.Lock()
         processed_count = 0
-        rate_limiter = RateLimiter(max_qps=25.0)
+        rate_limiter = RateLimiter(max_qps=40.0, min_qps=20.0, ceiling_qps=100.0, step_up=3.0)
 
         start_time = time.monotonic()
         last_log_time = start_time
@@ -1268,7 +1305,8 @@ class ItemCleanerEngine:
             try:
                 if total <= 20:
                     log(f"[商品删除] 【{store_display}】正在执行 CBT 跨境自发货全局下架删除 {item_id}")
-                res = self.client.delete_item(account_id, item_id)
+                res = self.client.delete_item(account_id, item_id, direct_pipeline=True)
+                rate_limiter.on_success()
                 success = True
                 if total <= 20:
                     if isinstance(res, dict) and res.get("already_deleted"):
@@ -1277,12 +1315,14 @@ class ItemCleanerEngine:
                         log(f"[商品删除] ✅ 【{store_display}】商品 {item_id} 已成功从美客多平台下架删除")
             except Exception as e:
                 err_msg = str(e)
+                if any(k in err_msg.lower() for k in ("429", "限流", "rate limit", "too many requests")):
+                    rate_limiter.on_rate_limit()
                 log(f"[商品删除] ❌ 【{store_display}】商品 {item_id} 下架删除失败: {err_msg}")
 
             return item_id, success, err_msg
 
         if total > 0:
-            max_workers = min(18, max(1, total))
+            max_workers = min(50, max(1, total))
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_item = {executor.submit(_delete_single_item, iid): iid for iid in item_ids}
                 for future in concurrent.futures.as_completed(future_to_item):
