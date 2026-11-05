@@ -149,20 +149,25 @@ page {
   font-weight: 500;
 }
 
-/* 索赔专区 */
+/* 索赔专区 - 统一黑金质感卡片 */
 .claim-alert-card {
-  background: #2D1717;
-  border: 1rpx solid #6B2323;
-  border-left: 8rpx solid #E53E3E;
+  background: #1C231F;
+  border: 1rpx solid #36423A;
+  border-left: 6rpx solid #D4AF37;
   border-radius: 12rpx;
   padding: 24rpx;
   margin-bottom: 24rpx;
 }
 
+.claim-alert-card.affects-rep {
+  border-left: 6rpx solid #EF5350;
+  background: #231C1C;
+}
+
 .claim-title {
   font-size: 30rpx;
   font-weight: bold;
-  color: #EF5350;
+  color: #F6F3EA;
   margin-bottom: 16rpx;
 }
 
@@ -279,11 +284,11 @@ page {
 
 .claim-status-pill {
   font-size: 22rpx;
-  background: #3B1B1B;
-  color: #FF8A80;
+  background: #252D28;
+  color: #D4AF37;
   padding: 4rpx 14rpx;
   border-radius: 20rpx;
-  border: 1rpx solid #7F2D2D;
+  border: 1rpx solid #4E472F;
 }
 
 .claim-chat-section {

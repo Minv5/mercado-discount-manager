@@ -224,6 +224,7 @@ function formatClaim(s) {
     rep_badge_class: repBadgeClass,
     status_text: statusText,
     status_class: statusClass,
+    reason: s.claim_reason || s.reason || (reasonTxt !== "买家投诉" ? reasonTxt : ""),
     reason_display: reasonDisplay,
     amount: cleanAmount,
     created_at: s.created_at || s.updated_at || new Date().toISOString(),

@@ -86,26 +86,22 @@
 
     <!-- 3. 索赔处理形态 -->
     <view class="claim-view" wx:if="{{chatType === 'claim'}}">
-      <view class="claim-alert-card">
+      <view class="claim-alert-card {{itemData.affects_reputation === 'affected' ? 'affects-rep' : ''}}">
         <view class="claim-title-row">
           <text class="claim-title">⚠️ 买家索赔详情</text>
-          <text class="claim-status-pill">{{itemData.stage_text}}</text>
+          <text class="claim-status-pill" wx:if="{{itemData.stage_text}}">{{itemData.stage_text}}</text>
         </view>
         <view class="claim-detail-row"><text class="k">关联订单：</text><text class="v mono">#{{itemData.order_id}}</text></view>
-        <view class="claim-detail-row"><text class="k">索赔原因：</text><text class="v">{{itemData.reason}}</text></view>
+        <view class="claim-detail-row" wx:if="{{itemData.reason}}"><text class="k">索赔原因：</text><text class="v">{{itemData.reason}}</text></view>
         <view class="claim-detail-row"><text class="k">涉及金额：</text><text class="v text-gold font-bold">{{itemData.amount}}</text></view>
         <view class="claim-detail-row"><text class="k">退货状态：</text><text class="v text-blue font-bold">{{itemData.return_status_label || '平台调解处理中'}}</text></view>
         <view class="claim-detail-row" wx:if="{{itemData.return_shipment_id}}"><text class="k">退货单号：</text><text class="v mono text-green font-bold">{{itemData.return_shipment_id}}</text></view>
-        <view class="claim-detail-row"><text class="k">信誉影响：</text><text class="v {{itemData.reputation_class}} font-bold">{{itemData.reputation_text}}</text></view>
+        <view class="claim-detail-row"><text class="k">信誉影响：</text><text class="v {{itemData.affects_reputation === 'affected' ? 'text-red' : 'text-green'}} font-bold">{{itemData.affects_reputation === 'affected' ? '是 (影响信誉)' : '否'}}</text></view>
         <view class="claim-detail-row" wx:if="{{itemData.deadline_hours > 0}}"><text class="k">处理时限：</text><text class="v text-orange">还剩 {{itemData.deadline_hours}} 小时</text></view>
       </view>
 
       <!-- 双方协商沟通历史流 -->
       <view class="claim-chat-section">
-        <view class="section-divider">
-          <text class="divider-text">💬 纠纷协商沟通记录</text>
-        </view>
-
         <block wx:if="{{itemData.history && itemData.history.length > 0}}">
           <block wx:for="{{itemData.history}}" wx:key="index">
             <view class="chat-bubble {{item.sender === 'seller' ? 'seller-bubble' : (item.sender === 'mediator' ? 'mediator-bubble' : 'buyer-bubble')}}">

@@ -196,6 +196,15 @@ def compute_overview(store_name: str | None = None) -> dict[str, Any]:
     today_order_count = len(today_orders_list)
     today_sales = sum(float(o.get("paid_amount") or o.get("total_amount") or 0.0) for o in today_orders_list)
 
+    # 严格按当月月份（本地时间）统计【本月】订单数与流水
+    now_month_str = time.strftime("%Y-%m", time.localtime())
+    month_orders_list = [
+        o for o in orders
+        if str(o.get("date_created", "")).startswith(now_month_str)
+    ]
+    month_order_count = len(month_orders_list)
+    month_sales = sum(float(o.get("paid_amount") or o.get("total_amount") or 0.0) for o in month_orders_list)
+
     # 统计历史累计与当前真实待打单发货（必须与桌面端一致以物流 ready_to_ship 状态为准，绝不能把已发货 shipped 算进去）
     total_orders = len(orders)
     pending_ship = sum(
@@ -209,6 +218,8 @@ def compute_overview(store_name: str | None = None) -> dict[str, Any]:
         "store_name": store_name or "全部店铺",
         "today_orders": today_order_count,
         "today_sales": round(today_sales, 2),
+        "month_orders": month_order_count,
+        "month_sales": round(month_sales, 2),
         "pending_ship": pending_ship,
         "total_orders": total_orders,
         "total_sales": round(total_sales, 2),

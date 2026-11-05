@@ -11,6 +11,8 @@ Page({
       todayOrderCount: 0,
       todaySalesAmount: "0.00",
       pendingShipCount: 0,
+      monthOrderCount: 0,
+      monthSalesAmount: "0.00",
       totalOrderCount: 0,
       totalSalesAmount: "0.00"
     },
@@ -88,6 +90,8 @@ Page({
         "todo.claims": ov.pending_claims !== undefined ? ov.pending_claims : 0,
         "todayStats.todayOrderCount": ov.today_orders !== undefined ? ov.today_orders : 0,
         "todayStats.todaySalesAmount": Number(ov.today_sales || 0).toFixed(2),
+        "todayStats.monthOrderCount": ov.month_orders !== undefined ? ov.month_orders : (ov.total_orders || 0),
+        "todayStats.monthSalesAmount": Number(ov.month_sales !== undefined ? ov.month_sales : (ov.total_sales || 0)).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
         "todayStats.pendingShipCount": ov.pending_ship !== undefined ? ov.pending_ship : 0,
         "todayStats.totalOrderCount": ov.total_orders !== undefined ? ov.total_orders : 0,
         "todayStats.totalSalesAmount": Number(ov.total_sales || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -106,6 +110,9 @@ Page({
         const todayStr = new Date().toISOString().slice(0, 10);
         const todayOrders = oList.filter(o => (o.created_at || "").slice(0, 10) === todayStr);
         const todaySales = todayOrders.reduce((acc, o) => acc + (Number(o.total_amount) || 0), 0);
+        const thisMonthStr = new Date().toISOString().slice(0, 7);
+        const monthOrders = oList.filter(o => (o.created_at || o.date_created || "").slice(0, 7) === thisMonthStr);
+        const monthSales = monthOrders.reduce((acc, o) => acc + (Number(o.total_amount) || 0), 0);
         const totalSales = oList.reduce((acc, o) => acc + (Number(o.total_amount) || 0), 0);
         const pendingShip = oList.filter(o => o.filter_cat === "paid" || o.status_text === "待发货").length;
 
@@ -116,6 +123,8 @@ Page({
           "todo.claims": pendingClaims,
           "todayStats.todayOrderCount": todayOrders.length,
           "todayStats.todaySalesAmount": todaySales.toFixed(2),
+          "todayStats.monthOrderCount": monthOrders.length,
+          "todayStats.monthSalesAmount": monthSales.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
           "todayStats.pendingShipCount": pendingShip,
           "todayStats.totalOrderCount": oList.length,
           "todayStats.totalSalesAmount": totalSales.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })

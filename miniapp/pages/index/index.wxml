@@ -38,7 +38,7 @@
       </view>
     </view>
     <view class="stat-sub-bar" bindtap="goToOrders">
-      <text class="sub-text text-muted">📦 店铺已同步订单: <text class="text-gold font-bold">{{todayStats.totalOrderCount}}</text> 单 · 累计流水: <text class="text-gold font-bold">${{todayStats.totalSalesAmount}}</text></text>
+      <text class="sub-text text-muted">📦 本月订单: <text class="text-gold font-bold">{{todayStats.monthOrderCount}}</text> 单 · 本月流水: <text class="text-gold font-bold">${{todayStats.monthSalesAmount}}</text></text>
       <text class="sub-arrow">全部订单 ➔</text>
     </view>
   </view>

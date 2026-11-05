@@ -24,12 +24,12 @@
         "text": "工作台"
       },
       {
-        "pagePath": "pages/messages/messages",
-        "text": "客服消息"
-      },
-      {
         "pagePath": "pages/orders/orders",
         "text": "订单中心"
+      },
+      {
+        "pagePath": "pages/messages/messages",
+        "text": "客服消息"
       },
       {
         "pagePath": "pages/settings/settings",
