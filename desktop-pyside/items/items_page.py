@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
 from engine.auth import AuthManager
 from engine.client import MercadoClient
 from items.models import ItemModel, load_items_snapshot, save_items_snapshot
+from items.product_vault_page import ProductVaultPage
 from ui_common.clipboard import copy_pure_text
 from ui_common.image_cache import load_image_async
 from ui_common.lightbox import show_image_preview
@@ -190,8 +192,66 @@ class ItemsPage(QFrame):
 
     def _init_ui(self) -> None:
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(16, 12, 16, 12)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(8)
+
+        # Top Switcher Bar: Local Vault vs Online Listings
+        switcher_row = QHBoxLayout()
+        switcher_row.setContentsMargins(0, 0, 0, 4)
+        switcher_row.setSpacing(10)
+
+        tab_btn_style = """
+            QPushButton {
+                background: #1A1D1A;
+                color: #A8A29E;
+                border: 1px solid #3B382C;
+                border-radius: 6px;
+                padding: 6px 18px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #252A25;
+                color: #F6F3EA;
+            }
+            QPushButton:checked {
+                background: #2F6B3F;
+                color: #FFFFFF;
+                border-color: #4E472F;
+            }
+        """
+
+        self.btn_tab_vault = QPushButton("📦 待刊登产品库 (本地产品)")
+        self.btn_tab_vault.setFixedHeight(34)
+        self.btn_tab_vault.setCheckable(True)
+        self.btn_tab_vault.setChecked(True)
+        self.btn_tab_vault.setStyleSheet(tab_btn_style)
+        self.btn_tab_vault.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_tab_vault.clicked.connect(lambda: self._switch_view(0))
+        switcher_row.addWidget(self.btn_tab_vault)
+
+        self.btn_tab_online = QPushButton("🌐 在线商品 (Mercado店铺)")
+        self.btn_tab_online.setFixedHeight(34)
+        self.btn_tab_online.setCheckable(True)
+        self.btn_tab_online.setChecked(False)
+        self.btn_tab_online.setStyleSheet(tab_btn_style)
+        self.btn_tab_online.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_tab_online.clicked.connect(lambda: self._switch_view(1))
+        switcher_row.addWidget(self.btn_tab_online)
+
+        switcher_row.addStretch(1)
+        main_layout.addLayout(switcher_row)
+
+        self.stack = QStackedWidget(self)
+        self.vault_page = ProductVaultPage(parent=self)
+        self.online_widget = QWidget(self)
+        self.stack.addWidget(self.vault_page)
+        self.stack.addWidget(self.online_widget)
+        main_layout.addWidget(self.stack, 1)
+
+        online_layout = QVBoxLayout(self.online_widget)
+        online_layout.setContentsMargins(0, 0, 0, 0)
+        online_layout.setSpacing(10)
 
         # 1. Header Toolbar
         top_bar = QWidget()
@@ -371,7 +431,7 @@ class ItemsPage(QFrame):
         self.status_hint.hide()
         top_bar_layout.addWidget(self.status_hint)
 
-        main_layout.addWidget(top_bar)
+        online_layout.addWidget(top_bar)
 
         # 2. Main Items Table
         self.table = QTableWidget()
@@ -440,7 +500,7 @@ class ItemsPage(QFrame):
         self.table.customContextMenuRequested.connect(self._show_context_menu)
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
 
-        main_layout.addWidget(self.table, 1)
+        online_layout.addWidget(self.table, 1)
 
         # 3. Footer Summary Bar
         footer = QHBoxLayout()
@@ -454,7 +514,12 @@ class ItemsPage(QFrame):
         self.tip_label.setStyleSheet("font-size: 11px; color: #666666;")
         footer.addWidget(self.tip_label)
 
-        main_layout.addLayout(footer)
+        online_layout.addLayout(footer)
+
+    def _switch_view(self, index: int) -> None:
+        self.stack.setCurrentIndex(index)
+        self.btn_tab_vault.setChecked(index == 0)
+        self.btn_tab_online.setChecked(index == 1)
 
     # ------------------------------------------------------------------
     # Data Filtering & Rendering
