@@ -11,7 +11,7 @@
 ```
 [Card 1: 本地数据持久化与三维入库引擎] ──────→ [x] 已完成
                 ↓
-[Card 2: 顶栏三行组合筛选面板与 AI 核价栏] ──→ [ ] 待执行
+[Card 2: 顶栏三行组合筛选面板与 AI 核价栏] ──→ [x] 已完成
                 ↓
 [Card 3: 商品卡片流网格、选区计数与批量设置] ─→ [ ] 待执行
                 ↓
@@ -43,7 +43,7 @@
 ---
 
 ### 任务卡 2：顶栏三行组合筛选面板与 AI 核价胶囊控制条
-* **状态**：`[ ] 待执行`
+* **状态**：`[x] 已完成`
 * **目标与交付物**：
   * 实现符合圆佑视觉排布的 3 行组合筛选器组件 `desktop-pyside/items/vault_filters.py`；
     * **第 1 行**：店铺多选、站点下拉、状态下拉、创建/更新时间范围日历、产品分组选择；
@@ -52,10 +52,10 @@
   * 实现 **AI 核价台控制条**：显示 8 色状态胶囊计数（本页全部、待核价、待回填、已回填、存疑待审、尺寸异常、侵权跳过、失败）。
 * **涉及文件**：
   * 新建：`desktop-pyside/items/vault_filters.py`
-  * 新建：`tests/test_vault_filters.py`
+  * 新建：`desktop-pyside/tests/test_vault_filters.py`
 * **机器质检命令**：
   ```bash
-  pytest tests/test_vault_filters.py -v
+  pytest desktop-pyside/tests/test_vault_filters.py -v
   ```
 
 ---
