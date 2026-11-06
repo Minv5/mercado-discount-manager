@@ -29,8 +29,8 @@ class VaultAICapsuleBar(QFrame):
         self.setStyleSheet("""
             QFrame#VaultAICapsuleBar {
                 background: #ffffff;
-                border: 1px solid #e8e8e8;
-                border-radius: 6px;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
                 padding: 6px 12px;
             }
         """)
@@ -43,9 +43,9 @@ class VaultAICapsuleBar(QFrame):
         title_box = QHBoxLayout()
         title_box.setSpacing(6)
         lbl_icon = QLabel("🤖 AI核价台")
-        lbl_icon.setStyleSheet("font-weight: bold; color: #1677ff; font-size: 13px;")
+        lbl_icon.setStyleSheet("font-weight: bold; color: #2563eb; font-size: 13px;")
         lbl_ver = QLabel("v1.4.36")
-        lbl_ver.setStyleSheet("background: #e6f4ff; color: #0958d9; border-radius: 4px; padding: 1px 6px; font-size: 11px;")
+        lbl_ver.setStyleSheet("background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 4px; padding: 1px 6px; font-size: 11px; font-weight: 500;")
         title_box.addWidget(lbl_icon)
         title_box.addWidget(lbl_ver)
         layout.addLayout(title_box)
@@ -54,15 +54,15 @@ class VaultAICapsuleBar(QFrame):
         self.btn_ai_verify = QPushButton("🚀 AI核价 (已选/本页)")
         self.btn_ai_verify.setStyleSheet("""
             QPushButton {
-                background: #1677ff;
+                background: #2563eb;
                 color: #ffffff;
                 border: none;
-                border-radius: 4px;
-                padding: 4px 10px;
-                font-weight: 500;
+                border-radius: 6px;
+                padding: 5px 12px;
+                font-weight: 600;
                 font-size: 12px;
             }
-            QPushButton:hover { background: #4096ff; }
+            QPushButton:hover { background: #1d4ed8; }
         """)
         self.btn_ai_verify.clicked.connect(self.ai_verify_clicked.emit)
         layout.addWidget(self.btn_ai_verify)
@@ -70,28 +70,29 @@ class VaultAICapsuleBar(QFrame):
         self.btn_list_verify = QPushButton("🎯 清单核价")
         self.btn_list_verify.setStyleSheet("""
             QPushButton {
-                background: #f0f0f0;
-                color: #262626;
-                border: 1px solid #d9d9d9;
-                border-radius: 4px;
-                padding: 4px 10px;
+                background: #f8fafc;
+                color: #334155;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 5px 12px;
                 font-size: 12px;
+                font-weight: 500;
             }
-            QPushButton:hover { background: #e6e6e6; }
+            QPushButton:hover { background: #f1f5f9; border-color: #94a3b8; }
         """)
         self.btn_list_verify.clicked.connect(self.list_verify_clicked.emit)
         layout.addWidget(self.btn_list_verify)
 
         # 8 Capsule Status Badges
         self.capsule_defs = [
-            ("this_page", "本页", "#595959", "#f5f5f5"),
-            ("pending_verify", "待核价", "#d46b08", "#fff7e6"),
-            ("pending_fill", "待回填", "#1d39c4", "#f0f5ff"),
-            ("filled", "已回填", "#389e0d", "#f6ffed"),
-            ("questionable", "存疑待审", "#cf1322", "#fff1f0"),
-            ("size_anomaly", "尺寸异常", "#c41d7f", "#fff0f6"),
-            ("infringement_skip", "侵权跳过", "#d48800", "#fffbe6"),
-            ("failed", "失败", "#cf1322", "#fff1f0"),
+            ("this_page", "本页", "#475569", "#f1f5f9"),
+            ("pending_verify", "待核价", "#c2410c", "#fff7ed"),
+            ("pending_fill", "待回填", "#1d4ed8", "#eff6ff"),
+            ("filled", "已回填", "#15803d", "#f0fdf4"),
+            ("questionable", "存疑待审", "#b91c1c", "#fef2f2"),
+            ("size_anomaly", "尺寸异常", "#be185d", "#fdf2f8"),
+            ("infringement_skip", "侵权跳过", "#b45309", "#fffbeb"),
+            ("failed", "失败", "#b91c1c", "#fef2f2"),
         ]
 
         self.capsule_labels: Dict[str, QLabel] = {}
@@ -104,9 +105,9 @@ class VaultAICapsuleBar(QFrame):
                     color: {text_color};
                     border: 1px solid {text_color}40;
                     border-radius: 12px;
-                    padding: 2px 8px;
+                    padding: 3px 10px;
                     font-size: 11px;
-                    font-weight: 500;
+                    font-weight: 600;
                 }}
                 QLabel:hover {{
                     border: 1px solid {text_color};
@@ -141,36 +142,39 @@ class VaultFilterBar(QWidget):
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 8, 10, 8)
+        main_layout.setContentsMargins(12, 10, 12, 10)
         main_layout.setSpacing(8)
 
         # Container styling
         self.setStyleSheet("""
             QWidget#VaultFilterBar {
                 background: #ffffff;
-                border: 1px solid #e8e8e8;
-                border-radius: 6px;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
             }
             QLabel {
                 font-size: 12px;
-                color: #595959;
+                color: #475569;
+                font-weight: 500;
             }
             QLineEdit, QComboBox, QDateEdit {
-                border: 1px solid #d9d9d9;
-                border-radius: 4px;
-                padding: 3px 6px;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 2px 8px;
                 font-size: 12px;
-                background: #ffffff;
-                min-height: 24px;
+                background: #f8fafc;
+                color: #0f172a;
+                min-height: 26px;
             }
             QLineEdit:focus, QComboBox:focus, QDateEdit:focus {
-                border-color: #4096ff;
+                border-color: #2563eb;
+                background: #ffffff;
             }
         """)
 
         # ================= ROW 1 =================
         row1 = QHBoxLayout()
-        row1.setSpacing(12)
+        row1.setSpacing(10)
 
         # 1. 店铺
         row1.addWidget(QLabel("店铺:"))
@@ -212,20 +216,20 @@ class VaultFilterBar(QWidget):
 
         # ================= ROW 2 =================
         row2 = QHBoxLayout()
-        row2.setSpacing(12)
+        row2.setSpacing(10)
 
         # 1. 自动识别语言的商品标题搜索框
         row2.addWidget(QLabel("商品标题:"))
         self.title_input = QLineEdit()
         self.title_input.setPlaceholderText("自动识别中/西/葡/英标题搜索...")
-        self.title_input.setFixedWidth(240)
+        self.title_input.setMinimumWidth(240)
         self.title_input.returnPressed.connect(self._on_search)
         row2.addWidget(self.title_input)
 
         # 2. 商品 ID
         row2.addWidget(QLabel("商品ID:"))
         self.id_input = QLineEdit()
-        self.id_input.setPlaceholderText("内部草稿ID")
+        self.id_input.setPlaceholderText("内部商品ID")
         self.id_input.setFixedWidth(130)
         self.id_input.returnPressed.connect(self._on_search)
         row2.addWidget(self.id_input)
@@ -251,7 +255,7 @@ class VaultFilterBar(QWidget):
         self.row3_widget = QWidget()
         row3 = QHBoxLayout(self.row3_widget)
         row3.setContentsMargins(0, 0, 0, 0)
-        row3.setSpacing(10)
+        row3.setSpacing(8)
 
         # 售价区间
         row3.addWidget(QLabel("售价:"))
@@ -321,14 +325,15 @@ class VaultFilterBar(QWidget):
         self.btn_reset = QPushButton("重 置")
         self.btn_reset.setStyleSheet("""
             QPushButton {
-                background: #ffffff;
-                color: #595959;
-                border: 1px solid #d9d9d9;
-                border-radius: 4px;
-                padding: 4px 12px;
+                background: #f8fafc;
+                color: #475569;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 4px 14px;
                 font-size: 12px;
+                font-weight: 500;
             }
-            QPushButton:hover { border-color: #4096ff; color: #1677ff; }
+            QPushButton:hover { background: #f1f5f9; border-color: #94a3b8; color: #1e293b; }
         """)
         self.btn_reset.clicked.connect(self._on_reset)
         row3.addWidget(self.btn_reset)
@@ -336,32 +341,54 @@ class VaultFilterBar(QWidget):
         self.btn_search = QPushButton("查 询")
         self.btn_search.setStyleSheet("""
             QPushButton {
-                background: #1677ff;
+                background: #2563eb;
                 color: #ffffff;
                 border: none;
-                border-radius: 4px;
-                padding: 4px 14px;
-                font-weight: 500;
+                border-radius: 6px;
+                padding: 4px 18px;
+                font-weight: 600;
                 font-size: 12px;
             }
-            QPushButton:hover { background: #4096ff; }
+            QPushButton:hover { background: #1d4ed8; }
         """)
         self.btn_search.clicked.connect(self._on_search)
         row3.addWidget(self.btn_search)
 
         self.btn_toggle = QPushButton("收 起 ∧")
-        self.btn_toggle.setStyleSheet("color: #1677ff; border: none; font-size: 12px; background: transparent;")
+        self.btn_toggle.setStyleSheet("color: #2563eb; border: none; font-size: 12px; background: transparent; font-weight: 500;")
         self.btn_toggle.clicked.connect(self._toggle_collapse)
         row3.addWidget(self.btn_toggle)
 
         # Table & Cost buttons
         self.btn_import_cost = QPushButton("📥 导入成本")
-        self.btn_import_cost.setStyleSheet("background: #f6ffed; color: #389e0d; border: 1px solid #b7eb8f; border-radius: 4px; padding: 4px 8px; font-size: 12px;")
+        self.btn_import_cost.setStyleSheet("""
+            QPushButton {
+                background: #f0fdf4;
+                color: #15803d;
+                border: 1px solid #86efac;
+                border-radius: 6px;
+                padding: 4px 12px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #dcfce7; }
+        """)
         self.btn_import_cost.clicked.connect(self.import_cost_clicked.emit)
         row3.addWidget(self.btn_import_cost)
 
         self.btn_create_table = QPushButton("➕ 表格创建")
-        self.btn_create_table.setStyleSheet("background: #e6f4ff; color: #0958d9; border: 1px solid #91caff; border-radius: 4px; padding: 4px 8px; font-size: 12px;")
+        self.btn_create_table.setStyleSheet("""
+            QPushButton {
+                background: #eff6ff;
+                color: #1e40af;
+                border: 1px solid #93c5fd;
+                border-radius: 6px;
+                padding: 4px 12px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #dbeafe; }
+        """)
         self.btn_create_table.clicked.connect(self.create_table_clicked.emit)
         row3.addWidget(self.btn_create_table)
 
@@ -373,16 +400,17 @@ class VaultFilterBar(QWidget):
         self.btn_toggle.setText("展 开 ∨" if self.is_collapsed else "收 起 ∧")
 
     def _on_search(self):
-        self.search_triggered.emit(self.get_filters())
+        filters = self.get_filters()
+        self.search_triggered.emit(filters)
 
     def _on_reset(self):
-        self.title_input.clear()
-        self.id_input.clear()
-        self.cbt_id_input.clear()
         self.store_combo.setCurrentIndex(0)
         self.site_combo.setCurrentIndex(0)
         self.status_combo.setCurrentIndex(0)
         self.group_combo.setCurrentIndex(0)
+        self.title_input.clear()
+        self.id_input.clear()
+        self.cbt_id_input.clear()
         self.category_combo.setCurrentIndex(0)
         self.min_price.clear()
         self.max_price.clear()
@@ -394,87 +422,59 @@ class VaultFilterBar(QWidget):
         self.size_combo.setCurrentIndex(0)
         self.sort_combo.setCurrentIndex(0)
         self.reset_triggered.emit()
-        self.search_triggered.emit(self.get_filters())
+        self._on_search()
 
     def get_filters(self) -> Dict[str, Any]:
-        """Collects all UI filter values for backend query."""
         filters: Dict[str, Any] = {}
+        if self.store_combo.currentData():
+            filters["account_id"] = self.store_combo.currentData()
+        if self.site_combo.currentData():
+            filters["site_id"] = self.site_combo.currentData()
+        if self.status_combo.currentData():
+            filters["status"] = self.status_combo.currentData()
+        if self.group_combo.currentData():
+            filters["group_id"] = self.group_combo.currentData()
 
-        kw = self.title_input.text().strip()
-        if kw:
+        if self.title_input.text().strip():
+            kw = self.title_input.text().strip()
+            filters["title"] = kw
             filters["keyword"] = kw
+        if self.id_input.text().strip():
+            filters["id"] = self.id_input.text().strip()
+        if self.cbt_id_input.text().strip():
+            filters["cbt_item_id"] = self.cbt_id_input.text().strip()
+        if self.category_combo.currentData():
+            filters["category_id"] = self.category_combo.currentData()
 
-        pid = self.id_input.text().strip()
-        if pid:
-            filters["product_id"] = pid
-
-        cbt_id = self.cbt_id_input.text().strip()
-        if cbt_id:
-            filters["cbt_item_id"] = cbt_id
-
-        site = self.site_combo.currentData()
-        if site:
-            filters["site_id"] = site
-
-        store = self.store_combo.currentData()
-        if store:
-            filters["store_name"] = store
-
-        status = self.status_combo.currentData()
-        if status:
-            filters["status"] = status
-
-        grp = self.group_combo.currentData()
-        if grp:
-            filters["group_id"] = grp
-
-        cat = self.category_combo.currentData()
-        if cat:
-            filters["category_id"] = cat
-
-        if self.min_price.text().strip():
-            try:
+        # Ranges
+        try:
+            if self.min_price.text().strip():
                 filters["min_price"] = float(self.min_price.text().strip())
-            except ValueError:
-                pass
-
-        if self.max_price.text().strip():
-            try:
+            if self.max_price.text().strip():
                 filters["max_price"] = float(self.max_price.text().strip())
-            except ValueError:
-                pass
+        except ValueError:
+            pass
 
-        if self.min_cost.text().strip():
-            try:
+        try:
+            if self.min_cost.text().strip():
                 filters["min_cost"] = float(self.min_cost.text().strip())
-            except ValueError:
-                pass
-
-        if self.max_cost.text().strip():
-            try:
+            if self.max_cost.text().strip():
                 filters["max_cost"] = float(self.max_cost.text().strip())
-            except ValueError:
-                pass
+        except ValueError:
+            pass
 
-        if self.min_weight.text().strip():
-            try:
+        try:
+            if self.min_weight.text().strip():
                 filters["min_weight"] = float(self.min_weight.text().strip())
-            except ValueError:
-                pass
-
-        if self.max_weight.text().strip():
-            try:
+            if self.max_weight.text().strip():
                 filters["max_weight"] = float(self.max_weight.text().strip())
-            except ValueError:
-                pass
+        except ValueError:
+            pass
 
-        var_mode = self.variant_combo.currentData()
-        if var_mode:
-            filters["has_variants"] = var_mode
-
-        sz_mode = self.size_combo.currentData()
-        if sz_mode:
-            filters["has_size"] = sz_mode
+        if self.variant_combo.currentData():
+            filters["has_variants"] = self.variant_combo.currentData() == "yes"
+        if self.size_combo.currentData():
+            filters["has_size"] = self.size_combo.currentData() == "yes"
 
         sort_data = self.sort_combo.currentData()
         if sort_data:
@@ -482,3 +482,10 @@ class VaultFilterBar(QWidget):
             filters["sort_order"] = sort_data[1]
 
         return filters
+
+    def set_groups(self, groups: list[dict[str, Any]]):
+        self.group_combo.clear()
+        self.group_combo.addItem("全部分组", "")
+        self.group_combo.addItem("未分组", "-1")
+        for g in groups:
+            self.group_combo.addItem(g.get("name", ""), str(g.get("id", "")))

@@ -43,12 +43,14 @@ from items.vault_ai_dialog import AIProductOptimizeDialog
 from items.vault_publisher import BatchPublishDialog
 
 
-class ProductVaultPage(QWidget):
+class ProductVaultPage(QFrame):
     """Master Local Product Vault Page (Card-Grid Stream with Full Suite of Batch Actions)."""
 
     def __init__(self, db: Optional[ProductVaultDB] = None, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setObjectName("ProductVaultPage")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("QFrame#ProductVaultPage { background: #f1f5f9; }")
         self.db = db or ProductVaultDB()
         self.db.init_db()
 
@@ -62,8 +64,8 @@ class ProductVaultPage(QWidget):
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(12, 10, 12, 10)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(10, 8, 10, 8)
+        main_layout.setSpacing(8)
 
         # 1. Top AI Capsule Bar
         self.capsule_bar = VaultAICapsuleBar(self)
@@ -84,117 +86,200 @@ class ProductVaultPage(QWidget):
         self.card_grid.edit_requested.connect(self._on_single_edit)
         main_layout.addWidget(self.card_grid, stretch=1)
 
-        # 4. Bottom Actions & Pagination Toolbar
+        # 4. Bottom Actions & Pagination Toolbar (2-Tier Clean Responsive Card)
         self.toolbar_frame = QFrame(self)
+        self.toolbar_frame.setObjectName("VaultToolbarFrame")
         self.toolbar_frame.setStyleSheet("""
-            QFrame {
+            QFrame#VaultToolbarFrame {
                 background: #ffffff;
-                border: 1px solid #e8e8e8;
-                border-radius: 6px;
-                padding: 4px 10px;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 6px 12px;
             }
             QPushButton {
-                border-radius: 4px;
-                padding: 4px 10px;
+                border-radius: 6px;
+                padding: 5px 12px;
                 font-size: 12px;
+                font-weight: 500;
                 background: #ffffff;
-                border: 1px solid #d9d9d9;
-                color: #262626;
+                border: 1px solid #cbd5e1;
+                color: #334155;
+                min-height: 20px;
             }
             QPushButton:hover {
-                border-color: #4096ff;
-                color: #1677ff;
+                border-color: #3b82f6;
+                color: #2563eb;
+                background: #f8fafc;
             }
         """)
 
-        bar_layout = QHBoxLayout(self.toolbar_frame)
-        bar_layout.setContentsMargins(4, 4, 4, 4)
-        bar_layout.setSpacing(8)
+        toolbar_vbox = QVBoxLayout(self.toolbar_frame)
+        toolbar_vbox.setContentsMargins(4, 4, 4, 4)
+        toolbar_vbox.setSpacing(8)
 
-        # Multi-select controllers
+        # Tier 1: Action Command Row
+        tier1 = QHBoxLayout()
+        tier1.setContentsMargins(0, 0, 0, 0)
+        tier1.setSpacing(8)
+
+        # Multi-select
         self.btn_select_all = QPushButton("全选")
         self.btn_select_all.clicked.connect(self.card_grid.select_all)
-        bar_layout.addWidget(self.btn_select_all)
+        tier1.addWidget(self.btn_select_all)
 
         self.btn_deselect_all = QPushButton("反选")
         self.btn_deselect_all.clicked.connect(self.card_grid.invert_selection)
-        bar_layout.addWidget(self.btn_deselect_all)
+        tier1.addWidget(self.btn_deselect_all)
 
         self.lbl_selection_count = QLabel("已选 0/0 条")
-        self.lbl_selection_count.setStyleSheet("color: #1677ff; font-weight: bold; font-size: 12px; margin-right: 4px;")
-        bar_layout.addWidget(self.lbl_selection_count)
+        self.lbl_selection_count.setStyleSheet("""
+            background: #eff6ff;
+            color: #2563eb;
+            border: 1px solid #bfdbfe;
+            border-radius: 6px;
+            padding: 3px 10px;
+            font-weight: bold;
+            font-size: 12px;
+        """)
+        tier1.addWidget(self.lbl_selection_count)
+
+        # Separator line
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        sep.setStyleSheet("color: #cbd5e1; margin: 2px 4px;")
+        tier1.addWidget(sep)
 
         # Core Action Buttons
         self.btn_publish = QPushButton("🚀 批量上传")
-        self.btn_publish.setStyleSheet("background: #1677ff; color: #ffffff; border: none; font-weight: bold;")
+        self.btn_publish.setStyleSheet("""
+            QPushButton {
+                background: #2563eb;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                padding: 5px 14px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover { background: #1d4ed8; }
+        """)
         self.btn_publish.clicked.connect(self._on_publish)
-        bar_layout.addWidget(self.btn_publish)
+        tier1.addWidget(self.btn_publish)
 
         self.btn_pre_upload = QPushButton("☁️ 自建图片预上传")
+        self.btn_pre_upload.setStyleSheet("""
+            QPushButton {
+                background: #eff6ff;
+                color: #1e40af;
+                border: 1px solid #bfdbfe;
+                border-radius: 6px;
+                padding: 5px 12px;
+                font-size: 12px;
+                font-weight: 500;
+            }
+            QPushButton:hover { background: #dbeafe; }
+        """)
         self.btn_pre_upload.clicked.connect(self._on_pre_upload)
-        bar_layout.addWidget(self.btn_pre_upload)
+        tier1.addWidget(self.btn_pre_upload)
 
         # Copy Trio
         self.btn_copy_title = QPushButton("📋 复制标题")
         self.btn_copy_title.clicked.connect(self._on_copy_titles)
-        bar_layout.addWidget(self.btn_copy_title)
+        tier1.addWidget(self.btn_copy_title)
 
         self.btn_copy_id = QPushButton("📋 复制ID")
         self.btn_copy_id.clicked.connect(self._on_copy_ids)
-        bar_layout.addWidget(self.btn_copy_id)
+        tier1.addWidget(self.btn_copy_id)
 
         self.btn_copy_cbt_id = QPushButton("📋 复制原美客多ID")
         self.btn_copy_cbt_id.clicked.connect(self._on_copy_cbt_ids)
-        bar_layout.addWidget(self.btn_copy_cbt_id)
+        tier1.addWidget(self.btn_copy_cbt_id)
 
         # Batch Settings Menu
         self.btn_batch_settings = QPushButton("✏️ 批量设置 ∨")
         self._init_batch_settings_menu()
-        bar_layout.addWidget(self.btn_batch_settings)
+        tier1.addWidget(self.btn_batch_settings)
 
         # AI Tools Menu (Solely AI Title Translation & Differentiation)
         self.btn_ai_tools = QPushButton("🤖 AI工具 ∨ (新)")
         self._init_ai_tools_menu()
-        bar_layout.addWidget(self.btn_ai_tools)
-
-        # Delete Selected
-        self.btn_delete_selected = QPushButton("🗑️ 删除已选")
-        self.btn_delete_selected.setStyleSheet("background: #fff1f0; color: #cf1322; border: 1px solid #ffa39e; font-weight: 500;")
-        self.btn_delete_selected.clicked.connect(self._on_delete_selected)
-        bar_layout.addWidget(self.btn_delete_selected)
+        tier1.addWidget(self.btn_ai_tools)
 
         # More Actions Menu
         self.btn_more_actions = QPushButton("⋮ 更多操作 ∨")
         self._init_more_actions_menu()
-        bar_layout.addWidget(self.btn_more_actions)
+        tier1.addWidget(self.btn_more_actions)
 
-        bar_layout.addStretch()
+        tier1.addStretch()
 
-        # Pagination on Right
+        # Delete Selected (aligned right in tier 1)
+        self.btn_delete_selected = QPushButton("🗑️ 删除已选")
+        self.btn_delete_selected.setStyleSheet("""
+            QPushButton {
+                background: #fef2f2;
+                color: #b91c1c;
+                border: 1px solid #fca5a5;
+                border-radius: 6px;
+                padding: 5px 12px;
+                font-weight: 600;
+                font-size: 12px;
+            }
+            QPushButton:hover { background: #fee2e2; border-color: #f87171; }
+        """)
+        self.btn_delete_selected.clicked.connect(self._on_delete_selected)
+        tier1.addWidget(self.btn_delete_selected)
+
+        toolbar_vbox.addLayout(tier1)
+
+        # Tier 2: Info & Pagination Row
+        tier2 = QHBoxLayout()
+        tier2.setContentsMargins(0, 2, 0, 0)
+        tier2.setSpacing(10)
+
+        tip_lbl = QLabel("💡 提示：在上方勾选商品后，可一键批量改价、改重量、估算尺寸或调用 AI 标题优化，也可直接批量刊登至美客多店铺。")
+        tip_lbl.setStyleSheet("color: #64748b; font-size: 11px;")
+        tier2.addWidget(tip_lbl)
+
+        tier2.addStretch()
+
         self.lbl_total = QLabel("总数据：0 条")
-        self.lbl_total.setStyleSheet("color: #8c8c8c; font-size: 12px;")
-        bar_layout.addWidget(self.lbl_total)
+        self.lbl_total.setStyleSheet("color: #475569; font-size: 12px; font-weight: 500;")
+        tier2.addWidget(self.lbl_total)
 
-        self.btn_prev_page = QPushButton("<")
-        self.btn_prev_page.setFixedWidth(28)
+        self.btn_prev_page = QPushButton("◀ 上一页")
+        self.btn_prev_page.setStyleSheet("padding: 3px 10px; font-size: 11px;")
         self.btn_prev_page.clicked.connect(self._prev_page)
-        bar_layout.addWidget(self.btn_prev_page)
+        tier2.addWidget(self.btn_prev_page)
 
-        self.lbl_page_info = QLabel("1 / 1")
-        self.lbl_page_info.setStyleSheet("font-size: 12px;")
-        bar_layout.addWidget(self.lbl_page_info)
+        self.lbl_page_info = QLabel("第 1 / 1 页")
+        self.lbl_page_info.setStyleSheet("font-size: 12px; font-weight: bold; color: #1e293b; padding: 0 4px;")
+        tier2.addWidget(self.lbl_page_info)
 
-        self.btn_next_page = QPushButton(">")
-        self.btn_next_page.setFixedWidth(28)
+        self.btn_next_page = QPushButton("下一页 ▶")
+        self.btn_next_page.setStyleSheet("padding: 3px 10px; font-size: 11px;")
         self.btn_next_page.clicked.connect(self._next_page)
-        bar_layout.addWidget(self.btn_next_page)
+        tier2.addWidget(self.btn_next_page)
 
         self.combo_page_size = QComboBox()
-        self.combo_page_size.addItem("50条/页", 50)
-        self.combo_page_size.addItem("100条/页", 100)
-        self.combo_page_size.addItem("200条/页", 200)
+        self.combo_page_size.setStyleSheet("""
+            QComboBox {
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 2px 8px;
+                font-size: 12px;
+                background: #ffffff;
+                color: #1e293b;
+                height: 24px;
+            }
+        """)
+        self.combo_page_size.addItem("50 条/页", 50)
+        self.combo_page_size.addItem("100 条/页", 100)
+        self.combo_page_size.addItem("200 条/页", 200)
         self.combo_page_size.currentIndexChanged.connect(self._on_page_size_changed)
-        bar_layout.addWidget(self.combo_page_size)
+        tier2.addWidget(self.combo_page_size)
+
+        toolbar_vbox.addLayout(tier2)
 
         main_layout.addWidget(self.toolbar_frame)
 
