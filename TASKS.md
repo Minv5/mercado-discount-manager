@@ -15,7 +15,7 @@
                 ↓
 [Card 3: 商品卡片流网格、选区计数与批量设置] ─→ [x] 已完成
                 ↓
-[Card 4: 更多操作、双重高危删除与图片预上传] → [ ] 待执行
+[Card 4: 更多操作、双重高危删除与图片预上传] → [x] 已完成
                 ↓
 [Card 5: AI标题差异化优化、CBT批量上传与总集成] → [ ] 待执行
 ```
@@ -91,7 +91,7 @@
 ---
 
 ### 任务卡 4：【更多操作 ∨】保留项、双重高危删除与图片预上传
-* **状态**：`[ ] 待执行`
+* **状态**：`[x] 已完成`
 * **目标与交付物**：
   * 实现 `[⋮ 更多操作 ∨]` 弹窗组件 `desktop-pyside/items/vault_more_actions.py`：
     1. **生成变体**：目标变体数（只增不减）、预设开关与自定义 tags 变体值输入、Default 自动补齐；
@@ -105,10 +105,10 @@
   * 实现 **`[☁️ 自建图片预上传]`**：宽屏图片列表向导、状态监控（待上传/上传中/成功/失败）、公网图床 URL 自动回填。
 * **涉及文件**：
   * 新建：`desktop-pyside/items/vault_more_actions.py`
-  * 新建：`tests/test_vault_more_actions.py`
+  * 新建：`desktop-pyside/tests/test_vault_more_actions.py`
 * **机器质检命令**：
   ```bash
-  pytest tests/test_vault_more_actions.py -v
+  pytest desktop-pyside/tests/test_vault_more_actions.py -v
   ```
 
 ---
