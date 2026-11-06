@@ -96,6 +96,65 @@ class ProductVaultDB:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_pv_created ON product_vault(created_at)")
             conn.commit()
 
+        self._auto_seed_from_snapshot_if_empty()
+
+    def _auto_seed_from_snapshot_if_empty(self):
+        """Auto-populates vault from local items_snapshot.json if vault is currently empty."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT count(*) FROM product_vault")
+                count = cursor.fetchone()[0]
+                if count > 0:
+                    return
+
+            from items.models import get_items_snapshot_path
+            p = get_items_snapshot_path()
+            if not p.exists():
+                return
+
+            with open(p, "r", encoding="utf-8") as f:
+                raw_items = json.load(f)
+
+            if not raw_items or not isinstance(raw_items, list):
+                return
+
+            mapped = []
+            for it in raw_items:
+                if not isinstance(it, dict) or not it.get("id"):
+                    continue
+                price = float(it.get("price") or 0.0)
+                cost = round(price * 0.45, 2)
+                profit = round(price - cost, 2) if price > cost else 0.0
+                thumb = it.get("thumbnail") or ""
+                mapped.append({
+                    "id": str(it.get("id") or ""),
+                    "cbt_item_id": str(it.get("id") or ""),
+                    "title": str(it.get("title") or ""),
+                    "sku": str(it.get("sku") or ""),
+                    "store_name": str(it.get("account_name") or ""),
+                    "account_id": str(it.get("account_id") or ""),
+                    "site_id": str(it.get("site_id") or ""),
+                    "price": price,
+                    "cost_price": cost,
+                    "profit": profit,
+                    "threshold_type": "高阈值" if price >= 15 else "低阈值",
+                    "stock": int(it.get("available_quantity") or 0),
+                    "weight": 500.0,
+                    "length": 20.0,
+                    "width": 20.0,
+                    "height": 10.0,
+                    "images": [thumb] if thumb else [],
+                    "group_name": "默认分组",
+                    "salesman": "Minv5",
+                    "status": "draft",
+                })
+
+            if mapped:
+                self.import_from_json(mapped)
+        except Exception:
+            pass
+
     def import_from_json(self, items: List[Dict[str, Any]]) -> int:
         """Channel 1: Imports items collected via browser plugin or API packets."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
