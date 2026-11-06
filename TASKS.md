@@ -13,7 +13,7 @@
                 ↓
 [Card 2: 顶栏三行组合筛选面板与 AI 核价栏] ──→ [x] 已完成
                 ↓
-[Card 3: 商品卡片流网格、选区计数与批量设置] ─→ [ ] 待执行
+[Card 3: 商品卡片流网格、选区计数与批量设置] ─→ [x] 已完成
                 ↓
 [Card 4: 更多操作、双重高危删除与图片预上传] → [ ] 待执行
                 ↓
@@ -61,7 +61,7 @@
 ---
 
 ### 任务卡 3：商品卡片流网格（Card Grid）、选区计数与【批量设置 ∨】四大弹窗
-* **状态**：`[ ] 待执行`
+* **状态**：`[x] 已完成`
 * **目标与交付物**：
   * 构建**卡片式商品组件** `ProductCardWidget`（与圆佑 100% 对齐的 6 层紧凑卡片）：
     1. 顶部复选框 + 正方形主图 + 右上角变体小角标；
@@ -81,11 +81,11 @@
 * **涉及文件**：
   * 新建：`desktop-pyside/items/vault_card.py`
   * 新建：`desktop-pyside/items/vault_batch_settings.py`
-  * 新建：`tests/test_vault_card.py`
-  * 新建：`tests/test_vault_batch_settings.py`
+  * 新建：`desktop-pyside/tests/test_vault_card.py`
+  * 新建：`desktop-pyside/tests/test_vault_batch_settings.py`
 * **机器质检命令**：
   ```bash
-  pytest tests/test_vault_card.py tests/test_vault_batch_settings.py -v
+  pytest desktop-pyside/tests/test_vault_card.py desktop-pyside/tests/test_vault_batch_settings.py -v
   ```
 
 ---
