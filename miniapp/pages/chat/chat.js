@@ -45,8 +45,15 @@ Page({
       getSessionDetail(targetId, chatType).then(detail => {
         if (detail && detail.id) {
           const detailBrazil = (detail.site_id || "").toUpperCase() === "MLB";
+          const current = this.data.itemData || {};
+          const merged = {
+            ...current,
+            ...detail,
+            item_title: (detail.item_title && detail.item_title !== "美客多订单商品") ? detail.item_title : (current.item_title || detail.item_title),
+            item_thumbnail: (detail.item_thumbnail && !detail.item_thumbnail.includes("default_product")) ? detail.item_thumbnail : (current.item_thumbnail || detail.item_thumbnail)
+          };
           this.setData({
-            itemData: detail,
+            itemData: merged,
             targetLang: detailBrazil ? "pt" : "es",
             targetLangName: detailBrazil ? "葡萄牙语(巴西)" : "西班牙语(拉美)"
           });
@@ -93,7 +100,21 @@ Page({
         title: "回复成功！",
         icon: "success"
       });
+
+      const newHistory = [...(this.data.itemData.history || [])];
+      if (this.data.chatType === "message" || this.data.chatType === "claim") {
+        newHistory.push({
+          sender: "seller",
+          sender_name: "我 (商家)",
+          text: contentToSend,
+          text_cn: this.data.inputCn,
+          time: "刚刚"
+        });
+      }
+
+      const updatedItemData = { ...this.data.itemData, history: newHistory };
       this.setData({
+        itemData: updatedItemData,
         replied: true,
         repliedTextEs: contentToSend,
         repliedTextCn: this.data.inputCn,

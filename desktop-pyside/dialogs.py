@@ -2560,10 +2560,45 @@ class SettingsDialog(QDialog):
         self.push_notify_claims.setChecked(bool(self.settings.get("pushNotifyClaims", True)))
         card_layout.addWidget(self.push_notify_claims)
 
+        sep_mobile = QFrame()
+        sep_mobile.setFrameShape(QFrame.Shape.HLine)
+        sep_mobile.setFrameShadow(QFrame.Shadow.Sunken)
+        card_layout.addWidget(sep_mobile)
+
+        mobile_title = QLabel("手机小程序连接")
+        mobile_title.setObjectName("sectionTitle")
+        card_layout.addWidget(mobile_title)
+
+        self.mobile_gateway_enabled = QCheckBox("启用手机小程序连接（开启后本机开放手机网关，并把订单与客服会话同步到你的路由器网关）")
+        self.mobile_gateway_enabled.setChecked(bool(self.settings.get("mobileGatewayEnabled", False)))
+        card_layout.addWidget(self.mobile_gateway_enabled)
+
+        mobile_token_layout = QHBoxLayout()
+        mobile_token_layout.setSpacing(8)
+        self.mobile_token_view = QLineEdit()
+        self.mobile_token_view.setReadOnly(True)
+        self.mobile_token_view.setEchoMode(QLineEdit.EchoMode.Password)
+        self.mobile_token_view.setPlaceholderText("点击右侧按钮生成并复制访问口令")
+        self.mobile_token_view.setFixedHeight(32)
+        self.copy_mobile_token_btn = QPushButton("复制访问口令")
+        self.copy_mobile_token_btn.setFixedHeight(32)
+        self.copy_mobile_token_btn.clicked.connect(self._on_copy_mobile_token_clicked)
+        mobile_token_layout.addWidget(QLabel("访问口令:"))
+        mobile_token_layout.addWidget(self.mobile_token_view, 1)
+        mobile_token_layout.addWidget(self.copy_mobile_token_btn)
+        card_layout.addLayout(mobile_token_layout)
+
+        mobile_tip = QLabel(
+            "💡 手机小程序和路由器网关必须填入同一个访问口令才能读取数据、回复买家或处理索赔；没有口令的请求一律被拒绝。口令请勿发给他人。"
+        )
+        mobile_tip.setWordWrap(True)
+        card_layout.addWidget(mobile_tip)
+
         card_layout.addStretch(1)
         layout.addWidget(card)
 
         self._initial_field_values.update({
+            "mobileGatewayEnabled": self.mobile_gateway_enabled.isChecked(),
             "pushEnabled": self.push_enabled.isChecked(),
             "pushToken": self.push_token.text().strip(),
             "pushNotifyOrders": self.push_notify_orders.isChecked(),
@@ -2572,6 +2607,17 @@ class SettingsDialog(QDialog):
             "pushNotifyClaims": self.push_notify_claims.isChecked(),
         })
         return page
+
+    def _on_copy_mobile_token_clicked(self) -> None:
+        try:
+            from mobile_gateway import ensure_access_token
+            token = ensure_access_token()
+        except Exception as exc:
+            QMessageBox.warning(self, "访问口令", f"无法生成访问口令: {exc}")
+            return
+        self.mobile_token_view.setText(token)
+        QGuiApplication.clipboard().setText(token)
+        QMessageBox.information(self, "访问口令", "访问口令已复制。请粘贴到手机小程序「设置 → 访问口令」，并配置到路由器网关。")
 
     def _on_test_push_clicked(self) -> None:
         token = self.push_token.text().strip()
@@ -2628,6 +2674,7 @@ class SettingsDialog(QDialog):
             ("activityCallbackSecretFile", self.activity_callback_secret_file, str(settings.get("activityCallbackSecretFile") or "")),
             ("activityCallbackClaimUrl", self.activity_callback_claim_url, str(settings.get("activityCallbackClaimUrl") or DEFAULT_ACTIVITY_CALLBACK_CLAIM_URL)),
             ("activityCallbackAckUrl", self.activity_callback_ack_url, str(settings.get("activityCallbackAckUrl") or DEFAULT_ACTIVITY_CALLBACK_ACK_URL)),
+            ("mobileGatewayEnabled", self.mobile_gateway_enabled, bool(settings.get("mobileGatewayEnabled", False))),
             ("pushEnabled", self.push_enabled, bool(settings.get("pushEnabled", False))),
             ("pushToken", self.push_token, str(settings.get("pushToken") or "")),
             ("pushNotifyOrders", self.push_notify_orders, bool(settings.get("pushNotifyOrders", True))),
@@ -2758,6 +2805,7 @@ class SettingsDialog(QDialog):
             "activityCallbackSecretFile": self.activity_callback_secret_file.text().strip(),
             "activityCallbackClaimUrl": self.activity_callback_claim_url.text().strip(),
             "activityCallbackAckUrl": self.activity_callback_ack_url.text().strip(),
+            "mobileGatewayEnabled": self.mobile_gateway_enabled.isChecked(),
             "pushEnabled": self.push_enabled.isChecked(),
             "pushToken": self.push_token.text().strip(),
             "pushNotifyOrders": self.push_notify_orders.isChecked(),

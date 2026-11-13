@@ -24,6 +24,14 @@
       <text class="info-label">连接网络模式</text>
       <text class="info-val">4G/5G 移动公网直连 (Cloudflare)</text>
     </view>
+    <view class="info-row">
+      <text class="info-label">访问口令</text>
+      <text class="badge {{tokenAccepted ? 'badge-green' : 'badge-gold'}}">{{tokenAccepted ? '已通过' : '未通过'}}</text>
+    </view>
+    <input class="token-input" password="true" value="{{gatewayToken}}" bindinput="onTokenInput" placeholder="粘贴电脑端「设置 → 消息推送」里复制的访问口令" />
+    <view style="margin-top: 20rpx;">
+      <button class="test-btn" bindtap="saveToken">保存并校验访问口令</button>
+    </view>
     <view style="margin-top: 20rpx;">
       <button class="test-btn" bindtap="checkGateway">一键检测网关连接</button>
     </view>

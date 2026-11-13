@@ -7,13 +7,23 @@ import json
 import logging
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import urllib.error
 import urllib.request
 
 from engine.crypto import get_data_dir
 
 logger = logging.getLogger(__name__)
+
+ACCESS_TOKEN_FILENAME = "mobile_gateway_token.txt"
+
+
+def read_gateway_token() -> str:
+    """Shared access token the gateway expects; empty when the mobile link was never set up."""
+    try:
+        return (get_data_dir() / ACCESS_TOKEN_FILENAME).read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
 
 PRIMARY_GATEWAY_SYNC_URL = "http://192.168.1.2:28760/api/sync"
 FALLBACK_GATEWAY_SYNC_URL = "https://minv5.trade/api/sync"
@@ -27,7 +37,9 @@ class MobileGatewaySynchronizer:
         primary_url: str = PRIMARY_GATEWAY_SYNC_URL,
         fallback_url: str = FALLBACK_GATEWAY_SYNC_URL,
         debounce_seconds: float = 0.5,
+        token_provider: Callable[[], str] = read_gateway_token,
     ) -> None:
+        self._token_provider = token_provider
         self.primary_url = primary_url
         self.fallback_url = fallback_url
         self.debounce_seconds = debounce_seconds
@@ -92,6 +104,10 @@ class MobileGatewaySynchronizer:
 
     def _post_sync(self, payload: dict[str, Any]) -> bool:
         """Try sending payload to primary (LAN) then fallback (WAN)."""
+        token = self._token_provider()
+        if not token:
+            logger.debug("Mobile gateway sync skipped: no access token configured")
+            return False
         try:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         except Exception as err:
@@ -107,6 +123,7 @@ class MobileGatewaySynchronizer:
                     headers={
                         "Content-Type": "application/json; charset=utf-8",
                         "User-Agent": "MDM-Desktop-Sync/1.0",
+                        "Authorization": f"Bearer {token}",
                     },
                     method="POST",
                 )
@@ -122,6 +139,13 @@ class MobileGatewaySynchronizer:
 
 
 _global_synchronizer = MobileGatewaySynchronizer()
+_sync_enabled = False
+
+
+def set_mobile_sync_enabled(enabled: bool) -> None:
+    """Order/session snapshots leave this machine only after the user opts in."""
+    global _sync_enabled
+    _sync_enabled = bool(enabled)
 
 
 def trigger_mobile_sync(
@@ -130,6 +154,8 @@ def trigger_mobile_sync(
     immediate: bool = False,
 ) -> None:
     """Global helper to trigger mobile gateway sync without blocking."""
+    if not _sync_enabled:
+        return
     try:
         _global_synchronizer.trigger(sessions=sessions, orders=orders, immediate=immediate)
     except Exception as e:
@@ -138,6 +164,9 @@ def trigger_mobile_sync(
 
 def full_sync_from_disk_async(immediate: bool = True) -> None:
     """Helper to read disk snapshots and push full state to mobile gateway asynchronously."""
+    if not _sync_enabled:
+        return
+
     def _do():
         sessions = _global_synchronizer._load_snapshot_from_disk_if_needed("sessions_snapshot.json")
         orders = _global_synchronizer._load_snapshot_from_disk_if_needed("orders_snapshot.json")

@@ -55,7 +55,10 @@
 .order-left {
   display: flex;
   align-items: center;
-  gap: 12rpx;
+  gap: 10rpx;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .store-badge {
@@ -65,6 +68,8 @@
   font-size: 20rpx;
   padding: 2rpx 10rpx;
   border-radius: 4rpx;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .site-tag {
@@ -74,6 +79,51 @@
   font-size: 20rpx;
   padding: 2rpx 10rpx;
   border-radius: 4rpx;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.sla-badge {
+  font-size: 20rpx;
+  font-weight: 600;
+  padding: 2rpx 10rpx;
+  border-radius: 6rpx;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.sla-green {
+  background: rgba(52, 211, 153, 0.15);
+  color: #34D399;
+  border: 1rpx solid rgba(52, 211, 153, 0.4);
+}
+
+.sla-yellow {
+  background: rgba(251, 191, 36, 0.15);
+  color: #FBBF24;
+  border: 1rpx solid rgba(251, 191, 36, 0.4);
+}
+
+.sla-red {
+  background: rgba(239, 68, 68, 0.18);
+  color: #EF4444;
+  border: 1rpx solid rgba(239, 68, 68, 0.45);
+}
+
+.sla-overdue {
+  background: rgba(239, 68, 68, 0.22);
+  color: #F87171;
+  border: 1rpx solid rgba(239, 68, 68, 0.5);
+}
+
+.buyer-nickname-top {
+  font-size: 22rpx;
+  color: #F6F3EA;
+  font-weight: bold;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 1;
 }
 
 .order-id-mono {
@@ -86,12 +136,15 @@
   font-size: 22rpx;
   padding: 4rpx 14rpx;
   border-radius: 20rpx;
+  white-space: nowrap;
+  flex-shrink: 0;
+  margin-left: 12rpx;
 }
 
 .order-body {
   display: flex;
   gap: 16rpx;
-  margin-bottom: 16rpx;
+  align-items: center;
 }
 
 .order-thumb {
@@ -108,58 +161,56 @@
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  min-width: 0;
 }
 
 .order-title {
   font-size: 26rpx;
-  color: #F6F3EA;
+  color: #E6E2D8;
   line-height: 1.3;
+  margin-bottom: 8rpx;
 }
 
 .order-bottom-row {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-}
-
-.order-amount {
-  font-size: 32rpx;
-  font-weight: bold;
-  color: #D4AF37;
-}
-
-.order-footer {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  border-top: 1rpx solid #2B352E;
-  padding-top: 14rpx;
-  font-size: 22rpx;
-  color: #777266;
   gap: 12rpx;
+  flex-wrap: wrap;
 }
 
-.tracking-pill {
-  display: flex;
-  align-items: center;
-  gap: 6rpx;
-  background: #18281E;
-  border: 1rpx solid #2F6B3F;
-  border-radius: 12rpx;
-  padding: 4rpx 12rpx;
+.order-paid-amount {
+  font-size: 24rpx;
+  font-weight: bold;
+  color: #34D399;
+}
+
+.order-qty-pill {
   font-size: 20rpx;
-  color: #4CAF50;
+  font-weight: bold;
+  color: #FCD34D;
+  background: rgba(245, 158, 11, 0.15);
+  border: 1rpx solid rgba(245, 158, 11, 0.3);
+  border-radius: 6rpx;
+  padding: 2rpx 10rpx;
 }
 
-.tracking-mono {
-  font-family: monospace;
+.order-sku-chip {
+  font-size: 20rpx;
+  font-weight: 500;
+  color: #D4AF37;
+  background: rgba(212, 175, 55, 0.12);
+  border: 1rpx solid rgba(212, 175, 55, 0.35);
+  border-radius: 6rpx;
+  padding: 2rpx 10rpx;
 }
 
-.buyer-city {
-  display: flex;
-  align-items: center;
-  gap: 6rpx;
-  color: #C8C3B7;
+.order-single-chip {
+  font-size: 20rpx;
+  color: #A8A29E;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1rpx solid rgba(255, 255, 255, 0.12);
+  border-radius: 6rpx;
+  padding: 2rpx 10rpx;
 }
 
 /* 空状态 */
@@ -282,28 +333,172 @@
   word-break: break-all;
 }
 
-.v-btn-row {
-  display: flex;
-  align-items: center;
-  gap: 16rpx;
+/* 费用收支与利润结算 3格指标卡 (对齐桌面端) */
+.fin-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12rpx;
+  margin-bottom: 12rpx;
 }
 
-.v-col {
+.fin-box {
+  background: #141A17;
+  border: 1rpx solid #2B3830;
+  border-radius: 10rpx;
+  padding: 12rpx 10rpx;
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
-  flex: 1;
+  gap: 6rpx;
 }
 
-.mini-copy-btn {
-  background: #2D2619;
-  color: #D4AF37;
-  border: 1rpx solid #6E5D2A;
+.fin-box-highlight {
+  background: #1A211D;
+  border: 1rpx solid #4E472F;
+}
+
+.fin-lbl {
   font-size: 20rpx;
+  color: #A8A29E;
+  white-space: nowrap;
+}
+
+.fin-val {
+  font-size: 22rpx;
+  font-weight: bold;
+  word-break: break-all;
+}
+
+.fin-footer-meta {
+  font-size: 20rpx;
+  color: #8C877A;
+  border-top: 1rpx dashed #2B352E;
+  padding-top: 10rpx;
+  margin-top: 6rpx;
+  line-height: 1.4;
+}
+
+/* 抽屉内分区头部横条 */
+.box-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12rpx;
+  border-bottom: 1rpx dashed #2B352E;
+  padding-bottom: 10rpx;
+}
+
+.box-title-text {
+  font-size: 26rpx;
+  font-weight: bold;
+  color: #D4AF37;
+}
+
+.print-badge {
+  font-size: 20rpx;
+  font-weight: 500;
+  padding: 2rpx 10rpx;
+  border-radius: 6rpx;
+}
+
+.print-done {
+  background: rgba(16, 185, 129, 0.16);
+  color: #34d399;
+  border: 1rpx solid rgba(16, 185, 129, 0.35);
+}
+
+.print-pending {
+  background: rgba(245, 158, 11, 0.16);
+  color: #fbbf24;
+  border: 1rpx solid rgba(245, 158, 11, 0.35);
+}
+
+.box-meta-line {
+  font-size: 22rpx;
+  color: #C8C3B7;
+  margin-bottom: 12rpx;
+}
+
+.btn-contact-buyer {
+  background: #1F3A2E;
+  color: #A7F3D0;
+  border: 1rpx solid #059669;
+  font-size: 20rpx;
+  font-weight: 600;
   padding: 4rpx 16rpx;
   border-radius: 20rpx;
   line-height: 1.4;
   margin: 0;
+}
+
+/* 堆叠式地址行 */
+.box-row-stacked {
+  display: flex;
+  flex-direction: column;
+  gap: 8rpx;
+  padding: 10rpx 0;
+}
+
+.k-copy-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.address-text {
+  font-size: 24rpx;
+  color: #F6F3EA;
+  line-height: 1.4;
+  background: #121714;
+  padding: 12rpx 14rpx;
+  border-radius: 8rpx;
+  border: 1rpx solid #28352C;
+  word-break: break-all;
+}
+
+/* 商品卡片内部标签行 */
+.p-chips-row {
+  display: flex;
+  gap: 10rpx;
+  flex-wrap: wrap;
+  margin-top: 4rpx;
+}
+
+.p-item-id {
+  font-size: 20rpx;
+  color: #93C5FD;
+  background: rgba(59, 130, 246, 0.12);
+  border: 1rpx solid rgba(59, 130, 246, 0.35);
+  border-radius: 6rpx;
+  padding: 2rpx 8rpx;
+}
+
+.p-sku {
+  font-size: 20rpx;
+  color: #D4AF37;
+  background: rgba(212, 175, 55, 0.12);
+  border: 1rpx solid rgba(212, 175, 55, 0.35);
+  border-radius: 6rpx;
+  padding: 2rpx 8rpx;
+}
+
+.p-single {
+  font-size: 20rpx;
+  color: #A8A29E;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1rpx solid rgba(255, 255, 255, 0.12);
+  border-radius: 6rpx;
+  padding: 2rpx 8rpx;
+}
+
+.p-price-qty-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 6rpx;
+}
+
+.text-purple {
+  color: #818CF8;
 }
 
 .product-item-row {

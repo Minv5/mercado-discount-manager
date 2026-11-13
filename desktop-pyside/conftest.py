@@ -8,6 +8,34 @@ from pathlib import Path
 import pytest
 
 
+def _ensure_qt_platform_plugins() -> None:
+    """Qt cannot load its platform plugin from a non-ASCII path, so expose it through an ASCII symlink dir."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        import PySide6
+    except ImportError:
+        return
+    qt_plugins = os.path.join(os.path.dirname(PySide6.__file__), "Qt", "plugins")
+    platforms_dir = os.path.join(qt_plugins, "platforms")
+    if not os.path.isdir(platforms_dir):
+        return
+    os.environ.setdefault("QT_PLUGIN_PATH", qt_plugins)
+    try:
+        platforms_dir.encode("ascii")
+        os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", platforms_dir)
+    except UnicodeEncodeError:
+        tmp_platforms = "/tmp/qt_platforms"
+        os.makedirs(tmp_platforms, exist_ok=True)
+        for item in os.listdir(platforms_dir):
+            dst = os.path.join(tmp_platforms, item)
+            if not os.path.exists(dst):
+                os.symlink(os.path.join(platforms_dir, item), dst)
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = tmp_platforms
+
+
+_ensure_qt_platform_plugins()
+
+
 @pytest.fixture(autouse=True, scope="session")
 def isolate_test_data_dir():
     """Ensure MDM_DATA_DIR always points to an isolated temp directory for test sessions."""

@@ -195,63 +195,8 @@ class ItemsPage(QFrame):
         main_layout.setContentsMargins(12, 10, 12, 10)
         main_layout.setSpacing(8)
 
-        # Top Switcher Bar: Local Vault vs Online Listings
-        switcher_row = QHBoxLayout()
-        switcher_row.setContentsMargins(0, 0, 0, 4)
-        switcher_row.setSpacing(10)
-
-        tab_btn_style = """
-            QPushButton {
-                background: #1A1D1A;
-                color: #A8A29E;
-                border: 1px solid #3B382C;
-                border-radius: 6px;
-                padding: 6px 18px;
-                font-size: 13px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background: #252A25;
-                color: #F6F3EA;
-            }
-            QPushButton:checked {
-                background: #2F6B3F;
-                color: #FFFFFF;
-                border-color: #4E472F;
-            }
-        """
-
-        self.btn_tab_vault = QPushButton("📦 待刊登产品库 (本地产品)")
-        self.btn_tab_vault.setFixedHeight(34)
-        self.btn_tab_vault.setCheckable(True)
-        self.btn_tab_vault.setChecked(True)
-        self.btn_tab_vault.setStyleSheet(tab_btn_style)
-        self.btn_tab_vault.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_tab_vault.clicked.connect(lambda: self._switch_view(0))
-        switcher_row.addWidget(self.btn_tab_vault)
-
-        self.btn_tab_online = QPushButton("🌐 在线商品 (Mercado店铺)")
-        self.btn_tab_online.setFixedHeight(34)
-        self.btn_tab_online.setCheckable(True)
-        self.btn_tab_online.setChecked(False)
-        self.btn_tab_online.setStyleSheet(tab_btn_style)
-        self.btn_tab_online.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_tab_online.clicked.connect(lambda: self._switch_view(1))
-        switcher_row.addWidget(self.btn_tab_online)
-
-        switcher_row.addStretch(1)
-        main_layout.addLayout(switcher_row)
-
-        self.stack = QStackedWidget(self)
-        self.vault_page = ProductVaultPage(parent=self)
-        self.online_widget = QWidget(self)
-        self.stack.addWidget(self.vault_page)
-        self.stack.addWidget(self.online_widget)
-        main_layout.addWidget(self.stack, 1)
-
-        online_layout = QVBoxLayout(self.online_widget)
-        online_layout.setContentsMargins(0, 0, 0, 0)
-        online_layout.setSpacing(10)
+        self.online_widget = self
+        online_layout = main_layout
 
         # 1. Header Toolbar
         top_bar = QWidget()
@@ -263,7 +208,7 @@ class ItemsPage(QFrame):
         header_row = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
-        main_title = QLabel("📦 商品管理")
+        main_title = QLabel("📦 商品后台 (在线商品)")
         main_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #F6F3EA;")
         sub_title = QLabel("全店铺商品信息汇总 · 实时在售状态 · 价格库存与前台直达")
         sub_title.setStyleSheet("font-size: 11px; color: #8C877D;")
@@ -517,9 +462,7 @@ class ItemsPage(QFrame):
         online_layout.addLayout(footer)
 
     def _switch_view(self, index: int) -> None:
-        self.stack.setCurrentIndex(index)
-        self.btn_tab_vault.setChecked(index == 0)
-        self.btn_tab_online.setChecked(index == 1)
+        pass
 
     # ------------------------------------------------------------------
     # Data Filtering & Rendering

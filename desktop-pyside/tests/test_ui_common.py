@@ -349,6 +349,28 @@ class UICommonTests(unittest.TestCase):
 
         dlg.close()
 
+    def test_lightbox_click_outside_and_blank_to_close(self) -> None:
+        from PySide6.QtTest import QTest
+        pix = QPixmap(100, 100)
+        pix.fill(Qt.GlobalColor.red)
+        dlg = ImagePreviewDialog(pixmap=pix, title="点击外部关闭测试")
+        dlg.resize(1200, 800)
+        dlg.show()
+        self.app.processEvents()
+
+        # 1. 点击卡片外部半透明遮罩区域 (5, 5)，触发关闭
+        QTest.mouseClick(dlg, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(5, 5))
+        self.assertFalse(dlg.isVisible())
+
+        # 2. 重新打开，测试在未放大状态下点击图片视口四周空白区域
+        dlg.show()
+        self.app.processEvents()
+        self.assertTrue(dlg.isVisible())
+        vp = dlg.scroll_area.viewport()
+        # 点击视口左上角空白处 (10, 10)
+        QTest.mouseClick(vp, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(10, 10))
+        self.assertFalse(dlg.isVisible())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -69,13 +69,16 @@ class ImagePreviewDialog(QDialog):
         self._pan_start: QPoint = QPoint()
 
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.card = QFrame(self)
         self.card.setObjectName("imagePreviewCard")
+        self.card.setMaximumSize(1020, 780)
+        self.card.setMinimumSize(600, 480)
         self.card.setStyleSheet("""
             QFrame#imagePreviewCard {
-                background-color: rgba(20, 24, 22, 0.96);
+                background-color: rgba(20, 24, 22, 0.98);
                 border: 1px solid #4E472F;
                 border-radius: 12px;
             }
@@ -535,6 +538,13 @@ class ImagePreviewDialog(QDialog):
                         self.img_lbl.setCursor(Qt.CursorShape.ClosedHandCursor)
                         self.scroll_area.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
                         return True
+                    else:
+                        vp = self.scroll_area.viewport()
+                        lbl_rect = self.img_lbl.geometry()
+                        pos = vp.mapFromGlobal(event.globalPosition().toPoint())
+                        if not lbl_rect.contains(pos):
+                            self.close()
+                            return True
             elif ev_type == QEvent.Type.MouseMove:
                 if getattr(self, "_is_panning", False) and (event.buttons() & Qt.MouseButton.LeftButton):
                     cur_pos = event.globalPosition().toPoint()
@@ -674,16 +684,35 @@ class ImagePreviewDialog(QDialog):
             crop=False,
         )
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        parent = self.parentWidget()
+        if parent:
+            top_win = parent.window()
+            if top_win and top_win.isVisible():
+                self.setGeometry(top_win.geometry())
+
+    def paintEvent(self, event) -> None:
+        from PySide6.QtGui import QPainter, QColor
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 185))
+        super().paintEvent(event)
+
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             card_rect = self.card.geometry()
-            if not card_rect.contains(event.pos()):
+            evt_pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            if not card_rect.contains(evt_pos):
                 self.close()
                 return
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            self._is_dragging = True
-            event.accept()
-            return
+            if hasattr(self, "title_lbl") and self.title_lbl.parentWidget():
+                hdr_geo = self.title_lbl.parentWidget().geometry()
+                local_pos = self.card.mapFromParent(evt_pos)
+                if hdr_geo.contains(local_pos):
+                    self._drag_pos = event.globalPosition().toPoint() - self.card.pos()
+                    self._is_dragging = True
+                    event.accept()
+                    return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
@@ -705,10 +734,11 @@ def show_image_preview(
     initial_index: int = 0,
 ) -> None:
     """Convenient entry point to display full-size lightbox for a local path, URL, QPixmap, or image list."""
+    top_parent = parent.window() if parent else None
     dlg = ImagePreviewDialog(
         images=url_or_pixmap,
         initial_index=initial_index,
         title=title,
-        parent=parent,
+        parent=top_parent or parent,
     )
     dlg.exec()

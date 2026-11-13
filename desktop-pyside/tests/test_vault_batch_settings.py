@@ -89,3 +89,7 @@ def test_size_setting_dialogs():
     est_dlg.radio_force.setChecked(True)
     e_data2 = est_dlg.get_data()
     assert e_data2["force_override"] is True
+
+    # Ensure unified Black-Gold dark theme (no white QDialog background)
+    assert "background: #171B19" in manual_dlg.styleSheet()
+    assert "background: #ffffff" not in manual_dlg.styleSheet().lower()

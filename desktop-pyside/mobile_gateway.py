@@ -7,11 +7,14 @@ orders, and to dispatch genuine replies back to buyers.
 """
 
 from __future__ import annotations
+from datetime import datetime, timezone, timedelta, time as dtime
 
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -40,6 +43,47 @@ def get_data_dir() -> Path:
     else:
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     return base / "MercadoDiscountManagerStandalone" / "data"
+
+
+ACCESS_TOKEN_ENV = "MDM_GATEWAY_TOKEN"
+ACCESS_TOKEN_FILENAME = "mobile_gateway_token.txt"
+REAL_WRITE_CONFIRM = "REAL_SUBMIT"
+CLAIM_ACTIONS = ("full-refund", "mediation")
+
+
+def get_access_token() -> str:
+    """Return the shared access token (env first, then data-dir file); empty when not configured."""
+    env_token = str(os.environ.get(ACCESS_TOKEN_ENV) or "").strip()
+    if env_token:
+        return env_token
+    try:
+        return (get_data_dir() / ACCESS_TOKEN_FILENAME).read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def ensure_access_token() -> str:
+    """Return the access token, generating and persisting a random one on first use."""
+    token = get_access_token()
+    if token:
+        return token
+    token = secrets.token_urlsafe(24)
+    p = get_data_dir() / ACCESS_TOKEN_FILENAME
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(token, encoding="utf-8")
+    try:
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
+    return token
+
+
+def is_token_valid(presented: str) -> bool:
+    """Constant-time check; always False when the gateway has no token configured."""
+    expected = get_access_token()
+    if not expected or not presented:
+        return False
+    return hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
 
 
 def load_sessions() -> list[dict[str, Any]]:
@@ -147,6 +191,128 @@ def classify_order_status(order: dict[str, Any]) -> tuple[str, str]:
     return ("已付款", "paid")
 
 
+
+def compute_shipping_deadline(order: dict[str, Any]) -> dict[str, Any] | None:
+    _, filter_cat = classify_order_status(order)
+    if filter_cat != "paid":
+        return None
+
+    sh = order.get("shipping") or {}
+    ship_st = str(sh.get("status") or "").strip().lower()
+    ship_sub = str(sh.get("substatus") or "").strip().lower()
+    if ship_st in ("shipped", "in_transit", "delivered", "completed", "cancelled") or ship_sub in (
+        "picked_up", "dropped_off", "in_hub", "forwarded_to_carrier", "on_carrier", "customs_cleared"
+    ):
+        return None
+
+    deadline_ts = 0.0
+    limit_str = sh.get("estimated_handling_limit")
+    if limit_str:
+        try:
+            deadline_ts = datetime.fromisoformat(str(limit_str).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            deadline_ts = 0.0
+
+    if not deadline_ts:
+        created_raw = order.get("created_timestamp") or order.get("date_created")
+        if created_raw:
+            try:
+                if isinstance(created_raw, (int, float)):
+                    base_dt = datetime.fromtimestamp(float(created_raw), tz=timezone.utc)
+                else:
+                    base_dt = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+            except Exception:
+                base_dt = datetime.now(timezone.utc)
+
+            site = str(order.get("site_id") or "").strip().upper()
+            h_hours = int(sh.get("handling_hours") or 0)
+            if h_hours > 0:
+                h_days = h_hours // 24
+                if site == "MLM":
+                    b_days = min(2, max(1, h_days))
+                elif site == "MLB":
+                    b_days = min(3, max(2, h_days))
+                elif site in ("MLC", "MCO"):
+                    b_days = min(3, max(2, h_days))
+                elif site == "MLA":
+                    b_days = min(4, max(3, h_days))
+                else:
+                    b_days = max(2, min(4, h_days))
+            else:
+                b_days = 3 if site in ("MLC", "MCO", "MLA") else 2
+
+            bjt_tz = timezone(timedelta(hours=8))
+            local_dt = base_dt.astimezone(bjt_tz)
+            curr_date = local_dt.date()
+
+            while curr_date.weekday() >= 5:
+                curr_date += timedelta(days=1)
+
+            days_counted = 0
+            while days_counted < b_days:
+                curr_date += timedelta(days=1)
+                if curr_date.weekday() < 5:
+                    days_counted += 1
+
+            deadline_dt = datetime.combine(curr_date, dtime(23, 59, 59), tzinfo=bjt_tz)
+            deadline_ts = deadline_dt.timestamp()
+
+    if not deadline_ts:
+        return None
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    diff = deadline_ts - now_ts
+
+    if diff > 0:
+        total_minutes = int(diff // 60)
+        hours = total_minutes // 60
+        minutes = total_minutes % 60
+        if hours >= 24:
+            days = hours // 24
+            rem_h = hours % 24
+            text = f"⏳ 剩 {days}天{rem_h}时" if rem_h > 0 else f"⏳ 剩 {days}天"
+            color = "#34D399"
+            bg = "rgba(52, 211, 153, 0.12)"
+            border = "1px solid rgba(52, 211, 153, 0.3)"
+            css_class = "sla-green"
+        elif hours >= 6:
+            text = f"⏳ 剩 {hours}时{minutes}分"
+            color = "#FBBF24"
+            bg = "rgba(251, 191, 36, 0.12)"
+            border = "1px solid rgba(251, 191, 36, 0.35)"
+            css_class = "sla-yellow"
+        else:
+            text = f"🚨 仅剩 {hours}时{minutes}分" if minutes > 0 else f"🚨 仅剩 {hours}时"
+            color = "#EF4444"
+            bg = "rgba(239, 68, 68, 0.18)"
+            border = "1px solid rgba(239, 68, 68, 0.4)"
+            css_class = "sla-red"
+    else:
+        overdue_minutes = int(abs(diff) // 60)
+        overdue_h = overdue_minutes // 60
+        overdue_m = overdue_minutes % 60
+        if overdue_h >= 24:
+            overdue_d = overdue_h // 24
+            overdue_rem_h = overdue_h % 24
+            text = f"⚠️ 已超时 {overdue_d}天{overdue_rem_h}时" if overdue_rem_h > 0 else f"⚠️ 已超时 {overdue_d}天"
+        elif overdue_h > 0:
+            text = f"⚠️ 已超时 {overdue_h}时{overdue_m}分"
+        else:
+            text = f"⚠️ 已超时 {overdue_m}分"
+        color = "#F87171"
+        bg = "rgba(239, 68, 68, 0.22)"
+        border = "1px solid rgba(239, 68, 68, 0.5)"
+        css_class = "sla-overdue"
+
+    return {
+        "text": text,
+        "color": color,
+        "bg": bg,
+        "border": border,
+        "class": css_class,
+        "deadline_ts": deadline_ts
+    }
+
 def is_store_match(target_store: str, item_store_name: Any, item_account_id: Any) -> bool:
     if not target_store or target_store in ("全部", "all", "全部店铺"):
         return True
@@ -243,43 +409,85 @@ def execute_claim_action(session_id: str, action: str, extra_params: dict | None
     if not target_session:
         return False, f"未找到对应索赔: {session_id}"
 
+    if action not in CLAIM_ACTIONS:
+        return False, f"不支持的索赔操作: {action}"
+
     account_id = target_session.get("account_id") or ""
     clean_id = session_id.replace("c_", "").strip()
 
-    dispatched = False
-    err_msg = ""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from engine.auth import AuthManager
         from engine.client import MercadoClient
 
-        auth = AuthManager()
-        client = MercadoClient(auth)
-
+        client = MercadoClient(AuthManager())
         if action == "full-refund":
             client.submit_claim_full_refund(account_id, clean_id)
-            dispatched = True
-        elif action == "mediation":
+        else:
             client.request_claim_mediation(account_id, clean_id)
-            dispatched = True
     except Exception as e:
         logger.warning("Claim action %s failed: %s", action, e)
-        err_msg = str(e)
+        return False, f"操作未成功提交至美客多，本地状态未变更: {e}"
 
-    # 本地状态更新
+    # 官方提交成功后才更新本地状态
     if action == "full-refund":
         target_session["stage"] = "closed"
         target_session["status"] = "closed"
         target_session["claim_reason"] = f"[已全额退款] {target_session.get('claim_reason', '')}"
-    elif action == "mediation":
+        message = "全额退款申请已成功同步至美客多官方，纠纷已关闭！"
+    else:
         target_session["stage"] = "dispute"
+        message = "已成功向美客多官方申请平台调解！"
 
     save_sessions(sessions)
+    return True, message
 
-    if dispatched:
-        return True, "全额退款申请已成功同步至美客多官方，纠纷已关闭！"
-    return True, f"已在本地登记退款处理（官方同步: {err_msg or 'OK'}）"
 
+def find_or_create_order_session(session_id: str, sessions: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    if sessions is None:
+        sessions = load_sessions()
+    clean_id = session_id.replace("m_", "").replace("q_", "").replace("c_", "").strip()
+    for s in sessions:
+        if s.get("id") == session_id or s.get("id") == f"m_{clean_id}":
+            return s
+        if s.get("session_type") == "message" and (str(s.get("order_id")) == clean_id or str(s.get("pack_id")) == clean_id):
+            return s
+
+    if session_id.startswith("m_") or session_id.startswith("20000"):
+        orders = load_orders()
+        for o in orders:
+            oid = str(o.get("order_id") or o.get("id") or "")
+            pid = str(o.get("pack_id") or "")
+            if clean_id in (oid, pid):
+                b_nick = o.get("buyer_nickname") or (o.get("buyer") or {}).get("nickname") or o.get("buyer_full_name") or "买家"
+                items = o.get("items") or o.get("order_items") or []
+                first_item = items[0] if items else {}
+                item_obj = first_item.get("item") if isinstance(first_item.get("item"), dict) else first_item
+                i_title = o.get("item_title") or item_obj.get("title") or "美客多订单商品"
+                i_thumb = o.get("item_thumbnail") or item_obj.get("thumbnail") or item_obj.get("picture_url") or "https://http2.mlstatic.com/D_NQ_NP_2X_841285-MLM43849301298_102020-F.webp"
+                i_sku = o.get("item_sku") or item_obj.get("sku") or item_obj.get("seller_sku") or item_obj.get("item_id") or ""
+                target_pack = pid or oid or clean_id
+                target_sess = {
+                    "id": f"m_{target_pack}",
+                    "session_type": "message",
+                    "account_id": str(o.get("account_id") or ""),
+                    "account_name": str(o.get("store_name") or "美客多店铺"),
+                    "site_id": str(o.get("site_id") or "MLA"),
+                    "order_id": oid or clean_id,
+                    "pack_id": target_pack,
+                    "buyer_id": str(o.get("buyer_id") or (o.get("buyer") or {}).get("id") or ""),
+                    "buyer_nickname": b_nick,
+                    "item_id": i_sku,
+                    "item_title": i_title,
+                    "item_thumbnail": i_thumb,
+                    "status": "read",
+                    "can_reply": True,
+                    "messages": []
+                }
+                sessions.append(target_sess)
+                save_sessions(sessions)
+                return target_sess
+    return None
 
 def send_real_reply(session_id: str, reply_text: str) -> tuple[bool, str]:
     """Execute real reply to buyer via MercadoClient if possible, else record locally."""
@@ -291,38 +499,34 @@ def send_real_reply(session_id: str, reply_text: str) -> tuple[bool, str]:
             break
 
     if not target_session:
+        target_session = find_or_create_order_session(session_id, sessions)
+    if not target_session:
         return False, f"未找到对应会话: {session_id}"
 
     account_id = target_session.get("account_id") or ""
     session_type = target_session.get("session_type") or "question"
     clean_id = session_id.replace("q_", "").replace("c_", "").replace("m_", "").strip()
 
-    # Try calling native Mercado Client
-    dispatched = False
-    err_msg = ""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from engine.auth import AuthManager
         from engine.client import MercadoClient
 
-        auth = AuthManager()
-        client = MercadoClient(auth)
-
+        client = MercadoClient(AuthManager())
         if session_type == "question":
             client.answer_question(account_id, clean_id, reply_text)
-            dispatched = True
         elif session_type == "claim":
             is_dispute = target_session.get("stage") == "dispute"
             receiver_role = "mediator" if is_dispute else "complainant"
             client.send_claim_message(account_id, clean_id, reply_text, receiver_role=receiver_role)
-            dispatched = True
         elif session_type == "message":
             pack_id = target_session.get("pack_id") or target_session.get("order_id") or clean_id
             client.send_pack_message(account_id, pack_id, reply_text)
-            dispatched = True
+        else:
+            return False, f"不支持的会话类型: {session_type}"
     except Exception as e:
-        logger.warning("Native Mercado dispatch failed: %s; saving reply locally", e)
-        err_msg = str(e)
+        logger.warning("Native Mercado dispatch failed: %s", e)
+        return False, f"回复未能发送至美客多买家: {e}"
 
     # Append message to local session snapshot
     messages = target_session.get("messages") or []
@@ -341,10 +545,7 @@ def send_real_reply(session_id: str, reply_text: str) -> tuple[bool, str]:
     target_session["updated_at"] = time.strftime("%Y-%m-%d %H:%M", time.localtime())
     target_session["is_read"] = True
     save_sessions(sessions)
-
-    if dispatched:
-        return True, "回复已成功发送至美客多买家！"
-    return True, f"回复已同步（本地已更新，官方重试中: {err_msg or 'OK'}）"
+    return True, "回复已成功发送至美客多买家！"
 
 
 class MobileGatewayHandler(BaseHTTPRequestHandler):
@@ -366,6 +567,18 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.close_connection = True
 
+    def _require_auth(self) -> bool:
+        """Every data and write endpoint requires the shared access token; fail closed when unset."""
+        header = str(self.headers.get("Authorization") or "")
+        presented = header[7:].strip() if header[:7].lower() == "bearer " else ""
+        if is_token_valid(presented):
+            return True
+        if not get_access_token():
+            self._send_json({"success": False, "error": "网关尚未配置访问口令，已拒绝访问"}, status_code=503)
+        else:
+            self._send_json({"success": False, "error": "访问口令缺失或不正确"}, status_code=401)
+        return False
+
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -383,14 +596,20 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
             return v[0] if v else default
 
         if path in ("/", "/api/status"):
-            tunnel_url = get_public_tunnel_url()
             self._send_json({
                 "status": "online",
                 "app": "MercadoDiscountManager Mobile Gateway",
-                "version": "1.1.0",
-                "tunnel_url": tunnel_url,
+                "version": "1.2.0",
+                "auth_required": True,
                 "server_time": int(time.time()),
             })
+            return
+
+        if not self._require_auth():
+            return
+
+        if path == "/api/auth_check":
+            self._send_json({"success": True})
         elif path == "/api/stores":
             stores = get_available_stores()
             self._send_json({"success": True, "stores": stores})
@@ -442,6 +661,8 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
                 if s.get("id") == session_id:
                     found = s
                     break
+            if not found:
+                found = find_or_create_order_session(session_id, sessions)
             if found:
                 self._send_json({"success": True, "session": found})
             else:
@@ -462,6 +683,7 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
                 o_dict = dict(o)
                 o_dict["status_text"] = badge_text
                 o_dict["filter_cat"] = filter_cat
+                o_dict["shipping_deadline"] = compute_shipping_deadline(o)
                 enriched_orders.append(o_dict)
 
             if status_filter and status_filter != "all":
@@ -492,6 +714,8 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        if not self._require_auth():
+            return
         content_len = int(self.headers.get("Content-Length", 0))
         body_bytes = self.rfile.read(content_len) if content_len > 0 else b"{}"
 
@@ -511,15 +735,26 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
             self._send_json({"success": ok, "message": msg})
         elif path == "/api/claim_action":
             session_id = payload.get("session_id") or ""
-            action = payload.get("action") or "full-refund"
+            action = str(payload.get("action") or "")
             if not session_id:
                 self._send_json({"success": False, "error": "缺少 session_id"}, status_code=400)
+                return
+            if action not in CLAIM_ACTIONS:
+                self._send_json({"success": False, "error": "缺少或不支持的 action"}, status_code=400)
+                return
+            if payload.get("confirm") != REAL_WRITE_CONFIRM:
+                self._send_json({"success": False, "error": "真实索赔操作缺少确认字段"}, status_code=400)
                 return
             ok, msg = execute_claim_action(session_id, action, payload.get("extra_params"))
             self._send_json({"success": ok, "message": msg})
         elif path == "/api/sync":
             orders = payload.get("orders")
             sessions = payload.get("sessions")
+            if (orders is not None and not isinstance(orders, list)) or (
+                sessions is not None and not isinstance(sessions, list)
+            ):
+                self._send_json({"success": False, "error": "orders / sessions 必须是列表"}, status_code=400)
+                return
             if orders is not None:
                 save_orders(orders)
             if sessions is not None:
@@ -588,9 +823,15 @@ def start_tunnel_in_background(port: int = GATEWAY_PORT) -> None:
         logger.error("Failed to start cloudflared tunnel: %s", e)
 
 
+def create_server(port: int = GATEWAY_PORT) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer(("0.0.0.0", port), MobileGatewayHandler)
+
+
 def run_server(port: int = GATEWAY_PORT, with_tunnel: bool = True) -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", port), MobileGatewayHandler)
+    server = create_server(port)
     logger.info(">>> 移动端多线程高并发网关服务已启动: http://0.0.0.0:%d <<<", port)
+    if not get_access_token():
+        logger.warning("未配置访问口令（环境变量 %s 或数据目录下 %s），所有数据接口将拒绝访问", ACCESS_TOKEN_ENV, ACCESS_TOKEN_FILENAME)
 
     if with_tunnel:
         start_tunnel_in_background(port)

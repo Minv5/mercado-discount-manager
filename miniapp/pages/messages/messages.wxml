@@ -35,7 +35,7 @@
           </view>
 
           <view class="row-bottom">
-            <text class="bottom-snip ellipsis-1">问: {{item.text_cn || item.text_es}}</text>
+            <text class="bottom-snip ellipsis-1" user-select="true" selectable="true">问: {{item.text_cn || item.text_es}}</text>
           </view>
         </view>
       </view>
@@ -71,7 +71,7 @@
           </view>
 
           <view class="row-bottom">
-            <text class="bottom-snip ellipsis-1">理由: {{item.reason_display}}</text>
+            <text class="bottom-snip ellipsis-1" user-select="true" selectable="true">理由: {{item.reason_display}}</text>
           </view>
         </view>
       </view>
@@ -106,7 +106,7 @@
           </view>
 
           <view class="row-bottom">
-            <text class="bottom-snip ellipsis-1">{{item.item_title || item.last_message}}</text>
+            <text class="bottom-snip ellipsis-1" user-select="true" selectable="true">{{item.item_title || item.last_message}}</text>
           </view>
         </view>
       </view>

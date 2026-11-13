@@ -26,7 +26,8 @@
         <view class="context-top">
           <text class="store-tag">{{itemData.store_name}}</text>
           <text class="site-tag">{{itemData.site_id}}</text>
-          <text class="item-id text-muted">{{itemData.item_id}}</text>
+          <text class="item-id text-muted" wx:if="{{itemData.order_id}}">#{{itemData.order_id}}</text>
+          <text class="item-id text-muted" wx:elif="{{itemData.item_id}}">{{itemData.item_id}}</text>
         </view>
         <text class="context-title ellipsis-2">{{itemData.item_title}}</text>
       </block>
@@ -43,9 +44,10 @@
           <text class="sender-name">{{itemData.buyer_name}}</text>
           <text class="bubble-time text-muted">{{itemData.created_at}}</text>
         </view>
-        <view class="bubble-text es-text">{{itemData.text_es}}</view>
+        <text class="bubble-text es-text" user-select="true" selectable="true">{{itemData.text_es}}</text>
         <view class="bubble-translation cn-text">
-          <text class="trans-tag">中文参考：</text>{{itemData.text_cn || '正在解析中文释义...'}}
+          <text class="trans-tag">中文参考：</text>
+          <text class="trans-text-body" user-select="true" selectable="true">{{itemData.text_cn || '正在解析中文释义...'}}</text>
         </view>
       </view>
 
@@ -55,9 +57,10 @@
           <text class="sender-name">我 (商家已回复)</text>
           <text class="bubble-time text-muted">{{itemData.answer_time || itemData.created_at}}</text>
         </view>
-        <view class="bubble-text es-text">{{itemData.answer_es}}</view>
+        <text class="bubble-text es-text" user-select="true" selectable="true">{{itemData.answer_es}}</text>
         <view class="bubble-translation cn-text" wx:if="{{itemData.answer_cn}}">
-          <text class="trans-tag">中文释义：</text>{{itemData.answer_cn}}
+          <text class="trans-tag">中文释义：</text>
+          <text class="trans-text-body" user-select="true" selectable="true">{{itemData.answer_cn}}</text>
         </view>
       </view>
 
@@ -67,9 +70,10 @@
             <text class="sender-name">我 (刚刚发送)</text>
             <text class="bubble-time text-muted">刚刚</text>
           </view>
-          <view class="bubble-text es-text">{{repliedTextEs}}</view>
+          <text class="bubble-text es-text" user-select="true" selectable="true">{{repliedTextEs}}</text>
           <view class="bubble-translation cn-text">
-            <text class="trans-tag">输入原文：</text>{{repliedTextCn}}
+            <text class="trans-tag">输入原文：</text>
+            <text class="trans-text-body" user-select="true" selectable="true">{{repliedTextCn}}</text>
           </view>
         </view>
         <view class="sent-success-tip">✅ 回复已成功同步至美客多官方平台！</view>
@@ -79,27 +83,38 @@
     <!-- 2. 售后私信多轮形态 -->
     <view class="messages-view" wx:if="{{chatType === 'message'}}">
       <view class="msg-history">
-        <block wx:for="{{itemData.history}}" wx:key="index">
-          <view class="chat-bubble {{item.sender === 'buyer' ? 'buyer-bubble' : 'seller-bubble'}}">
-            <view class="bubble-header">
-              <text class="sender-name">{{item.sender === 'buyer' ? itemData.buyer_name : '我 (商家)'}}</text>
-              <text class="bubble-time text-muted">{{item.time}}</text>
+        <block wx:if="{{itemData.history && itemData.history.length > 0}}">
+          <block wx:for="{{itemData.history}}" wx:key="index">
+            <view class="chat-bubble {{item.sender === 'buyer' ? 'buyer-bubble' : 'seller-bubble'}}">
+              <view class="bubble-header">
+                <text class="sender-name">{{item.sender === 'buyer' ? itemData.buyer_name : '我 (商家)'}}</text>
+                <text class="bubble-time text-muted">{{item.time}}</text>
+              </view>
+              <text class="bubble-text es-text" user-select="true" selectable="true">{{item.text}}</text>
+              <view class="bubble-translation cn-text" wx:if="{{item.text_cn}}">
+                <text class="trans-tag">释义：</text>
+                <text class="trans-text-body" user-select="true" selectable="true">{{item.text_cn}}</text>
+              </view>
             </view>
-            <view class="bubble-text es-text">{{item.text}}</view>
-            <view class="bubble-translation cn-text" wx:if="{{item.text_cn}}">
-              <text class="trans-tag">释义：</text>{{item.text_cn}}
-            </view>
-          </view>
+          </block>
         </block>
 
-        <view class="chat-bubble seller-bubble" wx:if="{{replied}}">
+        <!-- 初始空会话提示 -->
+        <view class="empty-chat-tip" wx:elif="{{!replied}}">
+          <text class="empty-chat-icon">💬</text>
+          <text class="empty-chat-text">买家尚未主动发起咨询或暂无往来记录</text>
+          <text class="empty-chat-sub">您可在下方直接输入中文，系统将自动双语转译为{{targetLangName}}并联系买家</text>
+        </view>
+
+        <view class="chat-bubble seller-bubble" wx:if="{{replied && (!itemData.history || itemData.history.length === 0)}}">
           <view class="bubble-header">
             <text class="sender-name">我 (刚刚发送)</text>
             <text class="bubble-time text-muted">刚刚</text>
           </view>
-          <view class="bubble-text es-text">{{repliedTextEs}}</view>
+          <text class="bubble-text es-text" user-select="true" selectable="true">{{repliedTextEs}}</text>
           <view class="bubble-translation cn-text">
-            <text class="trans-tag">输入原文：</text>{{repliedTextCn}}
+            <text class="trans-tag">输入原文：</text>
+            <text class="trans-text-body" user-select="true" selectable="true">{{repliedTextCn}}</text>
           </view>
         </view>
       </view>
@@ -116,9 +131,10 @@
                 <text class="sender-name">{{item.sender_name || (item.sender === 'seller' ? '我 (商家)' : (item.sender === 'mediator' ? '美客多调解员' : (itemData.buyer_name || '买家')))}}</text>
                 <text class="bubble-time text-muted">{{item.time}}</text>
               </view>
-              <view class="bubble-text es-text">{{item.text}}</view>
+              <text class="bubble-text es-text" user-select="true" selectable="true">{{item.text}}</text>
               <view class="bubble-translation cn-text" wx:if="{{item.text_cn}}">
-                <text class="trans-tag">中文参考：</text>{{item.text_cn}}
+                <text class="trans-tag">中文参考：</text>
+                <text class="trans-text-body" user-select="true" selectable="true">{{item.text_cn}}</text>
               </view>
             </view>
           </block>
@@ -151,14 +167,15 @@
         </view>
 
         <!-- 刚刚发送的商家消息 -->
-        <view class="chat-bubble seller-bubble" wx:if="{{replied}}">
+        <view class="chat-bubble seller-bubble" wx:if="{{replied && (!itemData.history || itemData.history.length === 0)}}">
           <view class="bubble-header">
             <text class="sender-name">我 (刚刚发送)</text>
             <text class="bubble-time text-muted">刚刚</text>
           </view>
-          <view class="bubble-text es-text">{{repliedTextEs}}</view>
+          <text class="bubble-text es-text" user-select="true" selectable="true">{{repliedTextEs}}</text>
           <view class="bubble-translation cn-text">
-            <text class="trans-tag">输入原文：</text>{{repliedTextCn}}
+            <text class="trans-tag">输入原文：</text>
+            <text class="trans-text-body" user-select="true" selectable="true">{{repliedTextCn}}</text>
           </view>
         </view>
       </view>

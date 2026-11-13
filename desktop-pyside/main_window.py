@@ -347,17 +347,22 @@ class MainWindow(QMainWindow):
         self.orders_page.oauthExpired.connect(self.handle_oauth_expired)
         self.orders_page.contactBuyerRequested.connect(self._on_contact_buyer_requested)
 
-        # 5: 商品管理页面
+        # 5: 刊登管理页面 (本地待刊登产品库)
+        from items.product_vault_page import ProductVaultPage
+        self.vault_page = ProductVaultPage(auth=cs_auth, parent=self)
+
+        # 6: 商品后台页面 (美客多在线商品)
         from items import ItemsPage
         self.items_page = ItemsPage(cs_client, cs_auth, parent=self)
 
         self.pages = QStackedWidget()
-        self.pages.addWidget(self.enrollment_page)
-        self.pages.addWidget(self.activity_page)
-        self.pages.addWidget(self.cleaner_page)
-        self.pages.addWidget(self.orders_page)
-        self.pages.addWidget(self.service_center_page)
-        self.pages.addWidget(self.items_page)
+        self.pages.addWidget(self.enrollment_page)     # 0: 活动报名
+        self.pages.addWidget(self.activity_page)       # 1: 活动管理
+        self.pages.addWidget(self.cleaner_page)        # 2: 商品清理
+        self.pages.addWidget(self.orders_page)         # 3: 订单管理
+        self.pages.addWidget(self.service_center_page) # 4: 客服售后
+        self.pages.addWidget(self.vault_page)          # 5: 刊登管理
+        self.pages.addWidget(self.items_page)          # 6: 商品后台
 
         self.view_stack = QStackedWidget()
         self.view_stack.addWidget(self.pages)
@@ -402,24 +407,32 @@ class MainWindow(QMainWindow):
         root.addWidget(self.view_stack, 1)
         self.setCentralWidget(central)
         self.statusBar().hide()
-        self._start_mobile_gateway()
-        self._start_mobile_sync()
+        self._mobile_gateway_server = None
 
-    def _start_mobile_sync(self) -> None:
+    def _apply_mobile_link_settings(self) -> None:
+        """Start or stop the phone gateway and snapshot sync according to the opt-in setting."""
+        enabled = bool(self.settings.get("mobileGatewayEnabled", False))
         try:
-            from engine.mobile_sync import full_sync_from_disk_async
-            full_sync_from_disk_async(immediate=True)
-        except Exception as e:
-            logger.debug("Startup mobile sync error: %s", e)
+            from engine.mobile_sync import full_sync_from_disk_async, set_mobile_sync_enabled
+            import mobile_gateway
 
-    def _start_mobile_gateway(self) -> None:
-        def _run() -> None:
-            try:
-                from mobile_gateway import run_server
-                run_server(port=28760, with_tunnel=True)
-            except Exception as e:
-                logger.warning("Mobile Gateway daemon: %s", e)
-        threading.Thread(target=_run, daemon=True, name="MobileGatewayDaemon").start()
+            set_mobile_sync_enabled(enabled)
+            server = getattr(self, "_mobile_gateway_server", None)
+            if enabled and server is None:
+                mobile_gateway.ensure_access_token()
+                server = mobile_gateway.create_server(port=28760)
+                self._mobile_gateway_server = server
+                threading.Thread(target=server.serve_forever, daemon=True, name="MobileGatewayDaemon").start()
+                full_sync_from_disk_async(immediate=True)
+            elif not enabled and server is not None:
+                self._mobile_gateway_server = None
+                threading.Thread(
+                    target=lambda: (server.shutdown(), server.server_close()),
+                    daemon=True,
+                    name="MobileGatewayStop",
+                ).start()
+        except Exception as e:
+            logger.warning("Mobile link settings: %s", e)
 
     def _surface(self) -> QFrame:
         frame = QFrame()
@@ -558,14 +571,26 @@ class MainWindow(QMainWindow):
         self.nav_buttons.append(self.service_center_btn)
         layout.addWidget(self.service_center_btn)
 
-        # 8. 商品管理
-        self.items_btn = QPushButton("商品管理")
-        self.items_btn.setObjectName("nav")
-        self.items_btn.setCheckable(True)
-        self.items_btn.setFixedSize(90, 34)
-        self.items_btn.clicked.connect(lambda checked=False: self._show_page(5))
-        self.nav_buttons.append(self.items_btn)
-        layout.addWidget(self.items_btn)
+        # 8. 刊登管理
+        self.listing_btn = QPushButton("刊登管理")
+        self.listing_btn.setObjectName("nav")
+        self.listing_btn.setCheckable(True)
+        self.listing_btn.setFixedSize(90, 34)
+        self.listing_btn.clicked.connect(lambda checked=False: self._show_page(5))
+        self.nav_buttons.append(self.listing_btn)
+        layout.addWidget(self.listing_btn)
+
+        # 9. 商品后台
+        self.backend_btn = QPushButton("商品后台")
+        self.backend_btn.setObjectName("nav")
+        self.backend_btn.setCheckable(True)
+        self.backend_btn.setFixedSize(90, 34)
+        self.backend_btn.clicked.connect(lambda checked=False: self._show_page(6))
+        self.nav_buttons.append(self.backend_btn)
+        layout.addWidget(self.backend_btn)
+
+        # 兼容旧引用
+        self.items_btn = self.listing_btn
 
         # 分隔线
         sep = QFrame()
@@ -1309,6 +1334,7 @@ class MainWindow(QMainWindow):
             PushService.instance().update_config(self.settings)
         except Exception:
             pass
+        self._apply_mobile_link_settings()
         first_session_load = not self.auto_shutdown_session_initialized
         if first_session_load:
             self.auto_shutdown_session_initialized = True
@@ -1338,6 +1364,8 @@ class MainWindow(QMainWindow):
             self.service_center_page.refresh_accounts()
         if hasattr(self, "orders_page"):
             self.orders_page.refresh_accounts()
+        if hasattr(self, "vault_page") and hasattr(self.vault_page, "refresh_accounts"):
+            self.vault_page.refresh_accounts()
         discount = dict(data.get("discount") or {})
         self.global_seller_discount = int(
             discount.get("seller_discount")
@@ -3422,6 +3450,8 @@ class MainWindow(QMainWindow):
             self.service_center_page.refresh_accounts()
         if hasattr(self, "orders_page"):
             self.orders_page.refresh_accounts()
+        if hasattr(self, "vault_page") and hasattr(self.vault_page, "refresh_accounts"):
+            self.vault_page.refresh_accounts()
         self.operating_rows_cache = operating
         self.benchmark_text_cache = benchmark
         if dialog.isVisible() or getattr(dialog, "embedded", False):
@@ -3435,6 +3465,7 @@ class MainWindow(QMainWindow):
             PushService.instance().update_config(self.settings)
         except Exception:
             pass
+        self._apply_mobile_link_settings()
         self.log(
             "设置已保存：读取全局上限 {read}，活动目录并发上限 {activity}，商品写入全局上限 {write}。".format(
                 read=self.settings.get("readConcurrency", 125),
@@ -4113,7 +4144,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.75"
+    return "2.2.96"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.

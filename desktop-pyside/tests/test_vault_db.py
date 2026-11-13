@@ -264,3 +264,83 @@ def test_delete_selected_and_delete_by_filter(db):
     res2 = db.query_products()
     assert res2["total"] == 1
     assert res2["items"][0]["id"] == "P2"
+
+
+def test_query_products_by_net_and_partial_dimensions(db):
+    db.import_from_json([
+        {"id": "D1", "price": 15.0, "length": 20.0, "width": 10.0, "height": 5.0},
+        {"id": "D2", "price": 25.0, "length": 20.0, "width": 30.0, "height": 15.0},
+        {"id": "D3", "price": 35.0, "length": 40.0, "width": 30.0, "height": 15.0},
+    ])
+
+    # Match length=20 only (width & height unrestricted)
+    res_l = db.query_products(filters={"length": 20.0})
+    assert {p["id"] for p in res_l["items"]} == {"D1", "D2"}
+
+    # Match width=30 & height=15 only (length unrestricted)
+    res_wh = db.query_products(filters={"width": 30.0, "height": 15.0})
+    assert {p["id"] for p in res_wh["items"]} == {"D2", "D3"}
+
+    # Combine min_net / max_net with dimension
+    res_net = db.query_products(filters={"min_net": 20.0, "max_net": 30.0, "length": 20.0})
+    assert [p["id"] for p in res_net["items"]] == ["D2"]
+
+
+def test_reduce_variants_categories_status_aliases_and_logs(db):
+    db.import_from_json([
+        {
+            "id": "RV1",
+            "title": "Item 1",
+            "status": "ready",
+            "category_id": "CBT1637",
+            "category_name": "Cushions",
+            "variants": [{"kvId": f"V{i}"} for i in range(5)],
+            "attributes": {"_variant_headers": [{"key": "颜色", "values": ["A", "B", "C", "D", "E"]}]},
+        },
+        {
+            "id": "RV2",
+            "title": "Item 2",
+            "status": "active",
+            "category_id": "CBT3697",
+            "category_name": "Headphones",
+            "variants": [{"kvId": "X1"}],
+        },
+        {
+            "id": "RV3",
+            "title": "Item 3",
+            "status": "pending",
+        },
+    ])
+
+    # Dynamic categories
+    cats = db.get_categories()
+    assert ("CBT1637", "Cushions") in cats
+    assert ("CBT3697", "Headphones") in cats
+
+    # Status alias queries
+    act_ids = {p["id"] for p in db.query_products(filters={"status": "active"})["items"]}
+    assert act_ids == {"RV1", "RV2"}
+    pau_ids = {p["id"] for p in db.query_products(filters={"status": "paused"})["items"]}
+    assert pau_ids == {"RV3"}
+
+    # Reduce 5 variants -> 2
+    cnt1 = db.batch_reduce_variants(["RV1", "RV2"], 2)
+    assert cnt1 == 1
+    rv1 = db.get_product("RV1")
+    assert rv1["variants_count"] == 2
+    assert len(rv1["variants"]) == 2
+    assert rv1["attributes"]["_logs"][0]["action"] == "裁剪变体"
+
+    # Reduce to 0 clears variants & headers
+    cnt2 = db.batch_reduce_variants(["RV1"], 0)
+    assert cnt2 == 1
+    rv1_zero = db.get_product("RV1")
+    assert rv1_zero["variants_count"] == 0
+    assert rv1_zero["variants"] == []
+    assert rv1_zero["attributes"]["_variant_headers"] == []
+
+    # Append product log
+    assert db.append_product_log("RV2", "测试记录", "验证持久化日志", "Tester") is True
+    rv2 = db.get_product("RV2")
+    assert rv2["attributes"]["_logs"][0]["action"] == "测试记录"
+

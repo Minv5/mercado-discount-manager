@@ -27,6 +27,7 @@ class TestMobileSync(unittest.TestCase):
             primary_url="http://127.0.0.1:28760/api/sync",
             fallback_url="https://minv5.trade/api/sync",
             debounce_seconds=0.1,
+            token_provider=lambda: "unit-test-token",
         )
 
     def tearDown(self) -> None:
@@ -45,6 +46,26 @@ class TestMobileSync(unittest.TestCase):
             req = mock_urlopen.call_args[0][0]
             self.assertEqual(req.full_url, "http://127.0.0.1:28760/api/sync")
             self.assertEqual(req.get_method(), "POST")
+            self.assertEqual(req.get_header("Authorization"), "Bearer unit-test-token")
+
+    def test_post_sync_sends_nothing_without_token(self) -> None:
+        sync = MobileGatewaySynchronizer(token_provider=lambda: "")
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            self.assertFalse(sync._post_sync({"orders": [{"order_id": "o1"}]}))
+            mock_urlopen.assert_not_called()
+
+    def test_global_sync_is_off_until_enabled(self) -> None:
+        import engine.mobile_sync as mobile_sync
+
+        with patch.object(mobile_sync._global_synchronizer, "trigger") as mock_trigger:
+            mobile_sync.set_mobile_sync_enabled(False)
+            trigger_mobile_sync(orders=[{"order_id": "o1"}])
+            full_sync_from_disk_async(immediate=True)
+            mock_trigger.assert_not_called()
+            mobile_sync.set_mobile_sync_enabled(True)
+            self.addCleanup(mobile_sync.set_mobile_sync_enabled, False)
+            trigger_mobile_sync(orders=[{"order_id": "o1"}])
+            mock_trigger.assert_called_once()
 
     def test_post_sync_fallback_when_primary_fails(self) -> None:
         mock_resp = MagicMock()
@@ -110,6 +131,10 @@ class TestMobileSync(unittest.TestCase):
             (tmp_p / "sessions_snapshot.json").write_text('[{"id": "s_disk"}]', encoding="utf-8")
             (tmp_p / "orders_snapshot.json").write_text('[{"order_id": "o_disk"}]', encoding="utf-8")
 
+            import engine.mobile_sync as mobile_sync
+
+            mobile_sync.set_mobile_sync_enabled(True)
+            self.addCleanup(mobile_sync.set_mobile_sync_enabled, False)
             with patch("engine.mobile_sync.get_data_dir", return_value=tmp_p):
                 with patch("engine.mobile_sync.trigger_mobile_sync") as mock_trigger:
                     full_sync_from_disk_async(immediate=True)

@@ -36,6 +36,7 @@ app = QApplication.instance() or QApplication([])
 
 from items.vault_more_actions import (
     GenerateVariantsDialog,
+    ReduceVariantsDialog,
     BatchAttrDialog,
     ReplaceKeywordDialog,
     BatchCategoryDialog,
@@ -97,3 +98,12 @@ def test_pre_upload_images_dialog():
     dlg = PreUploadImagesDialog(items)
     assert dlg.total_images == 1
     assert "1" in dlg.lbl_summary.text()
+    assert "background: #171B19" in dlg.styleSheet()
+    assert "background: #ffffff" not in dlg.styleSheet().lower()
+
+
+def test_reduce_variants_dialog():
+    dlg = ReduceVariantsDialog(selected_count=5)
+    dlg.input_count.setValue(3)
+    assert dlg.get_data() == {"target_count": 3}
+    assert "background: #171B19" in dlg.styleSheet()

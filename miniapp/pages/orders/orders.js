@@ -1,5 +1,5 @@
 const app = getApp();
-const { getOrders } = require("../../utils/api");
+const { getOrders, formatDeadline } = require("../../utils/api");
 const { formatCurrency, formatTime } = require("../../utils/format");
 
 Page({
@@ -28,6 +28,50 @@ Page({
 
   onShow() {
     this.fetchOrders();
+    this.startCountdownTimer();
+  },
+
+  onHide() {
+    this.clearCountdownTimer();
+  },
+
+  onUnload() {
+    this.clearCountdownTimer();
+  },
+
+  startCountdownTimer() {
+    this.clearCountdownTimer();
+    this.countdownTimer = setInterval(() => {
+      const { allOrders, showOrderDrawer, currentOrder } = this.data;
+      if (!allOrders || allOrders.length === 0) return;
+      let hasUpdate = false;
+      const updated = allOrders.map(o => {
+        if (o.deadline_ts) {
+          hasUpdate = true;
+          return { ...o, shipping_deadline: formatDeadline(o.deadline_ts) };
+        }
+        return o;
+      });
+      if (hasUpdate) {
+        const updateData = { allOrders: updated };
+        if (showOrderDrawer && currentOrder && currentOrder.deadline_ts) {
+          updateData.currentOrder = {
+            ...currentOrder,
+            shipping_deadline: formatDeadline(currentOrder.deadline_ts)
+          };
+        }
+        this.setData(updateData, () => {
+          this.applyFilter();
+        });
+      }
+    }, 30000);
+  },
+
+  clearCountdownTimer() {
+    if (this.countdownTimer) {
+      clearInterval(this.countdownTimer);
+      this.countdownTimer = null;
+    }
   },
 
   onPullDownRefresh() {
@@ -116,17 +160,47 @@ Page({
 
   preventProp() {},
 
-  copyText(e) {
-    const text = e.currentTarget.dataset.text;
-    if (!text) return;
-    wx.setClipboardData({
-      data: String(text),
-      success() {
-        wx.showToast({
-          title: "已复制到剪贴板",
-          icon: "success"
-        });
-      }
+  contactBuyer() {
+    const order = this.data.currentOrder;
+    if (!order) return;
+    this.closeOrderDrawer();
+
+    const orderId = String(order.order_id || "");
+    const packId = String(order.pack_id || orderId);
+    const buyerName = order.buyer_name || order.buyer_nickname || "买家";
+    const sessionId = `m_${packId || orderId}`;
+
+    // 优先在私信缓存中查找已有往来历史
+    const cachedList = wx.getStorageSync("cached_messages_list") || [];
+    const existing = cachedList.find(m => 
+      String(m.order_id) === orderId || 
+      String(m.pack_id) === packId || 
+      String(m.id) === sessionId ||
+      String(m.id) === `m_${orderId}`
+    );
+
+    const chatItem = existing ? { ...existing } : {
+      id: sessionId,
+      session_type: "message",
+      type: "message",
+      store_id: order.store_id || order.account_id || "",
+      store_name: order.store_name || "美客多店铺",
+      site_id: order.site_id || "MLA",
+      order_id: orderId,
+      pack_id: packId,
+      buyer_name: buyerName,
+      buyer_nickname: buyerName,
+      item_title: order.item_title || "美客多订单商品",
+      item_thumbnail: order.item_thumbnail || "",
+      item_id: order.item_sku || order.item_id || "",
+      status: "read",
+      can_reply: true,
+      history: []
+    };
+
+    wx.setStorageSync("activeChatItem", chatItem);
+    wx.navigateTo({
+      url: `/pages/chat/chat?type=message&id=${encodeURIComponent(chatItem.id)}`
     });
   }
 });

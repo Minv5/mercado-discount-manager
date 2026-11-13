@@ -1,5 +1,5 @@
 const app = getApp();
-const { getBaseUrl, getGatewayStatus } = require("../../utils/api");
+const { getBaseUrl, getGatewayStatus, checkGatewayAuth } = require("../../utils/api");
 
 Page({
   data: {
@@ -8,6 +8,8 @@ Page({
     pushEnabled: true,
     gatewayUrl: "",
     gatewayOnline: false,
+    gatewayToken: "",
+    tokenAccepted: false,
     miniappVersion: "v1.2.0"
   },
 
@@ -24,6 +26,7 @@ Page({
       stores: app.globalData.stores,
       pushEnabled: wx.getStorageSync("pushNotificationEnabled") !== false,
       gatewayUrl: getBaseUrl(),
+      gatewayToken: String(wx.getStorageSync("gateway_access_token") || ""),
       miniappVersion: version
     });
     this.checkGateway(false);
@@ -37,6 +40,7 @@ Page({
       if (showToast) wx.hideLoading();
       if (res.ok) {
         this.setData({ gatewayOnline: true });
+        checkGatewayAuth().then(auth => this.setData({ tokenAccepted: auth.ok }));
         if (showToast) {
           wx.showToast({ title: "网关在线，数据畅通！", icon: "success" });
         }
@@ -50,6 +54,21 @@ Page({
           });
         }
       }
+    });
+  },
+
+  onTokenInput(e) {
+    this.setData({ gatewayToken: e.detail.value });
+  },
+
+  saveToken() {
+    wx.setStorageSync("gateway_access_token", String(this.data.gatewayToken || "").trim());
+    wx._hasShownTokenTip = false;
+    wx.showLoading({ title: "校验访问口令..." });
+    checkGatewayAuth().then(res => {
+      wx.hideLoading();
+      this.setData({ tokenAccepted: res.ok });
+      wx.showToast({ title: res.ok ? "口令正确，已保存" : "口令未通过校验", icon: res.ok ? "success" : "none" });
     });
   },
 
