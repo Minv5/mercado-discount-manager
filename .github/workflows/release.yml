@@ -76,13 +76,13 @@ jobs:
         run: |
           python -m pytest tests -q -p no:cacheprovider
 
-      - name: Upload macOS Crash Reports
+      - name: Native Backtrace On Test Crash
         if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-crash-reports
-          path: ~/Library/Logs/DiagnosticReports/
-          if-no-files-found: ignore
+        working-directory: desktop-pyside
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          lldb --batch -o run -o "bt 60" -- "$(python -c 'import sys; print(sys.executable)')" -m pytest tests -q -p no:cacheprovider -x --deselect tests/test_ui.py 2>&1 | tail -150
 
       - name: Build macOS App Bundle & Archive
         env:
