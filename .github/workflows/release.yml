@@ -76,14 +76,6 @@ jobs:
         run: |
           python -m pytest tests -q -p no:cacheprovider
 
-      - name: Native Backtrace On Test Crash
-        if: failure()
-        working-directory: desktop-pyside
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: |
-          lldb --batch -O "settings set target.process.stop-on-exec false" -o run -k "bt 60" -k quit -- "$(python -c 'import sys; print(sys.executable)')" -m pytest tests -q -p no:cacheprovider -x --deselect tests/test_ui.py 2>&1 | tail -150
-
       - name: Build macOS App Bundle & Archive
         env:
           CI: "true"
