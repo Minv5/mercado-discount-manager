@@ -82,7 +82,7 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          lldb --batch -o run -o "bt 60" -- "$(python -c 'import sys; print(sys.executable)')" -m pytest tests -q -p no:cacheprovider -x --deselect tests/test_ui.py 2>&1 | tail -150
+          lldb --batch -O "settings set target.process.stop-on-exec false" -o run -k "bt 60" -k quit -- "$(python -c 'import sys; print(sys.executable)')" -m pytest tests -q -p no:cacheprovider -x --deselect tests/test_ui.py 2>&1 | tail -150
 
       - name: Build macOS App Bundle & Archive
         env:
