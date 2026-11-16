@@ -34,6 +34,13 @@ class TestMobileSync(unittest.TestCase):
         if self.sync._timer:
             self.sync._timer.cancel()
 
+    @staticmethod
+    def _wait_until(condition, timeout: float = 5.0) -> None:
+        """Poll instead of sleeping a fixed time so background dispatch isn't raced on slow machines."""
+        deadline = time.monotonic() + timeout
+        while not condition() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
     def test_post_sync_primary_success(self) -> None:
         mock_resp = MagicMock()
         mock_resp.status = 200
@@ -104,7 +111,8 @@ class TestMobileSync(unittest.TestCase):
         self.sync.trigger(orders=[{"order_id": "100"}])
         self.sync.trigger(sessions=[{"id": "2"}])
 
-        # Wait for debounce timer (0.1s)
+        # Debounce timer is 0.1s; allow slow machines to catch up, then confirm nothing extra follows
+        self._wait_until(lambda: dispatched_payloads)
         time.sleep(0.2)
 
         self.assertEqual(len(dispatched_payloads), 1)
@@ -121,7 +129,7 @@ class TestMobileSync(unittest.TestCase):
         self.sync._post_sync = mock_post_sync
         self.sync.trigger(sessions=[{"id": "imm"}], immediate=True)
 
-        time.sleep(0.1)
+        self._wait_until(lambda: dispatched_payloads)
         self.assertEqual(len(dispatched_payloads), 1)
         self.assertEqual(dispatched_payloads[0]["sessions"], [{"id": "imm"}])
 
