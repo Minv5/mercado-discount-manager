@@ -37,6 +37,33 @@ _ensure_qt_platform_plugins()
 
 
 @pytest.fixture(autouse=True, scope="session")
+def collect_qt_garbage_on_main_thread_only():
+    """Keep Python's cyclic GC from destroying Qt objects on background threads.
+
+    Tests leave widgets with running QTimers in reference cycles. If the automatic collector happens
+    to fire on a worker thread, Qt cannot unregister those timers from that thread, and the next
+    processEvents() delivers a timer event to freed memory (segfault seen on the macOS CI runner).
+    """
+    import gc
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+@pytest.fixture(autouse=True)
+def _collect_garbage_after_each_test(collect_qt_garbage_on_main_thread_only):
+    import gc
+
+    yield
+    gc.collect()
+
+
+@pytest.fixture(autouse=True, scope="session")
 def block_image_downloads():
     """Tests use made-up image URLs; never let the image cache fetch them from the real network.
 
