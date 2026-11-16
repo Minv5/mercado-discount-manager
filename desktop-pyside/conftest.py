@@ -37,6 +37,33 @@ _ensure_qt_platform_plugins()
 
 
 @pytest.fixture(autouse=True, scope="session")
+def block_image_downloads():
+    """Tests use made-up image URLs; never let the image cache fetch them from the real network.
+
+    Real fetches stall worker threads for minutes at interpreter exit and deliver results into
+    unrelated tests' event loops.
+    """
+    import types
+    import urllib.error
+    import urllib.request
+
+    from ui_common import image_cache
+
+    def _blocked(*_args, **_kwargs):
+        raise urllib.error.URLError("image downloads are disabled in tests")
+
+    offline_urllib = types.SimpleNamespace(
+        request=types.SimpleNamespace(Request=urllib.request.Request, urlopen=_blocked)
+    )
+    original = image_cache.urllib
+    image_cache.urllib = offline_urllib
+    try:
+        yield
+    finally:
+        image_cache.urllib = original
+
+
+@pytest.fixture(autouse=True, scope="session")
 def isolate_test_data_dir():
     """Ensure MDM_DATA_DIR always points to an isolated temp directory for test sessions."""
     with tempfile.TemporaryDirectory(prefix="mdm_test_env_") as tmp_dir:
