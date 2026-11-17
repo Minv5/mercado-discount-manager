@@ -410,12 +410,12 @@ class MainWindow(QMainWindow):
         self._mobile_gateway_server = None
 
     def _apply_mobile_link_settings(self) -> None:
-        """Start or stop the phone gateway and snapshot sync according to the opt-in setting."""
-        enabled = bool(self.settings.get("mobileGatewayEnabled", False))
+        """Start or stop the phone gateway and snapshot sync according to the phone link setting."""
         try:
-            from engine.mobile_sync import full_sync_from_disk_async, set_mobile_sync_enabled
+            from engine.mobile_sync import full_sync_from_disk_async, mobile_link_enabled, set_mobile_sync_enabled
             import mobile_gateway
 
+            enabled = mobile_link_enabled(self.settings)
             set_mobile_sync_enabled(enabled)
             server = getattr(self, "_mobile_gateway_server", None)
             if enabled and server is None:
@@ -4144,7 +4144,7 @@ def product_version() -> str:
         if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", value):
             return value
     # Native Python engine release product version
-    return "2.2.96"
+    return "2.2.97"
 
 
 # make_table, section_label, field_label are extracted to ui_common.widgets and imported above.

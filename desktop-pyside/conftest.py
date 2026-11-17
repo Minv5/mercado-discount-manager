@@ -91,6 +91,33 @@ def block_image_downloads():
 
 
 @pytest.fixture(autouse=True, scope="session")
+def keep_phone_link_inside_the_test_process():
+    """The phone link is on by default; windows built in tests must not open the real gateway port
+    or push test snapshots to the user's real gateway."""
+    from unittest.mock import MagicMock
+
+    import mobile_gateway
+    from engine import mobile_sync
+
+    real_create_server = mobile_gateway.create_server
+    real_post_sync = mobile_sync._global_synchronizer._post_sync
+
+    def _create_server(port=mobile_gateway.GATEWAY_PORT):
+        if port == mobile_gateway.GATEWAY_PORT:
+            return MagicMock(name="offline_gateway_server")
+        return real_create_server(port)
+
+    mobile_gateway.create_server = _create_server
+    mobile_sync._global_synchronizer._post_sync = lambda payload: True
+    try:
+        yield
+    finally:
+        mobile_gateway.create_server = real_create_server
+        mobile_sync._global_synchronizer._post_sync = real_post_sync
+        mobile_sync.set_mobile_sync_enabled(False)
+
+
+@pytest.fixture(autouse=True, scope="session")
 def isolate_test_data_dir():
     """Ensure MDM_DATA_DIR always points to an isolated temp directory for test sessions."""
     with tempfile.TemporaryDirectory(prefix="mdm_test_env_") as tmp_dir:

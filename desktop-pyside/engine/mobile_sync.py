@@ -142,8 +142,13 @@ _global_synchronizer = MobileGatewaySynchronizer()
 _sync_enabled = False
 
 
+def mobile_link_enabled(settings: dict[str, Any] | None) -> bool:
+    """The phone link is on unless the user switched it off in settings."""
+    return bool((settings or {}).get("mobileGatewayEnabled", True))
+
+
 def set_mobile_sync_enabled(enabled: bool) -> None:
-    """Order/session snapshots leave this machine only after the user opts in."""
+    """Order/session snapshots leave this machine only while the phone link setting is on."""
     global _sync_enabled
     _sync_enabled = bool(enabled)
 

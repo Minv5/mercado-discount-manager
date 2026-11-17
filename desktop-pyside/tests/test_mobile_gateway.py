@@ -159,7 +159,7 @@ class MobileLinkOptInTests(unittest.TestCase):
 
         MainWindow._apply_mobile_link_settings(window)
 
-    def test_gateway_stays_closed_by_default_and_follows_the_setting(self) -> None:
+    def test_gateway_is_on_by_default_and_follows_the_setting(self) -> None:
         from types import SimpleNamespace
         import engine.mobile_sync as mobile_sync
 
@@ -169,11 +169,6 @@ class MobileLinkOptInTests(unittest.TestCase):
         with patch.object(mobile_gateway, "create_server", return_value=fake_server) as create, \
                 patch.object(mobile_gateway, "ensure_access_token", return_value="t") as ensure, \
                 patch.object(mobile_sync, "full_sync_from_disk_async"):
-            self._apply(window)
-            create.assert_not_called()
-            self.assertFalse(mobile_sync._sync_enabled)
-
-            window.settings = {"mobileGatewayEnabled": True}
             self._apply(window)
             self._apply(window)
             create.assert_called_once_with(port=28760)

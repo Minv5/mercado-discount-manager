@@ -55,6 +55,7 @@ from callback_endpoints import (
 )
 from ui_common import copy_pure_text, make_table
 from core import Account, parse_targeted_cancel_item_ids, site_name
+from engine.mobile_sync import mobile_link_enabled
 from reason_text import business_reason_text
 
 
@@ -2570,7 +2571,7 @@ class SettingsDialog(QDialog):
         card_layout.addWidget(mobile_title)
 
         self.mobile_gateway_enabled = QCheckBox("启用手机小程序连接（开启后本机开放手机网关，并把订单与客服会话同步到你的路由器网关）")
-        self.mobile_gateway_enabled.setChecked(bool(self.settings.get("mobileGatewayEnabled", False)))
+        self.mobile_gateway_enabled.setChecked(mobile_link_enabled(self.settings))
         card_layout.addWidget(self.mobile_gateway_enabled)
 
         mobile_token_layout = QHBoxLayout()
@@ -2674,7 +2675,7 @@ class SettingsDialog(QDialog):
             ("activityCallbackSecretFile", self.activity_callback_secret_file, str(settings.get("activityCallbackSecretFile") or "")),
             ("activityCallbackClaimUrl", self.activity_callback_claim_url, str(settings.get("activityCallbackClaimUrl") or DEFAULT_ACTIVITY_CALLBACK_CLAIM_URL)),
             ("activityCallbackAckUrl", self.activity_callback_ack_url, str(settings.get("activityCallbackAckUrl") or DEFAULT_ACTIVITY_CALLBACK_ACK_URL)),
-            ("mobileGatewayEnabled", self.mobile_gateway_enabled, bool(settings.get("mobileGatewayEnabled", False))),
+            ("mobileGatewayEnabled", self.mobile_gateway_enabled, mobile_link_enabled(settings)),
             ("pushEnabled", self.push_enabled, bool(settings.get("pushEnabled", False))),
             ("pushToken", self.push_token, str(settings.get("pushToken") or "")),
             ("pushNotifyOrders", self.push_notify_orders, bool(settings.get("pushNotifyOrders", True))),
