@@ -1,5 +1,5 @@
 const app = getApp();
-const { getBaseUrl, getGatewayStatus, checkGatewayAuth } = require("../../utils/api");
+const { getBaseUrl, getGatewayStatus, checkGatewayAuth, getPairedVersion } = require("../../utils/api");
 
 Page({
   data: {
@@ -8,13 +8,14 @@ Page({
     pushEnabled: true,
     gatewayUrl: "",
     gatewayOnline: false,
-    gatewayToken: "",
     tokenAccepted: false,
-    miniappVersion: "v1.2.0"
+    miniappVersion: ""
   },
 
   onShow() {
-    let version = "v1.2.0";
+    // 体验版/开发版向微信查不到版本号，退回上传时内置的版本号
+    const pairedVersion = getPairedVersion();
+    let version = pairedVersion ? `v${pairedVersion}` : "开发版";
     try {
       const accountInfo = wx.getAccountInfoSync();
       if (accountInfo && accountInfo.miniProgram && accountInfo.miniProgram.version) {
@@ -26,7 +27,6 @@ Page({
       stores: app.globalData.stores,
       pushEnabled: wx.getStorageSync("pushNotificationEnabled") !== false,
       gatewayUrl: getBaseUrl(),
-      gatewayToken: String(wx.getStorageSync("gateway_access_token") || ""),
       miniappVersion: version
     });
     this.checkGateway(false);
@@ -54,21 +54,6 @@ Page({
           });
         }
       }
-    });
-  },
-
-  onTokenInput(e) {
-    this.setData({ gatewayToken: e.detail.value });
-  },
-
-  saveToken() {
-    wx.setStorageSync("gateway_access_token", String(this.data.gatewayToken || "").trim());
-    wx._hasShownTokenTip = false;
-    wx.showLoading({ title: "校验访问口令..." });
-    checkGatewayAuth().then(res => {
-      wx.hideLoading();
-      this.setData({ tokenAccepted: res.ok });
-      wx.showToast({ title: res.ok ? "口令正确，已保存" : "口令未通过校验", icon: res.ok ? "success" : "none" });
     });
   },
 

@@ -156,13 +156,3 @@
   color: #D4AF37;
   border: 1rpx solid #6E5C24;
 }
-
-.token-input {
-  margin-top: 16rpx;
-  padding: 16rpx 20rpx;
-  border: 1rpx solid #4E472F;
-  border-radius: 12rpx;
-  background: #18201C;
-  color: #E6E2D8;
-  font-size: 24rpx;
-}

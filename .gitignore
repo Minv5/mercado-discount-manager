@@ -26,3 +26,5 @@ tools/license_private_key.pem
 
 scripts/bin/
 miniapp/project.private.config.json
+# 上传小程序时临时生成的电脑端配对文件（含访问口令），不得提交
+miniapp/utils/desktop_pairing.js

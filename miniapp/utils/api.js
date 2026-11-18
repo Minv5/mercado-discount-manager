@@ -10,8 +10,23 @@ function getBaseUrl() {
   return (custom && custom.trim()) ? custom.trim().replace(/\/+$/, "") : DEFAULT_GATEWAY_URL;
 }
 
+// 电脑端访问口令在上传小程序时自动内置（scripts/upload_miniapp.cjs 生成 desktop_pairing.js），用户无需手动填写
+function loadDesktopPairing() {
+  try {
+    return require("./desktop_pairing.js") || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+const DESKTOP_PAIRING = loadDesktopPairing();
+
 function getGatewayToken() {
-  return String(wx.getStorageSync("gateway_access_token") || "").trim();
+  return String(DESKTOP_PAIRING.accessToken || "").trim();
+}
+
+function getPairedVersion() {
+  return String(DESKTOP_PAIRING.version || "").trim();
 }
 
 function request(path, options = {}) {
@@ -39,8 +54,8 @@ function request(path, options = {}) {
           if (!wx._hasShownTokenTip) {
             wx._hasShownTokenTip = true;
             wx.showModal({
-              title: "需要访问口令",
-              content: (res.data && res.data.error) || "请到「设置」页填写与电脑端一致的访问口令。",
+              title: "电脑端认证未通过",
+              content: "小程序与电脑端的认证不一致，请在电脑上重新上传一次小程序后再打开。",
               showCancel: false
             });
           }
@@ -543,7 +558,7 @@ function getGatewayStatus() {
     .catch(err => ({ ok: false, error: err.message }));
 }
 
-// 校验当前访问口令是否被网关接受
+// 校验内置的电脑端认证是否被网关接受
 function checkGatewayAuth() {
   return request("/api/auth_check")
     .then(() => ({ ok: true }))
@@ -596,5 +611,6 @@ module.exports = {
   handleClaimAction,
   getSessionDetail,
   getGatewayStatus,
-  checkGatewayAuth
+  checkGatewayAuth,
+  getPairedVersion
 };
